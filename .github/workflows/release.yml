@@ -1,0 +1,342 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "frontend/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 2026-04-12), defaults to today"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare:
+    name: Determine version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Compute version and image name
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(date +%Y-%m-%d)
+          fi
+          OWNER_LOWER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$OWNER_LOWER/rflush" >> "$GITHUB_OUTPUT"
+
+  frontend:
+    name: Build frontend
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Stage frontend dist artifact
+        shell: bash
+        run: |
+          mv frontend/dist frontend-dist
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+          retention-days: 7
+
+  build:
+    name: Build binary ${{ matrix.target }}
+    needs: [prepare, frontend]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            use_cross: true
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+            use_cross: true
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            use_cross: false
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            use_cross: false
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: .
+
+      - name: Restore frontend dist (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          rm -rf frontend/dist
+          mkdir -p frontend
+          mv frontend-dist frontend/dist
+
+      - name: Restore frontend dist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path frontend\dist) { Remove-Item -Recurse -Force frontend\dist }
+          New-Item -ItemType Directory -Force -Path frontend | Out-Null
+          Move-Item -LiteralPath frontend-dist -Destination frontend\dist
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build binary
+        run: |
+          ${{ matrix.use_cross && 'cross' || 'cargo' }} build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/rflush"
+          ARCHIVE="rflush-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $bin = "target\${{ matrix.target }}\release\rflush.exe"
+          $archive = "rflush-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.zip"
+          Compress-Archive -LiteralPath $bin -DestinationPath $archive
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rflush-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          retention-days: 7
+
+  docker-linux:
+    name: Docker linux ${{ matrix.platform }}
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            suffix: linux-amd64
+
+          - target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            suffix: linux-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rflush-${{ matrix.target }}
+          path: docker/linux
+
+      - name: Extract binary artifact
+        shell: bash
+        run: |
+          cd docker/linux
+          tar xzf rflush-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz
+          chmod +x rflush
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: docker/linux
+          file: docker/linux/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-${{ matrix.suffix }}
+            ${{ needs.prepare.outputs.image }}:latest-${{ matrix.suffix }}
+
+  docker-linux-manifest:
+    name: Docker linux manifest
+    needs: [prepare, docker-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch linux manifest
+        shell: bash
+        run: |
+          docker buildx imagetools create \
+            -t "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}" \
+            -t "${{ needs.prepare.outputs.image }}:latest" \
+            "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-amd64" \
+            "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-arm64"
+
+  docker-windows:
+    name: Docker windows/amd64
+    needs: [prepare, build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rflush-x86_64-pc-windows-msvc
+          path: docker\windows
+
+      - name: Extract binary artifact
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath "docker\windows\rflush-${{ needs.prepare.outputs.version }}-x86_64-pc-windows-msvc.zip" -DestinationPath "docker\windows" -Force
+
+      - name: Log in to GHCR
+        shell: pwsh
+        run: |
+          "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build windows image
+        shell: pwsh
+        run: |
+          docker build `
+            --file docker/windows/Dockerfile `
+            --tag "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-windows-amd64" `
+            --tag "${{ needs.prepare.outputs.image }}:latest-windows-amd64" `
+            docker\windows
+
+      - name: Push windows image
+        shell: pwsh
+        run: |
+          docker push "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-windows-amd64"
+          docker push "${{ needs.prepare.outputs.image }}:latest-windows-amd64"
+
+  release:
+    name: Create Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rflush-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.version }}
+          files: |
+            artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
