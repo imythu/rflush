@@ -269,7 +269,7 @@ pub async fn serve(base_dir: PathBuf, db: Database, scheduler: Arc<BrushSchedule
     );
     let state = AppState::new(base_dir, db, engine, scheduler);
     let app = app_router(state);
-    let addr: SocketAddr = "127.0.0.1:3000"
+    let addr: SocketAddr = "0.0.0.0:3000"
         .parse()
         .map_err(|e| AppError::Server {
             message: format!("invalid listen address: {}", e),
