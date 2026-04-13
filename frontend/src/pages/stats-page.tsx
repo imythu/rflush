@@ -34,6 +34,11 @@ import type {
   TaskStatsSnapshot,
 } from "@/types";
 
+type TimeWindow = {
+  start: number;
+  end: number;
+};
+
 /* ---------- helpers ---------- */
 
 function formatBytes(bytes: number): string {
@@ -49,9 +54,89 @@ function formatTime(isoString: string): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+function formatAxisTime(value: string | number, hours: number): string {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) {
+    return String(value);
+  }
+
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const month = d.getMonth() + 1;
+  const day = d.getDate();
+
+  if (hours <= 6) {
+    return `${hh}:${mm}`;
+  }
+  if (hours <= 12) {
+    return `${hh}:00`;
+  }
+  if (hours <= 24) {
+    return `${hh}:00`;
+  }
+  if (hours <= 24 * 7) {
+    return `${month}/${day}`;
+  }
+  return `${month}/${day}`;
+}
+
+function formatTooltipTime(value: string | number, hours: number): string {
+  return formatAxisTime(typeof value === "number" ? value : Number(value) || value, hours);
+}
+
+function formatSpeed(bytesPerSec: number): string {
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+function getTimeAxisProps(hours: number) {
+  if (hours <= 1) {
+    return { tickCount: 7, minTickGap: 24 };
+  }
+  if (hours <= 6) {
+    return { tickCount: 7, minTickGap: 28 };
+  }
+  if (hours <= 12) {
+    return { tickCount: 7, minTickGap: 32 };
+  }
+  if (hours <= 24) {
+    return { tickCount: 9, minTickGap: 36 };
+  }
+  return { tickCount: 8, minTickGap: 42 };
+}
+
+function buildTimeTicks(window: TimeWindow, hours: number): number[] {
+  const stepMs =
+    hours <= 1
+      ? 10 * 60_000
+      : hours <= 6
+        ? 30 * 60_000
+        : hours <= 24
+          ? 60 * 60_000
+          : 24 * 60 * 60_000;
+
+  const ticks: number[] = [];
+  const first = Math.ceil(window.start / stepMs) * stepMs;
+  for (let value = first; value <= window.end; value += stepMs) {
+    ticks.push(value);
+  }
+  return ticks.length > 0 ? ticks : [window.start, window.end];
+}
+
+function minuteBucket(isoString: string): string {
+  const timestamp = new Date(isoString).getTime();
+  if (Number.isNaN(timestamp)) {
+    return isoString;
+  }
+  return new Date(Math.floor(timestamp / 60_000) * 60_000).toISOString();
+}
+
 function ratio(up: number, down: number): string {
   if (down === 0) return up > 0 ? "∞" : "N/A";
   return (up / down).toFixed(2);
+}
+
+function withinWindow(timestamp: number, window: TimeWindow): boolean {
+  return timestamp >= window.start && timestamp <= window.end;
 }
 
 /* ---------- constants ---------- */
@@ -62,6 +147,14 @@ const TIME_RANGES = [
   { label: "12h", hours: 12 },
   { label: "24h", hours: 24 },
   { label: "7d", hours: 168 },
+] as const;
+
+const REFRESH_OPTIONS = [
+  { label: "不刷新", value: 0 },
+  { label: "3s", value: 3 },
+  { label: "5s", value: 5 },
+  { label: "10s", value: 10 },
+  { label: "60s", value: 60 },
 ] as const;
 
 const COLORS = {
@@ -75,16 +168,30 @@ const COLORS = {
 
 export function StatsPage() {
   const [overview, setOverview] = useState<StatsOverview | null>(null);
-  const [selectedTaskId, setSelectedTaskId] = useState<number | -1>(-1);
-  const [hours, setHours] = useState(24);
-  const [snapshots, setSnapshots] = useState<TaskStatsSnapshot[]>([]);
+  const [selectedTransferTaskId, setSelectedTransferTaskId] = useState<number | -1>(-1);
+  const [transferTrendHours, setTransferTrendHours] = useState(24);
+  const [transferRefreshSecs, setTransferRefreshSecs] = useState(0);
+  const [transferSnapshots, setTransferSnapshots] = useState<TaskStatsSnapshot[]>([]);
+  const [transferTimeWindow, setTransferTimeWindow] = useState<TimeWindow | null>(null);
+  const [selectedTorrentTaskId, setSelectedTorrentTaskId] = useState<number | -1>(-1);
+  const [torrentTrendHours, setTorrentTrendHours] = useState(24);
+  const [torrentRefreshSecs, setTorrentRefreshSecs] = useState(0);
+  const [torrentSnapshots, setTorrentSnapshots] = useState<TaskStatsSnapshot[]>([]);
+  const [torrentTimeWindow, setTorrentTimeWindow] = useState<TimeWindow | null>(null);
   const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
   const [selectedDownloaderId, setSelectedDownloaderId] = useState<number | -1>(-1);
+  const [downloaderTrendHours, setDownloaderTrendHours] = useState(24);
+  const [downloaderRefreshSecs, setDownloaderRefreshSecs] = useState(0);
   const [downloaderSnapshots, setDownloaderSnapshots] = useState<DownloaderSpeedSnapshot[]>([]);
+  const [downloaderTimeWindow, setDownloaderTimeWindow] = useState<TimeWindow | null>(null);
   const [downloaderTrendLoading, setDownloaderTrendLoading] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [trendLoading, setTrendLoading] = useState(false);
+  const [transferTrendLoading, setTransferTrendLoading] = useState(false);
+  const [torrentTrendLoading, setTorrentTrendLoading] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const transferRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const torrentRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const downloaderRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Fetch overview
   const fetchOverview = async () => {
@@ -106,23 +213,34 @@ export function StatsPage() {
   };
 
   // Fetch trend data for selected task(s)
-  const fetchTrend = async (taskId: number | -1, h: number) => {
-    setTrendLoading(true);
+  const fetchTaskTrend = async (
+    taskId: number | -1,
+    h: number,
+    setWindow: React.Dispatch<React.SetStateAction<TimeWindow | null>>,
+    setData: React.Dispatch<React.SetStateAction<TaskStatsSnapshot[]>>,
+    setLoadingState: React.Dispatch<React.SetStateAction<boolean>>,
+  ) => {
+    setLoadingState(true);
     try {
+      const end = Date.now();
+      const visibleStart = end - h * 60 * 60_000;
+      const fetchStart = visibleStart - 2 * 60_000;
+      setWindow({ start: visibleStart, end });
+
       if (taskId === -1) {
         // Combined: fetch all tasks and merge by recorded_at
         if (!overview || overview.tasks.length === 0) {
-          setSnapshots([]);
+          setData([]);
           return;
         }
-        const allData = await Promise.all(
-          overview.tasks.map((t) =>
-            api<TaskStatsSnapshot[]>(
-              `/api/stats/trend?task_id=${t.task_id}&hours=${h}`,
+          const allData = await Promise.all(
+            overview.tasks.map((t) =>
+              api<TaskStatsSnapshot[]>(
+                `/api/stats/trend?task_id=${t.task_id}&hours=${h}`,
+              ),
             ),
-          ),
-        );
-        // Merge: sum up values per timestamp
+          );
+        // Merge: sum up values per minute bucket to avoid interleaving task samples
         const map = new Map<
           string,
           {
@@ -133,13 +251,14 @@ export function StatsPage() {
         >();
         for (const arr of allData) {
           for (const s of arr) {
-            const existing = map.get(s.recorded_at);
+            const bucket = minuteBucket(s.recorded_at);
+            const existing = map.get(bucket);
             if (existing) {
               existing.total_uploaded += s.total_uploaded;
               existing.total_downloaded += s.total_downloaded;
               existing.torrent_count += s.torrent_count;
             } else {
-              map.set(s.recorded_at, {
+              map.set(bucket, {
                 total_uploaded: s.total_uploaded,
                 total_downloaded: s.total_downloaded,
                 torrent_count: s.torrent_count,
@@ -157,44 +276,50 @@ export function StatsPage() {
             recorded_at,
             ...v,
           }));
-        setSnapshots(merged);
+        setData(merged);
       } else {
         const data = await api<TaskStatsSnapshot[]>(
           `/api/stats/trend?task_id=${taskId}&hours=${h}`,
         );
-        setSnapshots(data);
+        setData(data);
       }
     } catch {
-      setSnapshots([]);
+      setData([]);
     } finally {
-      setTrendLoading(false);
+      setLoadingState(false);
     }
   };
 
   const fetchDownloaderTrend = async (downloaderId: number | -1, h: number) => {
     setDownloaderTrendLoading(true);
     try {
+      const end = Date.now();
+      const visibleStart = end - h * 60 * 60_000;
+      const fetchStart = visibleStart - 2 * 60_000;
+      setDownloaderTimeWindow({ start: visibleStart, end });
+
       if (downloaderId === -1) {
         if (downloaders.length === 0) {
           setDownloaderSnapshots([]);
           return;
         }
-        const allData = await Promise.all(
-          downloaders.map((downloader) =>
-            api<DownloaderSpeedSnapshot[]>(
-              `/api/stats/downloader-speed-trend?downloader_id=${downloader.id}&hours=${h}`,
+          const allData = await Promise.all(
+            downloaders.map((downloader) =>
+              api<DownloaderSpeedSnapshot[]>(
+                `/api/stats/downloader-speed-trend?downloader_id=${downloader.id}&hours=${h}`,
+              ),
             ),
-          ),
-        );
+          );
         const map = new Map<string, { upload_speed: number; download_speed: number }>();
         for (const arr of allData) {
           for (const snapshot of arr) {
-            const existing = map.get(snapshot.recorded_at);
+            const bucket = minuteBucket(snapshot.recorded_at);
+            const existing = map.get(bucket);
             if (existing) {
               existing.upload_speed += snapshot.upload_speed;
               existing.download_speed += snapshot.download_speed;
             } else {
-              map.set(snapshot.recorded_at, {
+              map.set(bucket, {
                 upload_speed: snapshot.upload_speed,
                 download_speed: snapshot.download_speed,
               });
@@ -243,39 +368,64 @@ export function StatsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-fetch trend when task/hours/overview changes
   useEffect(() => {
     if (overview) {
-      void fetchTrend(selectedTaskId, hours);
+      void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTaskId, hours, overview]);
+  }, [selectedTransferTaskId, transferTrendHours, overview]);
+
+  useEffect(() => {
+    if (overview) {
+      void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTorrentTaskId, torrentTrendHours, overview]);
 
   useEffect(() => {
     if (downloaders.length > 0 || selectedDownloaderId === -1) {
-      void fetchDownloaderTrend(selectedDownloaderId, hours);
+      void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDownloaderId, hours, downloaders]);
+  }, [selectedDownloaderId, downloaderTrendHours, downloaders]);
+
+  useEffect(() => {
+    if (transferRefreshRef.current) clearInterval(transferRefreshRef.current);
+    if (transferRefreshSecs > 0) {
+      transferRefreshRef.current = setInterval(() => {
+        void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
+      }, transferRefreshSecs * 1000);
+    }
+    return () => {
+      if (transferRefreshRef.current) clearInterval(transferRefreshRef.current);
+    };
+  }, [selectedTransferTaskId, transferTrendHours, transferRefreshSecs, overview]);
+
+  useEffect(() => {
+    if (torrentRefreshRef.current) clearInterval(torrentRefreshRef.current);
+    if (torrentRefreshSecs > 0) {
+      torrentRefreshRef.current = setInterval(() => {
+        void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
+      }, torrentRefreshSecs * 1000);
+    }
+    return () => {
+      if (torrentRefreshRef.current) clearInterval(torrentRefreshRef.current);
+    };
+  }, [selectedTorrentTaskId, torrentTrendHours, torrentRefreshSecs, overview]);
+
+  useEffect(() => {
+    if (downloaderRefreshRef.current) clearInterval(downloaderRefreshRef.current);
+    if (downloaderRefreshSecs > 0) {
+      downloaderRefreshRef.current = setInterval(() => {
+        void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours);
+      }, downloaderRefreshSecs * 1000);
+    }
+    return () => {
+      if (downloaderRefreshRef.current) clearInterval(downloaderRefreshRef.current);
+    };
+  }, [selectedDownloaderId, downloaderTrendHours, downloaderRefreshSecs, downloaders]);
 
   /* ---------- chart data ---------- */
-
-  const transferData = snapshots.map((s) => ({
-    time: formatTime(s.recorded_at),
-    upload: s.total_uploaded,
-    download: s.total_downloaded,
-  }));
-
-  const torrentData = snapshots.map((s) => ({
-    time: formatTime(s.recorded_at),
-    count: s.torrent_count,
-  }));
-
-  const downloaderSpeedData = downloaderSnapshots.map((s) => ({
-    time: formatTime(s.recorded_at),
-    uploadSpeed: s.upload_speed,
-    downloadSpeed: s.download_speed,
-  }));
 
   /* ---------- render ---------- */
 
@@ -289,6 +439,47 @@ export function StatsPage() {
   }
 
   const tasks = overview?.tasks ?? [];
+  const transferAxisProps = getTimeAxisProps(transferTrendHours);
+  const torrentAxisProps = getTimeAxisProps(torrentTrendHours);
+  const downloaderAxisProps = getTimeAxisProps(downloaderTrendHours);
+  const currentTransferWindow = transferTimeWindow ?? {
+    start: Date.now() - transferTrendHours * 60 * 60_000,
+    end: Date.now(),
+  };
+  const currentTorrentWindow = torrentTimeWindow ?? {
+    start: Date.now() - torrentTrendHours * 60 * 60_000,
+    end: Date.now(),
+  };
+  const currentDownloaderWindow = downloaderTimeWindow ?? {
+    start: Date.now() - downloaderTrendHours * 60 * 60_000,
+    end: Date.now(),
+  };
+  const transferTicks = buildTimeTicks(currentTransferWindow, transferTrendHours);
+  const torrentTicks = buildTimeTicks(currentTorrentWindow, torrentTrendHours);
+  const downloaderTicks = buildTimeTicks(currentDownloaderWindow, downloaderTrendHours);
+  const transferData = transferSnapshots
+    .map((s) => ({
+      recordedAt: s.recorded_at,
+      timestamp: new Date(s.recorded_at).getTime(),
+      upload: s.total_uploaded,
+      download: s.total_downloaded,
+    }))
+    .filter((item) => withinWindow(item.timestamp, currentTransferWindow));
+  const torrentData = torrentSnapshots
+    .map((s) => ({
+      recordedAt: s.recorded_at,
+      timestamp: new Date(s.recorded_at).getTime(),
+      count: s.torrent_count,
+    }))
+    .filter((item) => withinWindow(item.timestamp, currentTorrentWindow));
+  const downloaderSpeedData = downloaderSnapshots
+    .map((s) => ({
+      recordedAt: s.recorded_at,
+      timestamp: new Date(s.recorded_at).getTime(),
+      uploadSpeed: s.upload_speed,
+      downloadSpeed: s.download_speed,
+    }))
+    .filter((item) => withinWindow(item.timestamp, currentDownloaderWindow));
 
   return (
     <div className="grid gap-6">
@@ -331,65 +522,70 @@ export function StatsPage() {
         </CardHeader>
         <CardContent className="space-y-4">
           {/* Controls */}
-          <div className="flex flex-wrap items-center gap-3">
-            {/* Task selector */}
-            <select
-              className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-              value={selectedTaskId}
-              onChange={(e) => setSelectedTaskId(Number(e.target.value))}
-            >
-              <option value={-1}>全部任务</option>
-              {tasks.map((t) => (
-                <option key={t.task_id} value={t.task_id}>
-                  {t.task_name}
-                </option>
-              ))}
-            </select>
-
-            {/* Time range buttons */}
-            <div className="flex gap-1">
-              {TIME_RANGES.map((r) => (
-                <Button
-                  key={r.label}
-                  variant={hours === r.hours ? "default" : "secondary"}
-                  className="h-8 px-3 text-xs"
-                  onClick={() => setHours(r.hours)}
+          <div className="grid gap-6">
+            <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <ArrowUpDown className="h-4 w-4" />
+                下载量 / 上传量历史
+              </div>
+              <div className="mb-4 flex flex-wrap items-center gap-3">
+                <select
+                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                  value={selectedTransferTaskId}
+                  onChange={(e) => setSelectedTransferTaskId(Number(e.target.value))}
                 >
-                  {r.label}
-                </Button>
-              ))}
-            </div>
-
-            {/* Manual refresh */}
-            <Button
-              variant="outline"
-              className="h-8 px-3 text-xs"
-              onClick={() => void fetchTrend(selectedTaskId, hours)}
-              disabled={trendLoading}
-            >
-              <RefreshCw
-                className={`mr-1 h-4 w-4 ${trendLoading ? "animate-spin" : ""}`}
-              />
-              刷新
-            </Button>
-          </div>
-
-          {trendLoading && snapshots.length === 0 ? (
-            <div className="flex items-center justify-center py-16 text-sm text-muted">
-              <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-              加载趋势数据…
-            </div>
-          ) : snapshots.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
-              所选时间范围内无数据。
-            </div>
-          ) : (
-            <div className="grid gap-6">
-              <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
-                  <ArrowUpDown className="h-4 w-4" />
-                  下载量 / 上传量历史
+                  <option value={-1}>全部任务</option>
+                  {tasks.map((t) => (
+                    <option key={t.task_id} value={t.task_id}>
+                      {t.task_name}
+                    </option>
+                  ))}
+                </select>
+                <div className="flex gap-1">
+                  {TIME_RANGES.map((r) => (
+                    <Button
+                      key={`transfer-${r.label}`}
+                      variant={transferTrendHours === r.hours ? "default" : "secondary"}
+                      className="h-8 px-3 text-xs"
+                      onClick={() => setTransferTrendHours(r.hours)}
+                    >
+                      {r.label}
+                    </Button>
+                  ))}
                 </div>
+                <select
+                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                  value={transferRefreshSecs}
+                  onChange={(e) => setTransferRefreshSecs(Number(e.target.value))}
+                >
+                  {REFRESH_OPTIONS.map((option) => (
+                    <option key={`transfer-refresh-${option.value}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  variant="outline"
+                  className="h-8 px-3 text-xs"
+                  onClick={() =>
+                    void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading)
+                  }
+                  disabled={transferTrendLoading}
+                >
+                  <RefreshCw className={`mr-1 h-4 w-4 ${transferTrendLoading ? "animate-spin" : ""}`} />
+                  刷新
+                </Button>
+              </div>
+              {transferTrendLoading && transferData.length === 0 ? (
+                <div className="flex items-center justify-center py-16 text-sm text-muted">
+                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                  加载趋势数据…
+                </div>
+              ) : transferData.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
+                  所选时间范围内无数据。
+                </div>
+              ) : (
                 <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={transferData}>
                     <CartesianGrid
@@ -397,21 +593,27 @@ export function StatsPage() {
                       stroke={COLORS.grid}
                     />
                     <XAxis
-                      dataKey="time"
+                      dataKey="timestamp"
+                      type="number"
+                      scale="time"
+                      domain={[currentTransferWindow.start, currentTransferWindow.end]}
+                      ticks={transferTicks}
                       tick={{ fontSize: 12 }}
-                      interval="preserveStartEnd"
+                      tickCount={transferAxisProps.tickCount}
+                      minTickGap={transferAxisProps.minTickGap}
+                      tickFormatter={(value: number) => formatAxisTime(value, transferTrendHours)}
                     />
                     <YAxis
                       tick={{ fontSize: 12 }}
                       tickFormatter={(v: number) => formatBytes(v)}
-                      width={80}
+                      width={96}
                     />
                     <Tooltip
                       formatter={(value, name) => [
                         formatBytes(Number(value)),
                         name === "upload" ? "上传" : "下载",
                       ]}
-                      labelFormatter={(label) => `时间: ${label}`}
+                      labelFormatter={(label) => `时间: ${formatTooltipTime(label, transferTrendHours)}`}
                     />
                     <Legend
                       formatter={(value: string) =>
@@ -419,7 +621,7 @@ export function StatsPage() {
                       }
                     />
                     <Line
-                      type="natural"
+                      type="monotone"
                       dataKey="upload"
                       stroke={COLORS.upload}
                       strokeWidth={2}
@@ -427,7 +629,7 @@ export function StatsPage() {
                       activeDot={{ r: 4 }}
                     />
                     <Line
-                      type="natural"
+                      type="monotone"
                       dataKey="download"
                       stroke={COLORS.download}
                       strokeWidth={2}
@@ -436,13 +638,72 @@ export function StatsPage() {
                     />
                   </LineChart>
                 </ResponsiveContainer>
-              </div>
+              )}
+            </div>
 
-              <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
-                  <HardDrive className="h-4 w-4" />
-                  种子数历史图
+            <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
+              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+                <HardDrive className="h-4 w-4" />
+                种子数历史图
+              </div>
+              <div className="mb-4 flex flex-wrap items-center gap-3">
+                <select
+                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                  value={selectedTorrentTaskId}
+                  onChange={(e) => setSelectedTorrentTaskId(Number(e.target.value))}
+                >
+                  <option value={-1}>全部任务</option>
+                  {tasks.map((t) => (
+                    <option key={t.task_id} value={t.task_id}>
+                      {t.task_name}
+                    </option>
+                  ))}
+                </select>
+                <div className="flex gap-1">
+                  {TIME_RANGES.map((r) => (
+                    <Button
+                      key={`torrent-${r.label}`}
+                      variant={torrentTrendHours === r.hours ? "default" : "secondary"}
+                      className="h-8 px-3 text-xs"
+                      onClick={() => setTorrentTrendHours(r.hours)}
+                    >
+                      {r.label}
+                    </Button>
+                  ))}
                 </div>
+                <select
+                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+                  value={torrentRefreshSecs}
+                  onChange={(e) => setTorrentRefreshSecs(Number(e.target.value))}
+                >
+                  {REFRESH_OPTIONS.map((option) => (
+                    <option key={`torrent-refresh-${option.value}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  variant="outline"
+                  className="h-8 px-3 text-xs"
+                  onClick={() =>
+                    void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading)
+                  }
+                  disabled={torrentTrendLoading}
+                >
+                  <RefreshCw className={`mr-1 h-4 w-4 ${torrentTrendLoading ? "animate-spin" : ""}`} />
+                  刷新
+                </Button>
+              </div>
+              {torrentTrendLoading && torrentData.length === 0 ? (
+                <div className="flex items-center justify-center py-16 text-sm text-muted">
+                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                  加载种子数数据…
+                </div>
+              ) : torrentData.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
+                  所选时间范围内无数据。
+                </div>
+              ) : (
                 <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={torrentData}>
                     <CartesianGrid
@@ -450,9 +711,15 @@ export function StatsPage() {
                       stroke={COLORS.grid}
                     />
                     <XAxis
-                      dataKey="time"
+                      dataKey="timestamp"
+                      type="number"
+                      scale="time"
+                      domain={[currentTorrentWindow.start, currentTorrentWindow.end]}
+                      ticks={torrentTicks}
                       tick={{ fontSize: 12 }}
-                      interval="preserveStartEnd"
+                      tickCount={torrentAxisProps.tickCount}
+                      minTickGap={torrentAxisProps.minTickGap}
+                      tickFormatter={(value: number) => formatAxisTime(value, torrentTrendHours)}
                     />
                     <YAxis tick={{ fontSize: 12 }} width={50} />
                     <Tooltip
@@ -460,13 +727,13 @@ export function StatsPage() {
                         String(value),
                         "种子数",
                       ]}
-                      labelFormatter={(label) => `时间: ${label}`}
+                      labelFormatter={(label) => `时间: ${formatTooltipTime(label, torrentTrendHours)}`}
                     />
                     <Legend
                       formatter={() => "种子数"}
                     />
                     <Line
-                      type="natural"
+                      type="monotone"
                       dataKey="count"
                       stroke={COLORS.torrent}
                       strokeWidth={2}
@@ -475,9 +742,9 @@ export function StatsPage() {
                     />
                   </LineChart>
                 </ResponsiveContainer>
-              </div>
+              )}
             </div>
-          )}
+          </div>
         </CardContent>
       </Card>
 
@@ -510,19 +777,30 @@ export function StatsPage() {
               {TIME_RANGES.map((r) => (
                 <Button
                   key={`downloader-${r.label}`}
-                  variant={hours === r.hours ? "default" : "secondary"}
+                  variant={downloaderTrendHours === r.hours ? "default" : "secondary"}
                   className="h-8 px-3 text-xs"
-                  onClick={() => setHours(r.hours)}
+                  onClick={() => setDownloaderTrendHours(r.hours)}
                 >
                   {r.label}
                 </Button>
               ))}
             </div>
+            <select
+              className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
+              value={downloaderRefreshSecs}
+              onChange={(e) => setDownloaderRefreshSecs(Number(e.target.value))}
+            >
+              {REFRESH_OPTIONS.map((option) => (
+                <option key={`downloader-refresh-${option.value}`} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
 
             <Button
               variant="outline"
               className="h-8 px-3 text-xs"
-              onClick={() => void fetchDownloaderTrend(selectedDownloaderId, hours)}
+              onClick={() => void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours)}
               disabled={downloaderTrendLoading}
             >
               <RefreshCw
@@ -532,12 +810,12 @@ export function StatsPage() {
             </Button>
           </div>
 
-          {downloaderTrendLoading && downloaderSnapshots.length === 0 ? (
+          {downloaderTrendLoading && downloaderSpeedData.length === 0 ? (
             <div className="flex items-center justify-center py-16 text-sm text-muted">
               <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
               加载下载器速度数据…
             </div>
-          ) : downloaderSnapshots.length === 0 ? (
+          ) : downloaderSpeedData.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
               所选时间范围内无下载器速度数据。
             </div>
@@ -546,18 +824,28 @@ export function StatsPage() {
               <ResponsiveContainer width="100%" height={320}>
                 <LineChart data={downloaderSpeedData}>
                   <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} />
-                  <XAxis dataKey="time" tick={{ fontSize: 12 }} interval="preserveStartEnd" />
+                  <XAxis
+                    dataKey="timestamp"
+                    type="number"
+                    scale="time"
+                    domain={[currentDownloaderWindow.start, currentDownloaderWindow.end]}
+                    ticks={downloaderTicks}
+                    tick={{ fontSize: 12 }}
+                    tickCount={downloaderAxisProps.tickCount}
+                    minTickGap={downloaderAxisProps.minTickGap}
+                    tickFormatter={(value: number) => formatAxisTime(value, downloaderTrendHours)}
+                  />
                   <YAxis
                     tick={{ fontSize: 12 }}
-                    tickFormatter={(v: number) => `${(v / 1024).toFixed(0)} KB/s`}
-                    width={80}
+                    tickFormatter={(v: number) => formatSpeed(v)}
+                    width={96}
                   />
                   <Tooltip
                     formatter={(value, name) => [
-                      `${(Number(value) / 1024).toFixed(1)} KB/s`,
+                      formatSpeed(Number(value)),
                       name === "uploadSpeed" ? "上传速度" : "下载速度",
                     ]}
-                    labelFormatter={(label) => `时间: ${label}`}
+                    labelFormatter={(label) => `时间: ${formatTooltipTime(label, downloaderTrendHours)}`}
                   />
                   <Legend
                     formatter={(value: string) =>
@@ -565,7 +853,7 @@ export function StatsPage() {
                     }
                   />
                   <Line
-                    type="natural"
+                    type="monotone"
                     dataKey="uploadSpeed"
                     stroke={COLORS.upload}
                     strokeWidth={2}
@@ -573,7 +861,7 @@ export function StatsPage() {
                     activeDot={{ r: 4 }}
                   />
                   <Line
-                    type="natural"
+                    type="monotone"
                     dataKey="downloadSpeed"
                     stroke={COLORS.download}
                     strokeWidth={2}

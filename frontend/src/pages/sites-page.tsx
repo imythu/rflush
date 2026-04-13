@@ -111,6 +111,7 @@ function parseAuthConfig(
 export function SitesPage() {
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState("");
 
   // form dialog
   const [formOpen, setFormOpen] = useState(false);
@@ -137,8 +138,14 @@ export function SitesPage() {
   function loadSites() {
     setLoading(true);
     api<SiteRecord[]>("/api/sites")
-      .then(setSites)
-      .catch(() => setSites([]))
+      .then((data) => {
+        setSites(data);
+        setMessage("");
+      })
+      .catch((error: Error) => {
+        setSites([]);
+        setMessage(error.message || "加载站点失败");
+      })
       .finally(() => setLoading(false));
   }
 
@@ -192,8 +199,10 @@ export function SitesPage() {
     req
       .then(() => {
         setFormOpen(false);
+        setMessage(editingId != null ? "站点已更新" : "站点已创建");
         loadSites();
       })
+      .catch((error: Error) => setMessage(error.message || "保存站点失败"))
       .finally(() => setSubmitting(false));
   }
 
@@ -205,8 +214,10 @@ export function SitesPage() {
     api<{ ok: true }>(`/api/sites/${deleteTarget.id}`, { method: "DELETE" })
       .then(() => {
         setDeleteTarget(null);
+        setMessage("站点已删除");
         loadSites();
       })
+      .catch((error: Error) => setMessage(error.message || "删除站点失败"))
       .finally(() => setDeleting(false));
   }
 
@@ -232,7 +243,10 @@ export function SitesPage() {
     setStatsOpen(true);
     api<UserStats>(`/api/sites/${site.id}/stats`)
       .then(setStats)
-      .catch(() => setStats(null))
+      .catch((error: Error) => {
+        setStats(null);
+        setMessage(error.message || "加载站点统计失败");
+      })
       .finally(() => setStatsLoading(false));
   }
 
@@ -316,6 +330,17 @@ export function SitesPage() {
         </CardHeader>
 
         <CardContent className="space-y-4">
+          {message ? (
+            <div className="rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
+              <div className="flex items-start justify-between gap-3">
+                <span>{message}</span>
+                <button type="button" className="text-muted hover:text-foreground" onClick={() => setMessage("")}>
+                  关闭
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           {loading ? (
             <div className="flex items-center justify-center py-12 text-muted">
               <Loader2 className="mr-2 h-5 w-5 animate-spin" />

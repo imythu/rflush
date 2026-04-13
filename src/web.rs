@@ -1046,7 +1046,9 @@ async fn stats_trend(State(state): State<AppState>, Query(q): Query<StatsQuery>)
     let hours = q.hours.unwrap_or(24);
     let until = q.until.unwrap_or_else(|| Local::now().to_rfc3339());
     let since = q.since.unwrap_or_else(|| {
-        (Local::now() - chrono::Duration::hours(hours)).to_rfc3339()
+        // Stats are sampled periodically, so add a small grace window to avoid
+        // dropping the latest bucket on exact boundary cuts like "last 1h".
+        (Local::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
     });
     let data = state.db.get_task_stats_snapshots(q.task_id, &since, &until).await?;
     Ok(Json(data))
@@ -1067,7 +1069,7 @@ async fn downloader_speed_trend(
     let hours = q.hours.unwrap_or(24);
     let until = q.until.unwrap_or_else(|| Local::now().to_rfc3339());
     let since = q.since.unwrap_or_else(|| {
-        (Local::now() - chrono::Duration::hours(hours)).to_rfc3339()
+        (Local::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
     });
     let data = state
         .db

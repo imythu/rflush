@@ -45,11 +45,13 @@ export function DownloadersPage() {
   const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
   const [spaceStats, setSpaceStats] = useState<Record<number, DownloaderSpaceStats>>({});
   const [loading, setLoading] = useState(true);
+  const [message, setMessage] = useState("");
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<FormData>(emptyForm);
   const [saving, setSaving] = useState(false);
+  const [submitError, setSubmitError] = useState("");
 
   const [deleteTarget, setDeleteTarget] = useState<DownloaderRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -79,6 +81,12 @@ export function DownloadersPage() {
           }
         }
         setSpaceStats(next);
+        setMessage("");
+      })
+      .catch((error: Error) => {
+        setDownloaders([]);
+        setSpaceStats({});
+        setMessage(error.message || "加载下载器失败");
       })
       .finally(() => setLoading(false));
   }
@@ -90,6 +98,7 @@ export function DownloadersPage() {
   function openAdd() {
     setEditingId(null);
     setForm(emptyForm);
+    setSubmitError("");
     setDialogOpen(true);
   }
 
@@ -102,6 +111,7 @@ export function DownloadersPage() {
       username: d.username,
       password: d.password,
     });
+    setSubmitError("");
     setDialogOpen(true);
   }
 
@@ -109,10 +119,12 @@ export function DownloadersPage() {
     setDialogOpen(false);
     setEditingId(null);
     setForm(emptyForm);
+    setSubmitError("");
   }
 
   async function handleSave() {
     setSaving(true);
+    setSubmitError("");
     try {
       const body = JSON.stringify(form);
       if (editingId !== null) {
@@ -121,7 +133,10 @@ export function DownloadersPage() {
         await api("/api/downloaders", { method: "POST", body });
       }
       closeDialog();
+      setMessage(editingId !== null ? "下载器已更新" : "下载器已创建");
       loadDownloaders();
+    } catch (error) {
+      setSubmitError((error as Error).message || "保存下载器失败");
     } finally {
       setSaving(false);
     }
@@ -133,7 +148,10 @@ export function DownloadersPage() {
     try {
       await api(`/api/downloaders/${deleteTarget.id}`, { method: "DELETE" });
       setDeleteTarget(null);
+      setMessage("下载器已删除");
       loadDownloaders();
+    } catch (error) {
+      setMessage((error as Error).message || "删除下载器失败");
     } finally {
       setDeleting(false);
     }
@@ -147,8 +165,8 @@ export function DownloadersPage() {
         method: "POST",
       });
       setTestResult(result);
-    } catch {
-      setTestResult({ success: false, message: "请求失败", version: null, free_space: null });
+    } catch (error) {
+      setTestResult({ success: false, message: (error as Error).message || "请求失败", version: null, free_space: null });
     } finally {
       setTesting(null);
     }
@@ -199,6 +217,17 @@ export function DownloadersPage() {
           <CardTitle>下载器列表</CardTitle>
         </CardHeader>
         <CardContent>
+          {message ? (
+            <div className="mb-4 rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
+              <div className="flex items-start justify-between gap-3">
+                <span>{message}</span>
+                <button type="button" className="text-muted hover:text-foreground" onClick={() => setMessage("")}>
+                  关闭
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           {loading ? (
             <div className="text-sm text-muted">加载中...</div>
           ) : downloaders.length === 0 ? (
@@ -335,6 +364,12 @@ export function DownloadersPage() {
         description={editingId !== null ? "修改下载器配置信息。" : "填写下载器连接信息。"}
       >
         <div className="space-y-4 p-4 sm:p-6">
+          {submitError ? (
+            <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {submitError}
+            </div>
+          ) : null}
+
           <div className="space-y-2">
             <Label htmlFor="dl-name">名称</Label>
             <Input

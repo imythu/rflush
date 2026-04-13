@@ -97,16 +97,25 @@ export function BrushTasksPage() {
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState("");
 
   function reload() {
-    api<BrushTaskRecord[]>("/api/brush-tasks").then(setTasks);
-    api<BrushCacheStats>("/api/brush-tasks/cache-stats").then(setCacheStats);
+    api<BrushTaskRecord[]>("/api/brush-tasks")
+      .then(setTasks)
+      .catch((error: Error) => setMessage(error.message || "加载刷流任务失败"));
+    api<BrushCacheStats>("/api/brush-tasks/cache-stats")
+      .then(setCacheStats)
+      .catch((error: Error) => setMessage(error.message || "加载缓存状态失败"));
   }
 
   useEffect(() => {
     reload();
-    api<SiteRecord[]>("/api/sites").then(setSites);
-    api<DownloaderRecord[]>("/api/downloaders").then(setDownloaders);
+    api<SiteRecord[]>("/api/sites")
+      .then(setSites)
+      .catch((error: Error) => setMessage(error.message || "加载站点列表失败"));
+    api<DownloaderRecord[]>("/api/downloaders")
+      .then(setDownloaders)
+      .catch((error: Error) => setMessage(error.message || "加载下载器列表失败"));
   }, []);
 
   function openAdd() {
@@ -139,6 +148,7 @@ export function BrushTasksPage() {
         await api("/api/brush-tasks", { method: "POST", body: JSON.stringify(form) });
       }
       closeForm();
+      setMessage(editingId !== null ? "刷流任务已更新" : "刷流任务已创建");
       reload();
     } catch (error) {
       setSubmitError((error as Error).message || "提交失败");
@@ -148,24 +158,44 @@ export function BrushTasksPage() {
   }
 
   async function handleDelete(id: number) {
-    await api(`/api/brush-tasks/${id}`, { method: "DELETE" });
-    setDeleteConfirmId(null);
-    reload();
+    try {
+      await api(`/api/brush-tasks/${id}`, { method: "DELETE" });
+      setDeleteConfirmId(null);
+      setMessage("刷流任务已删除");
+      reload();
+    } catch (error) {
+      setMessage((error as Error).message || "删除刷流任务失败");
+    }
   }
 
   async function handleStart(id: number) {
-    await api(`/api/brush-tasks/${id}/start`, { method: "POST" });
-    reload();
+    try {
+      await api(`/api/brush-tasks/${id}/start`, { method: "POST" });
+      setMessage("刷流任务已启动");
+      reload();
+    } catch (error) {
+      setMessage((error as Error).message || "启动刷流任务失败");
+    }
   }
 
   async function handleStop(id: number) {
-    await api(`/api/brush-tasks/${id}/stop`, { method: "POST" });
-    reload();
+    try {
+      await api(`/api/brush-tasks/${id}/stop`, { method: "POST" });
+      setMessage("刷流任务已停止");
+      reload();
+    } catch (error) {
+      setMessage((error as Error).message || "停止刷流任务失败");
+    }
   }
 
   async function handleRunOnce(id: number) {
-    await api(`/api/brush-tasks/${id}/run`, { method: "POST" });
-    reload();
+    try {
+      await api(`/api/brush-tasks/${id}/run`, { method: "POST" });
+      setMessage("刷流任务已触发执行");
+      reload();
+    } catch (error) {
+      setMessage((error as Error).message || "触发刷流任务失败");
+    }
   }
 
   function openTorrents(task: BrushTaskRecord) {
@@ -174,6 +204,7 @@ export function BrushTasksPage() {
     setLoadingTorrents(true);
     api<BrushTorrentRecord[]>(`/api/brush-tasks/${task.id}/torrents`)
       .then((data) => setTorrents([...data].sort((a, b) => b.added_at.localeCompare(a.added_at))))
+      .catch((error: Error) => setMessage(error.message || "加载种子列表失败"))
       .finally(() => setLoadingTorrents(false));
   }
 
@@ -201,6 +232,17 @@ export function BrushTasksPage() {
             <CardDescription>显示免费种/H&R 详情增强的缓存体量和累计命中情况。</CardDescription>
           </CardHeader>
           <CardContent>
+            {message ? (
+              <div className="mb-4 rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
+                <div className="flex items-start justify-between gap-3">
+                  <span>{message}</span>
+                  <button type="button" className="text-muted hover:text-foreground" onClick={() => setMessage("")}>
+                    关闭
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
             {cacheStats ? (
               <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
                 <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
