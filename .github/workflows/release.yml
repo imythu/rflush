@@ -70,16 +70,11 @@ jobs:
         working-directory: frontend
         run: npm run build
 
-      - name: Stage frontend dist artifact
-        shell: bash
-        run: |
-          mv frontend/dist frontend-dist
-
       - name: Upload frontend dist
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
-          path: frontend-dist
+          path: frontend/dist
           retention-days: 7
 
   build:
@@ -122,23 +117,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: frontend-dist
-          path: .
-
-      - name: Restore frontend dist (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          rm -rf frontend/dist
-          mkdir -p frontend
-          mv frontend-dist frontend/dist
-
-      - name: Restore frontend dist (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (Test-Path frontend\dist) { Remove-Item -Recurse -Force frontend\dist }
-          New-Item -ItemType Directory -Force -Path frontend | Out-Null
-          Move-Item -LiteralPath frontend-dist -Destination frontend\dist
+          path: frontend/dist
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
