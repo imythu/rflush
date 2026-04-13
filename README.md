@@ -65,7 +65,7 @@
 镜像发布到：
 
 ```text
-ghcr.io/<github-owner>/rflush
+ghcr.io/imythu/rflush
 ```
 
 支持平台：
@@ -80,7 +80,7 @@ ghcr.io/<github-owner>/rflush
 docker run --name rflush \
   -p 3000:3000 \
   -v $(pwd)/data:/data \
-  ghcr.io/<github-owner>/rflush:latest
+  ghcr.io/imythu/rflush:latest
 ```
 
 指定版本：
@@ -89,13 +89,13 @@ docker run --name rflush \
 docker run --name rflush \
   -p 3000:3000 \
   -v $(pwd)/data:/data \
-  ghcr.io/<github-owner>/rflush:2026-04-13
+  ghcr.io/imythu/rflush:2026-04-13
 ```
 
 Windows 镜像标签示例：
 
 ```text
-ghcr.io/<github-owner>/rflush:latest-windows-amd64
+ghcr.io/imythu/rflush:latest-windows-amd64
 ```
 
 ### 开发模式
