@@ -1,5 +1,4 @@
 pub mod scheduler;
-pub mod selector;
 pub mod cleaner;
 
 use serde::{Deserialize, Serialize};
@@ -78,6 +77,7 @@ pub struct BrushTorrentRecord {
     pub id: i64,
     pub task_id: i64,
     pub torrent_id: Option<String>,
+    pub torrent_link: Option<String>,
     pub torrent_hash: String,
     pub torrent_name: String,
     pub added_at: String,

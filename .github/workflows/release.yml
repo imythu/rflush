@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 2026-04-12), defaults to today"
+        description: "Release version (e.g. 2026-04-13-1530), defaults to current UTC time"
         required: false
         default: ""
 
@@ -41,7 +41,7 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
             VERSION="${{ inputs.version }}"
           else
-            VERSION=$(date +%Y-%m-%d)
+            VERSION=$(date -u +%Y-%m-%d-%H%M)
           fi
           OWNER_LOWER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

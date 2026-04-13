@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronLeft, ChevronRight, Eye, Pause, Play, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -6,8 +6,8 @@ import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import { formatDate, statusBadge } from "@/lib/format";
-import type { DownloadRecord, JobInfo, RssSubscription, TaskRecordsResponse } from "@/types";
+import { formatDate } from "@/lib/format";
+import type { DownloadRecord, RssSubscription, TaskRecordsResponse } from "@/types";
 
 type TaskForm = {
   name: string;
@@ -17,7 +17,6 @@ type TaskForm = {
 
 export function TasksPage({
   tasks,
-  jobs,
   form,
   setForm,
   selectedIds,
@@ -36,7 +35,6 @@ export function TasksPage({
   onDeleteAll,
 }: {
   tasks: RssSubscription[];
-  jobs: JobInfo[];
   form: TaskForm;
   setForm: React.Dispatch<React.SetStateAction<TaskForm>>;
   selectedIds: number[];
@@ -75,16 +73,6 @@ export function TasksPage({
       .then(setDetails)
       .finally(() => setLoadingDetails(false));
   }, [page, selectedTask]);
-
-  const activeJobs = useMemo(() => {
-    const map = new Map<number, JobInfo>();
-    for (const job of jobs) {
-      if (job.task_id && (job.status === "queued" || job.status === "running")) {
-        map.set(job.task_id, job);
-      }
-    }
-    return map;
-  }, [jobs]);
 
   const allSelected = tasks.length > 0 && selectedIds.length === tasks.length;
   const totalPages = details ? Math.max(1, Math.ceil(details.total_records / details.page_size)) : 1;
@@ -217,7 +205,6 @@ export function TasksPage({
                 </TableHeader>
                 <TableBody>
                   {tasks.map((task) => {
-                    const activeJob = activeJobs.get(task.id);
                     return (
                       <TableRow key={task.id}>
                         <TableCell>
@@ -237,11 +224,6 @@ export function TasksPage({
                             <span className={`rounded-full px-3 py-1 text-xs font-medium ${task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
                               {task.enabled ? "已启用" : "已暂停"}
                             </span>
-                            {activeJob ? (
-                              <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusBadge(activeJob.status)}`}>
-                                {activeJob.status}
-                              </span>
-                            ) : null}
                           </div>
                         </TableCell>
                         <TableCell className="max-w-[420px] truncate">{task.url}</TableCell>
@@ -275,7 +257,6 @@ export function TasksPage({
 
             <div className="grid gap-3 xl:hidden">
               {tasks.map((task) => {
-                const activeJob = activeJobs.get(task.id);
                 return (
                   <div key={task.id} className="rounded-2xl border border-border bg-surface-container/70 p-4">
                     <div className="flex items-start justify-between gap-3">
@@ -295,11 +276,6 @@ export function TasksPage({
                         <span className={`rounded-full px-3 py-1 text-xs font-medium ${task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
                           {task.enabled ? "已启用" : "已暂停"}
                         </span>
-                        {activeJob ? (
-                          <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusBadge(activeJob.status)}`}>
-                            {activeJob.status}
-                          </span>
-                        ) : null}
                       </div>
                     </div>
                     <div className="mt-3 break-all text-sm text-muted">{task.url}</div>

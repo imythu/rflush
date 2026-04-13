@@ -384,14 +384,13 @@ export function StatsPage() {
               所选时间范围内无数据。
             </div>
           ) : (
-            <div className="grid gap-6 xl:grid-cols-2">
-              {/* Upload/Download trend */}
+            <div className="grid gap-6">
               <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
                 <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
                   <ArrowUpDown className="h-4 w-4" />
-                  上传 / 下载趋势
+                  下载量 / 上传量历史
                 </div>
-                <ResponsiveContainer width="100%" height={300}>
+                <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={transferData}>
                     <CartesianGrid
                       strokeDasharray="3 3"
@@ -420,7 +419,7 @@ export function StatsPage() {
                       }
                     />
                     <Line
-                      type="monotone"
+                      type="natural"
                       dataKey="upload"
                       stroke={COLORS.upload}
                       strokeWidth={2}
@@ -428,7 +427,7 @@ export function StatsPage() {
                       activeDot={{ r: 4 }}
                     />
                     <Line
-                      type="monotone"
+                      type="natural"
                       dataKey="download"
                       stroke={COLORS.download}
                       strokeWidth={2}
@@ -439,13 +438,12 @@ export function StatsPage() {
                 </ResponsiveContainer>
               </div>
 
-              {/* Torrent count trend */}
               <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
                 <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
                   <HardDrive className="h-4 w-4" />
-                  种子数趋势
+                  种子数历史图
                 </div>
-                <ResponsiveContainer width="100%" height={300}>
+                <ResponsiveContainer width="100%" height={320}>
                   <LineChart data={torrentData}>
                     <CartesianGrid
                       strokeDasharray="3 3"
@@ -468,7 +466,7 @@ export function StatsPage() {
                       formatter={() => "种子数"}
                     />
                     <Line
-                      type="monotone"
+                      type="natural"
                       dataKey="count"
                       stroke={COLORS.torrent}
                       strokeWidth={2}
@@ -487,7 +485,7 @@ export function StatsPage() {
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
             <Activity className="h-5 w-5" />
-            qB 上传 / 下载速度趋势
+            下载器上传 / 下载速度趋势
           </CardTitle>
           <CardDescription>
             查看下载器实时总上传速度和下载速度变化。
@@ -567,7 +565,7 @@ export function StatsPage() {
                     }
                   />
                   <Line
-                    type="monotone"
+                    type="natural"
                     dataKey="uploadSpeed"
                     stroke={COLORS.upload}
                     strokeWidth={2}
@@ -575,7 +573,7 @@ export function StatsPage() {
                     activeDot={{ r: 4 }}
                   />
                   <Line
-                    type="monotone"
+                    type="natural"
                     dataKey="downloadSpeed"
                     stroke={COLORS.download}
                     strokeWidth={2}

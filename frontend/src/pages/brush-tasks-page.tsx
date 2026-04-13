@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
+import { cn } from "@/lib/utils";
 import type { BrushCacheStats, BrushTaskRecord, BrushTaskRequest, BrushTorrentRecord, DownloaderRecord, SiteRecord } from "@/types";
 
 function formatBytes(bytes: number): string {
@@ -662,10 +663,13 @@ export function BrushTasksPage() {
                       <TableCell className="font-mono text-xs">
                         {t.torrent_id ? (
                           <a
-                            href={`https://kp.m-team.cc/detail/${t.torrent_id}`}
+                            href={t.torrent_link ?? "#"}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="text-blue-500 hover:text-blue-700 hover:underline"
+                            className={cn(
+                              "hover:underline",
+                              t.torrent_link ? "text-blue-500 hover:text-blue-700" : "pointer-events-none text-muted",
+                            )}
                           >
                             {t.torrent_id}
                           </a>

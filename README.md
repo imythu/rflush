@@ -262,7 +262,6 @@ SQLite 数据库位于：
 
 主要 API：
 
-- `GET /api/bootstrap`
 - `GET /api/settings`
 - `PUT /api/settings`
 - `GET /api/rss`
@@ -279,7 +278,6 @@ SQLite 数据库位于：
 - `POST /api/tasks/pause-all`
 - `POST /api/tasks/delete-all`
 - `GET /api/history`
-- `GET /api/jobs`
 - `POST /api/jobs/run-all`
 - `POST /api/jobs/run/:id`
 - `GET /api/sites`

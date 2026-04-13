@@ -901,7 +901,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, task_id, torrent_id, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason
+                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason
                      FROM brush_task_torrents WHERE task_id = ? ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -911,14 +911,15 @@ impl Database {
                         id: row.get(0)?,
                         task_id: row.get(1)?,
                         torrent_id: row.get(2)?,
-                        torrent_hash: row.get(3)?,
-                        torrent_name: row.get(4)?,
-                        added_at: row.get(5)?,
-                        size_bytes: row.get(6)?,
-                        is_hr: row.get::<_, i32>(7)? != 0,
-                        status: row.get(8)?,
-                        removed_at: row.get(9)?,
-                        remove_reason: row.get(10)?,
+                        torrent_link: row.get(3)?,
+                        torrent_hash: row.get(4)?,
+                        torrent_name: row.get(5)?,
+                        added_at: row.get(6)?,
+                        size_bytes: row.get(7)?,
+                        is_hr: row.get::<_, i32>(8)? != 0,
+                        status: row.get(9)?,
+                        removed_at: row.get(10)?,
+                        remove_reason: row.get(11)?,
                     })
                 })
                 .map_err(sql_error)?;
@@ -938,7 +939,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, task_id, torrent_id, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason
+                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason
                      FROM brush_task_torrents WHERE task_id = ? AND status = 'active' ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -948,14 +949,15 @@ impl Database {
                         id: row.get(0)?,
                         task_id: row.get(1)?,
                         torrent_id: row.get(2)?,
-                        torrent_hash: row.get(3)?,
-                        torrent_name: row.get(4)?,
-                        added_at: row.get(5)?,
-                        size_bytes: row.get(6)?,
-                        is_hr: row.get::<_, i32>(7)? != 0,
-                        status: row.get(8)?,
-                        removed_at: row.get(9)?,
-                        remove_reason: row.get(10)?,
+                        torrent_link: row.get(3)?,
+                        torrent_hash: row.get(4)?,
+                        torrent_name: row.get(5)?,
+                        added_at: row.get(6)?,
+                        size_bytes: row.get(7)?,
+                        is_hr: row.get::<_, i32>(8)? != 0,
+                        status: row.get(9)?,
+                        removed_at: row.get(10)?,
+                        remove_reason: row.get(11)?,
                     })
                 })
                 .map_err(sql_error)?;
@@ -969,19 +971,29 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn add_brush_torrent(&self, task_id: i64, torrent_id: Option<&str>, hash: &str, name: &str, size_bytes: Option<i64>, is_hr: bool) -> Result<i64, AppError> {
+    pub async fn add_brush_torrent(
+        &self,
+        task_id: i64,
+        torrent_id: Option<&str>,
+        torrent_link: Option<&str>,
+        hash: &str,
+        name: &str,
+        size_bytes: Option<i64>,
+        is_hr: bool,
+    ) -> Result<i64, AppError> {
         let path = self.path.clone();
         let now = Local::now().to_rfc3339();
-        let (torrent_id, hash, name) = (
+        let (torrent_id, torrent_link, hash, name) = (
             torrent_id.map(|value| value.to_string()),
+            torrent_link.map(|value| value.to_string()),
             hash.to_string(),
             name.to_string(),
         );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT OR IGNORE INTO brush_task_torrents (task_id, torrent_id, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')",
-                params![task_id, torrent_id, hash, name, now, size_bytes, is_hr as i32],
+                "INSERT OR IGNORE INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                params![task_id, torrent_id, torrent_link, hash, name, now, size_bytes, is_hr as i32],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -1311,6 +1323,7 @@ impl Database {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id INTEGER NOT NULL REFERENCES brush_tasks(id) ON DELETE CASCADE,
                     torrent_id TEXT,
+                    torrent_link TEXT,
                     torrent_hash TEXT NOT NULL,
                     torrent_name TEXT NOT NULL,
                     added_at TEXT NOT NULL,
@@ -1361,6 +1374,12 @@ impl Database {
                 "brush_task_torrents",
                 "torrent_id",
                 "ALTER TABLE brush_task_torrents ADD COLUMN torrent_id TEXT",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "torrent_link",
+                "ALTER TABLE brush_task_torrents ADD COLUMN torrent_link TEXT",
             )?;
             ensure_column(
                 &conn,

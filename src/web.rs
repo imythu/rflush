@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::Local;
+use futures::stream;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -70,15 +72,6 @@ struct JobInfo {
     run_id: Option<i64>,
     summary: Option<RunSummary>,
     error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BootstrapResponse {
-    settings: GlobalConfig,
-    rss: Vec<RssSubscription>,
-    history: Vec<DownloadHistoryRecord>,
-    runs: Vec<DownloadRunRecord>,
-    jobs: Vec<JobInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,13 +153,6 @@ impl AppState {
 }
 
 impl JobRegistry {
-    async fn list(&self) -> Vec<JobInfo> {
-        let jobs = self.jobs.lock().await;
-        let mut values = jobs.values().map(|job| job.info.clone()).collect::<Vec<_>>();
-        values.sort_by(|a, b| b.id.cmp(&a.id));
-        values
-    }
-
     async fn create(&self, scope: String, task_id: Option<i64>, shutdown: Arc<AtomicBool>) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut jobs = self.jobs.lock().await;
@@ -289,7 +275,6 @@ pub async fn serve(base_dir: PathBuf, db: Database, scheduler: Arc<BrushSchedule
 
 fn app_router(state: AppState) -> Router {
     Router::new()
-        .route("/api/bootstrap", get(get_bootstrap))
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/rss", get(list_rss).post(create_rss))
         .route("/api/rss/{id}", delete(delete_rss))
@@ -306,7 +291,6 @@ fn app_router(state: AppState) -> Router {
         .route("/api/history", get(get_history))
         .route("/api/runs", get(get_runs))
         .route("/api/runs/{id}/records", get(get_run_records))
-        .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/run-all", post(run_all))
         .route("/api/jobs/run/{id}", post(run_one))
         // 站点管理
@@ -327,6 +311,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/brush-tasks/{id}/run", post(run_brush_task_once))
         .route("/api/brush-tasks/{id}/torrents", get(list_brush_task_torrents))
         .route("/api/brush-tasks/cache-stats", get(get_brush_cache_stats))
+        .route("/api/system/logs/stream", get(stream_logs))
         // 统计
         .route("/api/stats/overview", get(stats_overview))
         .route("/api/stats/trend", get(stats_trend))
@@ -351,16 +336,6 @@ fn app_router(state: AppState) -> Router {
         )
 }
 
-async fn get_bootstrap(State(state): State<AppState>) -> Result<Json<BootstrapResponse>, ApiError> {
-    Ok(Json(BootstrapResponse {
-        settings: state.db.get_settings().await?,
-        rss: state.db.list_rss().await?,
-        history: state.db.list_history(200).await?,
-        runs: state.db.list_runs(100).await?,
-        jobs: state.jobs.list().await,
-    }))
-}
-
 async fn get_settings(State(state): State<AppState>) -> Result<Json<GlobalConfig>, ApiError> {
     Ok(Json(state.db.get_settings().await?))
 }
@@ -371,6 +346,7 @@ async fn update_settings(
 ) -> Result<Json<GlobalConfig>, ApiError> {
     validate_settings(&settings)?;
     state.db.update_settings(&settings).await?;
+    crate::logging::update_log_filter(settings.log_level.as_deref())?;
     Ok(Json(settings))
 }
 
@@ -578,10 +554,6 @@ async fn get_run_records(
         .await?
         .ok_or_else(|| ApiError::not_found("run not found"))?;
     Ok(Json(records))
-}
-
-async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<JobInfo>>, ApiError> {
-    Ok(Json(state.jobs.list().await))
 }
 
 async fn run_all(State(state): State<AppState>) -> Result<Json<JobInfo>, ApiError> {
@@ -998,6 +970,32 @@ async fn get_brush_cache_stats(
     Ok(Json(state.scheduler.detail_attr_cache_stats().await))
 }
 
+async fn stream_logs() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let receiver = crate::logging::subscribe_logs();
+    let stream = stream::unfold(receiver, |mut receiver| async move {
+        loop {
+            match receiver.recv().await {
+                Ok(line) => {
+                    let payload = serde_json::json!({
+                        "encoded_line": urlencoding::encode(&line).into_owned()
+                    })
+                    .to_string();
+                    let event = Event::default().event("log").data(payload);
+                    return Some((Ok(event), receiver));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return None;
+                }
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 // ========== Stats API ==========
 
 #[derive(Debug, Deserialize)]
@@ -1079,6 +1077,8 @@ async fn downloader_speed_trend(
 }
 
 fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
+    const ALLOWED_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+
     if settings.download_rate_limit.requests == 0 {
         return Err(ApiError::bad_request(
             "download_rate_limit.requests must be >= 1",
@@ -1091,6 +1091,11 @@ fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
     }
     if settings.retry_interval_secs == 0 {
         return Err(ApiError::bad_request("retry_interval_secs must be >= 1"));
+    }
+    if let Some(log_level) = settings.log_level.as_deref() {
+        if !ALLOWED_LOG_LEVELS.contains(&log_level) {
+            return Err(ApiError::bad_request("log_level must be one of: trace, debug, info, warn, error"));
+        }
     }
     Ok(())
 }

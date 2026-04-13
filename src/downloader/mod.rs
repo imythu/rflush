@@ -10,12 +10,6 @@ pub enum DownloaderType {
 }
 
 impl DownloaderType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DownloaderType::QBittorrent => "qbittorrent",
-        }
-    }
-
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "qbittorrent" | "qb" => Some(DownloaderType::QBittorrent),

@@ -57,14 +57,6 @@ export type JobInfo = {
   error: string | null;
 };
 
-export type BootstrapResponse = {
-  settings: GlobalConfig;
-  rss: RssSubscription[];
-  history: DownloadRecord[];
-  runs: DownloadRun[];
-  jobs: JobInfo[];
-};
-
 export type DownloadRun = {
   id: number;
   started_at: string;
@@ -210,6 +202,7 @@ export type BrushTorrentRecord = {
   id: number;
   task_id: number;
   torrent_id: string | null;
+  torrent_link: string | null;
   torrent_hash: string;
   torrent_name: string;
   added_at: string;

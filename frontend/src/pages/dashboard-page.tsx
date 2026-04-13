@@ -1,11 +1,9 @@
 import { ArrowRight, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { formatDate, statusBadge } from "@/lib/format";
-import type { DownloadRecord, JobInfo, RssSubscription } from "@/types";
+import type { DownloadRecord, RssSubscription } from "@/types";
 
 export function DashboardPage({
-  runningJobs,
   rss,
   history,
   onRunAll,
@@ -13,7 +11,6 @@ export function DashboardPage({
   onGoHistory,
   onRunOne,
 }: {
-  runningJobs: JobInfo[];
   rss: RssSubscription[];
   history: DownloadRecord[];
   onRunAll: () => Promise<void>;
@@ -27,8 +24,8 @@ export function DashboardPage({
     <div className="grid gap-4 xl:gap-6">
       <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-4">
         <MetricCard label="RSS 订阅数" value={rss.length} detail="当前已配置订阅" />
-        <MetricCard label="运行中任务" value={runningJobs.length} detail="按域名共享限流" />
         <MetricCard label="历史记录数" value={history.length} detail="来自 SQLite 持久化" />
+        <MetricCard label="已启用订阅" value={rss.filter((item) => item.enabled).length} detail="当前启用中的 RSS 任务" />
         <MetricCard
           label="最近成功数"
           value={history.filter((item) => item.final_status === "success").slice(0, 20).length}
@@ -36,7 +33,7 @@ export function DashboardPage({
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr] xl:gap-6">
+      <div className="grid gap-4 xl:gap-6">
         <Card>
           <CardHeader>
             <CardTitle>快捷操作</CardTitle>
@@ -67,32 +64,6 @@ export function DashboardPage({
               actionLabel={rss[0] ? "启动首个订阅" : "去添加订阅"}
               onClick={() => (rss[0] ? void onRunOne(rss[0].id) : onGoRss())}
             />
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>运行中的任务</CardTitle>
-            <CardDescription>桌面和移动端都保持单列信息流，避免挤压。</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {runningJobs.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-sm text-muted">
-                当前没有运行中的任务。
-              </div>
-            ) : (
-              runningJobs.map((job) => (
-                <div key={job.id} className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="font-semibold">{job.scope}</div>
-                    <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusBadge(job.status)}`}>
-                      {job.status}
-                    </span>
-                  </div>
-                  <div className="mt-2 text-xs text-muted">开始时间：{formatDate(job.started_at)}</div>
-                </div>
-              ))
-            )}
           </CardContent>
         </Card>
       </div>

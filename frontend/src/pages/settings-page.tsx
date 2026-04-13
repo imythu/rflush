@@ -19,7 +19,7 @@ export function SettingsPage({
     <Card>
       <CardHeader>
         <CardTitle>任务设置</CardTitle>
-        <CardDescription>下载策略、限流规则和日志输出都在这里统一配置。</CardDescription>
+        <CardDescription>下载策略、限流规则和并发控制都在这里统一配置。</CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         <FormNumber
@@ -88,17 +88,6 @@ export function SettingsPage({
             setSettings((prev) => ({ ...prev, max_concurrent_rss_fetches: value }))
           }
         />
-
-        <div className="space-y-2">
-          <Label>日志级别</Label>
-          <Input
-            value={settings.log_level ?? ""}
-            onChange={(event) =>
-              setSettings((prev) => ({ ...prev, log_level: event.target.value || null }))
-            }
-            placeholder="info"
-          />
-        </div>
 
         <div className="sm:col-span-2 xl:col-span-3">
           <Button onClick={() => void onSave()} disabled={saving}>

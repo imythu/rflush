@@ -25,13 +25,6 @@ pub enum SiteType {
 }
 
 impl SiteType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SiteType::NexusPhp => "nexusphp",
-            SiteType::MTeam => "mteam",
-        }
-    }
-
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "nexusphp" | "nexus_php" => Some(SiteType::NexusPhp),
@@ -114,76 +107,5 @@ pub fn create_site_client(
             base_url.to_string(),
             auth.clone(),
         )),
-    }
-}
-
-pub fn find_site_for_url<'a>(sites: &'a [SiteRecord], target_url: &str) -> Option<&'a SiteRecord> {
-    let target_host = extract_host(target_url)?;
-    sites.iter().find(|site| {
-        extract_host(&site.base_url)
-            .is_some_and(|site_host| host_matches(&site_host, &target_host))
-    })
-}
-
-fn extract_host(url: &str) -> Option<String> {
-    let without_scheme = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url)
-        .trim_start_matches('/');
-    let host_port = without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
-    if host_port.is_empty() {
-        return None;
-    }
-    Some(
-        host_port
-            .split(':')
-            .next()
-            .unwrap_or(host_port)
-            .to_ascii_lowercase(),
-    )
-}
-
-fn host_matches(site_host: &str, target_host: &str) -> bool {
-    site_host == target_host
-        || site_host.strip_prefix("www.") == Some(target_host)
-        || target_host.strip_prefix("www.") == Some(site_host)
-        || site_host.ends_with(&format!(".{target_host}"))
-        || target_host.ends_with(&format!(".{site_host}"))
-        || root_domain(site_host) == root_domain(target_host)
-}
-
-fn root_domain(host: &str) -> String {
-    let parts = host.split('.').collect::<Vec<_>>();
-    if parts.len() >= 2 {
-        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
-    } else {
-        host.to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SiteRecord, find_site_for_url};
-
-    #[test]
-    fn matches_site_by_host_suffix() {
-        let sites = vec![SiteRecord {
-            id: 1,
-            name: "mteam".to_string(),
-            site_type: "mteam".to_string(),
-            base_url: "https://api.m-team.cc".to_string(),
-            auth_config: "{}".to_string(),
-            created_at: "2026-01-01T00:00:00+00:00".to_string(),
-            updated_at: "2026-01-01T00:00:00+00:00".to_string(),
-        }];
-
-        let site = find_site_for_url(&sites, "https://kp.m-team.cc/detail/123")
-            .expect("site should match");
-        assert_eq!(site.name, "mteam");
     }
 }

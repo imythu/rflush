@@ -649,6 +649,7 @@ async fn execute_brush_task(
                             .add_brush_torrent(
                                 task.id,
                                 torrent_id.as_deref(),
+                                effective_item.link.as_deref(),
                                 &info_hash,
                                 &effective_item.title,
                                 effective_item.size_bytes.map(|size| size as i64),

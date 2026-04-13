@@ -34,48 +34,9 @@ pub struct TorrentItem {
 }
 
 impl TorrentItem {
-    pub fn is_free(&self) -> bool {
-        self.download_volume_factor
-            .is_some_and(|factor| factor <= f64::EPSILON)
-    }
-
-    pub fn is_promoted(&self) -> bool {
-        self.download_volume_factor
-            .is_some_and(|factor| factor < 1.0 - f64::EPSILON)
-            || self
-                .upload_volume_factor
-                .is_some_and(|factor| (factor - 1.0).abs() > f64::EPSILON)
-    }
-
     pub fn is_hr(&self) -> bool {
         self.minimum_seed_time.is_some_and(|secs| secs > 0)
             || self.minimum_ratio.is_some_and(|ratio| ratio > 0.0)
-    }
-
-    pub fn classification_summary(&self) -> String {
-        let promotion = match (self.download_volume_factor, self.upload_volume_factor) {
-            (Some(dl), Some(ul)) => format!("dl={dl:.2}x ul={ul:.2}x"),
-            (Some(dl), None) => format!("dl={dl:.2}x ul=default"),
-            (None, Some(ul)) => format!("dl=default ul={ul:.2}x"),
-            (None, None) => "dl=default ul=default".to_string(),
-        };
-
-        let hr = match (self.minimum_seed_time, self.minimum_ratio) {
-            (Some(seed_time), Some(ratio)) => {
-                format!("hr=yes seed_time={}s ratio={ratio:.2}", seed_time)
-            }
-            (Some(seed_time), None) => format!("hr=yes seed_time={}s ratio=none", seed_time),
-            (None, Some(ratio)) => format!("hr=yes seed_time=none ratio={ratio:.2}"),
-            (None, None) => "hr=no".to_string(),
-        };
-
-        format!(
-            "free={} promoted={} {} {}",
-            self.is_free(),
-            self.is_promoted(),
-            promotion,
-            hr
-        )
     }
 }
 
