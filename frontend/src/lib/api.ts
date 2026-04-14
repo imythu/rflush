@@ -35,3 +35,5 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
   return response.json() as Promise<T>;
 }
+
+export const APP_VERSION = import.meta.env.VITE_APP_VERSION as string | undefined;

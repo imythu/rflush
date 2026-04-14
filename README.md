@@ -1,5 +1,8 @@
 # rflush
 
+[![GitHub Release](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square)](https://github.com/imythu/rflush/releases/latest)
+[![Docker Image](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square&label=ghcr.io)](https://github.com/imythu/rflush/pkgs/container/rflush)
+
 基于 Web 界面的 RSS 种子下载器，同时包含 PT 刷流任务管理。
 
 现在的运行方式不再依赖 `rss.yaml`。程序启动后会开启一个本地 Web 服务，通过页面管理：
@@ -79,13 +82,13 @@ docker run --name rflush \
   ghcr.io/imythu/rflush:latest
 ```
 
-指定版本：
+指定版本（版本号见 [Releases](https://github.com/imythu/rflush/releases)）：
 
 ```bash
 docker run --name rflush \
   -p 3000:3000 \
   -v $(pwd)/data:/data \
-  ghcr.io/imythu/rflush:2026-04-13
+  ghcr.io/imythu/rflush:<version>
 ```
 
 ### 开发模式
