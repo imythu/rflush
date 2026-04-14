@@ -193,8 +193,8 @@ cargo build --release
 GitHub Release 发布产物：
 
 - 二进制：
-  - Linux `amd64`
-  - Linux `arm64`
+  - Linux `amd64` / `arm64`
+  - Windows `amd64` / `arm64`
 - Docker 镜像：
   - Linux `amd64`
   - Linux `arm64`

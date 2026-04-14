@@ -22,9 +22,6 @@ permissions:
   contents: write
   packages: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   prepare:
     name: Determine version
@@ -53,10 +50,10 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -73,7 +70,7 @@ jobs:
           VITE_APP_VERSION: ${{ needs.prepare.outputs.version }}
 
       - name: Upload frontend dist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: frontend/dist
@@ -97,11 +94,21 @@ jobs:
             archive: tar.gz
             use_cross: true
 
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            use_cross: false
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            use_cross: false
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download frontend dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: frontend-dist
           path: frontend/dist
@@ -118,7 +125,7 @@ jobs:
           tool: cross
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -135,13 +142,19 @@ jobs:
       - name: Package binary
         shell: bash
         run: |
-          BIN="target/${{ matrix.target }}/release/rflush"
-          ARCHIVE="rflush-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz"
-          tar czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            BIN="target/${{ matrix.target }}/release/rflush.exe"
+            ARCHIVE="rflush-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.zip"
+            7z a "$ARCHIVE" "$BIN"
+          else
+            BIN="target/${{ matrix.target }}/release/rflush"
+            ARCHIVE="rflush-${{ needs.prepare.outputs.version }}-${{ matrix.target }}.tar.gz"
+            tar czf "$ARCHIVE" -C "$(dirname "$BIN")" "$(basename "$BIN")"
+          fi
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rflush-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -164,10 +177,10 @@ jobs:
             suffix: linux-arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download binary artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: rflush-${{ matrix.target }}
           path: docker/linux
@@ -232,10 +245,10 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: rflush-*
           path: artifacts
