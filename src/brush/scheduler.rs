@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
@@ -9,12 +9,12 @@ use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
-use crate::brush::{is_in_active_window, in_any_range, parse_ranges, BrushTaskRecord};
+use crate::brush::{BrushTaskRecord, in_any_range, is_in_active_window, parse_ranges};
+use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
 use crate::downloader::{AddTorrentOptions, DownloaderType, TorrentInfo, create_downloader_client};
 use crate::rss;
 use crate::site::{SiteAuth, SiteType, create_site_client};
-use crate::stats;
 
 use super::cleaner;
 
@@ -63,6 +63,7 @@ fn detail_attr_fetch_successes() -> &'static AtomicU64 {
 /// 调度器状态
 pub struct BrushScheduler {
     db: Database,
+    collector: Arc<DownloaderSnapshotCollector>,
     running_tasks: Arc<RwLock<HashMap<i64, RunningBrushTask>>>,
 }
 
@@ -72,9 +73,10 @@ struct RunningBrushTask {
 }
 
 impl BrushScheduler {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, collector: Arc<DownloaderSnapshotCollector>) -> Self {
         Self {
             db,
+            collector,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -82,12 +84,6 @@ impl BrushScheduler {
     /// 启动调度器，周期性检查所有启用的刷流任务
     pub async fn start(self: Arc<Self>) {
         info!("brush scheduler started");
-        let stats_db = self.db.clone();
-
-        // 启动数据统计采集 (每60秒)
-        tokio::spawn(async move {
-            stats::start_stats_collector(stats_db).await;
-        });
 
         loop {
             if let Err(e) = self.check_and_schedule().await {
@@ -117,7 +113,9 @@ impl BrushScheduler {
 
             // 检查是否已有运行中的执行
             let running = self.running_tasks.read().await;
-            let config = running.get(&task.id).map(|running_task| running_task.config.clone());
+            let config = running
+                .get(&task.id)
+                .map(|running_task| running_task.config.clone());
             drop(running);
             if let Some(config) = config {
                 let mut config = config.write().await;
@@ -128,6 +126,7 @@ impl BrushScheduler {
             // 检查是否应该触发
             if should_trigger(&task) {
                 let db = self.db.clone();
+                let collector = self.collector.clone();
                 let running_tasks = self.running_tasks.clone();
                 let task_id = task.id;
                 let task_name = task.name.clone();
@@ -136,7 +135,7 @@ impl BrushScheduler {
 
                 info!("[刷流][{}] cron 触发，开始调度执行", task_name);
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = execute_brush_task(&db, execution_config).await {
+                    if let Err(e) = execute_brush_task(&db, &collector, execution_config).await {
                         error!("[刷流][{}] 任务执行失败: {}", task_name, e);
                     }
                     // 从运行列表移除
@@ -162,6 +161,7 @@ impl BrushScheduler {
             .ok_or_else(|| "任务不存在".to_string())?;
 
         let db = self.db.clone();
+        let collector = self.collector.clone();
         let running_tasks = self.running_tasks.clone();
 
         // 检查是否已有运行中
@@ -176,7 +176,7 @@ impl BrushScheduler {
         let execution_config = config.clone();
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
-            if let Err(e) = execute_brush_task(&db, execution_config).await {
+            if let Err(e) = execute_brush_task(&db, &collector, execution_config).await {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
             let mut running = running_tasks.write().await;
@@ -205,7 +205,9 @@ impl BrushScheduler {
             .ok_or_else(|| "任务不存在".to_string())?;
 
         let running = self.running_tasks.read().await;
-        let config = running.get(&task_id).map(|running_task| running_task.config.clone());
+        let config = running
+            .get(&task_id)
+            .map(|running_task| running_task.config.clone());
         drop(running);
         if let Some(config) = config {
             let mut config = config.write().await;
@@ -226,7 +228,10 @@ impl BrushScheduler {
         let cache = detail_attr_cache();
         let cache_guard = cache.read().await;
         let site_bucket_count = cache_guard.len();
-        let cached_entry_count = cache_guard.values().map(|site_cache| site_cache.len()).sum();
+        let cached_entry_count = cache_guard
+            .values()
+            .map(|site_cache| site_cache.len())
+            .sum();
 
         DetailAttrCacheStats {
             ttl_secs: DETAIL_ATTR_CACHE_TTL_SECS,
@@ -273,12 +278,15 @@ fn should_trigger(task: &BrushTaskRecord) -> bool {
     }
 }
 
-fn snapshot_task(task: &Arc<RwLock<BrushTaskRecord>>) -> impl std::future::Future<Output = BrushTaskRecord> + '_ {
+fn snapshot_task(
+    task: &Arc<RwLock<BrushTaskRecord>>,
+) -> impl std::future::Future<Output = BrushTaskRecord> + '_ {
     async move { task.read().await.clone() }
 }
 
 async fn execute_brush_task(
     db: &Database,
+    collector: &Arc<DownloaderSnapshotCollector>,
     shared_task: Arc<RwLock<BrushTaskRecord>>,
 ) -> Result<(), String> {
     let task_start = std::time::Instant::now();
@@ -313,7 +321,9 @@ async fn execute_brush_task(
         .await
         .map_err(|e| e.to_string())?;
 
-    let downloader_torrents = client.list_torrents(Some(&task.tag)).await?;
+    let downloader_torrents = collector
+        .get_tagged_torrents(&downloader_record, &task.tag)
+        .await?;
 
     info!(
         "[刷流][{}] 当前状态: 本系统管理 {} 个种子, 下载器中标签[{}]共 {} 个种子",
@@ -325,16 +335,50 @@ async fn execute_brush_task(
 
     // 3. 执行删种规则
     let task = snapshot_task(&shared_task).await;
-    let to_remove = cleaner::evaluate_delete_rules(&task, &managed_torrents, &downloader_torrents, db).await;
+    let to_remove =
+        cleaner::evaluate_delete_rules(&task, &managed_torrents, &downloader_torrents, db).await;
     if to_remove.is_empty() {
         info!("[刷流][{}] 删种检查: 无需删除种子", task.name);
     } else {
-        info!("[刷流][{}] 删种检查: 准备删除 {} 个种子", task.name, to_remove.len());
+        info!(
+            "[刷流][{}] 删种检查: 准备删除 {} 个种子",
+            task.name,
+            to_remove.len()
+        );
     }
     for (hash, reason) in &to_remove {
-        info!("[刷流][{}] 删种: hash={} 原因={}", task.name, &hash[..8.min(hash.len())], reason);
+        info!(
+            "[刷流][{}] 删种: hash={} 原因={}",
+            task.name,
+            &hash[..8.min(hash.len())],
+            reason
+        );
+        if let Some(torrent) = downloader_torrents
+            .iter()
+            .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
+        {
+            let _ = db
+                .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
+                .await;
+            let _ = db
+                .update_brush_torrent_stats(
+                    task.id,
+                    &torrent.hash,
+                    torrent.uploaded,
+                    torrent.downloaded,
+                    torrent.time_active.max(0),
+                    average_upload_speed(torrent.uploaded, torrent.time_active),
+                    calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
+                )
+                .await;
+        }
         if let Err(e) = client.delete_torrent(hash, true).await {
-            warn!("[刷流][{}] 删种失败: hash={} err={}", task.name, &hash[..8.min(hash.len())], e);
+            warn!(
+                "[刷流][{}] 删种失败: hash={} err={}",
+                task.name,
+                &hash[..8.min(hash.len())],
+                e
+            );
         }
         let _ = db
             .update_brush_torrent_status(task.id, hash, "removed", Some(reason))
@@ -351,7 +395,10 @@ async fn execute_brush_task(
     let can_add = (task.max_concurrent - active_count.max(0)).max(0) as usize;
     info!(
         "[刷流][{}] 并发检查: 活跃 {} 个, 最大 {}, 可添加 {} 个",
-        task.name, active_count.max(0), task.max_concurrent, can_add
+        task.name,
+        active_count.max(0),
+        task.max_concurrent,
+        can_add
     );
     if can_add == 0 {
         info!("[刷流][{}] 已达并发上限，跳过选种", task.name);
@@ -374,10 +421,7 @@ async fn execute_brush_task(
         }
     }
 
-    let downloader_free_space_bytes = client
-        .get_free_space(task.save_dir.as_deref())
-        .await
-        .ok();
+    let downloader_free_space_bytes = client.get_free_space(task.save_dir.as_deref()).await.ok();
     let pending_download_bytes = calculate_pending_download_bytes(&downloader_torrents);
     let mut effective_free_space_bytes = downloader_free_space_bytes
         .map(|free_space| free_space.saturating_sub(pending_download_bytes));
@@ -394,7 +438,10 @@ async fn execute_brush_task(
                 min_disk_space_gb
             );
         } else {
-            warn!("[刷流][{}] 无法获取下载器剩余空间，跳过最小剩余空间检查", task.name);
+            warn!(
+                "[刷流][{}] 无法获取下载器剩余空间，跳过最小剩余空间检查",
+                task.name
+            );
         }
 
         if effective_free_space_bytes.is_some_and(|free_space| free_space < min_disk_space_bytes) {
@@ -406,15 +453,24 @@ async fn execute_brush_task(
     // 6. 获取 RSS
     info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
     let rss_body = fetch_rss_text(&task.rss_url).await?;
-    let rss_xml = std::str::from_utf8(rss_body.as_bytes()).map_err(|_| "RSS 编码错误".to_string())?;
+    let rss_xml =
+        std::str::from_utf8(rss_body.as_bytes()).map_err(|_| "RSS 编码错误".to_string())?;
     let parsed = rss::parse_feed(rss_xml).map_err(|e| format!("RSS 解析失败: {}", e))?;
     let snapshot = parsed.into_snapshot(task.name.clone(), 1);
 
-    info!("[刷流][{}] RSS 解析完成，共 {} 个条目", task.name, snapshot.items.len());
+    info!(
+        "[刷流][{}] RSS 解析完成，共 {} 个条目",
+        task.name,
+        snapshot.items.len()
+    );
 
     let existing_hashes: std::collections::HashSet<String> = managed_torrents
         .iter()
-        .map(|t| t.torrent_id.clone().unwrap_or_else(|| t.torrent_hash.clone()))
+        .map(|t| {
+            t.torrent_id
+                .clone()
+                .unwrap_or_else(|| t.torrent_hash.clone())
+        })
         .collect();
 
     // 7. 准备站点详情增强
@@ -424,7 +480,10 @@ async fn execute_brush_task(
     // 排序：按发布时间降序，优先处理新种子
     let mut sorted_items: Vec<&rss::TorrentItem> = snapshot.items.values().collect();
     sorted_items.sort_by(|a, b| {
-        b.pub_date.as_deref().unwrap_or("").cmp(a.pub_date.as_deref().unwrap_or(""))
+        b.pub_date
+            .as_deref()
+            .unwrap_or("")
+            .cmp(a.pub_date.as_deref().unwrap_or(""))
     });
 
     // 8. 逐个增强、选种、添加
@@ -435,8 +494,16 @@ async fn execute_brush_task(
 
     for item in &sorted_items {
         let task = snapshot_task(&shared_task).await;
-        let size_ranges = task.size_ranges.as_deref().map(parse_ranges).unwrap_or_default();
-        let seeder_ranges = task.seeder_ranges.as_deref().map(parse_ranges).unwrap_or_default();
+        let size_ranges = task
+            .size_ranges
+            .as_deref()
+            .map(parse_ranges)
+            .unwrap_or_default();
+        let seeder_ranges = task
+            .seeder_ranges
+            .as_deref()
+            .map(parse_ranges)
+            .unwrap_or_default();
         let needs_site_attrs = task.promotion != "all" || task.skip_hit_and_run;
         checked += 1;
 
@@ -457,10 +524,15 @@ async fn execute_brush_task(
         if let Some(reason) = pre_filter {
             debug!(
                 "[刷流][{}] ✗ {} id={} size={} seeders={} dl={:?} ul={:?} 原因: {}",
-                task.name, item.title, extract_torrent_id(&item.guid),
+                task.name,
+                item.title,
+                extract_torrent_id(&item.guid),
                 format_size(item.size_bytes),
-                item.seeders.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
-                item.download_volume_factor, item.upload_volume_factor,
+                item.seeders
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                item.download_volume_factor,
+                item.upload_volume_factor,
                 reason
             );
             continue;
@@ -475,8 +547,11 @@ async fn execute_brush_task(
                     if let Ok(sites) = db.list_sites().await {
                         if let Some(site) = sites.iter().find(|s| s.id == site_id) {
                             if let Some(site_type) = SiteType::from_str(&site.site_type) {
-                                if let Ok(auth) = serde_json::from_str::<SiteAuth>(&site.auth_config) {
-                                    site_client = Some(create_site_client(site_type, &site.base_url, &auth));
+                                if let Ok(auth) =
+                                    serde_json::from_str::<SiteAuth>(&site.auth_config)
+                                {
+                                    site_client =
+                                        Some(create_site_client(site_type, &site.base_url, &auth));
                                 }
                             }
                         }
@@ -487,12 +562,16 @@ async fn execute_brush_task(
 
             // 检查 RSS 数据是否已经足够判断促销/H&R，足够则跳过请求
             let need_fetch = item.download_volume_factor.is_none()
-                || (task.skip_hit_and_run && item.minimum_seed_time.is_none() && item.minimum_ratio.is_none());
+                || (task.skip_hit_and_run
+                    && item.minimum_seed_time.is_none()
+                    && item.minimum_ratio.is_none());
 
             if need_fetch {
                 if let Some(ref client) = site_client {
                     let detail_url = if task.site_id.is_some() {
-                        item.link.as_deref().filter(|s| !s.is_empty())
+                        item.link
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
                             .unwrap_or(item.guid.as_str())
                     } else {
                         item.guid.as_str()
@@ -524,17 +603,24 @@ async fn execute_brush_task(
                                 // 写入缓存
                                 if let Some(sid) = task.site_id {
                                     let mut cache_guard = detail_attr_cache().write().await;
-                                    let site_cache = cache_guard.entry(sid).or_insert_with(HashMap::new);
-                                    site_cache.insert(detail_url.to_string(), CachedTorrentAttributes {
-                                        attrs,
-                                        fetched_at: now,
-                                    });
+                                    let site_cache =
+                                        cache_guard.entry(sid).or_insert_with(HashMap::new);
+                                    site_cache.insert(
+                                        detail_url.to_string(),
+                                        CachedTorrentAttributes {
+                                            attrs,
+                                            fetched_at: now,
+                                        },
+                                    );
                                 }
                             }
                             Err(e) => {
                                 warn!(
                                     "[刷流][{}] ✗ id={} 详情获取失败: {} {}",
-                                    task.name, extract_torrent_id(detail_url), e, detail_url
+                                    task.name,
+                                    extract_torrent_id(detail_url),
+                                    e,
+                                    detail_url
                                 );
                                 skipped_attrs += 1;
                                 continue;
@@ -556,10 +642,16 @@ async fn execute_brush_task(
         if let Some(reason) = post_filter {
             debug!(
                 "[刷流][{}] ✗ {} id={} size={} seeders={} dl={:?} ul={:?} 原因: {}",
-                task.name, effective_item.title, extract_torrent_id(&effective_item.guid),
+                task.name,
+                effective_item.title,
+                extract_torrent_id(&effective_item.guid),
                 format_size(effective_item.size_bytes),
-                effective_item.seeders.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
-                effective_item.download_volume_factor, effective_item.upload_volume_factor,
+                effective_item
+                    .seeders
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                effective_item.download_volume_factor,
+                effective_item.upload_volume_factor,
                 reason
             );
             continue;
@@ -644,7 +736,8 @@ async fn execute_brush_task(
                             .or_else(|| Some(extract_torrent_id(&effective_item.guid)))
                             .map(str::to_string)
                             .filter(|value| !value.is_empty());
-                        let info_hash = extract_info_hash(&data).unwrap_or_else(|| effective_item.guid.clone());
+                        let info_hash =
+                            extract_info_hash(&data).unwrap_or_else(|| effective_item.guid.clone());
                         let _ = db
                             .add_brush_torrent(
                                 task.id,
@@ -658,11 +751,16 @@ async fn execute_brush_task(
                             .await;
                         info!(
                             "[刷流][{}] ✓ 添加成功: {} id={} size={} seeders={} dl={:?} ul={:?} hr={}",
-                            task.name, effective_item.title,
+                            task.name,
+                            effective_item.title,
                             extract_torrent_id(&effective_item.guid),
                             format_size(effective_item.size_bytes),
-                            effective_item.seeders.map(|s| s.to_string()).unwrap_or_else(|| "?".into()),
-                            effective_item.download_volume_factor, effective_item.upload_volume_factor,
+                            effective_item
+                                .seeders
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "?".into()),
+                            effective_item.download_volume_factor,
+                            effective_item.upload_volume_factor,
                             effective_item.is_hr()
                         );
                         added += 1;
@@ -691,7 +789,10 @@ async fn execute_brush_task(
                 }
             }
             Err(e) => {
-                warn!("[刷流][{}] ✗ 下载种子文件失败: {} err={}", task.name, effective_item.title, e);
+                warn!(
+                    "[刷流][{}] ✗ 下载种子文件失败: {} err={}",
+                    task.name, effective_item.title, e
+                );
                 failed += 1;
             }
         }
@@ -747,44 +848,40 @@ fn check_filter_reason(
 
     // 促销筛选
     match task.promotion.as_str() {
-        "free" => {
-            match item.download_volume_factor {
-                Some(download_volume_factor) => {
-                    if download_volume_factor > f64::EPSILON {
-                        return Some(format!("非免费(dl={download_volume_factor:?})"));
-                    }
+        "free" => match item.download_volume_factor {
+            Some(download_volume_factor) => {
+                if download_volume_factor > f64::EPSILON {
+                    return Some(format!("非免费(dl={download_volume_factor:?})"));
                 }
-                None if matches!(stage, FilterStage::PostEnhancement) => {
-                    return Some("缺少免费属性".to_string());
-                }
-                None => {}
             }
-        }
-        "normal" => {
-            match (item.download_volume_factor, item.upload_volume_factor) {
-                (Some(download_volume_factor), Some(upload_volume_factor)) => {
-                    if download_volume_factor < 1.0 - f64::EPSILON
-                        || (upload_volume_factor - 1.0).abs() > f64::EPSILON
-                    {
-                        return Some("有促销活动".to_string());
-                    }
-                }
-                (Some(download_volume_factor), None) => {
-                    if download_volume_factor < 1.0 - f64::EPSILON {
-                        return Some("有促销活动".to_string());
-                    }
-                }
-                (None, Some(upload_volume_factor)) => {
-                    if (upload_volume_factor - 1.0).abs() > f64::EPSILON {
-                        return Some("有促销活动".to_string());
-                    }
-                }
-                (None, None) if matches!(stage, FilterStage::PostEnhancement) => {
-                    return Some("缺少促销属性".to_string());
-                }
-                (None, None) => {}
+            None if matches!(stage, FilterStage::PostEnhancement) => {
+                return Some("缺少免费属性".to_string());
             }
-        }
+            None => {}
+        },
+        "normal" => match (item.download_volume_factor, item.upload_volume_factor) {
+            (Some(download_volume_factor), Some(upload_volume_factor)) => {
+                if download_volume_factor < 1.0 - f64::EPSILON
+                    || (upload_volume_factor - 1.0).abs() > f64::EPSILON
+                {
+                    return Some("有促销活动".to_string());
+                }
+            }
+            (Some(download_volume_factor), None) => {
+                if download_volume_factor < 1.0 - f64::EPSILON {
+                    return Some("有促销活动".to_string());
+                }
+            }
+            (None, Some(upload_volume_factor)) => {
+                if (upload_volume_factor - 1.0).abs() > f64::EPSILON {
+                    return Some("有促销活动".to_string());
+                }
+            }
+            (None, None) if matches!(stage, FilterStage::PostEnhancement) => {
+                return Some("缺少促销属性".to_string());
+            }
+            (None, None) => {}
+        },
         _ => {}
     }
 
@@ -956,10 +1053,30 @@ mod tests {
 
 fn format_size(bytes: Option<u64>) -> String {
     match bytes {
-        Some(b) if b >= 1024 * 1024 * 1024 => format!("{:.2} GB", b as f64 / (1024.0 * 1024.0 * 1024.0)),
+        Some(b) if b >= 1024 * 1024 * 1024 => {
+            format!("{:.2} GB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+        }
         Some(b) if b >= 1024 * 1024 => format!("{:.1} MB", b as f64 / (1024.0 * 1024.0)),
         Some(b) => format!("{} B", b),
         None => "?".to_string(),
+    }
+}
+
+fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
+    if duration_secs <= 0 {
+        0.0
+    } else {
+        uploaded_bytes as f64 / duration_secs as f64
+    }
+}
+
+fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
+    if downloaded_bytes > 0 {
+        uploaded_bytes as f64 / downloaded_bytes as f64
+    } else if uploaded_bytes > 0 {
+        fallback.max(0.0)
+    } else {
+        0.0
     }
 }
 
@@ -1006,7 +1123,10 @@ fn apply_attrs_to_item(item: &mut rss::TorrentItem, attrs: &crate::site::Torrent
 
 /// 从详情链接中提取末尾的数字 ID（如 "https://kp.m-team.cc/detail/1165802" → "1165802"）
 fn extract_torrent_id(detail_url: &str) -> &str {
-    detail_url.rsplit('/').find(|s| !s.is_empty()).unwrap_or(detail_url)
+    detail_url
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(detail_url)
 }
 
 fn extract_info_hash(torrent_data: &[u8]) -> Option<String> {
@@ -1040,7 +1160,10 @@ fn parse_bencode_bytes(bytes: &[u8], start: usize) -> Option<(&[u8], usize)> {
         .iter()
         .position(|byte| *byte == b':')
         .map(|offset| start + offset)?;
-    let len = std::str::from_utf8(&bytes[start..colon]).ok()?.parse::<usize>().ok()?;
+    let len = std::str::from_utf8(&bytes[start..colon])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
     let value_start = colon + 1;
     let value_end = value_start.checked_add(len)?;
     Some((bytes.get(value_start..value_end)?, value_end))
@@ -1180,9 +1303,7 @@ async fn fetch_rss_text(url: &str) -> Result<String, String> {
         return Err(format!("RSS HTTP {}", resp.status()));
     }
 
-    resp.text()
-        .await
-        .map_err(|e| format!("读取RSS失败: {}", e))
+    resp.text().await.map_err(|e| format!("读取RSS失败: {}", e))
 }
 
 async fn fetch_torrent_bytes(url: &str) -> Result<Vec<u8>, String> {

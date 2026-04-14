@@ -484,6 +484,7 @@ export function SitesPage() {
             ? "修改站点连接配置"
             : "填写站点信息以添加新的 PT 站点"
         }
+        escMode="double"
       >
         <div className="space-y-4">
           <div className="space-y-2">

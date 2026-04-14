@@ -1,8 +1,10 @@
-use tokio::time::{Duration, sleep};
+use std::sync::Arc;
+
+use tokio::sync::broadcast;
 use tracing::{debug, error, info};
 
+use crate::collector::DownloaderSnapshot;
 use crate::db::Database;
-use crate::downloader::{DownloaderType, create_downloader_client};
 
 /// 统计快照记录
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -24,116 +26,110 @@ pub struct DownloaderSpeedSnapshot {
     pub recorded_at: String,
 }
 
-/// 启动统计数据采集循环 (每60秒)
-pub async fn start_stats_collector(db: Database) {
-    info!("stats collector started (interval: 60s)");
+pub async fn start_stats_consumer(
+    db: Database,
+    mut rx: broadcast::Receiver<Arc<DownloaderSnapshot>>,
+) {
+    info!("stats consumer started");
     loop {
-        if let Err(e) = collect_stats(&db).await {
-            error!("stats collection error: {}", e);
+        match rx.recv().await {
+            Ok(snapshot) => {
+                if let Err(error) = process_snapshot(&db, &snapshot).await {
+                    error!(
+                        "stats consumer error for downloader {} at {}: {}",
+                        snapshot.downloader_id, snapshot.recorded_at, error
+                    );
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                debug!("stats consumer lagged, skipped {} snapshot(s)", skipped);
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                info!("stats consumer stopped: snapshot publisher closed");
+                break;
+            }
         }
-        sleep(Duration::from_secs(60)).await;
     }
 }
 
-async fn collect_stats(db: &Database) -> Result<(), String> {
-    let tasks = db
-        .list_brush_tasks()
-        .await
-        .map_err(|e| e.to_string())?;
+async fn process_snapshot(db: &Database, snapshot: &DownloaderSnapshot) -> Result<(), String> {
+    let upload_speed: i64 = snapshot
+        .torrents
+        .iter()
+        .map(|torrent| torrent.upload_speed)
+        .sum();
+    let download_speed: i64 = snapshot
+        .torrents
+        .iter()
+        .map(|torrent| torrent.download_speed)
+        .sum();
+    let _ = db
+        .save_downloader_speed_snapshot(snapshot.downloader_id, upload_speed, download_speed)
+        .await;
 
-    let downloaders = db
-        .list_downloaders()
-        .await
-        .map_err(|e| e.to_string())?;
+    let tasks = db.list_brush_tasks().await.map_err(|e| e.to_string())?;
+    for task in tasks
+        .into_iter()
+        .filter(|task| task.downloader_id == snapshot.downloader_id)
+    {
+        let torrents: Vec<_> = snapshot
+            .torrents
+            .iter()
+            .filter(|torrent| torrent_has_tag(&torrent.tags, &task.tag))
+            .cloned()
+            .collect();
 
-    for downloader in &downloaders {
-        let dl_type = match DownloaderType::from_str(&downloader.downloader_type) {
-            Some(t) => t,
-            None => continue,
-        };
+        let total_uploaded: i64 = torrents.iter().map(|torrent| torrent.uploaded).sum();
+        let total_downloaded: i64 = torrents.iter().map(|torrent| torrent.downloaded).sum();
+        let count = torrents.len() as i64;
 
-        let client = create_downloader_client(
-            dl_type,
-            &downloader.url,
-            &downloader.username,
-            &downloader.password,
-        );
+        let _ = db
+            .save_task_stats_snapshot(task.id, total_uploaded, total_downloaded, count)
+            .await;
 
-        match client.list_torrents(None).await {
-            Ok(torrents) => {
-                let upload_speed: i64 = torrents.iter().map(|t| t.upload_speed).sum();
-                let download_speed: i64 = torrents.iter().map(|t| t.download_speed).sum();
-                let _ = db
-                    .save_downloader_speed_snapshot(
-                        downloader.id,
-                        upload_speed,
-                        download_speed,
-                    )
-                    .await;
-            }
-            Err(e) => {
-                debug!("failed to collect downloader speed for '{}': {}", downloader.name, e);
-            }
+        for torrent in &torrents {
+            let _ = db
+                .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
+                .await;
+            let _ = db
+                .update_brush_torrent_stats(
+                    task.id,
+                    &torrent.hash,
+                    torrent.uploaded,
+                    torrent.downloaded,
+                    torrent.time_active.max(0),
+                    average_upload_speed(torrent.uploaded, torrent.time_active),
+                    calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
+                )
+                .await;
         }
     }
 
-    for task in &tasks {
-        if !task.enabled {
-            continue;
-        }
-
-        let downloader = match db
-            .get_downloader(task.downloader_id)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let dl_type = match DownloaderType::from_str(&downloader.downloader_type) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let client = create_downloader_client(
-            dl_type,
-            &downloader.url,
-            &downloader.username,
-            &downloader.password,
-        );
-
-        match client.list_torrents(Some(&task.tag)).await {
-            Ok(torrents) => {
-                let total_uploaded: i64 = torrents.iter().map(|t| t.uploaded).sum();
-                let total_downloaded: i64 = torrents.iter().map(|t| t.downloaded).sum();
-                let count = torrents.len() as i64;
-
-                // 保存任务级别快照
-                let _ = db
-                    .save_task_stats_snapshot(task.id, total_uploaded, total_downloaded, count)
-                    .await;
-
-                // 保存每个种子的流量快照 (用于速度计算)
-                for torrent in &torrents {
-                    let _ = db
-                        .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
-                        .await;
-                }
-
-                debug!(
-                    "stats collected for task '{}': {} torrents, up={}, down={}",
-                    task.name, count, total_uploaded, total_downloaded
-                );
-            }
-            Err(e) => {
-                debug!("failed to collect stats for task '{}': {}", task.name, e);
-            }
-        }
-    }
-
-    // 清理旧的种子流量快照 (保留7天)
     let _ = db.cleanup_old_torrent_traffic(7).await;
 
     Ok(())
+}
+
+fn torrent_has_tag(tags: &str, tag: &str) -> bool {
+    tags.split(',')
+        .map(str::trim)
+        .any(|value| !value.is_empty() && value == tag)
+}
+
+fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
+    if duration_secs <= 0 {
+        0.0
+    } else {
+        uploaded_bytes as f64 / duration_secs as f64
+    }
+}
+
+fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
+    if downloaded_bytes > 0 {
+        uploaded_bytes as f64 / downloaded_bytes as f64
+    } else if uploaded_bytes > 0 {
+        fallback.max(0.0)
+    } else {
+        0.0
+    }
 }

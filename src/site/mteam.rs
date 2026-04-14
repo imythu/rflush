@@ -1,15 +1,14 @@
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 use tracing::debug;
 
 use super::{SiteAuth, SiteClient, SiteTestResult, TorrentAttributes, UserStats};
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
 const MTEAM_DEFAULT_API: &str = "https://api.m-team.cc";
-const BROWSER_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 /// M-Team 详情请求间最小间隔（毫秒），防止 API 限流
 const MTEAM_REQUEST_INTERVAL_MS: u64 = 4000;
 
@@ -93,7 +92,9 @@ impl MTeamClient {
         let url = format!("{}{}", self.base_url, path);
         debug!("M-Team API POST form: {} {:?}", url, form);
 
-        let resp = self.client.post(&url)
+        let resp = self
+            .client
+            .post(&url)
             .headers(self.build_headers())
             .form(form)
             .send()
@@ -162,7 +163,9 @@ impl MTeamClient {
 }
 
 impl SiteClient for MTeamClient {
-    fn test_connection(&self) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>> {
+    fn test_connection(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>> {
         Box::pin(async move {
             match self.get_user_stats().await {
                 Ok(stats) => Ok(SiteTestResult {
@@ -179,72 +182,74 @@ impl SiteClient for MTeamClient {
         })
     }
 
-    fn get_user_stats(&self) -> Pin<Box<dyn Future<Output = Result<UserStats, String>> + Send + '_>> {
+    fn get_user_stats(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<UserStats, String>> + Send + '_>> {
         Box::pin(async move {
-        let json = self.api_post("/api/member/profile", None).await?;
-        let data = json
-            .get("data")
-            .ok_or_else(|| "响应缺少 data 字段".to_string())?;
+            let json = self.api_post("/api/member/profile", None).await?;
+            let data = json
+                .get("data")
+                .ok_or_else(|| "响应缺少 data 字段".to_string())?;
 
-        let username = data
-            .get("username")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+            let username = data
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
 
-        let member_count = data.get("memberCount").unwrap_or(data);
+            let member_count = data.get("memberCount").unwrap_or(data);
 
-        let uploaded = member_count
-            .get("uploaded")
-            .and_then(|v| {
+            let uploaded = member_count
+                .get("uploaded")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.as_u64())
+                })
+                .unwrap_or(0);
+
+            let downloaded = member_count
+                .get("downloaded")
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.as_u64())
+                })
+                .unwrap_or(0);
+
+            let ratio = member_count.get("shareRate").and_then(|v| {
                 v.as_str()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .or_else(|| v.as_u64())
-            })
-            .unwrap_or(0);
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64())
+            });
 
-        let downloaded = member_count
-            .get("downloaded")
-            .and_then(|v| {
+            let bonus = data.get("bonus").and_then(|v| {
                 v.as_str()
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .or_else(|| v.as_u64())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .or_else(|| v.as_f64())
+            });
+
+            let seeding_count = member_count.get("seeding").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .or_else(|| v.as_u64().map(|n| n as u32))
+            });
+
+            let leeching_count = member_count.get("leeching").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .or_else(|| v.as_u64().map(|n| n as u32))
+            });
+
+            Ok(UserStats {
+                username,
+                uploaded,
+                downloaded,
+                ratio,
+                bonus,
+                seeding_count,
+                leeching_count,
             })
-            .unwrap_or(0);
-
-        let ratio = member_count.get("shareRate").and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| v.as_f64())
-        });
-
-        let bonus = data.get("bonus").and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| v.as_f64())
-        });
-
-        let seeding_count = member_count.get("seeding").and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse::<u32>().ok())
-                .or_else(|| v.as_u64().map(|n| n as u32))
-        });
-
-        let leeching_count = member_count.get("leeching").and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse::<u32>().ok())
-                .or_else(|| v.as_u64().map(|n| n as u32))
-        });
-
-        Ok(UserStats {
-            username,
-            uploaded,
-            downloaded,
-            ratio,
-            bonus,
-            seeding_count,
-            leeching_count,
-        })
         })
     }
 
@@ -263,7 +268,10 @@ impl SiteClient for MTeamClient {
             for attempt in 0..=max_retries {
                 if attempt > 0 {
                     let backoff_ms = 10000 * attempt as u64;
-                    debug!("M-Team 重试 {}/{} 等待 {}ms: {}", attempt, max_retries, backoff_ms, &detail_url);
+                    debug!(
+                        "M-Team 重试 {}/{} 等待 {}ms: {}",
+                        attempt, max_retries, backoff_ms, &detail_url
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 } else {
                     // 首次请求前也加延迟，防止并发触发限流
@@ -300,7 +308,12 @@ impl SiteClient for MTeamClient {
                     Err(e) => {
                         if e.contains("頻繁") {
                             last_err = e;
-                            debug!("M-Team 限流，准备重试 {}/{}: {}", attempt + 1, max_retries, &detail_url);
+                            debug!(
+                                "M-Team 限流，准备重试 {}/{}: {}",
+                                attempt + 1,
+                                max_retries,
+                                &detail_url
+                            );
                             continue;
                         }
                         return Err(e);

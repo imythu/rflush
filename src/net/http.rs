@@ -10,8 +10,7 @@ use tracing::{debug, warn};
 use crate::logging::current_task_context;
 use crate::net::rate_limiter::{RateLimitPolicy, SharedRateLimiter};
 
-const BROWSER_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const REDIRECT_LIMIT: usize = 20;
 const EXPIRED_MESSAGE: &str = "連結不可用！ 超出有效期";
 const RATE_LIMIT_MESSAGE: &str = "\u{8acb}\u{6c42}\u{904e}\u{65bc}\u{983b}\u{7e41}";
@@ -172,8 +171,7 @@ pub fn parse_api_error_response(body: &[u8]) -> Option<String> {
 }
 
 fn extract_rate_limit_key(url: &str) -> Result<String, String> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| format!("invalid URL '{}': {}", url, e))?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL '{}': {}", url, e))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("URL has no host: {}", url))?;

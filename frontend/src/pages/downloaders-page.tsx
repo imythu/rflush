@@ -362,6 +362,7 @@ export function DownloadersPage() {
         onClose={closeDialog}
         title={editingId !== null ? "编辑下载器" : "添加下载器"}
         description={editingId !== null ? "修改下载器配置信息。" : "填写下载器连接信息。"}
+        escMode="double"
       >
         <div className="space-y-4 p-4 sm:p-6">
           {submitError ? (

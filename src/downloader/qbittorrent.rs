@@ -1,18 +1,17 @@
 use std::sync::Arc;
 
+use reqwest::Client;
 use reqwest::header::{COOKIE, USER_AGENT};
 use reqwest::multipart;
-use reqwest::Client;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use super::{AddTorrentOptions, DownloaderClient, DownloaderTestResult, TorrentInfo};
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
-const BROWSER_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 pub struct QBittorrentClient {
     base_url: String,
@@ -60,12 +59,7 @@ impl QBittorrentClient {
             .iter()
             .filter_map(|v| v.to_str().ok())
             .find(|s| s.contains("SID="))
-            .map(|s| {
-                s.split(';')
-                    .next()
-                    .unwrap_or(s)
-                    .to_string()
-            })
+            .map(|s| s.split(';').next().unwrap_or(s).to_string())
             .ok_or_else(|| {
                 let body = "用户名或密码错误".to_string();
                 body
@@ -109,21 +103,22 @@ impl QBittorrentClient {
                 .send()
                 .await
                 .map_err(|e| format!("请求失败: {}", e))?;
-            return resp.text().await.map_err(|e| format!("读取响应失败: {}", e));
+            return resp
+                .text()
+                .await
+                .map_err(|e| format!("读取响应失败: {}", e));
         }
 
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        resp.text().await.map_err(|e| format!("读取响应失败: {}", e))
+        resp.text()
+            .await
+            .map_err(|e| format!("读取响应失败: {}", e))
     }
 
-    async fn api_post_form(
-        &self,
-        path: &str,
-        params: &[(&str, &str)],
-    ) -> Result<String, String> {
+    async fn api_post_form(&self, path: &str, params: &[(&str, &str)]) -> Result<String, String> {
         let cookie = self.ensure_cookie().await?;
         let url = format!("{}{}", self.base_url, path);
 
@@ -148,14 +143,19 @@ impl QBittorrentClient {
                 .send()
                 .await
                 .map_err(|e| format!("请求失败: {}", e))?;
-            return resp.text().await.map_err(|e| format!("读取响应失败: {}", e));
+            return resp
+                .text()
+                .await
+                .map_err(|e| format!("读取响应失败: {}", e));
         }
 
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        resp.text().await.map_err(|e| format!("读取响应失败: {}", e))
+        resp.text()
+            .await
+            .map_err(|e| format!("读取响应失败: {}", e))
     }
 
     async fn api_post_multipart(
@@ -176,7 +176,10 @@ impl QBittorrentClient {
             .send()
             .await
             .map_err(|e| {
-                warn!("qBittorrent multipart request failed: url={} err={}", url, e);
+                warn!(
+                    "qBittorrent multipart request failed: url={} err={}",
+                    url, e
+                );
                 format!("请求失败: url={} err={}", url, e)
             })?;
 
@@ -211,10 +214,15 @@ impl QBittorrentClient {
 }
 
 impl DownloaderClient for QBittorrentClient {
-    fn test_connection(&self) -> Pin<Box<dyn Future<Output = Result<DownloaderTestResult, String>> + Send + '_>> {
+    fn test_connection(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<DownloaderTestResult, String>> + Send + '_>> {
         Box::pin(async move {
             self.login().await?;
-            let version = self.api_get("/api/v2/app/version").await.unwrap_or_default();
+            let version = self
+                .api_get("/api/v2/app/version")
+                .await
+                .unwrap_or_default();
             let free_space = self.get_free_space(None).await.ok();
             Ok(DownloaderTestResult {
                 success: true,
@@ -271,7 +279,8 @@ impl DownloaderClient for QBittorrentClient {
                 form = form.text("paused", "true".to_string());
             }
 
-            self.api_post_multipart("/api/v2/torrents/add", form).await?;
+            self.api_post_multipart("/api/v2/torrents/add", form)
+                .await?;
             Ok(())
         })
     }
@@ -283,10 +292,7 @@ impl DownloaderClient for QBittorrentClient {
         let tag = tag.map(|t| t.to_string());
         Box::pin(async move {
             let path = match &tag {
-                Some(t) => format!(
-                    "/api/v2/torrents/info?tag={}",
-                    urlencoding::encode(t)
-                ),
+                Some(t) => format!("/api/v2/torrents/info?tag={}", urlencoding::encode(t)),
                 None => "/api/v2/torrents/info".to_string(),
             };
 

@@ -1,5 +1,5 @@
-pub mod nexusphp;
 pub mod mteam;
+pub mod nexusphp;
 
 use serde::{Deserialize, Serialize};
 
@@ -103,9 +103,6 @@ pub fn create_site_client(
             base_url.to_string(),
             auth.clone(),
         )),
-        SiteType::MTeam => Box::new(mteam::MTeamClient::new(
-            base_url.to_string(),
-            auth.clone(),
-        )),
+        SiteType::MTeam => Box::new(mteam::MTeamClient::new(base_url.to_string(), auth.clone())),
     }
 }

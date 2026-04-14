@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -7,13 +8,49 @@ export function Dialog({
   title,
   description,
   children,
+  escMode = "single",
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
   description?: string;
   children: React.ReactNode;
+  escMode?: "single" | "double";
 }) {
+  const lastEscAtRef = useRef(0);
+
+  useEffect(() => {
+    if (!open) {
+      lastEscAtRef.current = 0;
+      return;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") {
+        return;
+      }
+
+      if (escMode === "single") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+
+      const now = Date.now();
+      if (now - lastEscAtRef.current <= 700) {
+        event.preventDefault();
+        lastEscAtRef.current = 0;
+        onClose();
+        return;
+      }
+
+      lastEscAtRef.current = now;
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [escMode, onClose, open]);
+
   if (!open) return null;
 
   return (

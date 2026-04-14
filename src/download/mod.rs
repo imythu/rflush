@@ -1,8 +1,8 @@
 pub mod naming;
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio::fs;
@@ -12,9 +12,9 @@ use tracing::{info, warn};
 use crate::engine::{AppRuntime, RssRuntime};
 use crate::history::{FinalStatus, TorrentRunRecord};
 use crate::logging::current_task_context;
-use crate::net::http::{is_expired_response, parse_api_error_response, HttpError};
-use crate::rss::feed::refresh_download_url;
+use crate::net::http::{HttpError, is_expired_response, parse_api_error_response};
 use crate::rss::TorrentItem;
+use crate::rss::feed::refresh_download_url;
 use naming::{build_target_file_name, extract_original_filename};
 
 #[derive(Debug)]
@@ -106,17 +106,11 @@ pub async fn download_torrent(
                     if app_runtime.shutdown.load(Ordering::SeqCst) {
                         record.retry_count = attempt.saturating_sub(1);
                         record.final_status = FinalStatus::Failed;
-                        record.final_message =
-                            Some("cancelled by shutdown signal".to_string());
+                        record.final_message = Some("cancelled by shutdown signal".to_string());
                         return record;
                     }
-                    match refresh_download_url(
-                        &runtime,
-                        &item.guid,
-                        current_version,
-                        &app_runtime,
-                    )
-                    .await
+                    match refresh_download_url(&runtime, &item.guid, current_version, &app_runtime)
+                        .await
                     {
                         Ok((latest_url, latest_version, refreshed)) => {
                             if refreshed {
@@ -138,10 +132,8 @@ pub async fn download_torrent(
                                 runtime.config.name, item.guid, error
                             );
                             record.final_message = Some(error.to_string());
-                            sleep(Duration::from_secs(
-                                app_runtime.global.retry_interval_secs,
-                            ))
-                            .await;
+                            sleep(Duration::from_secs(app_runtime.global.retry_interval_secs))
+                                .await;
                         }
                     }
                 }
@@ -210,9 +202,7 @@ async fn try_download_once(
         .map_err(|e| match e {
             HttpError::RateLimited { key } => DownloadAttemptError::RateLimited(key),
             HttpError::InvalidUrl(msg) => DownloadAttemptError::Fatal(msg),
-            HttpError::Transport { source } => {
-                DownloadAttemptError::Retriable(source.to_string())
-            }
+            HttpError::Transport { source } => DownloadAttemptError::Retriable(source.to_string()),
         })?;
 
     if !response.status.is_success() {

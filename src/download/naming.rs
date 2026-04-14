@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::Path;
 
-use reqwest::header::{HeaderMap, CONTENT_DISPOSITION};
+use reqwest::header::{CONTENT_DISPOSITION, HeaderMap};
 
 use crate::rss::TorrentItem;
 

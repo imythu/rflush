@@ -20,8 +20,9 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{info, info_span};
 
+use crate::brush::BrushTaskRequest;
 use crate::brush::scheduler::BrushScheduler;
-use crate::brush::{BrushTaskRequest};
+use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
 use crate::db::{Database, DownloadHistoryRecord, DownloadRunRecord, PaginatedRunRecords};
 use crate::download::naming::sanitize_component;
@@ -29,7 +30,7 @@ use crate::downloader::{DownloaderType, create_downloader_client};
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
-use crate::site::{SiteType, SiteAuth, create_site_client};
+use crate::site::{SiteAuth, SiteType, create_site_client};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +39,7 @@ pub struct AppState {
     engine: DownloadEngine,
     jobs: Arc<JobRegistry>,
     scheduler: Arc<BrushScheduler>,
+    collector: Arc<DownloaderSnapshotCollector>,
 }
 
 struct JobRegistry {
@@ -86,6 +88,13 @@ struct RunRecordsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct BrushTorrentsQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+    keyword: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateRssRequest {
     name: String,
     url: String,
@@ -107,18 +116,34 @@ struct TaskRecordsResponse {
     records: Vec<DownloadHistoryRecord>,
 }
 
+#[derive(Debug, Serialize)]
+struct BrushTaskTorrentsResponse {
+    task: crate::brush::BrushTaskRecord,
+    page: usize,
+    page_size: usize,
+    total_records: usize,
+    records: Vec<crate::brush::BrushTorrentRecord>,
+}
+
 #[derive(RustEmbed)]
 #[folder = "frontend/dist"]
 struct FrontendAssets;
 
 impl AppState {
-    pub fn new(base_dir: PathBuf, db: Database, engine: DownloadEngine, scheduler: Arc<BrushScheduler>) -> Self {
+    pub fn new(
+        base_dir: PathBuf,
+        db: Database,
+        engine: DownloadEngine,
+        scheduler: Arc<BrushScheduler>,
+        collector: Arc<DownloaderSnapshotCollector>,
+    ) -> Self {
         Self {
             base_dir,
             db,
             engine,
             jobs: Arc::new(JobRegistry::default()),
             scheduler,
+            collector,
         }
     }
 
@@ -185,7 +210,10 @@ impl JobRegistry {
     async fn active_for_task(&self, task_id: i64) -> Option<JobInfo> {
         let jobs = self.jobs.lock().await;
         jobs.values()
-            .find(|job| job.task_id == Some(task_id) && matches!(job.info.status.as_str(), "queued" | "running"))
+            .find(|job| {
+                job.task_id == Some(task_id)
+                    && matches!(job.info.status.as_str(), "queued" | "running")
+            })
             .map(|job| job.info.clone())
     }
 
@@ -248,18 +276,21 @@ impl JobRegistry {
     }
 }
 
-pub async fn serve(base_dir: PathBuf, db: Database, scheduler: Arc<BrushScheduler>) -> Result<(), AppError> {
+pub async fn serve(
+    base_dir: PathBuf,
+    db: Database,
+    scheduler: Arc<BrushScheduler>,
+    collector: Arc<DownloaderSnapshotCollector>,
+) -> Result<(), AppError> {
     let engine = DownloadEngine::new(
         base_dir.clone(),
         Arc::new(crate::net::rate_limiter::SharedRateLimiter::new()),
     );
-    let state = AppState::new(base_dir, db, engine, scheduler);
+    let state = AppState::new(base_dir, db, engine, scheduler, collector);
     let app = app_router(state);
-    let addr: SocketAddr = "0.0.0.0:3000"
-        .parse()
-        .map_err(|e| AppError::Server {
-            message: format!("invalid listen address: {}", e),
-        })?;
+    let addr: SocketAddr = "0.0.0.0:3000".parse().map_err(|e| AppError::Server {
+        message: format!("invalid listen address: {}", e),
+    })?;
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| AppError::Server {
@@ -299,23 +330,46 @@ fn app_router(state: AppState) -> Router {
         .route("/api/sites/{id}/test", post(test_site))
         .route("/api/sites/{id}/stats", get(get_site_stats))
         // 下载器管理
-        .route("/api/downloaders", get(list_downloaders).post(create_downloader))
-        .route("/api/downloaders/{id}", put(update_downloader).delete(delete_downloader))
+        .route(
+            "/api/downloaders",
+            get(list_downloaders).post(create_downloader),
+        )
+        .route(
+            "/api/downloaders/{id}",
+            put(update_downloader).delete(delete_downloader),
+        )
         .route("/api/downloaders/{id}/test", post(test_downloader))
-        .route("/api/downloaders/{id}/space", get(get_downloader_space_stats))
+        .route(
+            "/api/downloaders/{id}/space",
+            get(get_downloader_space_stats),
+        )
         // 刷流任务
-        .route("/api/brush-tasks", get(list_brush_tasks).post(create_brush_task))
-        .route("/api/brush-tasks/{id}", get(get_brush_task).put(update_brush_task).delete(delete_brush_task))
+        .route(
+            "/api/brush-tasks",
+            get(list_brush_tasks).post(create_brush_task),
+        )
+        .route(
+            "/api/brush-tasks/{id}",
+            get(get_brush_task)
+                .put(update_brush_task)
+                .delete(delete_brush_task),
+        )
         .route("/api/brush-tasks/{id}/start", post(start_brush_task))
         .route("/api/brush-tasks/{id}/stop", post(stop_brush_task))
         .route("/api/brush-tasks/{id}/run", post(run_brush_task_once))
-        .route("/api/brush-tasks/{id}/torrents", get(list_brush_task_torrents))
+        .route(
+            "/api/brush-tasks/{id}/torrents",
+            get(list_brush_task_torrents),
+        )
         .route("/api/brush-tasks/cache-stats", get(get_brush_cache_stats))
         .route("/api/system/logs/stream", get(stream_logs))
         // 统计
         .route("/api/stats/overview", get(stats_overview))
         .route("/api/stats/trend", get(stats_trend))
-        .route("/api/stats/downloader-speed-trend", get(downloader_speed_trend))
+        .route(
+            "/api/stats/downloader-speed-trend",
+            get(downloader_speed_trend),
+        )
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state(state)
@@ -364,10 +418,13 @@ async fn create_rss(
     let auto_start = payload.auto_start.unwrap_or(true);
     let rss = state
         .db
-        .create_rss(RssConfig {
-            name: payload.name.trim().to_string(),
-            url: payload.url.trim().to_string(),
-        }, auto_start)
+        .create_rss(
+            RssConfig {
+                name: payload.name.trim().to_string(),
+                url: payload.url.trim().to_string(),
+            },
+            auto_start,
+        )
         .await?;
     if auto_start {
         spawn_task_job(state.clone(), rss.clone()).await?;
@@ -596,17 +653,16 @@ async fn spawn_task_job(state: AppState, task: RssSubscription) -> Result<JobInf
         .ok_or_else(|| ApiError::internal("job not found after enqueue"))
 }
 
-async fn spawn_job(
-    state: AppState,
-    scope: String,
-    task_id: Option<i64>,
-    config: AppConfig,
-) -> u64 {
+async fn spawn_job(state: AppState, scope: String, task_id: Option<i64>, config: AppConfig) -> u64 {
     let shutdown = Arc::new(AtomicBool::new(false));
     let job_id = state.jobs.create(scope, task_id, shutdown.clone()).await;
     tokio::spawn(async move {
         state.jobs.mark_running(job_id).await;
-        match state.engine.run_with_shutdown(config, shutdown.clone()).await {
+        match state
+            .engine
+            .run_with_shutdown(config, shutdown.clone())
+            .await
+        {
             Ok(history) => match state
                 .db
                 .save_history(
@@ -616,10 +672,12 @@ async fn spawn_job(
                 )
                 .await
             {
-                Ok(run_id) => state
-                    .jobs
-                    .mark_completed(job_id, run_id, history.summary.clone())
-                    .await,
+                Ok(run_id) => {
+                    state
+                        .jobs
+                        .mark_completed(job_id, run_id, history.summary.clone())
+                        .await
+                }
                 Err(error) => state.jobs.mark_failed(job_id, error.to_string()).await,
             },
             Err(error) => state.jobs.mark_failed(job_id, error.to_string()).await,
@@ -650,10 +708,13 @@ async fn delete_tasks_inner(
     if delete_files {
         for task in &tasks {
             let task_dir = state.base_dir.join(sanitize_component(&task.name));
-            if tokio::fs::try_exists(&task_dir).await.map_err(|source| AppError::ReadDir {
-                path: task_dir.display().to_string(),
-                source,
-            })? {
+            if tokio::fs::try_exists(&task_dir)
+                .await
+                .map_err(|source| AppError::ReadDir {
+                    path: task_dir.display().to_string(),
+                    source,
+                })?
+            {
                 tokio::fs::remove_dir_all(&task_dir)
                     .await
                     .map_err(|source| AppError::RemovePath {
@@ -691,7 +752,8 @@ fn serve_asset(path: &str) -> Response {
     let mut response = asset.data.into_owned().into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(mime.as_ref()).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+        HeaderValue::from_str(mime.as_ref())
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
     response
 }
@@ -706,54 +768,88 @@ struct CreateSiteRequest {
     auth_config: serde_json::Value,
 }
 
-async fn list_sites(State(state): State<AppState>) -> Result<Json<Vec<crate::site::SiteRecord>>, ApiError> {
+async fn list_sites(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::site::SiteRecord>>, ApiError> {
     Ok(Json(state.db.list_sites().await?))
 }
 
-async fn create_site(State(state): State<AppState>, Json(body): Json<CreateSiteRequest>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn create_site(
+    State(state): State<AppState>,
+    Json(body): Json<CreateSiteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if body.name.is_empty() || body.site_type.is_empty() || body.base_url.is_empty() {
         return Err(ApiError::bad_request("名称、站点类型和基础URL不能为空"));
     }
     let auth_str = serde_json::to_string(&body.auth_config)
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
-    let id = state.db.create_site(&body.name, &body.site_type, &body.base_url, &auth_str).await?;
+    let id = state
+        .db
+        .create_site(&body.name, &body.site_type, &body.base_url, &auth_str)
+        .await?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
-async fn update_site(State(state): State<AppState>, Path(id): Path<i64>, Json(body): Json<CreateSiteRequest>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn update_site(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateSiteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let auth_str = serde_json::to_string(&body.auth_config)
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
-    state.db.update_site(id, &body.name, &body.site_type, &body.base_url, &auth_str).await?;
+    state
+        .db
+        .update_site(id, &body.name, &body.site_type, &body.base_url, &auth_str)
+        .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn delete_site(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn delete_site(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     state.db.delete_site(id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn test_site(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<crate::site::SiteTestResult>, ApiError> {
-    let site = state.db.get_site(id).await?
+async fn test_site(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::site::SiteTestResult>, ApiError> {
+    let site = state
+        .db
+        .get_site(id)
+        .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
     let site_type = SiteType::from_str(&site.site_type)
         .ok_or_else(|| ApiError::bad_request("不支持的站点类型"))?;
     let auth: SiteAuth = serde_json::from_str(&site.auth_config)
         .map_err(|e| ApiError::bad_request(format!("认证配置解析失败: {}", e)))?;
     let client = create_site_client(site_type, &site.base_url, &auth);
-    let result = client.test_connection().await
+    let result = client
+        .test_connection()
+        .await
         .map_err(|e| ApiError::internal(e))?;
     Ok(Json(result))
 }
 
-async fn get_site_stats(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<crate::site::UserStats>, ApiError> {
-    let site = state.db.get_site(id).await?
+async fn get_site_stats(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::site::UserStats>, ApiError> {
+    let site = state
+        .db
+        .get_site(id)
+        .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
     let site_type = SiteType::from_str(&site.site_type)
         .ok_or_else(|| ApiError::bad_request("不支持的站点类型"))?;
     let auth: SiteAuth = serde_json::from_str(&site.auth_config)
         .map_err(|e| ApiError::bad_request(format!("认证配置解析失败: {}", e)))?;
     let client = create_site_client(site_type, &site.base_url, &auth);
-    let stats = client.get_user_stats().await
+    let stats = client
+        .get_user_stats()
+        .await
         .map_err(|e| ApiError::internal(e))?;
     Ok(Json(stats))
 }
@@ -778,43 +874,74 @@ struct CreateDownloaderRequest {
     password: Option<String>,
 }
 
-async fn list_downloaders(State(state): State<AppState>) -> Result<Json<Vec<crate::downloader::DownloaderRecord>>, ApiError> {
+async fn list_downloaders(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::downloader::DownloaderRecord>>, ApiError> {
     Ok(Json(state.db.list_downloaders().await?))
 }
 
-async fn create_downloader(State(state): State<AppState>, Json(body): Json<CreateDownloaderRequest>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn create_downloader(
+    State(state): State<AppState>,
+    Json(body): Json<CreateDownloaderRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     if body.name.is_empty() || body.url.is_empty() {
         return Err(ApiError::bad_request("名称和URL不能为空"));
     }
-    let id = state.db.create_downloader(
-        &body.name, &body.downloader_type, &body.url,
-        body.username.as_deref().unwrap_or(""),
-        body.password.as_deref().unwrap_or(""),
-    ).await?;
+    let id = state
+        .db
+        .create_downloader(
+            &body.name,
+            &body.downloader_type,
+            &body.url,
+            body.username.as_deref().unwrap_or(""),
+            body.password.as_deref().unwrap_or(""),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
-async fn update_downloader(State(state): State<AppState>, Path(id): Path<i64>, Json(body): Json<CreateDownloaderRequest>) -> Result<Json<serde_json::Value>, ApiError> {
-    state.db.update_downloader(
-        id, &body.name, &body.downloader_type, &body.url,
-        body.username.as_deref().unwrap_or(""),
-        body.password.as_deref().unwrap_or(""),
-    ).await?;
+async fn update_downloader(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<CreateDownloaderRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .db
+        .update_downloader(
+            id,
+            &body.name,
+            &body.downloader_type,
+            &body.url,
+            body.username.as_deref().unwrap_or(""),
+            body.password.as_deref().unwrap_or(""),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn delete_downloader(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn delete_downloader(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     state.db.delete_downloader(id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn test_downloader(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<crate::downloader::DownloaderTestResult>, ApiError> {
-    let dl = state.db.get_downloader(id).await?
+async fn test_downloader(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::downloader::DownloaderTestResult>, ApiError> {
+    let dl = state
+        .db
+        .get_downloader(id)
+        .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
     let dl_type = DownloaderType::from_str(&dl.downloader_type)
         .ok_or_else(|| ApiError::bad_request("不支持的下载器类型"))?;
     let client = create_downloader_client(dl_type, &dl.url, &dl.username, &dl.password);
-    let result = client.test_connection().await
+    let result = client
+        .test_connection()
+        .await
         .map_err(|e| ApiError::internal(e))?;
     Ok(Json(result))
 }
@@ -836,8 +963,9 @@ async fn get_downloader_space_stats(
         .get_free_space(None)
         .await
         .map_err(ApiError::internal)?;
-    let torrents = client
-        .list_torrents(None)
+    let torrents = state
+        .collector
+        .get_all_torrents(&dl)
         .await
         .map_err(ApiError::internal)?;
 
@@ -867,12 +995,20 @@ async fn get_downloader_space_stats(
 
 // ========== Brush Tasks API ==========
 
-async fn list_brush_tasks(State(state): State<AppState>) -> Result<Json<Vec<crate::brush::BrushTaskRecord>>, ApiError> {
+async fn list_brush_tasks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::brush::BrushTaskRecord>>, ApiError> {
     Ok(Json(state.db.list_brush_tasks().await?))
 }
 
-async fn get_brush_task(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<crate::brush::BrushTaskRecord>, ApiError> {
-    let task = state.db.get_brush_task(id).await?
+async fn get_brush_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::brush::BrushTaskRecord>, ApiError> {
+    let task = state
+        .db
+        .get_brush_task(id)
+        .await?
         .ok_or_else(|| ApiError::not_found("刷流任务不存在"))?;
     Ok(Json(task))
 }
@@ -887,81 +1023,133 @@ fn normalize_cron(expr: &str) -> String {
     }
 }
 
-async fn create_brush_task(State(state): State<AppState>, Json(mut body): Json<BrushTaskRequest>) -> Result<Json<serde_json::Value>, ApiError> {
-    if body.name.is_empty() || body.cron_expression.is_empty() || body.tag.is_empty() || body.rss_url.is_empty() {
-        return Err(ApiError::bad_request("名称、cron表达式、标签和RSS地址不能为空"));
+async fn create_brush_task(
+    State(state): State<AppState>,
+    Json(mut body): Json<BrushTaskRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.name.is_empty()
+        || body.cron_expression.is_empty()
+        || body.tag.is_empty()
+        || body.rss_url.is_empty()
+    {
+        return Err(ApiError::bad_request(
+            "名称、cron表达式、标签和RSS地址不能为空",
+        ));
     }
     body.cron_expression = normalize_cron(&body.cron_expression);
-    body.cron_expression.parse::<cron::Schedule>()
+    body.cron_expression
+        .parse::<cron::Schedule>()
         .map_err(|e| ApiError::bad_request(format!("无效的cron表达式: {}", e)))?;
     let id = state.db.create_brush_task(&body).await?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
 
-async fn update_brush_task(State(state): State<AppState>, Path(id): Path<i64>, Json(mut body): Json<BrushTaskRequest>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn update_brush_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(mut body): Json<BrushTaskRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     body.cron_expression = normalize_cron(&body.cron_expression);
-    body.cron_expression.parse::<cron::Schedule>()
+    body.cron_expression
+        .parse::<cron::Schedule>()
         .map_err(|e| ApiError::bad_request(format!("无效的cron表达式: {}", e)))?;
     state.db.update_brush_task(id, &body).await?;
-    state.scheduler.refresh_task_config(id).await
+    state
+        .scheduler
+        .refresh_task_config(id)
+        .await
         .map_err(ApiError::internal)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn delete_brush_task(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn delete_brush_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     state.scheduler.stop_task(id).await;
     state.db.delete_brush_task(id).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn start_brush_task(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn start_brush_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     state.db.set_brush_task_enabled(id, true).await?;
-    state.scheduler.trigger_task(id).await
+    state
+        .scheduler
+        .trigger_task(id)
+        .await
         .map_err(|e| ApiError::internal(e))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn stop_brush_task(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn stop_brush_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     state.db.set_brush_task_enabled(id, false).await?;
     state.scheduler.stop_task(id).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn run_brush_task_once(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<serde_json::Value>, ApiError> {
-    state.scheduler.trigger_task(id).await
+async fn run_brush_task_once(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .scheduler
+        .trigger_task(id)
+        .await
         .map_err(|e| ApiError::internal(e))?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-async fn list_brush_task_torrents(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Vec<crate::brush::BrushTorrentRecord>>, ApiError> {
-    let task = state.db.get_brush_task(id).await?
+async fn list_brush_task_torrents(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<BrushTorrentsQuery>,
+) -> Result<Json<BrushTaskTorrentsResponse>, ApiError> {
+    let task = state
+        .db
+        .get_brush_task(id)
+        .await?
         .ok_or_else(|| ApiError::not_found("刷流任务不存在"))?;
-    let mut torrents = state.db.list_brush_task_torrents(id).await?;
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.unwrap_or(20);
+    let mut torrents = state
+        .db
+        .list_brush_task_torrents(id, page, page_size, query.keyword.as_deref())
+        .await?;
 
     if let Some(downloader) = state.db.get_downloader(task.downloader_id).await? {
-        if let Some(dl_type) = DownloaderType::from_str(&downloader.downloader_type) {
-            let client = create_downloader_client(dl_type, &downloader.url, &downloader.username, &downloader.password);
-            if let Ok(live_torrents) = client.list_torrents(Some(&task.tag)).await {
-                for record in &mut torrents {
-                    if let Some(live) = find_live_brush_torrent(record, &live_torrents) {
-                        record.status = live.state.clone();
-                        record.remove_reason = None;
-                        record.removed_at = None;
-                        record.torrent_hash = live.hash.clone();
-                    }
+        if let Ok(live_torrents) = state
+            .collector
+            .get_tagged_torrents(&downloader, &task.tag)
+            .await
+        {
+            for record in &mut torrents.records {
+                if let Some(live) = find_live_brush_torrent(record, &live_torrents) {
+                    apply_live_torrent(record, live);
                 }
             }
         }
     }
 
-    for record in &mut torrents {
+    for record in &mut torrents.records {
         if record.torrent_id.is_none() && !looks_like_info_hash(&record.torrent_hash) {
             record.torrent_id = Some(record.torrent_hash.clone());
             record.torrent_hash.clear();
         }
     }
 
-    Ok(Json(torrents))
+    Ok(Json(BrushTaskTorrentsResponse {
+        task,
+        page: torrents.page,
+        page_size: torrents.page_size,
+        total_records: torrents.total_records,
+        records: torrents.records,
+    }))
 }
 
 async fn get_brush_cache_stats(
@@ -970,7 +1158,8 @@ async fn get_brush_cache_stats(
     Ok(Json(state.scheduler.detail_attr_cache_stats().await))
 }
 
-async fn stream_logs() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+async fn stream_logs() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
+{
     let receiver = crate::logging::subscribe_logs();
     let stream = stream::unfold(receiver, |mut receiver| async move {
         loop {
@@ -1028,21 +1217,31 @@ async fn stats_overview(State(state): State<AppState>) -> Result<Json<StatsOverv
         // 获取最新的统计快照
         let now = Local::now().to_rfc3339();
         let since = (Local::now() - chrono::Duration::seconds(120)).to_rfc3339();
-        let snapshots = state.db.get_task_stats_snapshots(Some(task.id), &since, &now).await?;
+        let snapshots = state
+            .db
+            .get_task_stats_snapshots(Some(task.id), &since, &now)
+            .await?;
         let latest = snapshots.last();
+        let (total_uploaded, total_downloaded, historical_torrent_count) =
+            state.db.get_brush_task_transfer_totals(task.id).await?;
         overviews.push(TaskOverview {
             task_id: task.id,
             task_name: task.name.clone(),
-            total_uploaded: latest.map(|s| s.total_uploaded).unwrap_or(0),
-            total_downloaded: latest.map(|s| s.total_downloaded).unwrap_or(0),
-            torrent_count: latest.map(|s| s.torrent_count).unwrap_or(0),
+            total_uploaded,
+            total_downloaded,
+            torrent_count: latest
+                .map(|s| s.torrent_count)
+                .unwrap_or(historical_torrent_count),
             enabled: task.enabled,
         });
     }
     Ok(Json(StatsOverview { tasks: overviews }))
 }
 
-async fn stats_trend(State(state): State<AppState>, Query(q): Query<StatsQuery>) -> Result<Json<Vec<crate::stats::TaskStatsSnapshot>>, ApiError> {
+async fn stats_trend(
+    State(state): State<AppState>,
+    Query(q): Query<StatsQuery>,
+) -> Result<Json<Vec<crate::stats::TaskStatsSnapshot>>, ApiError> {
     let hours = q.hours.unwrap_or(24);
     let until = q.until.unwrap_or_else(|| Local::now().to_rfc3339());
     let since = q.since.unwrap_or_else(|| {
@@ -1050,7 +1249,10 @@ async fn stats_trend(State(state): State<AppState>, Query(q): Query<StatsQuery>)
         // dropping the latest bucket on exact boundary cuts like "last 1h".
         (Local::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
     });
-    let data = state.db.get_task_stats_snapshots(q.task_id, &since, &until).await?;
+    let data = state
+        .db
+        .get_task_stats_snapshots(q.task_id, &since, &until)
+        .await?;
     Ok(Json(data))
 }
 
@@ -1096,7 +1298,9 @@ fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
     }
     if let Some(log_level) = settings.log_level.as_deref() {
         if !ALLOWED_LOG_LEVELS.contains(&log_level) {
-            return Err(ApiError::bad_request("log_level must be one of: trace, debug, info, warn, error"));
+            return Err(ApiError::bad_request(
+                "log_level must be one of: trace, debug, info, warn, error",
+            ));
         }
     }
     Ok(())
@@ -1109,7 +1313,44 @@ fn find_live_brush_torrent<'a>(
     live_torrents
         .iter()
         .find(|torrent| torrent.hash.eq_ignore_ascii_case(&record.torrent_hash))
-        .or_else(|| live_torrents.iter().find(|torrent| torrent.name == record.torrent_name))
+        .or_else(|| {
+            live_torrents
+                .iter()
+                .find(|torrent| torrent.name == record.torrent_name)
+        })
+}
+
+fn apply_live_torrent(
+    record: &mut crate::brush::BrushTorrentRecord,
+    live: &crate::downloader::TorrentInfo,
+) {
+    record.status = live.state.clone();
+    record.remove_reason = None;
+    record.removed_at = None;
+    record.torrent_hash = live.hash.clone();
+    record.uploaded_bytes = live.uploaded;
+    record.downloaded_bytes = live.downloaded;
+    record.download_duration_secs = live.time_active.max(0);
+    record.avg_upload_speed = average_upload_speed(live.uploaded, live.time_active);
+    record.ratio = calculate_ratio(live.uploaded, live.downloaded, live.ratio);
+}
+
+fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
+    if duration_secs <= 0 {
+        0.0
+    } else {
+        uploaded_bytes as f64 / duration_secs as f64
+    }
+}
+
+fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
+    if downloaded_bytes > 0 {
+        uploaded_bytes as f64 / downloaded_bytes as f64
+    } else if uploaded_bytes > 0 {
+        fallback.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 fn looks_like_info_hash(value: &str) -> bool {
@@ -1162,6 +1403,10 @@ impl From<AppError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(serde_json::json!({ "error": self.message }))).into_response()
+        (
+            self.status,
+            Json(serde_json::json!({ "error": self.message })),
+        )
+            .into_response()
     }
 }

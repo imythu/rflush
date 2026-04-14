@@ -21,13 +21,9 @@ pub async fn evaluate_delete_rules(
         }
 
         // 查找对应的下载器种子信息
-        let Some(dl_info) = find_matching_downloader_torrent(record, downloader_torrents)
-        else {
+        let Some(dl_info) = find_matching_downloader_torrent(record, downloader_torrents) else {
             // 下载器中不存在的种子，标记为已移除
-            to_remove.push((
-                record.torrent_hash.clone(),
-                "下载器中不存在".to_string(),
-            ));
+            to_remove.push((record.torrent_hash.clone(), "下载器中不存在".to_string()));
             continue;
         };
 
@@ -64,7 +60,10 @@ pub async fn evaluate_delete_rules(
             let passed = dl_info.ratio >= target_ratio;
             rule_results.push(passed);
             if passed {
-                reasons.push(format!("分享率 {:.2} >= {:.2}", dl_info.ratio, target_ratio));
+                reasons.push(format!(
+                    "分享率 {:.2} >= {:.2}",
+                    dl_info.ratio, target_ratio
+                ));
             }
         }
 
@@ -155,7 +154,11 @@ fn find_matching_downloader_torrent<'a>(
     downloader_torrents
         .iter()
         .find(|torrent| torrent.hash.eq_ignore_ascii_case(&record.torrent_hash))
-        .or_else(|| downloader_torrents.iter().find(|torrent| torrent.name == record.torrent_name))
+        .or_else(|| {
+            downloader_torrents
+                .iter()
+                .find(|torrent| torrent.name == record.torrent_name)
+        })
 }
 
 /// 获取最近10分钟的平均上传速度 (bytes/s)

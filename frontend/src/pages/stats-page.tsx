@@ -130,6 +130,147 @@ function minuteBucket(isoString: string): string {
   return new Date(Math.floor(timestamp / 60_000) * 60_000).toISOString();
 }
 
+function sortSnapshots(snapshots: TaskStatsSnapshot[]): TaskStatsSnapshot[] {
+  return [...snapshots].sort(
+    (a, b) =>
+      new Date(a.recorded_at).getTime() - new Date(b.recorded_at).getTime(),
+  );
+}
+
+function toTransferDeltaSnapshots(
+  snapshots: TaskStatsSnapshot[],
+): TaskStatsSnapshot[] {
+  const sorted = sortSnapshots(snapshots);
+  let previous: TaskStatsSnapshot | null = null;
+  return sorted.map((snapshot) => {
+    const total_uploaded =
+      previous == null
+        ? 0
+        : Math.max(0, snapshot.total_uploaded - previous.total_uploaded);
+    const total_downloaded =
+      previous == null
+        ? 0
+        : Math.max(0, snapshot.total_downloaded - previous.total_downloaded);
+    previous = snapshot;
+    return {
+      ...snapshot,
+      total_uploaded,
+      total_downloaded,
+    };
+  });
+}
+
+function toTransferGrowthSnapshots(
+  snapshots: TaskStatsSnapshot[],
+): TaskStatsSnapshot[] {
+  let uploadGrowth = 0;
+  let downloadGrowth = 0;
+  return toTransferDeltaSnapshots(snapshots).map((snapshot) => {
+    uploadGrowth += snapshot.total_uploaded;
+    downloadGrowth += snapshot.total_downloaded;
+    return {
+      ...snapshot,
+      total_uploaded: uploadGrowth,
+      total_downloaded: downloadGrowth,
+    };
+  });
+}
+
+function mergeTransferSnapshotsByMinute(
+  snapshotGroups: TaskStatsSnapshot[][],
+): TaskStatsSnapshot[] {
+  const map = new Map<
+    string,
+    {
+      total_uploaded: number;
+      total_downloaded: number;
+      torrent_count: number;
+    }
+  >();
+
+  for (const snapshots of snapshotGroups) {
+    for (const snapshot of toTransferDeltaSnapshots(snapshots)) {
+      const bucket = minuteBucket(snapshot.recorded_at);
+      const existing = map.get(bucket);
+      if (existing) {
+        existing.total_uploaded += snapshot.total_uploaded;
+        existing.total_downloaded += snapshot.total_downloaded;
+        existing.torrent_count = Math.max(
+          existing.torrent_count,
+          snapshot.torrent_count,
+        );
+      } else {
+        map.set(bucket, {
+          total_uploaded: snapshot.total_uploaded,
+          total_downloaded: snapshot.total_downloaded,
+          torrent_count: snapshot.torrent_count,
+        });
+      }
+    }
+  }
+
+  return Array.from(map.entries())
+    .sort(([a], [b]) => new Date(a).getTime() - new Date(b).getTime())
+    .map(([recorded_at, value], index) => ({
+      id: index,
+      task_id: -1,
+      recorded_at,
+      ...value,
+    }))
+    .reduce<TaskStatsSnapshot[]>((acc, snapshot, index) => {
+      const previous = acc[index - 1];
+      acc.push({
+        ...snapshot,
+        total_uploaded:
+          (previous?.total_uploaded ?? 0) + snapshot.total_uploaded,
+        total_downloaded:
+          (previous?.total_downloaded ?? 0) + snapshot.total_downloaded,
+      });
+      return acc;
+    }, []);
+}
+
+function mergeTorrentSnapshotsByMinute(
+  snapshotGroups: TaskStatsSnapshot[][],
+): TaskStatsSnapshot[] {
+  const map = new Map<
+    string,
+    {
+      total_uploaded: number;
+      total_downloaded: number;
+      torrent_count: number;
+    }
+  >();
+
+  for (const snapshots of snapshotGroups) {
+    const perMinute = new Map<string, TaskStatsSnapshot>();
+    for (const snapshot of sortSnapshots(snapshots)) {
+      perMinute.set(minuteBucket(snapshot.recorded_at), snapshot);
+    }
+    for (const [bucket, snapshot] of perMinute) {
+      const existing = map.get(bucket);
+      if (existing) {
+        existing.torrent_count += snapshot.torrent_count;
+      } else {
+        map.set(bucket, {
+          total_uploaded: 0,
+          total_downloaded: 0,
+          torrent_count: snapshot.torrent_count,
+        });
+      }
+    }
+  }
+
+  return Array.from(map.entries())
+    .sort(([a], [b]) => new Date(a).getTime() - new Date(b).getTime())
+    .map(([recorded_at, value], index) => ({
+      id: index,
+      task_id: -1,
+      recorded_at,
+      ...value,
+    }));
+}
+
 function ratio(up: number, down: number): string {
   if (down === 0) return up > 0 ? "∞" : "N/A";
   return (up / down).toFixed(2);
@@ -169,6 +310,7 @@ const COLORS = {
 export function StatsPage() {
   const [overview, setOverview] = useState<StatsOverview | null>(null);
   const [selectedTransferTaskId, setSelectedTransferTaskId] = useState<number | -1>(-1);
+  const [transferLineFilter, setTransferLineFilter] = useState<"both" | "upload" | "download">("both");
   const [transferTrendHours, setTransferTrendHours] = useState(24);
   const [transferRefreshSecs, setTransferRefreshSecs] = useState(0);
   const [transferSnapshots, setTransferSnapshots] = useState<TaskStatsSnapshot[]>([]);
@@ -180,6 +322,7 @@ export function StatsPage() {
   const [torrentTimeWindow, setTorrentTimeWindow] = useState<TimeWindow | null>(null);
   const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
   const [selectedDownloaderId, setSelectedDownloaderId] = useState<number | -1>(-1);
+  const [downloaderLineFilter, setDownloaderLineFilter] = useState<"both" | "upload" | "download">("both");
   const [downloaderTrendHours, setDownloaderTrendHours] = useState(24);
   const [downloaderRefreshSecs, setDownloaderRefreshSecs] = useState(0);
   const [downloaderSnapshots, setDownloaderSnapshots] = useState<DownloaderSpeedSnapshot[]>([]);
@@ -216,6 +359,7 @@ export function StatsPage() {
   const fetchTaskTrend = async (
     taskId: number | -1,
     h: number,
+    mode: "transfer" | "torrent",
     setWindow: React.Dispatch<React.SetStateAction<TimeWindow | null>>,
     setData: React.Dispatch<React.SetStateAction<TaskStatsSnapshot[]>>,
     setLoadingState: React.Dispatch<React.SetStateAction<boolean>>,
@@ -226,62 +370,35 @@ export function StatsPage() {
       const visibleStart = end - h * 60 * 60_000;
       const fetchStart = visibleStart - 2 * 60_000;
       setWindow({ start: visibleStart, end });
+      const since = new Date(fetchStart).toISOString();
+      const until = new Date(end).toISOString();
 
       if (taskId === -1) {
-        // Combined: fetch all tasks and merge by recorded_at
         if (!overview || overview.tasks.length === 0) {
           setData([]);
           return;
         }
-          const allData = await Promise.all(
-            overview.tasks.map((t) =>
-              api<TaskStatsSnapshot[]>(
-                `/api/stats/trend?task_id=${t.task_id}&hours=${h}`,
-              ),
+        const allData = await Promise.all(
+          overview.tasks.map((t) =>
+            api<TaskStatsSnapshot[]>(
+              `/api/stats/trend?task_id=${t.task_id}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
             ),
-          );
-        // Merge: sum up values per minute bucket to avoid interleaving task samples
-        const map = new Map<
-          string,
-          {
-            total_uploaded: number;
-            total_downloaded: number;
-            torrent_count: number;
-          }
-        >();
-        for (const arr of allData) {
-          for (const s of arr) {
-            const bucket = minuteBucket(s.recorded_at);
-            const existing = map.get(bucket);
-            if (existing) {
-              existing.total_uploaded += s.total_uploaded;
-              existing.total_downloaded += s.total_downloaded;
-              existing.torrent_count += s.torrent_count;
-            } else {
-              map.set(bucket, {
-                total_uploaded: s.total_uploaded,
-                total_downloaded: s.total_downloaded,
-                torrent_count: s.torrent_count,
-              });
-            }
-          }
-        }
-        const merged: TaskStatsSnapshot[] = Array.from(map.entries())
-          .sort(
-            ([a], [b]) => new Date(a).getTime() - new Date(b).getTime(),
-          )
-          .map(([recorded_at, v], i) => ({
-            id: i,
-            task_id: -1,
-            recorded_at,
-            ...v,
-          }));
+          ),
+        );
+        const merged =
+          mode === "transfer"
+            ? mergeTransferSnapshotsByMinute(allData)
+            : mergeTorrentSnapshotsByMinute(allData);
         setData(merged);
       } else {
         const data = await api<TaskStatsSnapshot[]>(
-          `/api/stats/trend?task_id=${taskId}&hours=${h}`,
+          `/api/stats/trend?task_id=${taskId}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
         );
-        setData(data);
+        setData(
+          mode === "transfer"
+            ? toTransferGrowthSnapshots(data)
+            : sortSnapshots(data),
+        );
       }
     } catch {
       setData([]);
@@ -297,19 +414,21 @@ export function StatsPage() {
       const visibleStart = end - h * 60 * 60_000;
       const fetchStart = visibleStart - 2 * 60_000;
       setDownloaderTimeWindow({ start: visibleStart, end });
+      const since = new Date(fetchStart).toISOString();
+      const until = new Date(end).toISOString();
 
       if (downloaderId === -1) {
         if (downloaders.length === 0) {
           setDownloaderSnapshots([]);
           return;
         }
-          const allData = await Promise.all(
-            downloaders.map((downloader) =>
-              api<DownloaderSpeedSnapshot[]>(
-                `/api/stats/downloader-speed-trend?downloader_id=${downloader.id}&hours=${h}`,
-              ),
+        const allData = await Promise.all(
+          downloaders.map((downloader) =>
+            api<DownloaderSpeedSnapshot[]>(
+              `/api/stats/downloader-speed-trend?downloader_id=${downloader.id}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
             ),
-          );
+          ),
+        );
         const map = new Map<string, { upload_speed: number; download_speed: number }>();
         for (const arr of allData) {
           for (const snapshot of arr) {
@@ -338,7 +457,7 @@ export function StatsPage() {
         setDownloaderSnapshots(merged);
       } else {
         const data = await api<DownloaderSpeedSnapshot[]>(
-          `/api/stats/downloader-speed-trend?downloader_id=${downloaderId}&hours=${h}`,
+          `/api/stats/downloader-speed-trend?downloader_id=${downloaderId}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
         );
         setDownloaderSnapshots(data);
       }
@@ -370,14 +489,14 @@ export function StatsPage() {
 
   useEffect(() => {
     if (overview) {
-      void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
+      void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTransferTaskId, transferTrendHours, overview]);
 
   useEffect(() => {
     if (overview) {
-      void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
+      void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTorrentTaskId, torrentTrendHours, overview]);
@@ -393,7 +512,7 @@ export function StatsPage() {
     if (transferRefreshRef.current) clearInterval(transferRefreshRef.current);
     if (transferRefreshSecs > 0) {
       transferRefreshRef.current = setInterval(() => {
-        void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
+        void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
       }, transferRefreshSecs * 1000);
     }
     return () => {
@@ -405,7 +524,7 @@ export function StatsPage() {
     if (torrentRefreshRef.current) clearInterval(torrentRefreshRef.current);
     if (torrentRefreshSecs > 0) {
       torrentRefreshRef.current = setInterval(() => {
-        void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
+        void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
       }, torrentRefreshSecs * 1000);
     }
     return () => {
@@ -517,7 +636,7 @@ export function StatsPage() {
             趋势图表
           </CardTitle>
           <CardDescription>
-            查看上传/下载量和种子数的变化趋势。
+            查看区间上传/下载增量，以及种子数变化趋势。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -526,7 +645,7 @@ export function StatsPage() {
             <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
                 <ArrowUpDown className="h-4 w-4" />
-                下载量 / 上传量历史
+                上传 / 下载区间增量
               </div>
               <div className="mb-4 flex flex-wrap items-center gap-3">
                 <select
@@ -553,6 +672,18 @@ export function StatsPage() {
                     </Button>
                   ))}
                 </div>
+                <div className="flex gap-1">
+                  {(["both", "upload", "download"] as const).map((f) => (
+                    <Button
+                      key={`transfer-filter-${f}`}
+                      variant={transferLineFilter === f ? "default" : "secondary"}
+                      className="h-8 px-3 text-xs"
+                      onClick={() => setTransferLineFilter(f)}
+                    >
+                      {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
+                    </Button>
+                  ))}
+                </div>
                 <select
                   className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
                   value={transferRefreshSecs}
@@ -568,7 +699,7 @@ export function StatsPage() {
                   variant="outline"
                   className="h-8 px-3 text-xs"
                   onClick={() =>
-                    void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading)
+                    void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading)
                   }
                   disabled={transferTrendLoading}
                 >
@@ -627,6 +758,7 @@ export function StatsPage() {
                       strokeWidth={2}
                       dot={false}
                       activeDot={{ r: 4 }}
+                      hide={transferLineFilter === "download"}
                     />
                     <Line
                       type="monotone"
@@ -635,6 +767,7 @@ export function StatsPage() {
                       strokeWidth={2}
                       dot={false}
                       activeDot={{ r: 4 }}
+                      hide={transferLineFilter === "upload"}
                     />
                   </LineChart>
                 </ResponsiveContainer>
@@ -686,7 +819,7 @@ export function StatsPage() {
                   variant="outline"
                   className="h-8 px-3 text-xs"
                   onClick={() =>
-                    void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading)
+                    void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading)
                   }
                   disabled={torrentTrendLoading}
                 >
@@ -785,6 +918,18 @@ export function StatsPage() {
                 </Button>
               ))}
             </div>
+            <div className="flex gap-1">
+              {(["both", "upload", "download"] as const).map((f) => (
+                <Button
+                  key={`downloader-filter-${f}`}
+                  variant={downloaderLineFilter === f ? "default" : "secondary"}
+                  className="h-8 px-3 text-xs"
+                  onClick={() => setDownloaderLineFilter(f)}
+                >
+                  {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
+                </Button>
+              ))}
+            </div>
             <select
               className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
               value={downloaderRefreshSecs}
@@ -859,6 +1004,7 @@ export function StatsPage() {
                     strokeWidth={2}
                     dot={false}
                     activeDot={{ r: 4 }}
+                    hide={downloaderLineFilter === "download"}
                   />
                   <Line
                     type="monotone"
@@ -867,6 +1013,7 @@ export function StatsPage() {
                     strokeWidth={2}
                     dot={false}
                     activeDot={{ r: 4 }}
+                    hide={downloaderLineFilter === "upload"}
                   />
                 </LineChart>
               </ResponsiveContainer>

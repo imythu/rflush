@@ -37,11 +37,8 @@
 从 GitHub Release 下载与你平台匹配的压缩包，解压后直接运行：
 
 ```bash
-# Linux / macOS
+# Linux
 ./rflush
-
-# Windows
-.\rflush.exe
 ```
 
 程序默认监听：
@@ -72,7 +69,6 @@ ghcr.io/imythu/rflush
 
 - Linux `amd64`
 - Linux `arm64`
-- Windows `amd64`
 
 示例：
 
@@ -90,12 +86,6 @@ docker run --name rflush \
   -p 3000:3000 \
   -v $(pwd)/data:/data \
   ghcr.io/imythu/rflush:2026-04-13
-```
-
-Windows 镜像标签示例：
-
-```text
-ghcr.io/imythu/rflush:latest-windows-amd64
 ```
 
 ### 开发模式
@@ -202,13 +192,9 @@ GitHub Release 发布产物：
 - 二进制：
   - Linux `amd64`
   - Linux `arm64`
-  - macOS `amd64`
-  - macOS `arm64`
-  - Windows `amd64`
 - Docker 镜像：
   - Linux `amd64`
   - Linux `arm64`
-  - Windows `amd64`
 
 发布流程：
 

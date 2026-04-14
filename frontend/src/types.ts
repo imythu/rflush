@@ -211,6 +211,20 @@ export type BrushTorrentRecord = {
   status: string;
   removed_at: string | null;
   remove_reason: string | null;
+  uploaded_bytes: number;
+  downloaded_bytes: number;
+  download_duration_secs: number;
+  avg_upload_speed: number;
+  ratio: number;
+  last_stats_at: string | null;
+};
+
+export type BrushTaskTorrentsResponse = {
+  task: BrushTaskRecord;
+  page: number;
+  page_size: number;
+  total_records: number;
+  records: BrushTorrentRecord[];
 };
 
 export type BrushCacheStats = {

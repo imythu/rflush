@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use chrono::Local;
+use chrono::{Local, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -55,6 +55,14 @@ pub struct PaginatedRunRecords {
     pub page_size: usize,
     pub total_records: usize,
     pub records: Vec<DownloadHistoryRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaginatedBrushTorrents {
+    pub page: usize,
+    pub page_size: usize,
+    pub total_records: usize,
+    pub records: Vec<BrushTorrentRecord>,
 }
 
 impl Database {
@@ -167,7 +175,11 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn create_rss(&self, rss: RssConfig, enabled: bool) -> Result<RssSubscription, AppError> {
+    pub async fn create_rss(
+        &self,
+        rss: RssConfig,
+        enabled: bool,
+    ) -> Result<RssSubscription, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<RssSubscription, AppError> {
             let conn = open_connection(&path)?;
@@ -576,10 +588,21 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn create_site(&self, name: &str, site_type: &str, base_url: &str, auth_config: &str) -> Result<i64, AppError> {
+    pub async fn create_site(
+        &self,
+        name: &str,
+        site_type: &str,
+        base_url: &str,
+        auth_config: &str,
+    ) -> Result<i64, AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
-        let (name, site_type, base_url, auth_config) = (name.to_string(), site_type.to_string(), base_url.to_string(), auth_config.to_string());
+        let now = Utc::now().to_rfc3339();
+        let (name, site_type, base_url, auth_config) = (
+            name.to_string(),
+            site_type.to_string(),
+            base_url.to_string(),
+            auth_config.to_string(),
+        );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -593,10 +616,22 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn update_site(&self, id: i64, name: &str, site_type: &str, base_url: &str, auth_config: &str) -> Result<(), AppError> {
+    pub async fn update_site(
+        &self,
+        id: i64,
+        name: &str,
+        site_type: &str,
+        base_url: &str,
+        auth_config: &str,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
-        let (name, site_type, base_url, auth_config) = (name.to_string(), site_type.to_string(), base_url.to_string(), auth_config.to_string());
+        let now = Utc::now().to_rfc3339();
+        let (name, site_type, base_url, auth_config) = (
+            name.to_string(),
+            site_type.to_string(),
+            base_url.to_string(),
+            auth_config.to_string(),
+        );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -682,10 +717,23 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn create_downloader(&self, name: &str, dtype: &str, url: &str, username: &str, password: &str) -> Result<i64, AppError> {
+    pub async fn create_downloader(
+        &self,
+        name: &str,
+        dtype: &str,
+        url: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<i64, AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
-        let (name, dtype, url, username, password) = (name.to_string(), dtype.to_string(), url.to_string(), username.to_string(), password.to_string());
+        let now = Utc::now().to_rfc3339();
+        let (name, dtype, url, username, password) = (
+            name.to_string(),
+            dtype.to_string(),
+            url.to_string(),
+            username.to_string(),
+            password.to_string(),
+        );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -699,10 +747,24 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn update_downloader(&self, id: i64, name: &str, dtype: &str, url: &str, username: &str, password: &str) -> Result<(), AppError> {
+    pub async fn update_downloader(
+        &self,
+        id: i64,
+        name: &str,
+        dtype: &str,
+        url: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Local::now().to_rfc3339();
-        let (name, dtype, url, username, password) = (name.to_string(), dtype.to_string(), url.to_string(), username.to_string(), password.to_string());
+        let (name, dtype, url, username, password) = (
+            name.to_string(),
+            dtype.to_string(),
+            url.to_string(),
+            username.to_string(),
+            password.to_string(),
+        );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -895,71 +957,103 @@ impl Database {
 
     // ========== Brush Task Torrents ==========
 
-    pub async fn list_brush_task_torrents(&self, task_id: i64) -> Result<Vec<BrushTorrentRecord>, AppError> {
+    pub async fn list_brush_task_torrents(
+        &self,
+        task_id: i64,
+        page: usize,
+        page_size: usize,
+        keyword: Option<&str>,
+    ) -> Result<PaginatedBrushTorrents, AppError> {
         let path = self.path.clone();
+        let keyword = keyword
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason
-                     FROM brush_task_torrents WHERE task_id = ? ORDER BY id",
+            let page = page.max(1);
+            let page_size = page_size.clamp(1, 100);
+            let offset = (page - 1) * page_size;
+
+            let like = keyword.as_ref().map(|value| format!("%{}%", value));
+            let total_records: usize = if let Some(ref like) = like {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM brush_task_torrents
+                     WHERE task_id = ?
+                       AND (torrent_name LIKE ? OR COALESCE(torrent_id, '') LIKE ?)",
+                    params![task_id, like, like],
+                    |row| row.get(0),
                 )
-                .map_err(sql_error)?;
-            let rows = stmt
-                .query_map(params![task_id], |row| {
-                    Ok(BrushTorrentRecord {
-                        id: row.get(0)?,
-                        task_id: row.get(1)?,
-                        torrent_id: row.get(2)?,
-                        torrent_link: row.get(3)?,
-                        torrent_hash: row.get(4)?,
-                        torrent_name: row.get(5)?,
-                        added_at: row.get(6)?,
-                        size_bytes: row.get(7)?,
-                        is_hr: row.get::<_, i32>(8)? != 0,
-                        status: row.get(9)?,
-                        removed_at: row.get(10)?,
-                        remove_reason: row.get(11)?,
-                    })
-                })
-                .map_err(sql_error)?;
+                .map_err(sql_error)?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM brush_task_torrents WHERE task_id = ?",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?
+            };
+
+            let sql = if like.is_some() {
+                "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason,
+                        uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
+                 FROM brush_task_torrents
+                 WHERE task_id = ?
+                   AND (torrent_name LIKE ? OR COALESCE(torrent_id, '') LIKE ?)
+                 ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, added_at DESC, id DESC
+                 LIMIT ? OFFSET ?"
+            } else {
+                "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason,
+                        uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
+                 FROM brush_task_torrents
+                 WHERE task_id = ?
+                 ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, added_at DESC, id DESC
+                 LIMIT ? OFFSET ?"
+            };
+
+            let mut stmt = conn.prepare(sql).map_err(sql_error)?;
             let mut list = Vec::new();
-            for row in rows {
-                list.push(row.map_err(sql_error)?);
+            if let Some(like) = like {
+                let rows = stmt
+                    .query_map(params![task_id, like, like, page_size as i64, offset as i64], map_brush_torrent_record)
+                    .map_err(sql_error)?;
+                for row in rows {
+                    list.push(row.map_err(sql_error)?);
+                }
+            } else {
+                let rows = stmt
+                    .query_map(params![task_id, page_size as i64, offset as i64], map_brush_torrent_record)
+                    .map_err(sql_error)?;
+                for row in rows {
+                    list.push(row.map_err(sql_error)?);
+                }
             }
-            Ok(list)
+            Ok(PaginatedBrushTorrents {
+                page,
+                page_size,
+                total_records,
+                records: list,
+            })
         })
         .await
         .map_err(join_error)?
     }
 
-    pub async fn list_active_brush_torrents(&self, task_id: i64) -> Result<Vec<BrushTorrentRecord>, AppError> {
+    pub async fn list_active_brush_torrents(
+        &self,
+        task_id: i64,
+    ) -> Result<Vec<BrushTorrentRecord>, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason
+                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason,
+                            uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
                      FROM brush_task_torrents WHERE task_id = ? AND status = 'active' ORDER BY id",
                 )
                 .map_err(sql_error)?;
             let rows = stmt
-                .query_map(params![task_id], |row| {
-                    Ok(BrushTorrentRecord {
-                        id: row.get(0)?,
-                        task_id: row.get(1)?,
-                        torrent_id: row.get(2)?,
-                        torrent_link: row.get(3)?,
-                        torrent_hash: row.get(4)?,
-                        torrent_name: row.get(5)?,
-                        added_at: row.get(6)?,
-                        size_bytes: row.get(7)?,
-                        is_hr: row.get::<_, i32>(8)? != 0,
-                        status: row.get(9)?,
-                        removed_at: row.get(10)?,
-                        remove_reason: row.get(11)?,
-                    })
-                })
+                .query_map(params![task_id], map_brush_torrent_record)
                 .map_err(sql_error)?;
             let mut list = Vec::new();
             for row in rows {
@@ -1002,7 +1096,13 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn update_brush_torrent_status(&self, task_id: i64, hash: &str, status: &str, reason: Option<&str>) -> Result<(), AppError> {
+    pub async fn update_brush_torrent_status(
+        &self,
+        task_id: i64,
+        hash: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Local::now().to_rfc3339();
         let (hash, status) = (hash.to_string(), status.to_string());
@@ -1022,7 +1122,13 @@ impl Database {
 
     // ========== Stats Snapshots ==========
 
-    pub async fn save_task_stats_snapshot(&self, task_id: i64, total_uploaded: i64, total_downloaded: i64, torrent_count: i64) -> Result<(), AppError> {
+    pub async fn save_task_stats_snapshot(
+        &self,
+        task_id: i64,
+        total_uploaded: i64,
+        total_downloaded: i64,
+        torrent_count: i64,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Local::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
@@ -1059,6 +1165,69 @@ impl Database {
         .map_err(join_error)?
     }
 
+    pub async fn update_brush_torrent_stats(
+        &self,
+        task_id: i64,
+        hash: &str,
+        uploaded_bytes: i64,
+        downloaded_bytes: i64,
+        download_duration_secs: i64,
+        avg_upload_speed: f64,
+        ratio: f64,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let now = Local::now().to_rfc3339();
+        let hash = hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE brush_task_torrents
+                 SET uploaded_bytes = ?, downloaded_bytes = ?, download_duration_secs = ?,
+                     avg_upload_speed = ?, ratio = ?, last_stats_at = ?
+                 WHERE task_id = ? AND torrent_hash = ?",
+                params![
+                    uploaded_bytes,
+                    downloaded_bytes,
+                    download_duration_secs,
+                    avg_upload_speed,
+                    ratio,
+                    now,
+                    task_id,
+                    hash
+                ],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn get_brush_task_transfer_totals(
+        &self,
+        task_id: i64,
+    ) -> Result<(i64, i64, i64), AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let totals = conn
+                .query_row(
+                    "SELECT
+                        COALESCE(SUM(uploaded_bytes), 0),
+                        COALESCE(SUM(downloaded_bytes), 0),
+                        COUNT(*)
+                     FROM brush_task_torrents
+                     WHERE task_id = ?",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(sql_error)?;
+            Ok(totals)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn get_downloader_speed_snapshots(
         &self,
         downloader_id: Option<i64>,
@@ -1072,12 +1241,23 @@ impl Database {
             let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
                 if let Some(downloader_id) = downloader_id {
                     (
-                        "SELECT id, downloader_id, upload_speed, download_speed, recorded_at FROM downloader_speed_snapshots WHERE downloader_id = ? AND recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at".to_string(),
+                        "SELECT id, downloader_id, upload_speed, download_speed, recorded_at
+                         FROM downloader_speed_snapshots
+                         WHERE downloader_id = ?
+                           AND datetime(recorded_at) >= datetime(?)
+                           AND datetime(recorded_at) <= datetime(?)
+                         ORDER BY datetime(recorded_at)"
+                            .to_string(),
                         vec![Box::new(downloader_id), Box::new(since), Box::new(until)],
                     )
                 } else {
                     (
-                        "SELECT id, downloader_id, upload_speed, download_speed, recorded_at FROM downloader_speed_snapshots WHERE recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at".to_string(),
+                        "SELECT id, downloader_id, upload_speed, download_speed, recorded_at
+                         FROM downloader_speed_snapshots
+                         WHERE datetime(recorded_at) >= datetime(?)
+                           AND datetime(recorded_at) <= datetime(?)
+                         ORDER BY datetime(recorded_at)"
+                            .to_string(),
                         vec![Box::new(since), Box::new(until)],
                     )
                 };
@@ -1105,19 +1285,33 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn get_task_stats_snapshots(&self, task_id: Option<i64>, since: &str, until: &str) -> Result<Vec<TaskStatsSnapshot>, AppError> {
+    pub async fn get_task_stats_snapshots(
+        &self,
+        task_id: Option<i64>,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<TaskStatsSnapshot>, AppError> {
         let path = self.path.clone();
         let (since, until) = (since.to_string(), until.to_string());
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(tid) = task_id {
                 (
-                    "SELECT id, task_id, total_uploaded, total_downloaded, torrent_count, recorded_at FROM task_stats_snapshots WHERE task_id = ? AND recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at".to_string(),
+                    "SELECT id, task_id, total_uploaded, total_downloaded, torrent_count, recorded_at
+                     FROM task_stats_snapshots
+                     WHERE task_id = ?
+                       AND datetime(recorded_at) >= datetime(?)
+                       AND datetime(recorded_at) <= datetime(?)
+                     ORDER BY datetime(recorded_at)".to_string(),
                     vec![Box::new(tid), Box::new(since), Box::new(until)],
                 )
             } else {
                 (
-                    "SELECT id, task_id, total_uploaded, total_downloaded, torrent_count, recorded_at FROM task_stats_snapshots WHERE recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at".to_string(),
+                    "SELECT id, task_id, total_uploaded, total_downloaded, torrent_count, recorded_at
+                     FROM task_stats_snapshots
+                     WHERE datetime(recorded_at) >= datetime(?)
+                       AND datetime(recorded_at) <= datetime(?)
+                     ORDER BY datetime(recorded_at)".to_string(),
                     vec![Box::new(since), Box::new(until)],
                 )
             };
@@ -1145,9 +1339,15 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn save_torrent_traffic(&self, task_id: i64, hash: &str, uploaded: i64, downloaded: i64) -> Result<(), AppError> {
+    pub async fn save_torrent_traffic(
+        &self,
+        task_id: i64,
+        hash: &str,
+        uploaded: i64,
+        downloaded: i64,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let hash = hash.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
@@ -1162,7 +1362,12 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn get_recent_torrent_traffic(&self, task_id: i64, hash: &str, minutes: i64) -> Result<Vec<(i64, i64, String)>, AppError> {
+    pub async fn get_recent_torrent_traffic(
+        &self,
+        task_id: i64,
+        hash: &str,
+        minutes: i64,
+    ) -> Result<Vec<(i64, i64, String)>, AppError> {
         let path = self.path.clone();
         let hash = hash.to_string();
         let since = (Local::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
@@ -1171,12 +1376,17 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT uploaded_bytes, downloaded_bytes, recorded_at FROM torrent_traffic
-                     WHERE task_id = ? AND torrent_hash = ? AND recorded_at >= ? ORDER BY recorded_at",
+                     WHERE task_id = ? AND torrent_hash = ? AND datetime(recorded_at) >= datetime(?)
+                     ORDER BY datetime(recorded_at)",
                 )
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map(params![task_id, hash, since], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(sql_error)?;
             let mut list = Vec::new();
@@ -1191,11 +1401,11 @@ impl Database {
 
     pub async fn cleanup_old_torrent_traffic(&self, days: i64) -> Result<(), AppError> {
         let path = self.path.clone();
-        let cutoff = (Local::now() - chrono::Duration::days(days)).to_rfc3339();
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "DELETE FROM torrent_traffic WHERE recorded_at < ?",
+                "DELETE FROM torrent_traffic WHERE datetime(recorded_at) < datetime(?)",
                 params![cutoff],
             )
             .map_err(sql_error)?;
@@ -1332,6 +1542,12 @@ impl Database {
                     status TEXT NOT NULL DEFAULT 'active',
                     removed_at TEXT,
                     remove_reason TEXT,
+                    uploaded_bytes INTEGER NOT NULL DEFAULT 0,
+                    downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+                    download_duration_secs INTEGER NOT NULL DEFAULT 0,
+                    avg_upload_speed REAL NOT NULL DEFAULT 0,
+                    ratio REAL NOT NULL DEFAULT 0,
+                    last_stats_at TEXT,
                     UNIQUE(task_id, torrent_hash)
                 );
 
@@ -1380,6 +1596,42 @@ impl Database {
                 "brush_task_torrents",
                 "torrent_link",
                 "ALTER TABLE brush_task_torrents ADD COLUMN torrent_link TEXT",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "uploaded_bytes",
+                "ALTER TABLE brush_task_torrents ADD COLUMN uploaded_bytes INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "downloaded_bytes",
+                "ALTER TABLE brush_task_torrents ADD COLUMN downloaded_bytes INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "download_duration_secs",
+                "ALTER TABLE brush_task_torrents ADD COLUMN download_duration_secs INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "avg_upload_speed",
+                "ALTER TABLE brush_task_torrents ADD COLUMN avg_upload_speed REAL NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "ratio",
+                "ALTER TABLE brush_task_torrents ADD COLUMN ratio REAL NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "last_stats_at",
+                "ALTER TABLE brush_task_torrents ADD COLUMN last_stats_at TEXT",
             )?;
             ensure_column(
                 &conn,
@@ -1524,6 +1776,29 @@ fn map_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadHisto
     })
 }
 
+fn map_brush_torrent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTorrentRecord> {
+    Ok(BrushTorrentRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        torrent_id: row.get(2)?,
+        torrent_link: row.get(3)?,
+        torrent_hash: row.get(4)?,
+        torrent_name: row.get(5)?,
+        added_at: row.get(6)?,
+        size_bytes: row.get(7)?,
+        is_hr: row.get::<_, i32>(8)? != 0,
+        status: row.get(9)?,
+        removed_at: row.get(10)?,
+        remove_reason: row.get(11)?,
+        uploaded_bytes: row.get(12)?,
+        downloaded_bytes: row.get(13)?,
+        download_duration_secs: row.get(14)?,
+        avg_upload_speed: row.get(15)?,
+        ratio: row.get(16)?,
+        last_stats_at: row.get(17)?,
+    })
+}
+
 fn open_connection(path: &Path) -> Result<Connection, AppError> {
     Connection::open(path).map_err(sql_error)
 }
@@ -1540,12 +1815,7 @@ fn sql_error(error: rusqlite::Error) -> AppError {
     }
 }
 
-fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    sql: &str,
-) -> Result<(), AppError> {
+fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Result<(), AppError> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(sql_error)?;

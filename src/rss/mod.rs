@@ -2,9 +2,9 @@ pub mod feed;
 
 use std::collections::HashMap;
 
+use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
 use serde::Serialize;
 use tracing::warn;
 
@@ -98,15 +98,8 @@ impl ParsedFeed {
                 minimum_ratio: item.minimum_ratio,
                 minimum_seed_time: item.minimum_seed_time,
             };
-            apply_textual_markers(
-                &mut torrent,
-                item.description.as_deref(),
-                &item.categories,
-            );
-            items.insert(
-                guid.clone(),
-                torrent,
-            );
+            apply_textual_markers(&mut torrent, item.description.as_deref(), &item.categories);
+            items.insert(guid.clone(), torrent);
         }
 
         FeedSnapshot { version, items }
@@ -327,7 +320,10 @@ fn apply_textual_markers(item: &mut TorrentItem, description: Option<&str>, cate
     let upper = joined.to_ascii_uppercase();
 
     if item.download_volume_factor.is_none() {
-        if contains_any(&upper, &["2XFREE", "2X FL", "2XFREE", "FREE,2XUP", "FREE 2XUP"]) {
+        if contains_any(
+            &upper,
+            &["2XFREE", "2X FL", "2XFREE", "FREE,2XUP", "FREE 2XUP"],
+        ) {
             item.download_volume_factor = Some(0.0);
             item.upload_volume_factor.get_or_insert(2.0);
         } else if contains_any(
@@ -377,7 +373,14 @@ fn apply_textual_markers(item: &mut TorrentItem, description: Option<&str>, cate
     if item.upload_volume_factor.is_none() {
         if contains_any(
             &upper,
-            &["2XUP", "2X UP", "2XUPLOAD", "UPLOAD 200%", "UP 200%", "双倍上传"],
+            &[
+                "2XUP",
+                "2X UP",
+                "2XUPLOAD",
+                "UPLOAD 200%",
+                "UP 200%",
+                "双倍上传",
+            ],
         ) {
             item.upload_volume_factor = Some(2.0);
         } else if contains_any(
@@ -496,4 +499,3 @@ mod tests {
         assert!(!item.is_free());
     }
 }
-

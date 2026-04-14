@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Edit, Eye, Pause, Play, Plus, Trash2, Zap } from "lucide-react";
+import { ChevronLeft, ChevronRight, Edit, Eye, Pause, Play, Plus, Search, Trash2, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -9,7 +9,15 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { BrushCacheStats, BrushTaskRecord, BrushTaskRequest, BrushTorrentRecord, DownloaderRecord, SiteRecord } from "@/types";
+import type {
+  BrushCacheStats,
+  BrushTaskRecord,
+  BrushTaskRequest,
+  BrushTaskTorrentsResponse,
+  BrushTorrentRecord,
+  DownloaderRecord,
+  SiteRecord,
+} from "@/types";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -17,6 +25,22 @@ function formatBytes(bytes: number): string {
   const sizes = ["B", "KB", "MB", "GB", "TB", "PB"];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+}
+
+function formatSpeed(bytesPerSec: number): string {
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return "0 B/s";
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+function formatDuration(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "0s";
+  const seconds = Math.floor(totalSeconds);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
 }
 
 const emptyForm: BrushTaskRequest = {
@@ -93,6 +117,10 @@ export function BrushTasksPage() {
   const [torrentsOpen, setTorrentsOpen] = useState(false);
   const [torrentsTask, setTorrentsTask] = useState<BrushTaskRecord | null>(null);
   const [torrents, setTorrents] = useState<BrushTorrentRecord[]>([]);
+  const [torrentsPage, setTorrentsPage] = useState(1);
+  const [torrentsPageSize] = useState(20);
+  const [torrentsTotal, setTorrentsTotal] = useState(0);
+  const [torrentKeyword, setTorrentKeyword] = useState("");
   const [loadingTorrents, setLoadingTorrents] = useState(false);
   const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
   const [submitError, setSubmitError] = useState("");
@@ -200,18 +228,18 @@ export function BrushTasksPage() {
 
   function openTorrents(task: BrushTaskRecord) {
     setTorrentsTask(task);
+    setTorrentsPage(1);
+    setTorrentKeyword("");
     setTorrentsOpen(true);
-    setLoadingTorrents(true);
-    api<BrushTorrentRecord[]>(`/api/brush-tasks/${task.id}/torrents`)
-      .then((data) => setTorrents([...data].sort((a, b) => b.added_at.localeCompare(a.added_at))))
-      .catch((error: Error) => setMessage(error.message || "加载种子列表失败"))
-      .finally(() => setLoadingTorrents(false));
   }
 
   function closeTorrents() {
     setTorrentsOpen(false);
     setTorrentsTask(null);
     setTorrents([]);
+    setTorrentsPage(1);
+    setTorrentsTotal(0);
+    setTorrentKeyword("");
   }
 
   function setField<K extends keyof BrushTaskRequest>(key: K, value: BrushTaskRequest[K]) {
@@ -222,6 +250,32 @@ export function BrushTasksPage() {
     const n = Number(value);
     return value === "" || Number.isNaN(n) ? null : n;
   }
+
+  useEffect(() => {
+    if (!torrentsOpen || !torrentsTask) {
+      return;
+    }
+
+    setLoadingTorrents(true);
+    const params = new URLSearchParams({
+      page: String(torrentsPage),
+      page_size: String(torrentsPageSize),
+    });
+    const keyword = torrentKeyword.trim();
+    if (keyword) {
+      params.set("keyword", keyword);
+    }
+
+    api<BrushTaskTorrentsResponse>(`/api/brush-tasks/${torrentsTask.id}/torrents?${params.toString()}`)
+      .then((data) => {
+        setTorrents(data.records);
+        setTorrentsTotal(data.total_records);
+      })
+      .catch((error: Error) => setMessage(error.message || "加载种子列表失败"))
+      .finally(() => setLoadingTorrents(false));
+  }, [torrentKeyword, torrentsOpen, torrentsPage, torrentsPageSize, torrentsTask]);
+
+  const torrentsTotalPages = Math.max(1, Math.ceil(torrentsTotal / torrentsPageSize));
 
   return (
     <>
@@ -377,6 +431,7 @@ export function BrushTasksPage() {
         onClose={closeForm}
         title={editingId !== null ? "编辑刷流任务" : "添加刷流任务"}
         description="配置任务的选种规则、删种策略和其他参数。"
+        escMode="double"
       >
         <div className="space-y-6 p-4 sm:p-6">
           {submitError ? (
@@ -674,42 +729,74 @@ export function BrushTasksPage() {
         open={torrentsOpen}
         onClose={closeTorrents}
         title={torrentsTask ? `${torrentsTask.name} 的种子列表` : "种子列表"}
-        description="当前任务中所有种子的状态信息。"
+        description="支持分页、关键字检索，并优先展示未移除种子。"
       >
         <div className="space-y-4 p-4 sm:p-6">
+          <div className="flex flex-col gap-3 rounded-3xl border border-border/70 bg-surface-container/60 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="rounded-full border border-border bg-card px-3 py-1 text-xs font-medium text-muted">
+                第 {torrentsPage} / {torrentsTotalPages} 页
+              </div>
+              <div className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700">
+                共 {torrentsTotal} 条
+              </div>
+            </div>
+            <div className="relative w-full sm:max-w-sm">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+              <Input
+                className="h-11 rounded-2xl border-border/70 bg-card pl-9 shadow-sm"
+                placeholder="搜索名称或种子ID"
+                value={torrentKeyword}
+                onChange={(e) => {
+                  setTorrentKeyword(e.target.value);
+                  setTorrentsPage(1);
+                }}
+              />
+            </div>
+          </div>
+
           {loadingTorrents ? (
             <div className="text-sm text-muted">加载中...</div>
           ) : torrents.length === 0 ? (
             <div className="py-8 text-center text-sm text-muted">暂无种子记录。</div>
           ) : (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>名称</TableHead>
-                    <TableHead>种子ID</TableHead>
-                    <TableHead>大小</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>HR</TableHead>
-                    <TableHead>添加时间</TableHead>
-                    <TableHead>移除原因</TableHead>
-                    <TableHead>信息Hash</TableHead>
+            <div className="grid gap-3">
+              <Table className="table-fixed">
+                <TableHeader className="sticky top-0 z-10 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/85">
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">名称</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">种子ID</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">大小</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">状态</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">HR</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">添加时间</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">移除时间</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">下载量</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">上传量</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">下载耗时</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">平均上传速度</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">分享率</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">移除原因</TableHead>
+                    <TableHead className="w-40 border-b border-border/70 bg-card/90">信息Hash</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {torrents.map((t) => (
-                    <TableRow key={t.id}>
-                      <TableCell>
-                        <div className="max-w-[240px] truncate font-medium">{t.torrent_name}</div>
+                    <TableRow key={t.id} className="odd:bg-card/70 even:bg-surface-container/30 hover:bg-accent/60">
+                      <TableCell className="p-4 text-xs">
+                        <div className="truncate font-medium text-foreground" title={t.torrent_name}>
+                          {t.torrent_name}
+                        </div>
                       </TableCell>
-                      <TableCell className="font-mono text-xs">
+                      <TableCell className="p-4 text-xs font-mono">
                         {t.torrent_id ? (
                           <a
                             href={t.torrent_link ?? "#"}
                             target="_blank"
                             rel="noopener noreferrer"
+                            title={t.torrent_id}
                             className={cn(
-                              "hover:underline",
+                              "block truncate font-medium underline-offset-4 hover:underline",
                               t.torrent_link ? "text-blue-500 hover:text-blue-700" : "pointer-events-none text-muted",
                             )}
                           >
@@ -719,8 +806,10 @@ export function BrushTasksPage() {
                           <span className="text-muted">-</span>
                         )}
                       </TableCell>
-                      <TableCell>{t.size_bytes != null ? formatBytes(t.size_bytes) : "-"}</TableCell>
-                      <TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={t.size_bytes != null ? formatBytes(t.size_bytes) : "-"}>
+                        {t.size_bytes != null ? formatBytes(t.size_bytes) : "-"}
+                      </TableCell>
+                      <TableCell className="p-4 text-xs">
                         <span
                           className={`rounded-full px-3 py-1 text-xs font-medium ${
                             t.status === "seeding"
@@ -735,24 +824,72 @@ export function BrushTasksPage() {
                           {t.status}
                         </span>
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="p-4 text-xs">
                         {t.is_hr ? (
-                          <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-700">
+                          <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
                             HR
                           </span>
                         ) : (
                           <span className="text-xs text-muted">否</span>
                         )}
                       </TableCell>
-                      <TableCell className="text-xs">{formatDate(t.added_at)}</TableCell>
-                      <TableCell className="text-xs text-muted">{t.remove_reason ?? "-"}</TableCell>
-                      <TableCell className="font-mono text-xs">{t.torrent_hash || "-"}</TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={t.added_at}>
+                        {formatDate(t.added_at)}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={t.removed_at ?? "-"}>
+                        {t.removed_at ? formatDate(t.removed_at) : "-"}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={formatBytes(t.downloaded_bytes)}>
+                        {formatBytes(t.downloaded_bytes)}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={formatBytes(t.uploaded_bytes)}>
+                        {formatBytes(t.uploaded_bytes)}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={formatDuration(t.download_duration_secs)}>
+                        {formatDuration(t.download_duration_secs)}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={formatSpeed(t.avg_upload_speed)}>
+                        {formatSpeed(t.avg_upload_speed)}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs font-semibold text-foreground" title={t.ratio.toFixed(2)}>
+                        {t.ratio.toFixed(2)}
+                      </TableCell>
+                      <TableCell className="p-4 text-xs text-muted">
+                        <div className="truncate" title={t.remove_reason ?? "-"}>
+                          {t.remove_reason ?? "-"}
+                        </div>
+                      </TableCell>
+                      <TableCell className="p-4 text-xs font-mono text-muted">
+                        <div className="truncate" title={t.torrent_hash || "-"}>
+                          {t.torrent_hash || "-"}
+                        </div>
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
             </div>
           )}
+
+          <div className="flex flex-col gap-3 rounded-3xl border border-border/70 bg-surface-container/50 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-sm text-muted">
+              第 {torrentsPage} / {torrentsTotalPages} 页，共 {torrentsTotal} 条
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" disabled={torrentsPage <= 1} onClick={() => setTorrentsPage((prev) => Math.max(1, prev - 1))}>
+                <ChevronLeft className="mr-2 h-4 w-4" />
+                上一页
+              </Button>
+              <Button
+                variant="outline"
+                disabled={torrentsPage >= torrentsTotalPages}
+                onClick={() => setTorrentsPage((prev) => Math.min(torrentsTotalPages, prev + 1))}
+              >
+                下一页
+                <ChevronRight className="ml-2 h-4 w-4" />
+              </Button>
+            </div>
+          </div>
         </div>
       </Dialog>
 

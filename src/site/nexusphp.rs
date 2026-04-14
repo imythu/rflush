@@ -1,15 +1,14 @@
-use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::Client;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use tracing::debug;
 
 use super::{SiteAuth, SiteClient, SiteTestResult, TorrentAttributes, UserStats};
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 
-const BROWSER_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
 pub struct NexusPhpClient {
     base_url: String,
@@ -65,7 +64,10 @@ impl NexusPhpClient {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let text = resp.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取响应失败: {}", e))?;
         let json: Value =
             serde_json::from_str(&text).map_err(|_| "响应不是有效JSON".to_string())?;
 
@@ -123,7 +125,10 @@ impl NexusPhpClient {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let html = resp.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取响应失败: {}", e))?;
 
         if html.contains("login.php") && !html.contains("userdetails") {
             return Err("Cookie 无效或已过期".to_string());
@@ -162,7 +167,10 @@ impl NexusPhpClient {
             return Err(format!("HTTP {}", resp.status()));
         }
 
-        let html = resp.text().await.map_err(|e| format!("读取响应失败: {}", e))?;
+        let html = resp
+            .text()
+            .await
+            .map_err(|e| format!("读取响应失败: {}", e))?;
         if html.contains("login.php") && !html.contains("details") {
             return Err("Cookie 无效或已过期".to_string());
         }
@@ -216,16 +224,40 @@ impl NexusPhpClient {
 
         let has_two_x_free = contains_any(
             &upper,
-            &["2XFREE", "2X FREE", "FREE 2XUP", "FREE,2XUP", "TWOUPFREE", "PRO_FREE2UP"],
+            &[
+                "2XFREE",
+                "2X FREE",
+                "FREE 2XUP",
+                "FREE,2XUP",
+                "TWOUPFREE",
+                "PRO_FREE2UP",
+            ],
         );
         let has_free = has_two_x_free
             || contains_any(
                 &upper,
-                &["FREELEECH", "FREE LEECH", " FREE ", "PRO_FREE", " 免费 ", " FREE<", ">FREE "],
+                &[
+                    "FREELEECH",
+                    "FREE LEECH",
+                    " FREE ",
+                    "PRO_FREE",
+                    " 免费 ",
+                    " FREE<",
+                    ">FREE ",
+                ],
             );
         let hit_and_run = contains_any(
             &upper,
-            &["H&R", "HIT AND RUN", "HIT&RUN", "HR:", "HNR", "HITRUN", "HITANDRUN", " HR "],
+            &[
+                "H&R",
+                "HIT AND RUN",
+                "HIT&RUN",
+                "HR:",
+                "HNR",
+                "HITRUN",
+                "HITANDRUN",
+                " HR ",
+            ],
         );
 
         let (download_volume_factor, upload_volume_factor) = if has_two_x_free {
@@ -251,7 +283,9 @@ impl NexusPhpClient {
 }
 
 impl SiteClient for NexusPhpClient {
-    fn test_connection(&self) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>> {
+    fn test_connection(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>> {
         Box::pin(async move {
             match self.get_user_stats().await {
                 Ok(stats) => Ok(SiteTestResult {
@@ -268,7 +302,9 @@ impl SiteClient for NexusPhpClient {
         })
     }
 
-    fn get_user_stats(&self) -> Pin<Box<dyn Future<Output = Result<UserStats, String>> + Send + '_>> {
+    fn get_user_stats(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<UserStats, String>> + Send + '_>> {
         Box::pin(async move {
             match self.fetch_user_info_api().await {
                 Ok(stats) => Ok(stats),
@@ -315,7 +351,15 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 fn detect_download_factor(upper: &str) -> Option<f64> {
     if contains_any(
         upper,
-        &["50%DL", "50% DL", "0.5X", "DOWNLOAD 50%", "50%DOWN", "半价", "五折"],
+        &[
+            "50%DL",
+            "50% DL",
+            "0.5X",
+            "DOWNLOAD 50%",
+            "50%DOWN",
+            "半价",
+            "五折",
+        ],
     ) {
         Some(0.5)
     } else if contains_any(
@@ -331,13 +375,17 @@ fn detect_download_factor(upper: &str) -> Option<f64> {
 fn detect_upload_factor(upper: &str) -> Option<f64> {
     if contains_any(
         upper,
-        &["2XUP", "2X UP", "2XUPLOAD", "UPLOAD 200%", "UP 200%", "双倍上传"],
+        &[
+            "2XUP",
+            "2X UP",
+            "2XUPLOAD",
+            "UPLOAD 200%",
+            "UP 200%",
+            "双倍上传",
+        ],
     ) {
         Some(2.0)
-    } else if contains_any(
-        upper,
-        &["0XUP", "UPLOAD 0%", "UP 0%", "零上传", "不计上传"],
-    ) {
+    } else if contains_any(upper, &["0XUP", "UPLOAD 0%", "UP 0%", "零上传", "不计上传"]) {
         Some(0.0)
     } else {
         None

@@ -1,5 +1,5 @@
-pub mod scheduler;
 pub mod cleaner;
+pub mod scheduler;
 
 use serde::{Deserialize, Serialize};
 
@@ -52,14 +52,14 @@ pub struct BrushTaskRequest {
     pub rss_url: String,
     pub seed_volume_gb: Option<f64>,
     pub save_dir: Option<String>,
-    pub active_time_windows: Option<String>,  // JSON array string
+    pub active_time_windows: Option<String>, // JSON array string
     pub promotion: Option<String>,
     pub skip_hit_and_run: Option<bool>,
     pub max_concurrent: Option<i32>,
     pub download_speed_limit: Option<i64>,
     pub upload_speed_limit: Option<i64>,
-    pub size_ranges: Option<String>,  // JSON array string
-    pub seeder_ranges: Option<String>,  // JSON array string
+    pub size_ranges: Option<String>,   // JSON array string
+    pub seeder_ranges: Option<String>, // JSON array string
     pub delete_mode: Option<String>,
     pub min_seed_time_hours: Option<f64>,
     pub hr_min_seed_time_hours: Option<f64>,
@@ -86,6 +86,12 @@ pub struct BrushTorrentRecord {
     pub status: String,
     pub removed_at: Option<String>,
     pub remove_reason: Option<String>,
+    pub uploaded_bytes: i64,
+    pub downloaded_bytes: i64,
+    pub download_duration_secs: i64,
+    pub avg_upload_speed: f64,
+    pub ratio: f64,
+    pub last_stats_at: Option<String>,
 }
 
 /// 解析范围字符串 (如 "0-10", "1-100")
@@ -114,7 +120,9 @@ pub fn in_any_range(value: f64, ranges: &[(f64, f64)]) -> bool {
     if ranges.is_empty() {
         return true; // 没有配置范围限制 = 全部通过
     }
-    ranges.iter().any(|(min, max)| value >= *min && value <= *max)
+    ranges
+        .iter()
+        .any(|(min, max)| value >= *min && value <= *max)
 }
 
 /// 解析时间窗口 (如 "00:00-09:00")

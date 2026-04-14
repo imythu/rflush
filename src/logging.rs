@@ -1,6 +1,6 @@
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
@@ -26,7 +26,8 @@ tokio::task_local! {
 }
 
 fn reload_handle() -> &'static OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> {
-    static HANDLE: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> = OnceLock::new();
+    static HANDLE: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> =
+        OnceLock::new();
     &HANDLE
 }
 
@@ -138,7 +139,9 @@ impl BroadcastWriter {
     }
 
     fn emit_line(&self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes).trim_end_matches(&['\r', '\n'][..]).to_string();
+        let text = String::from_utf8_lossy(bytes)
+            .trim_end_matches(&['\r', '\n'][..])
+            .to_string();
         if text.is_empty() {
             return;
         }

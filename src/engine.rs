@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use chrono::Local;
@@ -15,11 +15,11 @@ use crate::download::download_torrent;
 use crate::download::naming::{extract_guid_key_from_file_name, guid_key};
 use crate::error::AppError;
 use crate::history::{OutputLogger, RssRunSummary, RunHistory, RunSummary, TorrentRunRecord};
-use crate::logging::{current_task_context, next_async_task_id, TASK_LOG_CONTEXT};
+use crate::logging::{TASK_LOG_CONTEXT, current_task_context, next_async_task_id};
 use crate::net::http::AppHttpClient;
 use crate::net::rate_limiter::{RateLimitPolicy, SharedRateLimiter};
-use crate::rss::feed::fetch_all_rss;
 use crate::rss::FeedSnapshot;
+use crate::rss::feed::fetch_all_rss;
 
 #[derive(Clone)]
 pub struct RssRuntime {
@@ -92,9 +92,8 @@ impl DownloadEngine {
                         item.title.clone(),
                     );
                     record.final_status = crate::history::FinalStatus::SkippedExisting;
-                    record.final_message = Some(
-                        "skipped because guid already exists in target directory".to_string(),
-                    );
+                    record.final_message =
+                        Some("skipped because guid already exists in target directory".to_string());
                     torrent_records.push(record);
                     skipped += 1;
                 } else {
@@ -113,10 +112,7 @@ impl DownloadEngine {
             );
         }
 
-        info!(
-            "[RSS下载] 开始下载，共 {} 个任务排队",
-            download_jobs.len()
-        );
+        info!("[RSS下载] 开始下载，共 {} 个任务排队", download_jobs.len());
 
         let concurrency = config.global.max_concurrent_downloads;
         let mut downloaded_records = stream::iter(download_jobs.into_iter())
@@ -137,16 +133,31 @@ impl DownloadEngine {
             .await;
         torrent_records.append(&mut downloaded_records);
 
-        let succeeded = torrent_records.iter().filter(|r| matches!(r.final_status, crate::history::FinalStatus::Success)).count();
-        let failed = torrent_records.iter().filter(|r| matches!(r.final_status, crate::history::FinalStatus::Failed)).count();
-        let skipped_total = torrent_records.iter().filter(|r| matches!(r.final_status, crate::history::FinalStatus::SkippedExisting)).count();
+        let succeeded = torrent_records
+            .iter()
+            .filter(|r| matches!(r.final_status, crate::history::FinalStatus::Success))
+            .count();
+        let failed = torrent_records
+            .iter()
+            .filter(|r| matches!(r.final_status, crate::history::FinalStatus::Failed))
+            .count();
+        let skipped_total = torrent_records
+            .iter()
+            .filter(|r| matches!(r.final_status, crate::history::FinalStatus::SkippedExisting))
+            .count();
         let elapsed = run_start_instant.elapsed();
         info!(
             "[RSS下载] 执行完成: 成功 {}, 失败 {}, 跳过 {}, 耗时 {:.1}s",
-            succeeded, failed, skipped_total, elapsed.as_secs_f64()
+            succeeded,
+            failed,
+            skipped_total,
+            elapsed.as_secs_f64()
         );
         if failed > 0 {
-            for r in torrent_records.iter().filter(|r| matches!(r.final_status, crate::history::FinalStatus::Failed)) {
+            for r in torrent_records
+                .iter()
+                .filter(|r| matches!(r.final_status, crate::history::FinalStatus::Failed))
+            {
                 warn!(
                     "[RSS下载][{}] 失败: guid={} msg={}",
                     r.rss_name,
@@ -182,8 +193,10 @@ impl DownloadEngine {
         );
 
         let http = Arc::new(
-            AppHttpClient::new(self.limiter.clone(), policy).map_err(|e| AppError::InvalidConfig {
-                message: format!("failed to build HTTP client: {}", e),
+            AppHttpClient::new(self.limiter.clone(), policy).map_err(|e| {
+                AppError::InvalidConfig {
+                    message: format!("failed to build HTTP client: {}", e),
+                }
             })?,
         );
 
@@ -263,14 +276,21 @@ async fn scan_downloaded_guid_keys(output_dir: &Path) -> Result<HashSet<String>,
             source,
         })?;
 
-    while let Some(entry) = entries.next_entry().await.map_err(|source| AppError::ReadDir {
-        path: output_dir.display().to_string(),
-        source,
-    })? {
-        let file_type = entry.file_type().await.map_err(|source| AppError::ReadDir {
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| AppError::ReadDir {
             path: output_dir.display().to_string(),
             source,
-        })?;
+        })?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|source| AppError::ReadDir {
+                path: output_dir.display().to_string(),
+                source,
+            })?;
         if !file_type.is_file() {
             continue;
         }

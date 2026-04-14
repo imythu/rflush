@@ -12,7 +12,7 @@ use crate::config::{AppConfig, RssConfig};
 use crate::download::naming::sanitize_component;
 use crate::engine::{AppRuntime, RssRuntime};
 use crate::error::AppError;
-use crate::logging::{current_task_context, next_async_task_id, TASK_LOG_CONTEXT};
+use crate::logging::{TASK_LOG_CONTEXT, current_task_context, next_async_task_id};
 use crate::net::http::HttpError;
 use crate::rss::FeedSnapshot;
 
@@ -169,8 +169,7 @@ pub async fn refresh_download_url(
     let next_version = snapshot.version + 1;
     drop(snapshot);
 
-    let refreshed =
-        fetch_feed_snapshot_once(&runtime.config, next_version, app_runtime).await?;
+    let refreshed = fetch_feed_snapshot_once(&runtime.config, next_version, app_runtime).await?;
     let refreshed_version = refreshed.version;
     let refreshed_url = refreshed
         .items

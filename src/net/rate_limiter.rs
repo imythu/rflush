@@ -47,7 +47,10 @@ impl SharedRateLimiter {
         let mut state = gate.state.lock().await;
         let now = Instant::now();
         if state.throttle_until.is_some_and(|t| t > now) {
-            debug!("rate limiter: key={} throttle already active, skipping", key);
+            debug!(
+                "rate limiter: key={} throttle already active, skipping",
+                key
+            );
             return;
         }
         let until = now + policy.throttle_duration;
@@ -93,7 +96,10 @@ impl SharedRateLimiter {
                 return;
             }
 
-            let oldest = *state.timestamps.front().expect("non-empty after length check");
+            let oldest = *state
+                .timestamps
+                .front()
+                .expect("non-empty after length check");
             let wait = (oldest + policy.interval).saturating_duration_since(now);
             debug!(
                 "rate limiter: key={} wait_ms={} slots={}/{}",
