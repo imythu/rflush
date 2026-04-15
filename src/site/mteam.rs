@@ -150,18 +150,18 @@ impl MTeamAdapter {
         last
     }
 
-    fn parse_discount(discount: Option<&str>) -> (Option<f64>, Option<f64>, bool) {
+    fn parse_discount(discount: Option<&str>) -> (Option<f64>, Option<f64>) {
         match discount.unwrap_or_default() {
-            "FREE" => (Some(0.0), Some(1.0), false),
-            "FREE_2XUP" | "TWOFREE" => (Some(0.0), Some(2.0), false),
-            "PERCENT_50" => (Some(0.5), Some(1.0), false),
-            "PERCENT_50_2XUP" => (Some(0.5), Some(2.0), false),
-            "PERCENT_70" => (Some(0.3), Some(1.0), false),
-            "PERCENT_70_2XUP" => (Some(0.3), Some(2.0), false),
-            "NORMAL" | "" => (Some(1.0), Some(1.0), false),
+            "FREE" => (Some(0.0), Some(1.0)),
+            "FREE_2XUP" | "TWOFREE" => (Some(0.0), Some(2.0)),
+            "PERCENT_50" => (Some(0.5), Some(1.0)),
+            "PERCENT_50_2XUP" => (Some(0.5), Some(2.0)),
+            "PERCENT_70" => (Some(0.3), Some(1.0)),
+            "PERCENT_70_2XUP" => (Some(0.3), Some(2.0)),
+            "NORMAL" | "" => (Some(1.0), Some(1.0)),
             other => {
                 debug!("未识别的 M-Team 促销类型: {:?}", other);
-                (Some(1.0), Some(1.0), false)
+                (Some(1.0), Some(1.0))
             }
         }
     }
@@ -292,7 +292,7 @@ impl SiteAdapter for MTeamAdapter {
                             .ok_or_else(|| "响应缺少 data 字段".to_string())?;
                         let status = data.get("status").unwrap_or(data);
                         let discount = status.get("discount").and_then(|v| v.as_str());
-                        let (download_volume_factor, upload_volume_factor, hit_and_run) =
+                        let (download_volume_factor, upload_volume_factor) =
                             Self::parse_discount(discount);
                         let seeder_count = status.get("seeders").and_then(|v| {
                             v.as_str()
@@ -309,7 +309,7 @@ impl SiteAdapter for MTeamAdapter {
                             free: download_volume_factor == Some(0.0),
                             two_x_free: download_volume_factor == Some(0.0)
                                 && upload_volume_factor.is_some_and(|factor| factor >= 2.0),
-                            hit_and_run,
+                            hit_and_run: false,
                             seeder_count,
                             free_end_timestamp,
                             download_volume_factor,

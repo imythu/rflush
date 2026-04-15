@@ -146,7 +146,11 @@ export function BrushTasksPage() {
   }, []);
 
   function openAdd() {
-    setForm({ ...emptyForm, downloader_id: downloaders[0]?.id ?? 0 });
+    setForm({
+      ...emptyForm,
+      site_id: sites[0]?.id ?? null,
+      downloader_id: downloaders[0]?.id ?? 0,
+    });
     setEditingId(null);
     setSubmitError("");
     setFormOpen(true);
@@ -166,6 +170,10 @@ export function BrushTasksPage() {
   }
 
   async function handleSubmit() {
+    if (form.site_id == null) {
+      setSubmitError("必须选择一个具体站点");
+      return;
+    }
     setSubmitting(true);
     setSubmitError("");
     try {
@@ -361,7 +369,7 @@ export function BrushTasksPage() {
                       </div>
                       <div>
                         <span className="font-medium text-foreground">站点：</span>
-                        {sites.find((site) => site.id === task.site_id)?.name ?? (task.site_id ? `#${task.site_id}` : "自动匹配")}
+                        {sites.find((site) => site.id === task.site_id)?.name ?? (task.site_id ? `#${task.site_id}` : "未绑定")}
                       </div>
                       <div>
                         <span className="font-medium text-foreground">标签：</span>
@@ -427,7 +435,7 @@ export function BrushTasksPage() {
                   value={form.site_id ?? ""}
                   onChange={(e) => setField("site_id", e.target.value === "" ? null : Number(e.target.value))}
                 >
-                  <option value="">按 RSS/详情页域名自动匹配</option>
+                  {sites.length === 0 ? <option value="">请先添加站点</option> : null}
                   {sites.map((site) => (
                     <option key={site.id} value={site.id}>
                       {site.name} ({site.site_type})

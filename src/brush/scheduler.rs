@@ -451,9 +451,10 @@ async fn execute_brush_task(
 
         // 第一轮过滤：用 RSS 已有属性快速筛选，避免不必要的详情请求
         // RSS 中通常已有体积、做种数，部分站点也有促销/H&R 信息
+        let pre_filter_item = (*item).clone();
         let pre_filter = check_filter_reason(
             &task,
-            item,
+            &pre_filter_item,
             &size_ranges,
             &seeder_ranges,
             FilterStage::RssPreFilter,
@@ -481,9 +482,35 @@ async fn execute_brush_task(
             if site_client_binding != Some(task.site_id) {
                 site_adapter = None;
                 if let Some(site_id) = task.site_id {
-                    if let Ok(Some(site)) = db.get_site(site_id).await {
-                        if let Ok(adapter) = site_factory::create_adapter(&site) {
-                            site_adapter = Some(adapter);
+                    match db.get_site(site_id).await {
+                        Ok(Some(site)) => match site_factory::create_adapter(&site) {
+                            Ok(adapter) => {
+                                site_adapter = Some(adapter);
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "[刷流][{}] 创建站点适配器失败: site_id={} name={} type={} err={}",
+                                    task.name, site.id, site.name, site.site_type, error
+                                );
+                                error!("{}", message);
+                                return Err(message);
+                            }
+                        },
+                        Ok(None) => {
+                            let message = format!(
+                                "[刷流][{}] 站点不存在: site_id={}",
+                                task.name, site_id
+                            );
+                            error!("{}", message);
+                            return Err(message);
+                        }
+                        Err(error) => {
+                            let message = format!(
+                                "[刷流][{}] 加载站点失败: site_id={} err={}",
+                                task.name, site_id, error
+                            );
+                            error!("{}", message);
+                            return Err(message);
                         }
                     }
                 }

@@ -993,6 +993,14 @@ async fn create_brush_task(
             "名称、cron表达式、标签和RSS地址不能为空",
         ));
     }
+    let site_id = body
+        .site_id
+        .ok_or_else(|| ApiError::bad_request("必须选择一个具体站点"))?;
+    state
+        .db
+        .get_site(site_id)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("所选站点不存在"))?;
     body.cron_expression = normalize_cron(&body.cron_expression);
     body.cron_expression
         .parse::<cron::Schedule>()
@@ -1006,6 +1014,14 @@ async fn update_brush_task(
     Path(id): Path<i64>,
     Json(mut body): Json<BrushTaskRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let site_id = body
+        .site_id
+        .ok_or_else(|| ApiError::bad_request("必须选择一个具体站点"))?;
+    state
+        .db
+        .get_site(site_id)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("所选站点不存在"))?;
     body.cron_expression = normalize_cron(&body.cron_expression);
     body.cron_expression
         .parse::<cron::Schedule>()

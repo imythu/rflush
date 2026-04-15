@@ -393,23 +393,6 @@ fn apply_textual_markers(item: &mut TorrentItem, description: Option<&str>, cate
         }
     }
 
-    if item.minimum_seed_time.is_none() && item.minimum_ratio.is_none() {
-        if contains_any(
-            &upper,
-            &[
-                "H&R",
-                "HIT AND RUN",
-                "HIT&RUN",
-                "HNR",
-                "HR:",
-                "HITRUN",
-                "禁转",
-                "HR ",
-            ],
-        ) {
-            item.minimum_seed_time = Some(1);
-        }
-    }
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -454,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_nonstandard_markers_from_title_and_description() {
+    fn parses_nonstandard_promotion_markers_from_title_and_description() {
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0">
   <channel>
@@ -474,7 +457,6 @@ mod tests {
         assert_eq!(item.download_volume_factor, Some(0.0));
         assert_eq!(item.upload_volume_factor, Some(2.0));
         assert!(item.is_free());
-        assert!(item.is_hr());
         assert!(item.is_promoted());
     }
 
