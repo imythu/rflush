@@ -66,8 +66,7 @@ pub struct PaginatedBrushTorrents {
 }
 
 impl Database {
-    pub async fn open(base_dir: &Path) -> Result<Self, AppError> {
-        let data_dir = base_dir.join("data");
+    pub async fn open(data_dir: &Path) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&data_dir)
             .await
             .map_err(|source| AppError::CreateDir {

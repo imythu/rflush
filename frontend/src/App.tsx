@@ -30,6 +30,7 @@ const LOG_LEVEL_PRIORITY = {
 } as const;
 
 type LogLevel = keyof typeof LOG_LEVEL_PRIORITY;
+const LOG_LEVELS: LogLevel[] = ["trace", "debug", "info", "warn", "error"];
 
 type AppPage =
   | "dashboard"
@@ -196,12 +197,22 @@ export default function App() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsConnected, setLogsConnected] = useState(false);
+  const [logLevelFilter, setLogLevelFilter] = useState<LogLevel>("info");
   const [logKeywordFilter, setLogKeywordFilter] = useState("");
   const logsViewportRef = useRef<HTMLDivElement | null>(null);
   const pendingLogsRef = useRef<string[]>([]);
 
   const currentNav = navItems.find((item) => item.key === page) ?? navItems[0];
   const effectiveLogLevel = getEffectiveLogLevel(settings);
+  const selectableLogLevels = LOG_LEVELS.filter(
+    (level) => LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[effectiveLogLevel],
+  );
+
+  useEffect(() => {
+    setLogLevelFilter((prev) =>
+      LOG_LEVEL_PRIORITY[prev] >= LOG_LEVEL_PRIORITY[effectiveLogLevel] ? prev : effectiveLogLevel,
+    );
+  }, [effectiveLogLevel]);
 
   async function loadPageData(targetPage: AppPage) {
     switch (targetPage) {
@@ -319,7 +330,7 @@ export default function App() {
 
   const filteredLogs = logs.filter((line) => {
     const lineLevel = extractLogLevel(line);
-    if (lineLevel && LOG_LEVEL_PRIORITY[lineLevel] < LOG_LEVEL_PRIORITY[effectiveLogLevel]) {
+    if (lineLevel && LOG_LEVEL_PRIORITY[lineLevel] < LOG_LEVEL_PRIORITY[logLevelFilter]) {
       return false;
     }
 
@@ -668,16 +679,31 @@ export default function App() {
               </Button>
             </div>
           </div>
-          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-            <div className="rounded-2xl border border-border bg-surface-container px-4 py-3 text-sm">
+          <div className="grid gap-3 sm:grid-cols-[220px_minmax(0,1fr)]">
+            <div className="space-y-2">
               <div className="flex items-center gap-2">
-                <span className="text-muted">当前日志级别</span>
-                <span className="rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold uppercase text-secondary-foreground">
-                  {effectiveLogLevel}
-                </span>
+                <select
+                  className="flex h-11 w-full rounded-2xl border border-border bg-input px-4 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30"
+                  value={logLevelFilter}
+                  onChange={(event) => setLogLevelFilter(event.target.value as LogLevel)}
+                >
+                  {selectableLogLevels.map((level) => (
+                    <option key={level} value={level}>
+                      {level.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-border bg-surface-container text-xs font-semibold text-muted transition hover:text-foreground"
+                  title={`当前系统日志级别是 ${effectiveLogLevel.toUpperCase()}。低于该级别的日志已被后端过滤，所以这里只能选择该级别及以上。`}
+                  aria-label="查看日志级别筛选说明"
+                >
+                  ?
+                </button>
               </div>
-              <p className="mt-2 text-xs leading-5 text-muted">
-                实时日志只展示当前系统日志级别及以上的内容。更低级别的日志已被后端日志过滤器抑制，前端不会展示这部分内容。
+              <p className="text-xs leading-5 text-muted">
+                当前系统日志级别：{effectiveLogLevel.toUpperCase()}。筛选项只显示该级别及以上。
               </p>
             </div>
             <Input

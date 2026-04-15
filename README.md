@@ -31,7 +31,6 @@
 - PT 刷流任务支持 cron 调度和手动立即执行
 - PT 刷流支持站点绑定、下载器绑定、选种规则和删种规则
 - 免费种 / H&R 判定支持 RSS 扩展属性和站点详情增强两层来源
-- 站点详情增强带进程内缓存、TTL 清理和缓存统计
 
 ## Get Started
 
@@ -44,13 +43,34 @@
 ./rflush
 ```
 
-程序默认监听：
+查看启动参数与帮助：
 
-- `http://0.0.0.0:3000`
+```bash
+./rflush -h
+./rflush --help
+```
 
-首次启动会自动创建：
+支持的启动参数：
 
-- `data/rflush.db`
+- `-H, --host`：监听地址，默认 `0.0.0.0`（支持环境变量 `RFLUSH_HOST`）
+- `-p, --port`：监听端口，默认 `3000`（支持环境变量 `RFLUSH_PORT`）
+- `-d, --data-dir <DIR>`：数据目录（数据库和下载输出都写入该目录，支持环境变量 `RFLUSH_DATA_DIR`）
+
+启动示例：
+
+```bash
+# 监听本机回环地址
+./rflush -H 127.0.0.1 -p 8080
+
+# 指定数据目录
+./rflush -d ./runtime-data
+```
+
+默认行为（不传 `--data-dir`）：
+
+- 监听 `http://0.0.0.0:3000`
+- 数据库 `./data/rflush.db`
+- RSS 下载输出目录仍在当前工作目录
 
 然后在浏览器打开页面，完成以下配置：
 
@@ -78,6 +98,24 @@ ghcr.io/imythu/rflush
 ```bash
 docker run --name rflush \
   -p 3000:3000 \
+  -v $(pwd)/data:/data \
+  ghcr.io/imythu/rflush:latest
+```
+
+镜像内默认环境变量：
+
+- `RFLUSH_HOST=0.0.0.0`
+- `RFLUSH_PORT=3000`
+- `RFLUSH_DATA_DIR=/data`
+
+因此上面的挂载会把数据库与下载输出统一写到宿主机的 `$(pwd)/data`。
+
+也可以覆盖端口：
+
+```bash
+docker run --name rflush \
+  -e RFLUSH_PORT=8080 \
+  -p 8080:8080 \
   -v $(pwd)/data:/data \
   ghcr.io/imythu/rflush:latest
 ```
@@ -142,8 +180,8 @@ npm run dev
 
 首次启动会自动创建：
 
-- `data/rflush.db`：配置与历史数据库
-- 各 RSS 对应下载目录：以订阅名称（清洗后）命名
+- `data/rflush.db`：配置与历史数据库（未指定 `--data-dir` 时）
+- 各 RSS 对应下载目录：默认在当前目录；指定 `--data-dir` 后写入该目录
 
 ### 使用流程
 
@@ -231,7 +269,8 @@ chmod +x merge.sh
 SQLite 数据库位于：
 
 ```text
-./data/rflush.db
+默认: ./data/rflush.db
+指定 --data-dir 后: <data-dir>/rflush.db
 ```
 
 其中包含：
@@ -289,6 +328,5 @@ SQLite 数据库位于：
 - `POST /api/brush-tasks/:id/stop`
 - `POST /api/brush-tasks/:id/run`
 - `GET /api/brush-tasks/:id/torrents`
-- `GET /api/brush-tasks/cache-stats`
 - `GET /api/stats/overview`
 - `GET /api/stats/trend`

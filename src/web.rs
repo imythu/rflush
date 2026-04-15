@@ -279,6 +279,7 @@ impl JobRegistry {
 
 pub async fn serve(
     base_dir: PathBuf,
+    addr: SocketAddr,
     db: Database,
     scheduler: Arc<BrushScheduler>,
     collector: Arc<DownloaderSnapshotCollector>,
@@ -289,9 +290,6 @@ pub async fn serve(
     );
     let state = AppState::new(base_dir, db, engine, scheduler, collector);
     let app = app_router(state);
-    let addr: SocketAddr = "0.0.0.0:3000".parse().map_err(|e| AppError::Server {
-        message: format!("invalid listen address: {}", e),
-    })?;
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| AppError::Server {
@@ -299,6 +297,13 @@ pub async fn serve(
         })?;
     info!("web server listening on http://{}", addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                info!("failed to listen for Ctrl+C: {}", error);
+            } else {
+                info!("Ctrl+C received, shutting down web server");
+            }
+        })
         .await
         .map_err(|e| AppError::Server {
             message: format!("server exited: {}", e),
