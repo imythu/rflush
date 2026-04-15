@@ -3,20 +3,21 @@ use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use tracing::debug;
+use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 
-use super::{SiteAuth, SiteClient, SiteTestResult, TorrentAttributes, UserStats};
+use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
 use std::future::Future;
 use std::pin::Pin;
 
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
-pub struct NexusPhpClient {
+pub struct NexusPhpAdapter {
     base_url: String,
     auth: SiteAuth,
     client: Client,
 }
 
-impl NexusPhpClient {
+impl NexusPhpAdapter {
     pub fn new(base_url: String, auth: SiteAuth) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -271,18 +272,25 @@ impl NexusPhpClient {
             )
         };
 
+        let free_end_timestamp = if has_free {
+            detect_free_end_timestamp(html)
+        } else {
+            None
+        };
+
         TorrentAttributes {
             free: has_free || download_volume_factor == Some(0.0),
             two_x_free: has_two_x_free,
             hit_and_run,
-            peer_count: None,
+            seeder_count: None,
+            free_end_timestamp,
             download_volume_factor,
             upload_volume_factor,
         }
     }
 }
 
-impl SiteClient for NexusPhpClient {
+impl SiteAdapter for NexusPhpAdapter {
     fn test_connection(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>> {
@@ -392,13 +400,63 @@ fn detect_upload_factor(upper: &str) -> Option<f64> {
     }
 }
 
+fn detect_free_end_timestamp(html: &str) -> Option<i64> {
+    const KEYWORDS: &[&str] = &[
+        "free结束",
+        "free 到期",
+        "free截止",
+        "free until",
+        "promotion until",
+        "限时免费",
+        "優惠到期",
+        "促销结束",
+    ];
+
+    let lower = html.to_lowercase();
+    for keyword in KEYWORDS {
+        let keyword_lower = keyword.to_lowercase();
+        if let Some(pos) = lower.find(&keyword_lower) {
+            let end = (pos + 160).min(html.len());
+            if let Some(timestamp) = extract_datetime_to_utc8(&html[pos..end]) {
+                return Some(timestamp);
+            }
+        }
+    }
+
+    extract_datetime_to_utc8(html)
+}
+
+fn extract_datetime_to_utc8(text: &str) -> Option<i64> {
+    for window in text.as_bytes().windows(19) {
+        let candidate = std::str::from_utf8(window).ok()?;
+        if looks_like_datetime(candidate) {
+            let naive = NaiveDateTime::parse_from_str(candidate, "%Y-%m-%d %H:%M:%S").ok()?;
+            let tz = FixedOffset::east_opt(8 * 3600)?;
+            if let Some(datetime) = tz.from_local_datetime(&naive).single() {
+                return Some(datetime.timestamp());
+            }
+        }
+    }
+    None
+}
+
+fn looks_like_datetime(value: &str) -> bool {
+    value.len() == 19
+        && value.chars().enumerate().all(|(index, ch)| match index {
+            4 | 7 => ch == '-',
+            10 => ch == ' ',
+            13 | 16 => ch == ':',
+            _ => ch.is_ascii_digit(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::NexusPhpClient;
+    use super::NexusPhpAdapter;
 
     #[test]
     fn detects_free_and_hr_from_detail_html() {
-        let attrs = NexusPhpClient::detect_torrent_attributes(
+        let attrs = NexusPhpAdapter::detect_torrent_attributes(
             r#"<html><body><span>FREE</span><span>2XUP</span><span>H&amp;R</span></body></html>"#,
         );
 
@@ -406,6 +464,15 @@ mod tests {
         assert!(attrs.hit_and_run);
         assert_eq!(attrs.download_volume_factor, Some(0.0));
         assert_eq!(attrs.upload_volume_factor, Some(2.0));
+    }
+
+    #[test]
+    fn detects_free_end_time_from_detail_html() {
+        let attrs = NexusPhpAdapter::detect_torrent_attributes(
+            r#"<html><body><span>FREE</span><span>Free到期：2026-04-16 12:30:00</span></body></html>"#,
+        );
+
+        assert!(attrs.free_end_timestamp.is_some());
     }
 }
 

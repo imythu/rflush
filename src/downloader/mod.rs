@@ -1,6 +1,9 @@
+pub mod factory;
 pub mod qbittorrent;
 
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 
 /// 下载器类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,7 +13,7 @@ pub enum DownloaderType {
 }
 
 impl DownloaderType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Option<Self> {
         match s {
             "qbittorrent" | "qb" => Some(DownloaderType::QBittorrent),
             _ => None,
@@ -74,8 +77,14 @@ pub struct DownloaderTestResult {
     pub free_space: Option<u64>,
 }
 
-use std::future::Future;
-use std::pin::Pin;
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloaderSpaceStats {
+    pub free_space: u64,
+    pub pending_download_bytes: u64,
+    pub effective_free_space: u64,
+    pub torrent_count: usize,
+    pub incomplete_count: usize,
+}
 
 /// 下载器客户端 trait — 通用接口，可扩展支持不同下载器
 pub trait DownloaderClient: Send + Sync {
@@ -105,19 +114,40 @@ pub trait DownloaderClient: Send + Sync {
         &self,
         path: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>>;
+
+    fn get_effective_free_space<'a>(
+        &'a self,
+        path: Option<&'a str>,
+        torrents: &'a [TorrentInfo],
+    ) -> Pin<Box<dyn Future<Output = Result<DownloaderSpaceStats, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let free_space = self.get_free_space(path).await?;
+            let pending_download_bytes = calculate_pending_download_bytes(torrents);
+            let incomplete_count = torrents
+                .iter()
+                .filter(|torrent| torrent.completion_on <= 0 && torrent.downloaded < torrent.size)
+                .count();
+
+            Ok(DownloaderSpaceStats {
+                free_space,
+                pending_download_bytes,
+                effective_free_space: free_space.saturating_sub(pending_download_bytes),
+                torrent_count: torrents.len(),
+                incomplete_count,
+            })
+        })
+    }
 }
 
-pub fn create_downloader_client(
-    downloader_type: DownloaderType,
-    url: &str,
-    username: &str,
-    password: &str,
-) -> Box<dyn DownloaderClient> {
-    match downloader_type {
-        DownloaderType::QBittorrent => Box::new(qbittorrent::QBittorrentClient::new(
-            url.to_string(),
-            username.to_string(),
-            password.to_string(),
-        )),
-    }
+pub fn calculate_pending_download_bytes(torrents: &[TorrentInfo]) -> u64 {
+    torrents
+        .iter()
+        .map(|torrent| {
+            if torrent.completion_on > 0 || torrent.downloaded >= torrent.size {
+                return 0;
+            }
+
+            (torrent.size - torrent.downloaded).max(0) as u64
+        })
+        .sum()
 }

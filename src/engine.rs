@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use chrono::Local;
+use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
@@ -54,7 +54,7 @@ impl DownloadEngine {
         shutdown: Arc<AtomicBool>,
     ) -> Result<RunHistory, AppError> {
         let app_runtime = self.build_app_runtime(&config, shutdown)?;
-        let run_started_at = Local::now();
+        let run_started_at = Utc::now();
         let run_start_instant = std::time::Instant::now();
 
         info!(
@@ -170,7 +170,7 @@ impl DownloadEngine {
         rss_summaries.extend(build_rss_summaries(&runtimes, &torrent_records).await);
         let history = RunHistory {
             started_at: run_started_at.to_rfc3339(),
-            finished_at: Local::now().to_rfc3339(),
+            finished_at: Utc::now().to_rfc3339(),
             retry_delay_secs: app_runtime.global.retry_interval_secs,
             summary: RunSummary::from_records(&torrent_records),
             rss: rss_summaries,

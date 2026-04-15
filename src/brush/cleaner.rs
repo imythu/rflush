@@ -40,6 +40,18 @@ pub async fn evaluate_delete_rules(
             }
         }
 
+        // 规则 1.5: free 到期删除
+        if task.delete_on_free_expiry {
+            if let Some(free_end_timestamp) = record.free_end_timestamp {
+                let now_secs = Utc::now().timestamp();
+                let passed = now_secs >= free_end_timestamp;
+                rule_results.push(passed);
+                if passed {
+                    reasons.push("free已到期".to_string());
+                }
+            }
+        }
+
         // 规则 2: H&R 种子最小做种时长
         if record.is_hr {
             if let Some(hr_min_hours) = task.hr_min_seed_time_hours {

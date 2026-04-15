@@ -1,7 +1,10 @@
+pub mod factory;
 pub mod mteam;
 pub mod nexusphp;
 
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 
 /// PT 站点认证配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,11 +61,19 @@ pub struct SiteRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TorrentAttributes {
+    /// 是否为免费种。
     pub free: bool,
+    /// 是否为免费且双倍上传的种子。
     pub two_x_free: bool,
+    /// 是否命中 H&R 规则。
     pub hit_and_run: bool,
-    pub peer_count: Option<i32>,
+    /// 做种数。
+    pub seeder_count: Option<i32>,
+    /// Free 促销结束时间的 Unix 时间戳（秒）。
+    pub free_end_timestamp: Option<i64>,
+    /// 下载系数，`0.0` 表示免费，`1.0` 表示原价下载。
     pub download_volume_factor: Option<f64>,
+    /// 上传系数，`1.0` 表示原价上传，`2.0` 表示双倍上传。
     pub upload_volume_factor: Option<f64>,
 }
 
@@ -73,11 +84,8 @@ pub struct SiteTestResult {
     pub user_stats: Option<UserStats>,
 }
 
-use std::future::Future;
-use std::pin::Pin;
-
-/// 站点客户端 trait — 面向接口，可扩展不同类型站点
-pub trait SiteClient: Send + Sync {
+/// 站点适配器 trait
+pub trait SiteAdapter: Send + Sync {
     fn test_connection(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>>;
@@ -90,19 +98,4 @@ pub trait SiteClient: Send + Sync {
         &self,
         detail_url: &str,
     ) -> Pin<Box<dyn Future<Output = Result<TorrentAttributes, String>> + Send + '_>>;
-}
-
-/// 根据站点类型和配置创建对应客户端
-pub fn create_site_client(
-    site_type: SiteType,
-    base_url: &str,
-    auth: &SiteAuth,
-) -> Box<dyn SiteClient> {
-    match site_type {
-        SiteType::NexusPhp => Box::new(nexusphp::NexusPhpClient::new(
-            base_url.to_string(),
-            auth.clone(),
-        )),
-        SiteType::MTeam => Box::new(mteam::MTeamClient::new(base_url.to_string(), auth.clone())),
-    }
 }

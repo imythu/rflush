@@ -156,7 +156,9 @@ export type BrushTaskRecord = {
   upload_speed_limit: number | null;
   size_ranges: string | null;
   seeder_ranges: string | null;
+  min_free_hours: number | null;
   delete_mode: string;
+  delete_on_free_expiry: boolean;
   min_seed_time_hours: number | null;
   hr_min_seed_time_hours: number | null;
   target_ratio: number | null;
@@ -187,7 +189,9 @@ export type BrushTaskRequest = {
   upload_speed_limit?: number | null;
   size_ranges?: string | null;
   seeder_ranges?: string | null;
+  min_free_hours?: number | null;
   delete_mode?: string | null;
+  delete_on_free_expiry?: boolean | null;
   min_seed_time_hours?: number | null;
   hr_min_seed_time_hours?: number | null;
   target_ratio?: number | null;
@@ -208,6 +212,7 @@ export type BrushTorrentRecord = {
   added_at: string;
   size_bytes: number | null;
   is_hr: boolean;
+  free_end_timestamp: number | null;
   status: string;
   removed_at: string | null;
   remove_reason: string | null;
@@ -225,15 +230,6 @@ export type BrushTaskTorrentsResponse = {
   page_size: number;
   total_records: number;
   records: BrushTorrentRecord[];
-};
-
-export type BrushCacheStats = {
-  ttl_secs: number;
-  max_concurrency: number;
-  site_bucket_count: number;
-  cached_entry_count: number;
-  total_cache_hits: number;
-  total_fetch_successes: number;
 };
 
 export type TaskStatsSnapshot = {

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use cron::Schedule;
@@ -12,14 +10,13 @@ use tracing::{debug, error, info, warn};
 use crate::brush::{BrushTaskRecord, in_any_range, is_in_active_window, parse_ranges};
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
-use crate::downloader::{AddTorrentOptions, DownloaderType, TorrentInfo, create_downloader_client};
+use crate::downloader::AddTorrentOptions;
+use crate::downloader::factory;
 use crate::rss;
-use crate::site::{SiteAuth, SiteType, create_site_client};
+use crate::site::factory as site_factory;
+use crate::site::SiteAdapter;
 
 use super::cleaner;
-
-const DETAIL_ATTR_CACHE_TTL_SECS: i64 = 600;
-const DETAIL_ATTR_FETCH_MAX_CONCURRENCY: usize = 1;
 
 #[derive(Clone, Copy)]
 enum FilterStage {
@@ -27,38 +24,6 @@ enum FilterStage {
     PostEnhancement,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct DetailAttrCacheStats {
-    pub ttl_secs: i64,
-    pub max_concurrency: usize,
-    pub site_bucket_count: usize,
-    pub cached_entry_count: usize,
-    pub total_cache_hits: u64,
-    pub total_fetch_successes: u64,
-}
-
-#[derive(Clone)]
-struct CachedTorrentAttributes {
-    attrs: crate::site::TorrentAttributes,
-    fetched_at: i64,
-}
-
-type SiteDetailAttrCache = HashMap<i64, HashMap<String, CachedTorrentAttributes>>;
-
-fn detail_attr_cache() -> &'static RwLock<SiteDetailAttrCache> {
-    static CACHE: OnceLock<RwLock<SiteDetailAttrCache>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-fn detail_attr_cache_hits() -> &'static AtomicU64 {
-    static HITS: OnceLock<AtomicU64> = OnceLock::new();
-    HITS.get_or_init(|| AtomicU64::new(0))
-}
-
-fn detail_attr_fetch_successes() -> &'static AtomicU64 {
-    static SUCCESSES: OnceLock<AtomicU64> = OnceLock::new();
-    SUCCESSES.get_or_init(|| AtomicU64::new(0))
-}
 
 /// 调度器状态
 pub struct BrushScheduler {
@@ -220,28 +185,6 @@ impl BrushScheduler {
 
         Ok(())
     }
-
-    pub async fn detail_attr_cache_stats(&self) -> DetailAttrCacheStats {
-        let now = Utc::now().timestamp();
-        prune_expired_detail_attr_cache(now).await;
-
-        let cache = detail_attr_cache();
-        let cache_guard = cache.read().await;
-        let site_bucket_count = cache_guard.len();
-        let cached_entry_count = cache_guard
-            .values()
-            .map(|site_cache| site_cache.len())
-            .sum();
-
-        DetailAttrCacheStats {
-            ttl_secs: DETAIL_ATTR_CACHE_TTL_SECS,
-            max_concurrency: DETAIL_ATTR_FETCH_MAX_CONCURRENCY,
-            site_bucket_count,
-            cached_entry_count,
-            total_cache_hits: detail_attr_cache_hits().load(Ordering::Relaxed),
-            total_fetch_successes: detail_attr_fetch_successes().load(Ordering::Relaxed),
-        }
-    }
 }
 
 fn should_trigger(task: &BrushTaskRecord) -> bool {
@@ -305,15 +248,7 @@ async fn execute_brush_task(
         task.name, downloader_record.name, downloader_record.url
     );
 
-    let dl_type = DownloaderType::from_str(&downloader_record.downloader_type)
-        .ok_or_else(|| "不支持的下载器类型".to_string())?;
-
-    let client = create_downloader_client(
-        dl_type,
-        &downloader_record.url,
-        &downloader_record.username,
-        &downloader_record.password,
-    );
+    let client = factory::create_client(&downloader_record)?;
 
     // 2. 获取当前管理的种子列表
     let managed_torrents = db
@@ -421,19 +356,20 @@ async fn execute_brush_task(
         }
     }
 
-    let downloader_free_space_bytes = client.get_free_space(task.save_dir.as_deref()).await.ok();
-    let pending_download_bytes = calculate_pending_download_bytes(&downloader_torrents);
-    let mut effective_free_space_bytes = downloader_free_space_bytes
-        .map(|free_space| free_space.saturating_sub(pending_download_bytes));
+    let space_stats = client
+        .get_effective_free_space(task.save_dir.as_deref(), &downloader_torrents)
+        .await
+        .ok();
+    let mut effective_free_space_bytes = space_stats.as_ref().map(|stats| stats.effective_free_space);
 
     if let Some(min_disk_space_gb) = task.min_disk_space_gb {
         let min_disk_space_bytes = gb_to_bytes(min_disk_space_gb);
-        if let Some(free_space) = downloader_free_space_bytes {
+        if let Some(stats) = &space_stats {
             info!(
                 "[刷流][{}] 磁盘空间: 当前空闲 {:.2} GB, 未完成剩余 {:.2} GB, 预测可用 {:.2} GB, 最低保留 {:.2} GB",
                 task.name,
-                bytes_to_gb(free_space),
-                bytes_to_gb(pending_download_bytes),
+                bytes_to_gb(stats.free_space),
+                bytes_to_gb(stats.pending_download_bytes),
                 bytes_to_gb(effective_free_space_bytes.unwrap_or(0)),
                 min_disk_space_gb
             );
@@ -474,7 +410,7 @@ async fn execute_brush_task(
         .collect();
 
     // 7. 准备站点详情增强
-    let mut site_client: Option<Box<dyn crate::site::SiteClient>> = None;
+    let mut site_adapter: Option<Box<dyn SiteAdapter>> = None;
     let mut site_client_binding: Option<Option<i64>> = None;
 
     // 排序：按发布时间降序，优先处理新种子
@@ -504,7 +440,8 @@ async fn execute_brush_task(
             .as_deref()
             .map(parse_ranges)
             .unwrap_or_default();
-        let needs_site_attrs = task.promotion != "all" || task.skip_hit_and_run;
+        let needs_free_end = task.promotion == "free" && task.min_free_hours.is_some();
+        let needs_site_attrs = task.promotion != "all" || task.skip_hit_and_run || needs_free_end;
         checked += 1;
 
         // 跳过已存在的种子
@@ -542,18 +479,11 @@ async fn execute_brush_task(
         let mut effective_item = (*item).clone();
         if needs_site_attrs {
             if site_client_binding != Some(task.site_id) {
-                site_client = None;
+                site_adapter = None;
                 if let Some(site_id) = task.site_id {
-                    if let Ok(sites) = db.list_sites().await {
-                        if let Some(site) = sites.iter().find(|s| s.id == site_id) {
-                            if let Some(site_type) = SiteType::from_str(&site.site_type) {
-                                if let Ok(auth) =
-                                    serde_json::from_str::<SiteAuth>(&site.auth_config)
-                                {
-                                    site_client =
-                                        Some(create_site_client(site_type, &site.base_url, &auth));
-                                }
-                            }
+                    if let Ok(Some(site)) = db.get_site(site_id).await {
+                        if let Ok(adapter) = site_factory::create_adapter(&site) {
+                            site_adapter = Some(adapter);
                         }
                     }
                 }
@@ -562,12 +492,15 @@ async fn execute_brush_task(
 
             // 检查 RSS 数据是否已经足够判断促销/H&R，足够则跳过请求
             let need_fetch = item.download_volume_factor.is_none()
+                || (task.promotion == "free"
+                    && task.min_free_hours.is_some()
+                    && item.free_end_timestamp.is_none())
                 || (task.skip_hit_and_run
                     && item.minimum_seed_time.is_none()
                     && item.minimum_ratio.is_none());
 
             if need_fetch {
-                if let Some(ref client) = site_client {
+                if let Some(ref adapter) = site_adapter {
                     let detail_url = if task.site_id.is_some() {
                         item.link
                             .as_deref()
@@ -576,55 +509,20 @@ async fn execute_brush_task(
                     } else {
                         item.guid.as_str()
                     };
-                    let now = Utc::now().timestamp();
-
-                    // 先查缓存
-                    let mut cache_hit = false;
-                    if let Some(sid) = task.site_id {
-                        let cache = detail_attr_cache();
-                        let cache_guard = cache.read().await;
-                        if let Some(entry) = cache_guard
-                            .get(&sid)
-                            .and_then(|sc| sc.get(detail_url))
-                            .filter(|e| now - e.fetched_at <= DETAIL_ATTR_CACHE_TTL_SECS)
-                        {
-                            apply_attrs_to_item(&mut effective_item, &entry.attrs);
-                            cache_hit = true;
-                            detail_attr_cache_hits().fetch_add(1, Ordering::Relaxed);
+                    match adapter.get_torrent_attributes(detail_url).await {
+                        Ok(attrs) => {
+                            apply_attrs_to_item(&mut effective_item, &attrs);
                         }
-                    }
-
-                    if !cache_hit {
-                        match client.get_torrent_attributes(detail_url).await {
-                            Ok(attrs) => {
-                                apply_attrs_to_item(&mut effective_item, &attrs);
-                                detail_attr_fetch_successes().fetch_add(1, Ordering::Relaxed);
-
-                                // 写入缓存
-                                if let Some(sid) = task.site_id {
-                                    let mut cache_guard = detail_attr_cache().write().await;
-                                    let site_cache =
-                                        cache_guard.entry(sid).or_insert_with(HashMap::new);
-                                    site_cache.insert(
-                                        detail_url.to_string(),
-                                        CachedTorrentAttributes {
-                                            attrs,
-                                            fetched_at: now,
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "[刷流][{}] ✗ id={} 详情获取失败: {} {}",
-                                    task.name,
-                                    extract_torrent_id(detail_url),
-                                    e,
-                                    detail_url
-                                );
-                                skipped_attrs += 1;
-                                continue;
-                            }
+                        Err(e) => {
+                            warn!(
+                                "[刷流][{}] ✗ id={} 详情获取失败: {} {}",
+                                task.name,
+                                extract_torrent_id(detail_url),
+                                e,
+                                detail_url
+                            );
+                            skipped_attrs += 1;
+                            continue;
                         }
                     }
                 }
@@ -747,6 +645,7 @@ async fn execute_brush_task(
                                 &effective_item.title,
                                 effective_item.size_bytes.map(|size| size as i64),
                                 effective_item.is_hr(),
+                                effective_item.free_end_timestamp,
                             )
                             .await;
                         info!(
@@ -853,6 +752,23 @@ fn check_filter_reason(
                 if download_volume_factor > f64::EPSILON {
                     return Some(format!("非免费(dl={download_volume_factor:?})"));
                 }
+                if let Some(min_free_hours) = task.min_free_hours {
+                    match item.free_end_timestamp {
+                        Some(free_end_timestamp) => {
+                            let remaining_hours =
+                                (free_end_timestamp - Utc::now().timestamp()) as f64 / 3600.0;
+                            if remaining_hours < min_free_hours {
+                                return Some(format!(
+                                    "剩余free时长{remaining_hours:.1}h < {min_free_hours:.1}h"
+                                ));
+                            }
+                        }
+                        None if matches!(stage, FilterStage::PostEnhancement) => {
+                            return Some("缺少free到期时间".to_string());
+                        }
+                        None => {}
+                    }
+                }
             }
             None if matches!(stage, FilterStage::PostEnhancement) => {
                 return Some("缺少免费属性".to_string());
@@ -904,11 +820,13 @@ fn check_filter_reason(
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+
     use crate::brush::BrushTaskRecord;
-    use crate::downloader::TorrentInfo;
+    use crate::downloader::{TorrentInfo, calculate_pending_download_bytes};
     use crate::rss::TorrentItem;
 
-    use super::{FilterStage, calculate_pending_download_bytes, check_filter_reason};
+    use super::{FilterStage, check_filter_reason};
 
     fn task() -> BrushTaskRecord {
         BrushTaskRecord {
@@ -929,7 +847,9 @@ mod tests {
             upload_speed_limit: None,
             size_ranges: None,
             seeder_ranges: None,
+            min_free_hours: None,
             delete_mode: "or".to_string(),
+            delete_on_free_expiry: false,
             min_seed_time_hours: None,
             hr_min_seed_time_hours: None,
             target_ratio: None,
@@ -955,6 +875,7 @@ mod tests {
             version: 1,
             size_bytes: Some(1024),
             seeders: Some(10),
+            free_end_timestamp: None,
             download_volume_factor: None,
             upload_volume_factor: None,
             minimum_ratio: None,
@@ -980,6 +901,35 @@ mod tests {
         let reason = check_filter_reason(&task, &item(), &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("缺少免费属性"));
+    }
+
+    #[test]
+    fn post_filter_rejects_free_item_when_remaining_free_hours_too_short() {
+        let mut task = task();
+        task.promotion = "free".to_string();
+        task.min_free_hours = Some(2.0);
+
+        let mut item = item();
+        item.download_volume_factor = Some(0.0);
+        item.free_end_timestamp = Some(Utc::now().timestamp() + 3600);
+
+        let reason = check_filter_reason(&task, &item, &[], &[], FilterStage::PostEnhancement);
+
+        assert_eq!(reason.as_deref(), Some("剩余free时长1.0h < 2.0h"));
+    }
+
+    #[test]
+    fn post_filter_requires_free_end_time_when_min_free_hours_is_configured() {
+        let mut task = task();
+        task.promotion = "free".to_string();
+        task.min_free_hours = Some(2.0);
+
+        let mut item = item();
+        item.download_volume_factor = Some(0.0);
+
+        let reason = check_filter_reason(&task, &item, &[], &[], FilterStage::PostEnhancement);
+
+        assert_eq!(reason.as_deref(), Some("缺少free到期时间"));
     }
 
     #[test]
@@ -1080,19 +1030,6 @@ fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) ->
     }
 }
 
-fn calculate_pending_download_bytes(torrents: &[TorrentInfo]) -> u64 {
-    torrents
-        .iter()
-        .map(|torrent| {
-            if torrent.completion_on > 0 || torrent.downloaded >= torrent.size {
-                return 0;
-            }
-
-            (torrent.size - torrent.downloaded).max(0) as u64
-        })
-        .sum()
-}
-
 fn gb_to_bytes(gb: f64) -> u64 {
     if gb <= 0.0 {
         0
@@ -1116,8 +1053,11 @@ fn apply_attrs_to_item(item: &mut rss::TorrentItem, attrs: &crate::site::Torrent
     if attrs.hit_and_run {
         item.minimum_seed_time.get_or_insert(1);
     }
-    if attrs.peer_count.is_some() {
-        item.seeders = attrs.peer_count;
+    if attrs.seeder_count.is_some() {
+        item.seeders = attrs.seeder_count;
+    }
+    if attrs.free_end_timestamp.is_some() {
+        item.free_end_timestamp = attrs.free_end_timestamp;
     }
 }
 
@@ -1276,15 +1216,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-async fn prune_expired_detail_attr_cache(now: i64) {
-    let cache = detail_attr_cache();
-    let mut cache_guard = cache.write().await;
-    cache_guard.retain(|_, site_cache| {
-        site_cache.retain(|_, entry| now - entry.fetched_at <= DETAIL_ATTR_CACHE_TTL_SECS);
-        !site_cache.is_empty()
-    });
 }
 
 async fn fetch_rss_text(url: &str) -> Result<String, String> {

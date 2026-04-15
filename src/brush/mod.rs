@@ -25,8 +25,10 @@ pub struct BrushTaskRecord {
     pub upload_speed_limit: Option<i64>,
     pub size_ranges: Option<String>,
     pub seeder_ranges: Option<String>,
+    pub min_free_hours: Option<f64>,
     // 删种规则
     pub delete_mode: String,
+    pub delete_on_free_expiry: bool,
     pub min_seed_time_hours: Option<f64>,
     pub hr_min_seed_time_hours: Option<f64>,
     pub target_ratio: Option<f64>,
@@ -60,7 +62,9 @@ pub struct BrushTaskRequest {
     pub upload_speed_limit: Option<i64>,
     pub size_ranges: Option<String>,   // JSON array string
     pub seeder_ranges: Option<String>, // JSON array string
+    pub min_free_hours: Option<f64>,
     pub delete_mode: Option<String>,
+    pub delete_on_free_expiry: Option<bool>,
     pub min_seed_time_hours: Option<f64>,
     pub hr_min_seed_time_hours: Option<f64>,
     pub target_ratio: Option<f64>,
@@ -83,6 +87,7 @@ pub struct BrushTorrentRecord {
     pub added_at: String,
     pub size_bytes: Option<i64>,
     pub is_hr: bool,
+    pub free_end_timestamp: Option<i64>,
     pub status: String,
     pub removed_at: Option<String>,
     pub remove_reason: Option<String>,
@@ -158,7 +163,7 @@ pub fn is_in_active_window(windows_json: Option<&str>) -> bool {
         return true;
     }
 
-    let now = chrono::Local::now();
+    let now = chrono::Utc::now();
     let current_minutes = now.format("%H").to_string().parse::<u32>().unwrap_or(0) * 60
         + now.format("%M").to_string().parse::<u32>().unwrap_or(0);
 

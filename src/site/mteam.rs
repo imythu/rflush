@@ -2,8 +2,9 @@ use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 use tracing::debug;
+use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 
-use super::{SiteAuth, SiteClient, SiteTestResult, TorrentAttributes, UserStats};
+use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -12,13 +13,13 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 /// M-Team 详情请求间最小间隔（毫秒），防止 API 限流
 const MTEAM_REQUEST_INTERVAL_MS: u64 = 4000;
 
-pub struct MTeamClient {
+pub struct MTeamAdapter {
     base_url: String,
     api_key: String,
     client: Client,
 }
 
-impl MTeamClient {
+impl MTeamAdapter {
     pub fn new(base_url: String, auth: SiteAuth) -> Self {
         let api_key = match &auth {
             SiteAuth::ApiKey { api_key } => api_key.clone(),
@@ -110,6 +111,10 @@ impl MTeamClient {
             .await
             .map_err(|e| format!("读取响应失败: {}", e))?;
 
+        if path == "/api/torrent/detail" {
+            debug!("M-Team torrent detail response: {}", text);
+        }
+
         let json: Value =
             serde_json::from_str(&text).map_err(|_| "响应不是有效JSON".to_string())?;
 
@@ -162,7 +167,7 @@ impl MTeamClient {
     }
 }
 
-impl SiteClient for MTeamClient {
+impl SiteAdapter for MTeamAdapter {
     fn test_connection(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<SiteTestResult, String>> + Send + '_>> {
@@ -289,18 +294,24 @@ impl SiteClient for MTeamClient {
                         let discount = status.get("discount").and_then(|v| v.as_str());
                         let (download_volume_factor, upload_volume_factor, hit_and_run) =
                             Self::parse_discount(discount);
-                        let peer_count = status.get("seeders").and_then(|v| {
+                        let seeder_count = status.get("seeders").and_then(|v| {
                             v.as_str()
                                 .and_then(|s| s.parse::<i32>().ok())
                                 .or_else(|| v.as_i64().map(|n| n as i32))
                         });
+                        let free_end_timestamp = status
+                            .get("discountEndTime")
+                            .or_else(|| data.get("discountEndTime"))
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_mteam_datetime);
 
                         return Ok(TorrentAttributes {
                             free: download_volume_factor == Some(0.0),
                             two_x_free: download_volume_factor == Some(0.0)
                                 && upload_volume_factor.is_some_and(|factor| factor >= 2.0),
                             hit_and_run,
-                            peer_count,
+                            seeder_count,
+                            free_end_timestamp,
                             download_volume_factor,
                             upload_volume_factor,
                         });
@@ -334,4 +345,10 @@ fn simple_random_ms(max_ms: u64) -> u64 {
     // 混入当前线程地址作为额外熵源
     let seed = nanos ^ (nanos >> 32);
     if max_ms == 0 { 0 } else { seed % max_ms }
+}
+
+fn parse_mteam_datetime(value: &str) -> Option<i64> {
+    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()?;
+    let tz = FixedOffset::east_opt(8 * 3600)?;
+    tz.from_local_datetime(&naive).single().map(|dt| dt.timestamp())
 }

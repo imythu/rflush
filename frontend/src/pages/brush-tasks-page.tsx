@@ -10,7 +10,6 @@ import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type {
-  BrushCacheStats,
   BrushTaskRecord,
   BrushTaskRequest,
   BrushTaskTorrentsResponse,
@@ -60,7 +59,9 @@ const emptyForm: BrushTaskRequest = {
   upload_speed_limit: null,
   size_ranges: null,
   seeder_ranges: null,
+  min_free_hours: null,
   delete_mode: "or",
+  delete_on_free_expiry: false,
   min_seed_time_hours: null,
   hr_min_seed_time_hours: null,
   target_ratio: null,
@@ -89,7 +90,9 @@ function taskToForm(task: BrushTaskRecord): BrushTaskRequest {
     upload_speed_limit: task.upload_speed_limit,
     size_ranges: task.size_ranges,
     seeder_ranges: task.seeder_ranges,
+    min_free_hours: task.min_free_hours,
     delete_mode: task.delete_mode,
+    delete_on_free_expiry: task.delete_on_free_expiry,
     min_seed_time_hours: task.min_seed_time_hours,
     hr_min_seed_time_hours: task.hr_min_seed_time_hours,
     target_ratio: task.target_ratio,
@@ -110,7 +113,6 @@ export function BrushTasksPage() {
   const [tasks, setTasks] = useState<BrushTaskRecord[]>([]);
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
-  const [cacheStats, setCacheStats] = useState<BrushCacheStats | null>(null);
   const [form, setForm] = useState<BrushTaskRequest>({ ...emptyForm });
   const [editingId, setEditingId] = useState<number | null>(null);
   const [formOpen, setFormOpen] = useState(false);
@@ -131,9 +133,6 @@ export function BrushTasksPage() {
     api<BrushTaskRecord[]>("/api/brush-tasks")
       .then(setTasks)
       .catch((error: Error) => setMessage(error.message || "加载刷流任务失败"));
-    api<BrushCacheStats>("/api/brush-tasks/cache-stats")
-      .then(setCacheStats)
-      .catch((error: Error) => setMessage(error.message || "加载缓存状态失败"));
   }
 
   useEffect(() => {
@@ -282,12 +281,8 @@ export function BrushTasksPage() {
       <div className="grid gap-4 xl:gap-6">
         <Card>
           <CardHeader>
-            <CardTitle>详情增强缓存</CardTitle>
-            <CardDescription>显示免费种/H&R 详情增强的缓存体量和累计命中情况。</CardDescription>
-          </CardHeader>
-          <CardContent>
             {message ? (
-              <div className="mb-4 rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
+              <div className="rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
                 <div className="flex items-start justify-between gap-3">
                   <span>{message}</span>
                   <button type="button" className="text-muted hover:text-foreground" onClick={() => setMessage("")}>
@@ -296,42 +291,6 @@ export function BrushTasksPage() {
                 </div>
               </div>
             ) : null}
-
-            {cacheStats ? (
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-                <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="text-xs text-muted">缓存条目</div>
-                  <div className="mt-1 text-2xl font-semibold">{cacheStats.cached_entry_count}</div>
-                </div>
-                <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="text-xs text-muted">站点桶数</div>
-                  <div className="mt-1 text-2xl font-semibold">{cacheStats.site_bucket_count}</div>
-                </div>
-                <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="text-xs text-muted">累计命中</div>
-                  <div className="mt-1 text-2xl font-semibold">{cacheStats.total_cache_hits}</div>
-                </div>
-                <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="text-xs text-muted">累计成功抓取</div>
-                  <div className="mt-1 text-2xl font-semibold">{cacheStats.total_fetch_successes}</div>
-                </div>
-                <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="text-xs text-muted">TTL</div>
-                  <div className="mt-1 text-2xl font-semibold">{cacheStats.ttl_secs}s</div>
-                </div>
-                <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                  <div className="text-xs text-muted">并发上限</div>
-                  <div className="mt-1 text-2xl font-semibold">{cacheStats.max_concurrency}</div>
-                </div>
-              </div>
-            ) : (
-              <div className="py-6 text-sm text-muted">缓存状态加载中...</div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
                 <CardTitle>刷流任务管理</CardTitle>
@@ -555,7 +514,13 @@ export function BrushTasksPage() {
                 <select
                   className={selectClass}
                   value={form.promotion ?? "all"}
-                  onChange={(e) => setField("promotion", e.target.value)}
+                  onChange={(e) => {
+                    const promotion = e.target.value;
+                    setField("promotion", promotion);
+                    if (promotion !== "free") {
+                      setField("min_free_hours", null);
+                    }
+                  }}
                 >
                   <option value="all">全部</option>
                   <option value="free">免费</option>
@@ -607,6 +572,17 @@ export function BrushTasksPage() {
                 />
                 <p className="text-xs text-muted">JSON 数组</p>
               </div>
+              <div className="space-y-2">
+                <Label>最少 free 时长 (小时)</Label>
+                <Input
+                  type="number"
+                  placeholder="不限"
+                  disabled={(form.promotion ?? "all") !== "free"}
+                  value={(form.promotion ?? "all") === "free" ? (form.min_free_hours ?? "") : ""}
+                  onChange={(e) => setField("min_free_hours", numOrNull(e.target.value))}
+                />
+                <p className="text-xs text-muted">仅免费种可设置，表示剩余 free 时长至少多少小时。</p>
+              </div>
               <div className="flex items-end pb-2">
                 <label className="flex items-center gap-3 text-sm text-muted">
                   <input
@@ -653,6 +629,17 @@ export function BrushTasksPage() {
                   value={form.hr_min_seed_time_hours ?? ""}
                   onChange={(e) => setField("hr_min_seed_time_hours", numOrNull(e.target.value))}
                 />
+              </div>
+              <div className="flex items-end pb-2">
+                <label className="flex items-center gap-3 text-sm text-muted">
+                  <input
+                    type="checkbox"
+                    className={checkboxClass}
+                    checked={form.delete_on_free_expiry ?? false}
+                    onChange={(e) => setField("delete_on_free_expiry", e.target.checked)}
+                  />
+                  free到期删除种子
+                </label>
               </div>
               <div className="space-y-2">
                 <Label>目标分享率</Label>

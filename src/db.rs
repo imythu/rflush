@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, Utc};
+use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -183,7 +183,7 @@ impl Database {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<RssSubscription, AppError> {
             let conn = open_connection(&path)?;
-            let now = Local::now().to_rfc3339();
+            let now = Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO rss_subscriptions (name, url, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
                 params![rss.name, rss.url, if enabled { 1 } else { 0 }, now, now],
@@ -211,7 +211,7 @@ impl Database {
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let mut conn = open_connection(&path)?;
             let tx = conn.transaction().map_err(sql_error)?;
-            let now = Local::now().to_rfc3339();
+            let now = Utc::now().to_rfc3339();
             for id in ids {
                 tx.execute(
                     "UPDATE rss_subscriptions SET enabled = ?, updated_at = ? WHERE id = ?",
@@ -232,7 +232,7 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.execute(
                 "UPDATE rss_subscriptions SET enabled = ?, updated_at = ?",
-                params![if enabled { 1 } else { 0 }, Local::now().to_rfc3339()],
+                params![if enabled { 1 } else { 0 }, Utc::now().to_rfc3339()],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -757,7 +757,7 @@ impl Database {
         password: &str,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let (name, dtype, url, username, password) = (
             name.to_string(),
             dtype.to_string(),
@@ -802,8 +802,8 @@ impl Database {
                      seed_volume_gb, save_dir, active_time_windows,
                      promotion, skip_hit_and_run, max_concurrent,
                      download_speed_limit, upload_speed_limit,
-                     size_ranges, seeder_ranges,
-                     delete_mode, min_seed_time_hours, hr_min_seed_time_hours,
+                     size_ranges, seeder_ranges, min_free_hours,
+                     delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                      target_ratio, max_upload_gb, download_timeout_hours,
                      min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                      enabled, created_at, updated_at
@@ -832,8 +832,8 @@ impl Database {
                  seed_volume_gb, save_dir, active_time_windows,
                  promotion, skip_hit_and_run, max_concurrent,
                  download_speed_limit, upload_speed_limit,
-                 size_ranges, seeder_ranges,
-                 delete_mode, min_seed_time_hours, hr_min_seed_time_hours,
+                 size_ranges, seeder_ranges, min_free_hours,
+                 delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                  enabled, created_at, updated_at
@@ -850,32 +850,38 @@ impl Database {
 
     pub async fn create_brush_task(&self, req: &BrushTaskRequest) -> Result<i64, AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let req = req.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let promotion = req.promotion.unwrap_or_else(|| "all".to_string());
+            let min_free_hours = if promotion == "free" {
+                req.min_free_hours
+            } else {
+                None
+            };
             let skip_hr = req.skip_hit_and_run.unwrap_or(true) as i32;
             let max_concurrent = req.max_concurrent.unwrap_or(100);
             let delete_mode = req.delete_mode.unwrap_or_else(|| "or".to_string());
+            let delete_on_free_expiry = req.delete_on_free_expiry.unwrap_or(false) as i32;
             conn.execute(
                 "INSERT INTO brush_tasks (name, cron_expression, site_id, downloader_id, tag, rss_url,
                  seed_volume_gb, save_dir, active_time_windows,
                  promotion, skip_hit_and_run, max_concurrent,
                  download_speed_limit, upload_speed_limit,
-                 size_ranges, seeder_ranges,
-                 delete_mode, min_seed_time_hours, hr_min_seed_time_hours,
+                 size_ranges, seeder_ranges, min_free_hours,
+                 delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                  enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
                     req.name, req.cron_expression, req.site_id, req.downloader_id, req.tag, req.rss_url,
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
-                    req.size_ranges, req.seeder_ranges,
-                    delete_mode, req.min_seed_time_hours, req.hr_min_seed_time_hours,
+                    req.size_ranges, req.seeder_ranges, min_free_hours,
+                    delete_mode, delete_on_free_expiry, req.min_seed_time_hours, req.hr_min_seed_time_hours,
                     req.target_ratio, req.max_upload_gb, req.download_timeout_hours,
                     req.min_avg_upload_speed_kbs, req.max_inactive_hours, req.min_disk_space_gb,
                     now, now
@@ -890,21 +896,27 @@ impl Database {
 
     pub async fn update_brush_task(&self, id: i64, req: &BrushTaskRequest) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let req = req.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let promotion = req.promotion.unwrap_or_else(|| "all".to_string());
+            let min_free_hours = if promotion == "free" {
+                req.min_free_hours
+            } else {
+                None
+            };
             let skip_hr = req.skip_hit_and_run.unwrap_or(true) as i32;
             let max_concurrent = req.max_concurrent.unwrap_or(100);
             let delete_mode = req.delete_mode.unwrap_or_else(|| "or".to_string());
+            let delete_on_free_expiry = req.delete_on_free_expiry.unwrap_or(false) as i32;
             conn.execute(
                 "UPDATE brush_tasks SET name = ?, cron_expression = ?, site_id = ?, downloader_id = ?, tag = ?, rss_url = ?,
                  seed_volume_gb = ?, save_dir = ?, active_time_windows = ?,
                  promotion = ?, skip_hit_and_run = ?, max_concurrent = ?,
                  download_speed_limit = ?, upload_speed_limit = ?,
-                 size_ranges = ?, seeder_ranges = ?,
-                 delete_mode = ?, min_seed_time_hours = ?, hr_min_seed_time_hours = ?,
+                 size_ranges = ?, seeder_ranges = ?, min_free_hours = ?,
+                 delete_mode = ?, delete_on_free_expiry = ?, min_seed_time_hours = ?, hr_min_seed_time_hours = ?,
                  target_ratio = ?, max_upload_gb = ?, download_timeout_hours = ?,
                  min_avg_upload_speed_kbs = ?, max_inactive_hours = ?, min_disk_space_gb = ?,
                  updated_at = ? WHERE id = ?",
@@ -913,8 +925,8 @@ impl Database {
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
-                    req.size_ranges, req.seeder_ranges,
-                    delete_mode, req.min_seed_time_hours, req.hr_min_seed_time_hours,
+                    req.size_ranges, req.seeder_ranges, min_free_hours,
+                    delete_mode, delete_on_free_expiry, req.min_seed_time_hours, req.hr_min_seed_time_hours,
                     req.target_ratio, req.max_upload_gb, req.download_timeout_hours,
                     req.min_avg_upload_speed_kbs, req.max_inactive_hours, req.min_disk_space_gb,
                     now, id
@@ -941,7 +953,7 @@ impl Database {
 
     pub async fn set_brush_task_enabled(&self, id: i64, enabled: bool) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -994,7 +1006,7 @@ impl Database {
             };
 
             let sql = if like.is_some() {
-                "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason,
+                "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, removed_at, remove_reason,
                         uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
                  FROM brush_task_torrents
                  WHERE task_id = ?
@@ -1002,7 +1014,7 @@ impl Database {
                  ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, added_at DESC, id DESC
                  LIMIT ? OFFSET ?"
             } else {
-                "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason,
+                "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, removed_at, remove_reason,
                         uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
                  FROM brush_task_torrents
                  WHERE task_id = ?
@@ -1047,7 +1059,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status, removed_at, remove_reason,
+                    "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, removed_at, remove_reason,
                             uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
                      FROM brush_task_torrents WHERE task_id = ? AND status = 'active' ORDER BY id",
                 )
@@ -1074,9 +1086,10 @@ impl Database {
         name: &str,
         size_bytes: Option<i64>,
         is_hr: bool,
+        free_end_timestamp: Option<i64>,
     ) -> Result<i64, AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let (torrent_id, torrent_link, hash, name) = (
             torrent_id.map(|value| value.to_string()),
             torrent_link.map(|value| value.to_string()),
@@ -1086,8 +1099,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT OR IGNORE INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')",
-                params![task_id, torrent_id, torrent_link, hash, name, now, size_bytes, is_hr as i32],
+                "INSERT OR IGNORE INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                params![task_id, torrent_id, torrent_link, hash, name, now, size_bytes, is_hr as i32, free_end_timestamp],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -1104,7 +1117,7 @@ impl Database {
         reason: Option<&str>,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let (hash, status) = (hash.to_string(), status.to_string());
         let reason = reason.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
@@ -1130,7 +1143,7 @@ impl Database {
         torrent_count: i64,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -1151,7 +1164,7 @@ impl Database {
         download_speed: i64,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
@@ -1176,7 +1189,7 @@ impl Database {
         ratio: f64,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Local::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         let hash = hash.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
@@ -1370,7 +1383,7 @@ impl Database {
     ) -> Result<Vec<(i64, i64, String)>, AppError> {
         let path = self.path.clone();
         let hash = hash.to_string();
-        let since = (Local::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        let since = (Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
@@ -1515,7 +1528,9 @@ impl Database {
                     upload_speed_limit INTEGER,
                     size_ranges TEXT,
                     seeder_ranges TEXT,
+                    min_free_hours REAL,
                     delete_mode TEXT NOT NULL DEFAULT 'or',
+                    delete_on_free_expiry INTEGER NOT NULL DEFAULT 0,
                     min_seed_time_hours REAL,
                     hr_min_seed_time_hours REAL,
                     target_ratio REAL,
@@ -1539,6 +1554,7 @@ impl Database {
                     added_at TEXT NOT NULL,
                     size_bytes INTEGER,
                     is_hr INTEGER NOT NULL DEFAULT 0,
+                    free_end_timestamp INTEGER,
                     status TEXT NOT NULL DEFAULT 'active',
                     removed_at TEXT,
                     remove_reason TEXT,
@@ -1635,6 +1651,24 @@ impl Database {
             )?;
             ensure_column(
                 &conn,
+                "brush_task_torrents",
+                "free_end_timestamp",
+                "ALTER TABLE brush_task_torrents ADD COLUMN free_end_timestamp INTEGER",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_tasks",
+                "min_free_hours",
+                "ALTER TABLE brush_tasks ADD COLUMN min_free_hours REAL",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_tasks",
+                "delete_on_free_expiry",
+                "ALTER TABLE brush_tasks ADD COLUMN delete_on_free_expiry INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
                 "brush_tasks",
                 "site_id",
                 "ALTER TABLE brush_tasks ADD COLUMN site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL",
@@ -1701,18 +1735,20 @@ fn row_to_brush_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTaskRecor
         upload_speed_limit: row.get(14)?,
         size_ranges: row.get(15)?,
         seeder_ranges: row.get(16)?,
-        delete_mode: row.get(17)?,
-        min_seed_time_hours: row.get(18)?,
-        hr_min_seed_time_hours: row.get(19)?,
-        target_ratio: row.get(20)?,
-        max_upload_gb: row.get(21)?,
-        download_timeout_hours: row.get(22)?,
-        min_avg_upload_speed_kbs: row.get(23)?,
-        max_inactive_hours: row.get(24)?,
-        min_disk_space_gb: row.get(25)?,
-        enabled: row.get::<_, i32>(26)? != 0,
-        created_at: row.get(27)?,
-        updated_at: row.get(28)?,
+        min_free_hours: row.get(17)?,
+        delete_mode: row.get(18)?,
+        delete_on_free_expiry: row.get::<_, i32>(19)? != 0,
+        min_seed_time_hours: row.get(20)?,
+        hr_min_seed_time_hours: row.get(21)?,
+        target_ratio: row.get(22)?,
+        max_upload_gb: row.get(23)?,
+        download_timeout_hours: row.get(24)?,
+        min_avg_upload_speed_kbs: row.get(25)?,
+        max_inactive_hours: row.get(26)?,
+        min_disk_space_gb: row.get(27)?,
+        enabled: row.get::<_, i32>(28)? != 0,
+        created_at: row.get(29)?,
+        updated_at: row.get(30)?,
     })
 }
 
@@ -1787,15 +1823,16 @@ fn map_brush_torrent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTo
         added_at: row.get(6)?,
         size_bytes: row.get(7)?,
         is_hr: row.get::<_, i32>(8)? != 0,
-        status: row.get(9)?,
-        removed_at: row.get(10)?,
-        remove_reason: row.get(11)?,
-        uploaded_bytes: row.get(12)?,
-        downloaded_bytes: row.get(13)?,
-        download_duration_secs: row.get(14)?,
-        avg_upload_speed: row.get(15)?,
-        ratio: row.get(16)?,
-        last_stats_at: row.get(17)?,
+        free_end_timestamp: row.get(9)?,
+        status: row.get(10)?,
+        removed_at: row.get(11)?,
+        remove_reason: row.get(12)?,
+        uploaded_bytes: row.get(13)?,
+        downloaded_bytes: row.get(14)?,
+        download_duration_secs: row.get(15)?,
+        avg_upload_speed: row.get(16)?,
+        ratio: row.get(17)?,
+        last_stats_at: row.get(18)?,
     })
 }
 

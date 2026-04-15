@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::Local;
+use chrono::Utc;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info};
 
 use crate::db::Database;
-use crate::downloader::{DownloaderRecord, DownloaderType, TorrentInfo, create_downloader_client};
+use crate::downloader::{DownloaderRecord, TorrentInfo};
+use crate::downloader::factory;
 
 #[derive(Debug, Clone)]
 pub struct DownloaderSnapshot {
@@ -104,18 +105,11 @@ impl DownloaderSnapshotCollector {
         downloader: &DownloaderRecord,
         publish: bool,
     ) -> Result<Arc<DownloaderSnapshot>, String> {
-        let dl_type = DownloaderType::from_str(&downloader.downloader_type)
-            .ok_or_else(|| "不支持的下载器类型".to_string())?;
-        let client = create_downloader_client(
-            dl_type,
-            &downloader.url,
-            &downloader.username,
-            &downloader.password,
-        );
+        let client = factory::create_client(downloader)?;
         let torrents = client.list_torrents(None).await?;
         let snapshot = Arc::new(DownloaderSnapshot {
             downloader_id: downloader.id,
-            recorded_at: Local::now().to_rfc3339(),
+            recorded_at: Utc::now().to_rfc3339(),
             torrents,
         });
         self.latest

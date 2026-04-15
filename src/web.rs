@@ -10,7 +10,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use chrono::Local;
+use chrono::Utc;
 use futures::stream;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -26,11 +26,12 @@ use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
 use crate::db::{Database, DownloadHistoryRecord, DownloadRunRecord, PaginatedRunRecords};
 use crate::download::naming::sanitize_component;
-use crate::downloader::{DownloaderType, create_downloader_client};
+use crate::downloader::factory as downloader_factory;
+use crate::downloader::DownloaderSpaceStats;
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
-use crate::site::{SiteAuth, SiteType, create_site_client};
+use crate::site::factory as site_factory;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -189,7 +190,7 @@ impl JobRegistry {
                     scope,
                     task_id,
                     status: "queued".to_string(),
-                    started_at: Local::now().to_rfc3339(),
+                    started_at: Utc::now().to_rfc3339(),
                     finished_at: None,
                     run_id: None,
                     summary: None,
@@ -228,7 +229,7 @@ impl JobRegistry {
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get_mut(&id) {
             job.info.status = "completed".to_string();
-            job.info.finished_at = Some(Local::now().to_rfc3339());
+            job.info.finished_at = Some(Utc::now().to_rfc3339());
             job.info.run_id = Some(run_id);
             job.info.summary = Some(summary);
         }
@@ -238,7 +239,7 @@ impl JobRegistry {
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get_mut(&id) {
             job.info.status = "failed".to_string();
-            job.info.finished_at = Some(Local::now().to_rfc3339());
+            job.info.finished_at = Some(Utc::now().to_rfc3339());
             job.info.error = Some(error);
         }
     }
@@ -247,7 +248,7 @@ impl JobRegistry {
         let mut jobs = self.jobs.lock().await;
         if let Some(job) = jobs.get_mut(&id) {
             job.info.status = "paused".to_string();
-            job.info.finished_at = Some(Local::now().to_rfc3339());
+            job.info.finished_at = Some(Utc::now().to_rfc3339());
             job.info.run_id = run_id;
             job.info.summary = summary;
         }
@@ -361,7 +362,6 @@ fn app_router(state: AppState) -> Router {
             "/api/brush-tasks/{id}/torrents",
             get(list_brush_task_torrents),
         )
-        .route("/api/brush-tasks/cache-stats", get(get_brush_cache_stats))
         .route("/api/system/logs/stream", get(stream_logs))
         // 统计
         .route("/api/stats/overview", get(stats_overview))
@@ -821,12 +821,8 @@ async fn test_site(
         .get_site(id)
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
-    let site_type = SiteType::from_str(&site.site_type)
-        .ok_or_else(|| ApiError::bad_request("不支持的站点类型"))?;
-    let auth: SiteAuth = serde_json::from_str(&site.auth_config)
-        .map_err(|e| ApiError::bad_request(format!("认证配置解析失败: {}", e)))?;
-    let client = create_site_client(site_type, &site.base_url, &auth);
-    let result = client
+    let adapter = site_factory::create_adapter(&site).map_err(ApiError::bad_request)?;
+    let result = adapter
         .test_connection()
         .await
         .map_err(|e| ApiError::internal(e))?;
@@ -842,12 +838,8 @@ async fn get_site_stats(
         .get_site(id)
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
-    let site_type = SiteType::from_str(&site.site_type)
-        .ok_or_else(|| ApiError::bad_request("不支持的站点类型"))?;
-    let auth: SiteAuth = serde_json::from_str(&site.auth_config)
-        .map_err(|e| ApiError::bad_request(format!("认证配置解析失败: {}", e)))?;
-    let client = create_site_client(site_type, &site.base_url, &auth);
-    let stats = client
+    let adapter = site_factory::create_adapter(&site).map_err(ApiError::bad_request)?;
+    let stats = adapter
         .get_user_stats()
         .await
         .map_err(|e| ApiError::internal(e))?;
@@ -855,15 +847,6 @@ async fn get_site_stats(
 }
 
 // ========== Downloaders API ==========
-
-#[derive(Debug, Serialize)]
-struct DownloaderSpaceStats {
-    free_space: u64,
-    pending_download_bytes: u64,
-    effective_free_space: u64,
-    torrent_count: usize,
-    incomplete_count: usize,
-}
 
 #[derive(Debug, Deserialize)]
 struct CreateDownloaderRequest {
@@ -936,9 +919,7 @@ async fn test_downloader(
         .get_downloader(id)
         .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
-    let dl_type = DownloaderType::from_str(&dl.downloader_type)
-        .ok_or_else(|| ApiError::bad_request("不支持的下载器类型"))?;
-    let client = create_downloader_client(dl_type, &dl.url, &dl.username, &dl.password);
+    let client = downloader_factory::create_client(&dl).map_err(ApiError::bad_request)?;
     let result = client
         .test_connection()
         .await
@@ -955,42 +936,18 @@ async fn get_downloader_space_stats(
         .get_downloader(id)
         .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
-    let dl_type = DownloaderType::from_str(&dl.downloader_type)
-        .ok_or_else(|| ApiError::bad_request("不支持的下载器类型"))?;
-    let client = create_downloader_client(dl_type, &dl.url, &dl.username, &dl.password);
-
-    let free_space = client
-        .get_free_space(None)
-        .await
-        .map_err(ApiError::internal)?;
+    let client = downloader_factory::create_client(&dl).map_err(ApiError::bad_request)?;
     let torrents = state
         .collector
         .get_all_torrents(&dl)
         .await
         .map_err(ApiError::internal)?;
+    let stats = client
+        .get_effective_free_space(None, &torrents)
+        .await
+        .map_err(ApiError::internal)?;
 
-    let pending_download_bytes: u64 = torrents
-        .iter()
-        .map(|torrent| {
-            if torrent.completion_on > 0 || torrent.downloaded >= torrent.size {
-                0
-            } else {
-                (torrent.size - torrent.downloaded).max(0) as u64
-            }
-        })
-        .sum();
-    let incomplete_count = torrents
-        .iter()
-        .filter(|torrent| torrent.completion_on <= 0 && torrent.downloaded < torrent.size)
-        .count();
-
-    Ok(Json(DownloaderSpaceStats {
-        free_space,
-        pending_download_bytes,
-        effective_free_space: free_space.saturating_sub(pending_download_bytes),
-        torrent_count: torrents.len(),
-        incomplete_count,
-    }))
+    Ok(Json(stats))
 }
 
 // ========== Brush Tasks API ==========
@@ -1080,7 +1037,7 @@ async fn start_brush_task(
         .scheduler
         .trigger_task(id)
         .await
-        .map_err(|e| ApiError::internal(e))?;
+        .map_err(map_brush_trigger_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1101,7 +1058,7 @@ async fn run_brush_task_once(
         .scheduler
         .trigger_task(id)
         .await
-        .map_err(|e| ApiError::internal(e))?;
+        .map_err(map_brush_trigger_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1150,12 +1107,6 @@ async fn list_brush_task_torrents(
         total_records: torrents.total_records,
         records: torrents.records,
     }))
-}
-
-async fn get_brush_cache_stats(
-    State(state): State<AppState>,
-) -> Result<Json<crate::brush::scheduler::DetailAttrCacheStats>, ApiError> {
-    Ok(Json(state.scheduler.detail_attr_cache_stats().await))
 }
 
 async fn stream_logs() -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>
@@ -1215,8 +1166,8 @@ async fn stats_overview(State(state): State<AppState>) -> Result<Json<StatsOverv
     let mut overviews = Vec::new();
     for task in &tasks {
         // 获取最新的统计快照
-        let now = Local::now().to_rfc3339();
-        let since = (Local::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        let now = Utc::now().to_rfc3339();
+        let since = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
         let snapshots = state
             .db
             .get_task_stats_snapshots(Some(task.id), &since, &now)
@@ -1243,11 +1194,11 @@ async fn stats_trend(
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<Vec<crate::stats::TaskStatsSnapshot>>, ApiError> {
     let hours = q.hours.unwrap_or(24);
-    let until = q.until.unwrap_or_else(|| Local::now().to_rfc3339());
+    let until = q.until.unwrap_or_else(|| Utc::now().to_rfc3339());
     let since = q.since.unwrap_or_else(|| {
         // Stats are sampled periodically, so add a small grace window to avoid
         // dropping the latest bucket on exact boundary cuts like "last 1h".
-        (Local::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
+        (Utc::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
     });
     let data = state
         .db
@@ -1269,9 +1220,9 @@ async fn downloader_speed_trend(
     Query(q): Query<DownloaderStatsQuery>,
 ) -> Result<Json<Vec<crate::stats::DownloaderSpeedSnapshot>>, ApiError> {
     let hours = q.hours.unwrap_or(24);
-    let until = q.until.unwrap_or_else(|| Local::now().to_rfc3339());
+    let until = q.until.unwrap_or_else(|| Utc::now().to_rfc3339());
     let since = q.since.unwrap_or_else(|| {
-        (Local::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
+        (Utc::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
     });
     let data = state
         .db
@@ -1357,6 +1308,14 @@ fn looks_like_info_hash(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn map_brush_trigger_error(message: String) -> ApiError {
+    match message.as_str() {
+        "任务不存在" => ApiError::not_found(message),
+        "任务正在运行中" => ApiError::conflict(message),
+        _ => ApiError::internal(message),
+    }
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -1381,6 +1340,13 @@ impl ApiError {
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }
