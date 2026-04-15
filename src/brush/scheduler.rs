@@ -1078,7 +1078,12 @@ fn apply_attrs_to_item(item: &mut rss::TorrentItem, attrs: &crate::site::Torrent
         item.upload_volume_factor = attrs.upload_volume_factor;
     }
     if attrs.hit_and_run {
-        item.minimum_seed_time.get_or_insert(1);
+        item.minimum_seed_time = Some(1);
+        item.minimum_ratio = None;
+    } else if item.minimum_seed_time.is_none() && item.minimum_ratio.is_none() {
+        // 适配器已明确返回“非 H&R”时，用 0 作为共享链路中的显式否定值，
+        // 避免在后置过滤阶段被当成“缺少 H&R 属性”。
+        item.minimum_seed_time = Some(0);
     }
     if attrs.seeder_count.is_some() {
         item.seeders = attrs.seeder_count;

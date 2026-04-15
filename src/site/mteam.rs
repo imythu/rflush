@@ -1,7 +1,7 @@
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, trace};
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 
 use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
@@ -112,7 +112,7 @@ impl MTeamAdapter {
             .map_err(|e| format!("读取响应失败: {}", e))?;
 
         if path == "/api/torrent/detail" {
-            debug!("M-Team torrent detail response: {}", text);
+            trace!("M-Team torrent detail response: {}", text);
         }
 
         let json: Value =

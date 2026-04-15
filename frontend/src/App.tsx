@@ -21,16 +21,15 @@ import type { DownloadRecord, GlobalConfig, RssSubscription } from "@/types";
 
 const MAX_LOG_LINES = 500;
 const LOG_FLUSH_INTERVAL_MS = 250;
-const LOG_LEVELS = ["all", "trace", "debug", "info", "warn", "error"] as const;
-const LOG_LEVEL_PRIORITY: Record<Exclude<LogLevelFilter, "all">, number> = {
+const LOG_LEVEL_PRIORITY = {
   trace: 10,
   debug: 20,
   info: 30,
   warn: 40,
   error: 50,
-};
+} as const;
 
-type LogLevelFilter = (typeof LOG_LEVELS)[number];
+type LogLevel = keyof typeof LOG_LEVEL_PRIORITY;
 
 type AppPage =
   | "dashboard"
@@ -159,7 +158,7 @@ function getLogsStreamUrl() {
   return `${API_BASE}/api/system/logs/stream`;
 }
 
-function extractLogLevel(line: string): Exclude<LogLevelFilter, "all"> | null {
+function extractLogLevel(line: string): LogLevel | null {
   const normalized = line.toLowerCase();
   if (normalized.includes(" trace ")) return "trace";
   if (normalized.includes(" debug ")) return "debug";
@@ -167,6 +166,14 @@ function extractLogLevel(line: string): Exclude<LogLevelFilter, "all"> | null {
   if (normalized.includes(" warn ")) return "warn";
   if (normalized.includes(" error ")) return "error";
   return null;
+}
+
+function getEffectiveLogLevel(settings: GlobalConfig): LogLevel {
+  const level = settings.log_level?.trim().toLowerCase();
+  if (level && level in LOG_LEVEL_PRIORITY) {
+    return level as LogLevel;
+  }
+  return "info";
 }
 
 export default function App() {
@@ -189,12 +196,12 @@ export default function App() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsConnected, setLogsConnected] = useState(false);
-  const [logLevelFilter, setLogLevelFilter] = useState<LogLevelFilter>("all");
   const [logKeywordFilter, setLogKeywordFilter] = useState("");
   const logsViewportRef = useRef<HTMLDivElement | null>(null);
   const pendingLogsRef = useRef<string[]>([]);
 
   const currentNav = navItems.find((item) => item.key === page) ?? navItems[0];
+  const effectiveLogLevel = getEffectiveLogLevel(settings);
 
   async function loadPageData(targetPage: AppPage) {
     switch (targetPage) {
@@ -311,14 +318,9 @@ export default function App() {
   }, [logsOpen]);
 
   const filteredLogs = logs.filter((line) => {
-    if (logLevelFilter !== "all") {
-      const lineLevel = extractLogLevel(line);
-      if (!lineLevel) {
-        return false;
-      }
-      if (LOG_LEVEL_PRIORITY[lineLevel] < LOG_LEVEL_PRIORITY[logLevelFilter]) {
-        return false;
-      }
+    const lineLevel = extractLogLevel(line);
+    if (lineLevel && LOG_LEVEL_PRIORITY[lineLevel] < LOG_LEVEL_PRIORITY[effectiveLogLevel]) {
+      return false;
     }
 
     if (logKeywordFilter.trim() !== "") {
@@ -666,19 +668,18 @@ export default function App() {
               </Button>
             </div>
           </div>
-          <div className="grid gap-3 sm:grid-cols-[180px_minmax(0,1fr)]">
-            <select
-              className="flex h-11 w-full rounded-2xl border border-border bg-input px-4 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30"
-              value={logLevelFilter}
-              onChange={(event) => setLogLevelFilter(event.target.value as LogLevelFilter)}
-            >
-              <option value="all">全部级别</option>
-              <option value="trace">TRACE</option>
-              <option value="debug">DEBUG</option>
-              <option value="info">INFO</option>
-              <option value="warn">WARN</option>
-              <option value="error">ERROR</option>
-            </select>
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+            <div className="rounded-2xl border border-border bg-surface-container px-4 py-3 text-sm">
+              <div className="flex items-center gap-2">
+                <span className="text-muted">当前日志级别</span>
+                <span className="rounded-full bg-secondary px-2.5 py-1 text-xs font-semibold uppercase text-secondary-foreground">
+                  {effectiveLogLevel}
+                </span>
+              </div>
+              <p className="mt-2 text-xs leading-5 text-muted">
+                实时日志只展示当前系统日志级别及以上的内容。更低级别的日志已被后端日志过滤器抑制，前端不会展示这部分内容。
+              </p>
+            </div>
             <Input
               value={logKeywordFilter}
               onChange={(event) => setLogKeywordFilter(event.target.value)}

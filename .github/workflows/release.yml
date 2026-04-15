@@ -14,9 +14,22 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 2026-04-13-1530), defaults to current UTC time"
+        description: "正式版版本号，例如 0.2.0；留空则自动生成 snapshot 版本"
         required: false
         default: ""
+      prerelease:
+        description: "手动发布时是否标记为预发布"
+        required: false
+        type: boolean
+        default: false
+      release_notes:
+        description: "手动追加的发布说明（可选）"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -24,26 +37,69 @@ permissions:
 
 jobs:
   prepare:
-    name: Determine version
+    name: Determine release metadata
     runs-on: ubuntu-latest
     outputs:
+      base_version: ${{ steps.meta.outputs.base_version }}
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
       image: ${{ steps.meta.outputs.image }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      release_kind: ${{ steps.meta.outputs.release_kind }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      channel_tag: ${{ steps.meta.outputs.channel_tag }}
+      sha_short: ${{ steps.meta.outputs.sha_short }}
+      published_at: ${{ steps.meta.outputs.published_at }}
     steps:
-      - name: Compute version and image name
+      - uses: actions/checkout@v6
+
+      - name: Compute release metadata
         id: meta
         shell: bash
         run: |
+          set -euo pipefail
+
+          BASE_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [[ -z "$BASE_VERSION" ]]; then
+            echo "failed to determine base version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          OWNER_LOWER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          SHA_SHORT=$(git rev-parse --short=7 HEAD)
+          PUBLISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.version }}" ]]; then
             VERSION="${{ inputs.version }}"
+            RELEASE_KIND="manual"
+            if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+              PRERELEASE="true"
+              CHANNEL_TAG="rc"
+              RELEASE_NAME="rflush ${VERSION} (prerelease)"
+            else
+              PRERELEASE="false"
+              CHANNEL_TAG="latest"
+              RELEASE_NAME="rflush ${VERSION}"
+            fi
           else
-            VERSION=$(date -u +%Y-%m-%d-%H%M)
+            UTC_STAMP=$(date -u +%Y%m%d.%H%M)
+            VERSION="${BASE_VERSION}-snapshot.${UTC_STAMP}.${GITHUB_RUN_NUMBER}"
+            RELEASE_KIND="snapshot"
+            PRERELEASE="true"
+            CHANNEL_TAG="edge"
+            RELEASE_NAME="rflush ${VERSION} (snapshot)"
           fi
-          OWNER_LOWER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+
+          echo "base_version=$BASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$OWNER_LOWER/rflush" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_kind=$RELEASE_KIND" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "channel_tag=$CHANNEL_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$SHA_SHORT" >> "$GITHUB_OUTPUT"
+          echo "published_at=$PUBLISHED_AT" >> "$GITHUB_OUTPUT"
 
   frontend:
     name: Build frontend
@@ -205,6 +261,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Prepare Docker tags
+        id: docker_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAGS="${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-${{ matrix.suffix }}"
+          if [[ -n "${{ needs.prepare.outputs.channel_tag }}" ]]; then
+            TAGS="$TAGS"$'\n'"${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.channel_tag }}-${{ matrix.suffix }}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
@@ -212,9 +283,7 @@ jobs:
           file: docker/linux/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: |
-            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-${{ matrix.suffix }}
-            ${{ needs.prepare.outputs.image }}:latest-${{ matrix.suffix }}
+          tags: ${{ steps.docker_meta.outputs.tags }}
 
   docker-linux-manifest:
     name: Docker linux manifest
@@ -234,18 +303,27 @@ jobs:
       - name: Create multi-arch linux manifest
         shell: bash
         run: |
+          set -euo pipefail
           docker buildx imagetools create \
             -t "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}" \
-            -t "${{ needs.prepare.outputs.image }}:latest" \
             "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-amd64" \
             "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-arm64"
 
+          if [[ -n "${{ needs.prepare.outputs.channel_tag }}" ]]; then
+            docker buildx imagetools create \
+              -t "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.channel_tag }}" \
+              "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-amd64" \
+              "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-arm64"
+          fi
+
   release:
     name: Create Release
-    needs: [prepare, build]
+    needs: [prepare, build, docker-linux-manifest]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Download all binary artifacts
         uses: actions/download-artifact@v8
@@ -261,13 +339,76 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Generate release notes
+        shell: bash
+        env:
+          MANUAL_RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          RELEASE_KIND="${{ needs.prepare.outputs.release_kind }}"
+          IMAGE="${{ needs.prepare.outputs.image }}"
+          CHANNEL_TAG="${{ needs.prepare.outputs.channel_tag }}"
+          SHA_SHORT="${{ needs.prepare.outputs.sha_short }}"
+          PUBLISHED_AT="${{ needs.prepare.outputs.published_at }}"
+
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -n1 || true)
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            CHANGE_RANGE="${PREVIOUS_TAG}..HEAD"
+            CHANGE_TITLE="## 变更摘要"
+          else
+            CHANGE_RANGE="HEAD"
+            CHANGE_TITLE="## 变更摘要（首次发布，无历史标签）"
+          fi
+
+          {
+            echo "# ${TAG}"
+            echo
+            echo "## 发版信息"
+            echo "- 版本号：\`${VERSION}\`"
+            echo "- 发布类型：\`${RELEASE_KIND}\`"
+            echo "- 提交：\`${SHA_SHORT}\`"
+            echo "- 分支：\`${GITHUB_REF_NAME}\`"
+            echo "- 发布时间（UTC）：\`${PUBLISHED_AT}\`"
+            echo
+            echo "## 交付物"
+            echo "- GitHub Release 附件：Linux / Windows 多架构二进制包"
+            echo "- 校验文件：\`SHA256SUMS.txt\`"
+            echo "- Docker 镜像：\`${IMAGE}:${VERSION}\`"
+            if [[ -n "$CHANNEL_TAG" ]]; then
+              echo "- 渠道镜像标签：\`${IMAGE}:${CHANNEL_TAG}\`"
+            fi
+            echo
+            echo "## 版本策略"
+            echo "- 自动推送到 \`master\`：生成 snapshot 预发布，版本格式为 \`<base>-snapshot.<UTC时间>.<run_number>\`"
+            echo "- 手动触发并填写 \`version\`：生成手动发布版本，适合正式版或指定版本补发"
+            echo "- Docker 渠道标签：snapshot 使用 \`edge\`，正式版使用 \`latest\`，手动预发布使用 \`rc\`"
+            echo
+            echo "$CHANGE_TITLE"
+            if [[ -n "$PREVIOUS_TAG" ]]; then
+              echo "- 对比范围：\`${PREVIOUS_TAG}..${TAG}\`"
+            fi
+            git log --no-merges --pretty=format:"- %s (%h)" "$CHANGE_RANGE" || true
+            echo
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${MANUAL_RELEASE_NOTES}" ]]; then
+              echo
+              echo "## 手动补充说明"
+              printf '%s\n' "${MANUAL_RELEASE_NOTES}"
+            fi
+          } > artifacts/RELEASE_NOTES.md
+
+          cat artifacts/RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
-          name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          body_path: artifacts/RELEASE_NOTES.md
           files: |
             artifacts/*
-          generate_release_notes: true
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          target_commitish: ${{ github.sha }}
