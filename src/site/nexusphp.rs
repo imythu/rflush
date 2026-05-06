@@ -1,9 +1,9 @@
+use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use tracing::debug;
-use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 
 use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
 use std::future::Future;

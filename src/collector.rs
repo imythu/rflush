@@ -7,8 +7,8 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info};
 
 use crate::db::Database;
-use crate::downloader::{DownloaderRecord, TorrentInfo};
 use crate::downloader::factory;
+use crate::downloader::{DownloaderRecord, TorrentInfo};
 
 #[derive(Debug, Clone)]
 pub struct DownloaderSnapshot {

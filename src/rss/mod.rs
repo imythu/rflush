@@ -392,7 +392,6 @@ fn apply_textual_markers(item: &mut TorrentItem, description: Option<&str>, cate
             item.upload_volume_factor = Some(0.0);
         }
     }
-
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {

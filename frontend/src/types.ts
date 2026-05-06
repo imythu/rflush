@@ -202,6 +202,55 @@ export type BrushTaskRequest = {
   min_disk_space_gb?: number | null;
 };
 
+export type SignInTaskRecord = {
+  id: number;
+  name: string;
+  site_id: number;
+  cron_expression: string;
+  lightpanda_endpoint: string | null;
+  lightpanda_token: string;
+  lightpanda_region: string;
+  browser: string;
+  proxy: string;
+  country: string | null;
+  enabled: boolean;
+  last_status: string | null;
+  last_message: string | null;
+  last_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SignInTaskRequest = {
+  name: string;
+  site_id: number;
+  cron_expression: string;
+  lightpanda_endpoint?: string | null;
+  lightpanda_token: string;
+  lightpanda_region?: "euwest" | "uswest" | string | null;
+  browser?: "lightpanda" | "chrome" | string | null;
+  proxy?: "fast_dc" | "datacenter" | string | null;
+  country?: string | null;
+};
+
+export type SignInRecord = {
+  id: number;
+  task_id: number;
+  site_id: number;
+  site_name: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  message: string;
+};
+
+export type LightpandaProbeResult = {
+  success: boolean;
+  url: string;
+  message: string;
+  title: string | null;
+};
+
 export type BrushTorrentRecord = {
   id: number;
   task_id: number;

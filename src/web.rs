@@ -26,11 +26,12 @@ use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
 use crate::db::{Database, DownloadHistoryRecord, DownloadRunRecord, PaginatedRunRecords};
 use crate::download::naming::sanitize_component;
-use crate::downloader::factory as downloader_factory;
 use crate::downloader::DownloaderSpaceStats;
+use crate::downloader::factory as downloader_factory;
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
+use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
 
 #[derive(Clone)]
@@ -40,6 +41,7 @@ pub struct AppState {
     engine: DownloadEngine,
     jobs: Arc<JobRegistry>,
     scheduler: Arc<BrushScheduler>,
+    sign_in_scheduler: Arc<SignInScheduler>,
     collector: Arc<DownloaderSnapshotCollector>,
 }
 
@@ -136,6 +138,7 @@ impl AppState {
         db: Database,
         engine: DownloadEngine,
         scheduler: Arc<BrushScheduler>,
+        sign_in_scheduler: Arc<SignInScheduler>,
         collector: Arc<DownloaderSnapshotCollector>,
     ) -> Self {
         Self {
@@ -144,6 +147,7 @@ impl AppState {
             engine,
             jobs: Arc::new(JobRegistry::default()),
             scheduler,
+            sign_in_scheduler,
             collector,
         }
     }
@@ -282,13 +286,21 @@ pub async fn serve(
     addr: SocketAddr,
     db: Database,
     scheduler: Arc<BrushScheduler>,
+    sign_in_scheduler: Arc<SignInScheduler>,
     collector: Arc<DownloaderSnapshotCollector>,
 ) -> Result<(), AppError> {
     let engine = DownloadEngine::new(
         base_dir.clone(),
         Arc::new(crate::net::rate_limiter::SharedRateLimiter::new()),
     );
-    let state = AppState::new(base_dir, db, engine, scheduler, collector);
+    let state = AppState::new(
+        base_dir,
+        db,
+        engine,
+        scheduler,
+        sign_in_scheduler,
+        collector,
+    );
     let app = app_router(state);
     let listener = TcpListener::bind(addr)
         .await
@@ -335,6 +347,27 @@ fn app_router(state: AppState) -> Router {
         .route("/api/sites/{id}", put(update_site).delete(delete_site))
         .route("/api/sites/{id}/test", post(test_site))
         .route("/api/sites/{id}/stats", get(get_site_stats))
+        // 自动签到
+        .route(
+            "/api/sign-in-tasks",
+            get(list_sign_in_tasks).post(create_sign_in_task),
+        )
+        .route(
+            "/api/sign-in-tasks/{id}",
+            put(update_sign_in_task).delete(delete_sign_in_task),
+        )
+        .route("/api/sign-in-tasks/{id}/start", post(start_sign_in_task))
+        .route("/api/sign-in-tasks/{id}/stop", post(stop_sign_in_task))
+        .route("/api/sign-in-tasks/{id}/run", post(run_sign_in_task_once))
+        .route(
+            "/api/sign-in-tasks/{id}/probe-1-1-1-1",
+            post(probe_sign_in_task_1_1_1_1),
+        )
+        .route(
+            "/api/sign-in-probe-1-1-1-1",
+            post(probe_sign_in_form_1_1_1_1),
+        )
+        .route("/api/sign-in-records", get(list_sign_in_records))
         // 下载器管理
         .route(
             "/api/downloaders",
@@ -851,6 +884,192 @@ async fn get_site_stats(
     Ok(Json(stats))
 }
 
+// ========== Sign-in API ==========
+
+#[derive(Debug, Deserialize)]
+struct SignInRecordsQuery {
+    task_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn list_sign_in_tasks(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::sign_in::SignInTaskRecord>>, ApiError> {
+    Ok(Json(state.db.list_sign_in_tasks().await?))
+}
+
+async fn create_sign_in_task(
+    State(state): State<AppState>,
+    Json(mut body): Json<crate::sign_in::SignInTaskRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_sign_in_task(&state, &mut body).await?;
+    let id = state.db.create_sign_in_task(&body).await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn update_sign_in_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(mut body): Json<crate::sign_in::SignInTaskRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_sign_in_task(&state, &mut body).await?;
+    state.db.update_sign_in_task(id, &body).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn delete_sign_in_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.sign_in_scheduler.stop_task(id).await;
+    state.db.delete_sign_in_task(id).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn start_sign_in_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.db.set_sign_in_task_enabled(id, true).await?;
+    state
+        .sign_in_scheduler
+        .trigger_task(id)
+        .await
+        .map_err(map_sign_in_trigger_error)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn stop_sign_in_task(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.db.set_sign_in_task_enabled(id, false).await?;
+    state.sign_in_scheduler.stop_task(id).await;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn run_sign_in_task_once(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .sign_in_scheduler
+        .trigger_task(id)
+        .await
+        .map_err(map_sign_in_trigger_error)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn probe_sign_in_task_1_1_1_1(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sign_in::LightpandaProbeResult>, ApiError> {
+    let task = state
+        .db
+        .get_sign_in_task(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("签到任务不存在"))?;
+    let result = crate::sign_in::probe_lightpanda_1_1_1_1(task)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(result))
+}
+
+async fn probe_sign_in_form_1_1_1_1(
+    Json(mut body): Json<crate::sign_in::SignInTaskRequest>,
+) -> Result<Json<crate::sign_in::LightpandaProbeResult>, ApiError> {
+    body.lightpanda_endpoint = body
+        .lightpanda_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    body.lightpanda_token = body.lightpanda_token.trim().to_string();
+    if body.lightpanda_endpoint.is_none() && body.lightpanda_token.is_empty() {
+        return Err(ApiError::bad_request("Lightpanda endpoint 不能为空"));
+    }
+    let result = crate::sign_in::probe_lightpanda_request_1_1_1_1(body)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(result))
+}
+
+async fn list_sign_in_records(
+    State(state): State<AppState>,
+    Query(query): Query<SignInRecordsQuery>,
+) -> Result<Json<Vec<crate::sign_in::SignInRecord>>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .list_sign_in_records(query.task_id, query.limit.unwrap_or(100))
+            .await?,
+    ))
+}
+
+async fn validate_sign_in_task(
+    state: &AppState,
+    body: &mut crate::sign_in::SignInTaskRequest,
+) -> Result<(), ApiError> {
+    body.name = body.name.trim().to_string();
+    body.cron_expression = normalize_cron(&body.cron_expression);
+    body.lightpanda_token = body.lightpanda_token.trim().to_string();
+    body.lightpanda_endpoint = body
+        .lightpanda_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    body.lightpanda_region = Some(
+        body.lightpanda_region
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("euwest")
+            .to_string(),
+    );
+    body.browser = Some(
+        body.browser
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("lightpanda")
+            .to_string(),
+    );
+    body.proxy = Some(
+        body.proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("fast_dc")
+            .to_string(),
+    );
+    body.country = body
+        .country
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if body.name.is_empty() {
+        return Err(ApiError::bad_request("名称不能为空"));
+    }
+    if body.lightpanda_endpoint.is_none() && body.lightpanda_token.is_empty() {
+        return Err(ApiError::bad_request("Lightpanda Token 不能为空"));
+    }
+    body.cron_expression
+        .parse::<cron::Schedule>()
+        .map_err(|e| ApiError::bad_request(format!("无效的cron表达式: {}", e)))?;
+    let site = state
+        .db
+        .get_site(body.site_id)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("所选站点不存在"))?;
+    if site.site_type != "nexusphp" && site.site_type != "nexus_php" {
+        return Err(ApiError::bad_request("自动签到目前仅支持 NexusPHP 站点"));
+    }
+    Ok(())
+}
+
 // ========== Downloaders API ==========
 
 #[derive(Debug, Deserialize)]
@@ -1333,6 +1552,14 @@ fn map_brush_trigger_error(message: String) -> ApiError {
     match message.as_str() {
         "任务不存在" => ApiError::not_found(message),
         "任务正在运行中" => ApiError::conflict(message),
+        _ => ApiError::internal(message),
+    }
+}
+
+fn map_sign_in_trigger_error(message: String) -> ApiError {
+    match message.as_str() {
+        "签到任务不存在" => ApiError::not_found(message),
+        "签到任务正在运行中" => ApiError::conflict(message),
         _ => ApiError::internal(message),
     }
 }

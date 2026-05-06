@@ -9,6 +9,7 @@ use crate::config::{GlobalConfig, RssConfig, RssSubscription, TimeUnit};
 use crate::downloader::DownloaderRecord;
 use crate::error::AppError;
 use crate::history::{FinalStatus, RunHistory, TorrentRunRecord};
+use crate::sign_in::{SignInRecord, SignInResult, SignInTaskRecord, SignInTaskRequest};
 use crate::site::SiteRecord;
 use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
@@ -651,6 +652,249 @@ impl Database {
             conn.execute("DELETE FROM sites WHERE id = ?", params![id])
                 .map_err(sql_error)?;
             Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    // ========== Sign-in Tasks ==========
+
+    pub async fn list_sign_in_tasks(&self) -> Result<Vec<SignInTaskRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
+                     lightpanda_region, browser, proxy, country, enabled, last_status, last_message,
+                     last_run_at, created_at, updated_at
+                     FROM sign_in_tasks ORDER BY id",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], map_sign_in_task)
+                .map_err(sql_error)?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(sql_error)?);
+            }
+            Ok(list)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn get_sign_in_task(&self, id: i64) -> Result<Option<SignInTaskRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.query_row(
+                "SELECT id, name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
+                 lightpanda_region, browser, proxy, country, enabled, last_status, last_message,
+                 last_run_at, created_at, updated_at
+                 FROM sign_in_tasks WHERE id = ?",
+                params![id],
+                map_sign_in_task,
+            )
+            .optional()
+            .map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn create_sign_in_task(&self, req: &SignInTaskRequest) -> Result<i64, AppError> {
+        let path = self.path.clone();
+        let req = req.clone();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "INSERT INTO sign_in_tasks
+                 (name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
+                  lightpanda_region, browser, proxy, country, enabled, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                params![
+                    req.name,
+                    req.site_id,
+                    req.cron_expression,
+                    req.lightpanda_endpoint,
+                    req.lightpanda_token,
+                    req.lightpanda_region
+                        .unwrap_or_else(|| "euwest".to_string()),
+                    req.browser.unwrap_or_else(|| "lightpanda".to_string()),
+                    req.proxy.unwrap_or_else(|| "fast_dc".to_string()),
+                    req.country,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(sql_error)?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn update_sign_in_task(
+        &self,
+        id: i64,
+        req: &SignInTaskRequest,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let req = req.clone();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE sign_in_tasks SET
+                 name = ?, site_id = ?, cron_expression = ?, lightpanda_endpoint = ?, lightpanda_token = ?,
+                 lightpanda_region = ?, browser = ?, proxy = ?, country = ?, updated_at = ?
+                 WHERE id = ?",
+                params![
+                    req.name,
+                    req.site_id,
+                    req.cron_expression,
+                    req.lightpanda_endpoint,
+                    req.lightpanda_token,
+                    req.lightpanda_region.unwrap_or_else(|| "euwest".to_string()),
+                    req.browser.unwrap_or_else(|| "lightpanda".to_string()),
+                    req.proxy.unwrap_or_else(|| "fast_dc".to_string()),
+                    req.country,
+                    now,
+                    id,
+                ],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn delete_sign_in_task(&self, id: i64) -> Result<(), AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute("DELETE FROM sign_in_tasks WHERE id = ?", params![id])
+                .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn set_sign_in_task_enabled(&self, id: i64, enabled: bool) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE sign_in_tasks SET enabled = ?, updated_at = ? WHERE id = ?",
+                params![enabled as i32, now, id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn update_sign_in_task_result(
+        &self,
+        id: i64,
+        status: &str,
+        message: &str,
+        run_at: &str,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let (status, message, run_at) =
+            (status.to_string(), message.to_string(), run_at.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE sign_in_tasks SET last_status = ?, last_message = ?, last_run_at = ?, updated_at = ? WHERE id = ?",
+                params![status, message, run_at, Utc::now().to_rfc3339(), id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn insert_sign_in_record(
+        &self,
+        task: &SignInTaskRecord,
+        site_id: i64,
+        site_name: &str,
+        result: &SignInResult,
+    ) -> Result<i64, AppError> {
+        let path = self.path.clone();
+        let task = task.clone();
+        let site_name = site_name.to_string();
+        let result = result.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "INSERT INTO sign_in_records
+                 (task_id, site_id, site_name, started_at, finished_at, status, message)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    task.id,
+                    site_id,
+                    site_name,
+                    result.started_at,
+                    result.finished_at,
+                    result.status,
+                    result.message
+                ],
+            )
+            .map_err(sql_error)?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn list_sign_in_records(
+        &self,
+        task_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SignInRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let limit = limit.clamp(1, 500) as i64;
+            let mut records = Vec::new();
+            if let Some(task_id) = task_id {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, task_id, site_id, site_name, started_at, finished_at, status, message
+                         FROM sign_in_records WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+                    )
+                    .map_err(sql_error)?;
+                let rows = stmt
+                    .query_map(params![task_id, limit], map_sign_in_record)
+                    .map_err(sql_error)?;
+                for row in rows {
+                    records.push(row.map_err(sql_error)?);
+                }
+            } else {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id, task_id, site_id, site_name, started_at, finished_at, status, message
+                         FROM sign_in_records ORDER BY id DESC LIMIT ?",
+                    )
+                    .map_err(sql_error)?;
+                let rows = stmt
+                    .query_map(params![limit], map_sign_in_record)
+                    .map_err(sql_error)?;
+                for row in rows {
+                    records.push(row.map_err(sql_error)?);
+                }
+            }
+            Ok(records)
         })
         .await
         .map_err(join_error)?
@@ -1592,10 +1836,41 @@ impl Database {
                     recorded_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS sign_in_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+                    cron_expression TEXT NOT NULL,
+                    lightpanda_endpoint TEXT,
+                    lightpanda_token TEXT NOT NULL,
+                    lightpanda_region TEXT NOT NULL DEFAULT 'euwest',
+                    browser TEXT NOT NULL DEFAULT 'lightpanda',
+                    proxy TEXT NOT NULL DEFAULT 'fast_dc',
+                    country TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_status TEXT,
+                    last_message TEXT,
+                    last_run_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS sign_in_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL REFERENCES sign_in_tasks(id) ON DELETE CASCADE,
+                    site_id INTEGER NOT NULL,
+                    site_name TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_brush_task_torrents_task ON brush_task_torrents(task_id, status);
                 CREATE INDEX IF NOT EXISTS idx_task_stats_task ON task_stats_snapshots(task_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_torrent_traffic_lookup ON torrent_traffic(task_id, torrent_hash, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_downloader_speed_snapshots_lookup ON downloader_speed_snapshots(downloader_id, recorded_at);
+                CREATE INDEX IF NOT EXISTS idx_sign_in_records_lookup ON sign_in_records(task_id, finished_at);
                 ",
             )
             .map_err(sql_error)?;
@@ -1788,6 +2063,40 @@ fn map_rss_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSubscrip
         enabled: row.get::<_, i64>(3)? != 0,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+    })
+}
+
+fn map_sign_in_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInTaskRecord> {
+    Ok(SignInTaskRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        site_id: row.get(2)?,
+        cron_expression: row.get(3)?,
+        lightpanda_endpoint: row.get(4)?,
+        lightpanda_token: row.get(5)?,
+        lightpanda_region: row.get(6)?,
+        browser: row.get(7)?,
+        proxy: row.get(8)?,
+        country: row.get(9)?,
+        enabled: row.get::<_, i32>(10)? != 0,
+        last_status: row.get(11)?,
+        last_message: row.get(12)?,
+        last_run_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+    })
+}
+
+fn map_sign_in_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInRecord> {
+    Ok(SignInRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        site_id: row.get(2)?,
+        site_name: row.get(3)?,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+        status: row.get(6)?,
+        message: row.get(7)?,
     })
 }
 

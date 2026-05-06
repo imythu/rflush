@@ -16,6 +16,7 @@ const DEPENDENCY_LOG_DIRECTIVES: &[&str] = &[
     "h2=info",
     "reqwest=info",
     "rustls=info",
+    "tungstenite=info",
 ];
 const LOG_CHANNEL_CAPACITY: usize = 1024;
 
@@ -146,13 +147,14 @@ impl BroadcastWriter {
             return;
         }
 
-        let _ = self.sender.send(strip_ansi_sequences(&text));
+        let redacted = redact_sensitive_values(&strip_ansi_sequences(&text));
+        let _ = writeln!(io::stdout(), "{redacted}");
+        let _ = self.sender.send(redacted);
     }
 }
 
 impl Write for BroadcastWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        io::stdout().write_all(buf)?;
         self.pending.extend_from_slice(buf);
         self.flush_lines(false);
         Ok(buf.len())
@@ -192,5 +194,32 @@ fn strip_ansi_sequences(input: &str) -> String {
         output.push(ch);
     }
 
+    output
+}
+
+fn redact_sensitive_values(input: &str) -> String {
+    redact_query_value(input, "token")
+}
+
+fn redact_query_value(input: &str, key: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let pattern = format!("{key}=");
+    let mut rest = input;
+
+    while let Some(index) = rest.find(&pattern) {
+        let (before, after_before) = rest.split_at(index);
+        output.push_str(before);
+        output.push_str(&pattern);
+        output.push_str("[REDACTED]");
+
+        let value_start = pattern.len();
+        let after_value_start = &after_before[value_start..];
+        let value_end = after_value_start
+            .find(|ch| matches!(ch, '&' | ' ' | '\t' | '\r' | '\n'))
+            .unwrap_or(after_value_start.len());
+        rest = &after_value_start[value_end..];
+    }
+
+    output.push_str(rest);
     output
 }

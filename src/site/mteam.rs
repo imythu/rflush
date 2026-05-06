@@ -1,8 +1,8 @@
+use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 use tracing::{debug, trace};
-use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 
 use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
 use std::future::Future;
@@ -350,5 +350,7 @@ fn simple_random_ms(max_ms: u64) -> u64 {
 fn parse_mteam_datetime(value: &str) -> Option<i64> {
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()?;
     let tz = FixedOffset::east_opt(8 * 3600)?;
-    tz.from_local_datetime(&naive).single().map(|dt| dt.timestamp())
+    tz.from_local_datetime(&naive)
+        .single()
+        .map(|dt| dt.timestamp())
 }

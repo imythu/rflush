@@ -13,8 +13,8 @@ use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
 use crate::downloader::factory;
 use crate::rss;
-use crate::site::factory as site_factory;
 use crate::site::SiteAdapter;
+use crate::site::factory as site_factory;
 
 use super::cleaner;
 
@@ -23,7 +23,6 @@ enum FilterStage {
     RssPreFilter,
     PostEnhancement,
 }
-
 
 /// 调度器状态
 pub struct BrushScheduler {
@@ -360,7 +359,8 @@ async fn execute_brush_task(
         .get_effective_free_space(task.save_dir.as_deref(), &downloader_torrents)
         .await
         .ok();
-    let mut effective_free_space_bytes = space_stats.as_ref().map(|stats| stats.effective_free_space);
+    let mut effective_free_space_bytes =
+        space_stats.as_ref().map(|stats| stats.effective_free_space);
 
     if let Some(min_disk_space_gb) = task.min_disk_space_gb {
         let min_disk_space_bytes = gb_to_bytes(min_disk_space_gb);
@@ -497,10 +497,8 @@ async fn execute_brush_task(
                             }
                         },
                         Ok(None) => {
-                            let message = format!(
-                                "[刷流][{}] 站点不存在: site_id={}",
-                                task.name, site_id
-                            );
+                            let message =
+                                format!("[刷流][{}] 站点不存在: site_id={}", task.name, site_id);
                             error!("{}", message);
                             return Err(message);
                         }

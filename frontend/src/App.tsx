@@ -9,6 +9,7 @@ import {
   History,
   LayoutDashboard,
   Menu,
+  CalendarCheck,
   Settings,
   X,
 } from "lucide-react";
@@ -40,6 +41,7 @@ type AppPage =
   | "sites"
   | "downloaders"
   | "brush-tasks"
+  | "sign-in"
   | "stats"
   | "system-settings";
 
@@ -52,6 +54,7 @@ const TasksPage = lazy(() => import("@/pages/tasks-page").then((module) => ({ de
 const SitesPage = lazy(() => import("@/pages/sites-page").then((module) => ({ default: module.SitesPage })));
 const DownloadersPage = lazy(() => import("@/pages/downloaders-page").then((module) => ({ default: module.DownloadersPage })));
 const BrushTasksPage = lazy(() => import("@/pages/brush-tasks-page").then((module) => ({ default: module.BrushTasksPage })));
+const SignInPage = lazy(() => import("@/pages/sign-in-page").then((module) => ({ default: module.SignInPage })));
 const StatsPage = lazy(() => import("@/pages/stats-page").then((module) => ({ default: module.StatsPage })));
 const SystemSettingsPage = lazy(() =>
   import("@/pages/system-settings-page").then((module) => ({ default: module.SystemSettingsPage })),
@@ -83,6 +86,13 @@ const navItems: Array<{
     label: "刷流任务",
     description: "自动刷流任务配置、选种与删种规则",
     icon: Download,
+    group: "brush",
+  },
+  {
+    key: "sign-in",
+    label: "自动签到",
+    description: "NexusPHP 站点自动签到任务与执行记录",
+    icon: CalendarCheck,
     group: "brush",
   },
   {
@@ -139,6 +149,7 @@ function readPageFromHash(): AppPage {
     "sites",
     "downloaders",
     "brush-tasks",
+    "sign-in",
     "stats",
     "system-settings",
   ];
@@ -646,6 +657,7 @@ export default function App() {
               {page === "sites" ? <SitesPage /> : null}
               {page === "downloaders" ? <DownloadersPage /> : null}
               {page === "brush-tasks" ? <BrushTasksPage /> : null}
+              {page === "sign-in" ? <SignInPage /> : null}
               {page === "stats" ? <StatsPage /> : null}
               {page === "system-settings" ? (
                 <SystemSettingsPage settings={settings} setSettings={setSettings} saving={saving} onSave={saveSettings} />

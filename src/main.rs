@@ -11,6 +11,7 @@ mod history;
 mod logging;
 mod net;
 mod rss;
+mod sign_in;
 mod site;
 mod stats;
 mod web;
@@ -68,15 +69,34 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         scheduler_ref.start().await;
     });
 
-    let web_result = web::serve(base_dir, listen_addr, db, scheduler, collector).await;
+    let sign_in_scheduler = std::sync::Arc::new(sign_in::scheduler::SignInScheduler::new(
+        db.clone(),
+        base_dir.clone(),
+    ));
+    let sign_in_scheduler_ref = sign_in_scheduler.clone();
+    let sign_in_scheduler_handle = tokio::spawn(async move {
+        sign_in_scheduler_ref.start().await;
+    });
+
+    let web_result = web::serve(
+        base_dir,
+        listen_addr,
+        db,
+        scheduler,
+        sign_in_scheduler,
+        collector,
+    )
+    .await;
 
     collector_handle.abort();
     stats_handle.abort();
     scheduler_handle.abort();
+    sign_in_scheduler_handle.abort();
 
     let _ = collector_handle.await;
     let _ = stats_handle.await;
     let _ = scheduler_handle.await;
+    let _ = sign_in_scheduler_handle.await;
 
     web_result
 }
