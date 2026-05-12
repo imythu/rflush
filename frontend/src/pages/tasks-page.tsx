@@ -6,7 +6,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import { formatDate } from "@/lib/format";
+import { formatDate, statusBadge } from "@/lib/format";
 import type { DownloadRecord, RssSubscription, TaskRecordsResponse } from "@/types";
 
 type TaskForm = {
@@ -93,210 +93,190 @@ export function TasksPage({
   return (
     <>
       <div className="grid gap-4 xl:gap-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>任务管理</CardTitle>
-            <CardDescription>RSS 订阅现在直接作为任务管理，支持自动启动、暂停、批量操作和按任务查看历史。</CardDescription>
+        <Card className="rounded-[22px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-lg">任务管理</CardTitle>
+            <CardDescription className="text-[11px]">配置 RSS 订阅任务及其自动化策略。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid gap-3 xl:grid-cols-[220px_minmax(0,1fr)_auto]">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[200px_1fr_auto]">
               <Input
+                className="h-10 rounded-xl bg-background/50 border-border/50 text-[13px]"
                 placeholder="任务名称"
                 value={form.name}
                 onChange={(event) => setForm((prev) => ({ ...prev, name: event.target.value }))}
               />
               <Input
+                className="h-10 rounded-xl bg-background/50 border-border/50 text-[13px]"
                 placeholder="RSS 地址"
                 value={form.url}
                 onChange={(event) => setForm((prev) => ({ ...prev, url: event.target.value }))}
               />
-              <Button className="w-full xl:w-auto" onClick={() => void onAddTask()}>
+              <Button className="h-10 rounded-xl px-6 font-semibold shadow-glow sm:col-span-2 lg:col-span-1" onClick={() => void onAddTask()}>
                 <Plus className="mr-2 h-4 w-4" />
                 添加任务
               </Button>
             </div>
 
-            <label className="flex items-center gap-3 text-sm text-muted">
-              <input
-                type="checkbox"
-                className="h-4 w-4 rounded border border-border accent-[hsl(var(--primary))]"
-                checked={form.autoStart}
-                onChange={(event) => setForm((prev) => ({ ...prev, autoStart: event.target.checked }))}
-              />
-              添加后自动启动
-            </label>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>批量操作</CardTitle>
-            <CardDescription>支持对全部任务或当前勾选任务执行启动、暂停、删除。</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={() => void onStartAll()}>
-                <Play className="mr-2 h-4 w-4" />
-                启动全部
-              </Button>
-              <Button variant="secondary" onClick={() => void onPauseAll()}>
-                <Pause className="mr-2 h-4 w-4" />
-                暂停全部
-              </Button>
-              <Button variant="destructive" onClick={() => void onDeleteAll()}>
-                <Trash2 className="mr-2 h-4 w-4" />
-                删除全部
-              </Button>
-            </div>
-
-            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-              <div className="flex flex-wrap gap-2">
-                <Button variant="outline" disabled={selectedIds.length === 0} onClick={() => void onStartSelected()}>
-                  <Play className="mr-2 h-4 w-4" />
-                  启动所选
-                </Button>
-                <Button variant="outline" disabled={selectedIds.length === 0} onClick={() => void onPauseSelected()}>
-                  <Pause className="mr-2 h-4 w-4" />
-                  暂停所选
-                </Button>
-                <Button variant="destructive" disabled={selectedIds.length === 0} onClick={() => void onDeleteSelected()}>
-                  <Trash2 className="mr-2 h-4 w-4" />
-                  删除所选
-                </Button>
-              </div>
-
-              <label className="flex items-center gap-3 text-sm text-muted">
+            <div className="flex items-center justify-between px-1">
+              <label className="flex items-center gap-3 cursor-pointer group">
                 <input
                   type="checkbox"
-                  className="h-4 w-4 rounded border border-border accent-[hsl(var(--primary))]"
-                  checked={deleteFiles}
-                  onChange={(event) => setDeleteFiles(event.target.checked)}
+                  className="h-4 w-4 rounded border border-border accent-[hsl(var(--primary))] transition-all group-hover:scale-110"
+                  checked={form.autoStart}
+                  onChange={(event) => setForm((prev) => ({ ...prev, autoStart: event.target.checked }))}
                 />
-                删除任务时同时删除已下载种子文件
+                <span className="text-xs text-muted-foreground group-hover:text-foreground transition-colors font-medium">添加后自动启动任务</span>
               </label>
             </div>
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>任务列表</CardTitle>
-            <CardDescription>可单个操作，也可勾选多项后批量处理；任务记录支持弹窗分页查看。</CardDescription>
+        <Card className="rounded-[22px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-lg">批量操作</CardTitle>
+            <CardDescription className="text-[11px]">对全部或勾选任务执行统一操作。</CardDescription>
           </CardHeader>
-          <CardContent>
-            <div className="hidden xl:block">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>
-                      <input
-                        type="checkbox"
-                        className="h-4 w-4 rounded border border-border accent-[hsl(var(--primary))]"
-                        checked={allSelected}
-                        onChange={(event) => toggleAll(event.target.checked)}
-                      />
-                    </TableHead>
-                    <TableHead>任务</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead>地址</TableHead>
-                    <TableHead>更新时间</TableHead>
-                    <TableHead>操作</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {tasks.map((task) => {
-                    return (
-                      <TableRow key={task.id}>
-                        <TableCell>
-                          <input
-                            type="checkbox"
-                            className="h-4 w-4 rounded border border-border accent-[hsl(var(--primary))]"
-                            checked={selectedIds.includes(task.id)}
-                            onChange={(event) => toggleSelection(task.id, event.target.checked)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <div className="font-medium">{task.name}</div>
-                          <div className="text-xs text-muted">#{task.id}</div>
-                        </TableCell>
-                        <TableCell>
-                          <div className="flex flex-wrap gap-2">
-                            <span className={`rounded-full px-3 py-1 text-xs font-medium ${task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
-                              {task.enabled ? "已启用" : "已暂停"}
-                            </span>
-                          </div>
-                        </TableCell>
-                        <TableCell className="max-w-[420px] truncate">{task.url}</TableCell>
-                        <TableCell>{formatDate(task.updated_at)}</TableCell>
-                        <TableCell>
-                          <div className="flex flex-wrap gap-2">
-                            <Button variant="secondary" onClick={() => void onStartTask(task.id)}>
-                              <Play className="mr-2 h-4 w-4" />
-                              启动
-                            </Button>
-                            <Button variant="outline" onClick={() => void onPauseTask(task.id)}>
-                              <Pause className="mr-2 h-4 w-4" />
-                              暂停
-                            </Button>
-                            <Button variant="outline" onClick={() => { setSelectedTask(task); setPage(1); }}>
-                              <Eye className="mr-2 h-4 w-4" />
-                              记录
-                            </Button>
-                            <Button variant="destructive" onClick={() => void onDeleteTask(task.id)}>
-                              <Trash2 className="mr-2 h-4 w-4" />
-                              删除
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
+          <CardContent className="space-y-5">
+            <div className="space-y-2">
+              <div className="text-[10px] font-black uppercase tracking-wider text-primary/70 px-1">全量控制</div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" className="h-8 rounded-xl text-xs" onClick={() => void onStartAll()}>
+                  <Play className="mr-2 h-3.5 w-3.5" />
+                  全部启动
+                </Button>
+                <Button size="sm" variant="secondary" className="h-8 rounded-xl text-xs" onClick={() => void onPauseAll()}>
+                  <Pause className="mr-2 h-3.5 w-3.5" />
+                  全部暂停
+                </Button>
+                <Button size="sm" variant="destructive" className="h-8 rounded-xl text-xs bg-destructive/10 text-destructive hover:bg-destructive/20 border-none" onClick={() => void onDeleteAll()}>
+                  <Trash2 className="mr-2 h-3.5 w-3.5" />
+                  全部删除
+                </Button>
+              </div>
             </div>
 
-            <div className="grid gap-3 xl:hidden">
+            <div className="space-y-3 pt-2 border-t border-border/30">
+              <div className="flex items-center justify-between px-1">
+                <div className="text-[10px] font-black uppercase tracking-wider text-primary/70">勾选控制 ({selectedIds.length})</div>
+                <label className="flex items-center gap-2 cursor-pointer group">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 rounded border border-border accent-[hsl(var(--primary))] transition-all group-hover:scale-110"
+                    checked={deleteFiles}
+                    onChange={(event) => setDeleteFiles(event.target.checked)}
+                  />
+                  <span className="text-[10px] text-muted-foreground group-hover:text-foreground transition-colors">同时删除种子文件</span>
+                </label>
+              </div>
+              
+              <div className="flex flex-wrap gap-2">
+                <Button 
+                  size="sm" 
+                  variant="outline" 
+                  className="h-8 rounded-xl text-xs border-border/50 bg-background/50" 
+                  disabled={selectedIds.length === 0} 
+                  onClick={() => void onStartSelected()}
+                >
+                  <Play className="mr-2 h-3.5 w-3.5" />
+                  启动所选
+                </Button>
+                <Button 
+                  size="sm" 
+                  variant="outline" 
+                  className="h-8 rounded-xl text-xs border-border/50 bg-background/50" 
+                  disabled={selectedIds.length === 0} 
+                  onClick={() => void onPauseSelected()}
+                >
+                  <Pause className="mr-2 h-3.5 w-3.5" />
+                  暂停所选
+                </Button>
+                <Button 
+                  size="sm" 
+                  variant="destructive" 
+                  className="h-8 rounded-xl text-xs bg-destructive/10 text-destructive hover:bg-destructive/20 border-none" 
+                  disabled={selectedIds.length === 0} 
+                  onClick={() => void onDeleteSelected()}
+                >
+                  <Trash2 className="mr-2 h-3.5 w-3.5" />
+                  删除所选
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="rounded-[22px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+          <CardHeader className="pb-3 flex flex-row items-center justify-between space-y-0">
+            <div>
+              <CardTitle className="text-lg">任务列表</CardTitle>
+              <CardDescription className="text-[10px]">管理当前已配置的 RSS 订阅任务。</CardDescription>
+            </div>
+            <label className="flex items-center gap-2 cursor-pointer group bg-background/40 px-3 py-1.5 rounded-full border border-border/50 transition-all hover:bg-background/60">
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 rounded border border-border accent-[hsl(var(--primary))] transition-all group-hover:scale-110"
+                checked={allSelected}
+                onChange={(event) => toggleAll(event.target.checked)}
+              />
+              <span className="text-[10px] font-bold text-primary group-hover:text-primary/80 transition-colors">全选</span>
+            </label>
+          </CardHeader>
+          <CardContent>
+            <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
               {tasks.map((task) => {
                 return (
-                  <div key={task.id} className="rounded-2xl border border-border bg-surface-container/70 p-4">
+                  <div key={task.id} className="rounded-[20px] border border-border bg-surface-container/30 p-3.5 shadow-sm transition-all hover:bg-surface-container/50">
                     <div className="flex items-start justify-between gap-3">
-                      <div className="flex items-start gap-3">
+                      <div className="flex items-start gap-2.5 min-w-0">
                         <input
                           type="checkbox"
-                          className="mt-1 h-4 w-4 rounded border border-border accent-[hsl(var(--primary))]"
+                          className="mt-1 h-3.5 w-3.5 rounded border border-border accent-[hsl(var(--primary))] shrink-0"
                           checked={selectedIds.includes(task.id)}
                           onChange={(event) => toggleSelection(task.id, event.target.checked)}
                         />
-                        <div>
-                          <div className="font-semibold">{task.name}</div>
-                          <div className="text-xs text-muted">#{task.id}</div>
+                        <div className="min-w-0">
+                          <div className="text-[13px] font-semibold truncate text-foreground">{task.name}</div>
+                          <div className="text-[10px] text-muted-foreground mt-0.5">#{task.id}</div>
                         </div>
                       </div>
-                      <div className="flex flex-wrap justify-end gap-2">
-                        <span className={`rounded-full px-3 py-1 text-xs font-medium ${task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
-                          {task.enabled ? "已启用" : "已暂停"}
-                        </span>
-                      </div>
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${task.enabled ? "bg-emerald-500/10 text-emerald-500" : "bg-amber-500/10 text-amber-500"}`}>
+                        {task.enabled ? "已启用" : "已暂停"}
+                      </span>
                     </div>
-                    <div className="mt-3 break-all text-sm text-muted">{task.url}</div>
-                    <div className="mt-3 text-xs text-muted">更新时间：{formatDate(task.updated_at)}</div>
-                    <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                      <Button variant="secondary" onClick={() => void onStartTask(task.id)}>
-                        <Play className="mr-2 h-4 w-4" />
+                    
+                    <div className="mt-2.5 break-all text-[11px] text-muted-foreground line-clamp-1">{task.url}</div>
+                    <div className="mt-1.5 text-[10px] text-muted-foreground">更新：{formatDate(task.updated_at)}</div>
+                    
+                    <div className="mt-3.5 flex flex-wrap gap-1.5">
+                      <button 
+                        onClick={() => void onStartTask(task.id)}
+                        className="h-7 px-2.5 rounded-lg text-[10px] font-medium bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 transition-colors flex items-center"
+                      >
+                        <Play className="mr-1 h-3 w-3" />
                         启动
-                      </Button>
-                      <Button variant="outline" onClick={() => void onPauseTask(task.id)}>
-                        <Pause className="mr-2 h-4 w-4" />
+                      </button>
+                      <button 
+                        onClick={() => void onPauseTask(task.id)}
+                        className="h-7 px-2.5 rounded-lg text-[10px] font-medium bg-surface-container-highest text-foreground hover:bg-surface-container-highest/80 transition-colors flex items-center"
+                      >
+                        <Pause className="mr-1 h-3 w-3" />
                         暂停
-                      </Button>
-                      <Button variant="outline" onClick={() => { setSelectedTask(task); setPage(1); }}>
-                        <Eye className="mr-2 h-4 w-4" />
-                        查看记录
-                      </Button>
-                      <Button variant="destructive" onClick={() => void onDeleteTask(task.id)}>
-                        <Trash2 className="mr-2 h-4 w-4" />
+                      </button>
+                      <button 
+                        onClick={() => { setSelectedTask(task); setPage(1); }}
+                        className="h-7 px-2.5 rounded-lg text-[10px] font-medium border border-border text-foreground hover:bg-accent transition-colors flex items-center"
+                      >
+                        <Eye className="mr-1 h-3 w-3" />
+                        记录
+                      </button>
+                      <button 
+                        onClick={() => void onDeleteTask(task.id)}
+                        className="h-7 px-2.5 rounded-lg text-[10px] font-medium bg-destructive/10 text-destructive hover:bg-destructive/20 transition-colors flex items-center"
+                      >
+                        <Trash2 className="mr-1 h-3 w-3" />
                         删除
-                      </Button>
+                      </button>
                     </div>
                   </div>
                 );

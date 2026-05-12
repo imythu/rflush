@@ -13,6 +13,7 @@ export const defaultSettings: GlobalConfig = {
   max_concurrent_downloads: 32,
   max_concurrent_rss_fetches: 8,
   log_level: "info",
+  proxy: null,
 };
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {

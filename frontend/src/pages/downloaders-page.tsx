@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -307,44 +308,45 @@ export function DownloadersPage() {
                 {downloaders.map((d) => (
                   <div
                     key={d.id}
-                    className="rounded-2xl border border-border bg-surface-container/70 p-4"
+                    className="rounded-[20px] border border-border bg-surface-container/70 p-3.5 shadow-sm"
                   >
                     <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="font-medium">{d.name}</div>
-                        <div className="mt-1 text-xs text-muted">#{d.id}</div>
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium text-sm truncate">{d.name}</div>
+                        <div className="mt-0.5 text-[11px] text-muted">#{d.id}</div>
                       </div>
-                      <span className="rounded-full bg-violet-100 px-3 py-1 text-xs font-medium text-violet-700">
+                      <span className="shrink-0 rounded-full bg-violet-100 px-2.5 py-0.5 text-[11px] font-medium text-violet-700">
                         {d.downloader_type}
                       </span>
                     </div>
-                    <div className="mt-3 grid gap-2 text-xs text-muted sm:grid-cols-2">
-                      <div className="truncate">URL：{d.url}</div>
-                      <div>创建时间：{formatDate(d.created_at)}</div>
+                    <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2">
+                      <div className="truncate">URL: {d.url}</div>
+                      <div>创建时间: {formatDate(d.created_at)}</div>
                     </div>
                     {spaceStats[d.id] ? (
-                      <div className="mt-3 grid gap-2 text-xs text-muted sm:grid-cols-2">
-                        <div>当前空闲：{formatBytes(spaceStats[d.id].free_space)}</div>
-                        <div>未完成剩余：{formatBytes(spaceStats[d.id].pending_download_bytes)}</div>
-                        <div>预测可用：{formatBytes(spaceStats[d.id].effective_free_space)}</div>
-                        <div>未完成数：{spaceStats[d.id].incomplete_count} / 总数：{spaceStats[d.id].torrent_count}</div>
+                      <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2">
+                        <div>空闲: {formatBytes(spaceStats[d.id].free_space)}</div>
+                        <div>未完成剩余: {formatBytes(spaceStats[d.id].pending_download_bytes)}</div>
+                        <div>预测可用: {formatBytes(spaceStats[d.id].effective_free_space)}</div>
+                        <div>未完成: {spaceStats[d.id].incomplete_count} / 总数: {spaceStats[d.id].torrent_count}</div>
                       </div>
                     ) : null}
                     <div className="mt-3 flex flex-wrap gap-2">
                       <Button
                         variant="outline"
+                        className="h-7 text-[11px] px-2.5"
                         disabled={testing === d.id}
                         onClick={() => handleTest(d.id)}
                       >
-                        <TestTubeDiagonal className="mr-2 h-4 w-4" />
+                        <TestTubeDiagonal className="mr-1.5 h-3.5 w-3.5" />
                         {testing === d.id ? "测试中..." : "测试连接"}
                       </Button>
-                      <Button variant="outline" onClick={() => openEdit(d)}>
-                        <Edit className="mr-2 h-4 w-4" />
+                      <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openEdit(d)}>
+                        <Edit className="mr-1.5 h-3.5 w-3.5" />
                         编辑
                       </Button>
-                      <Button variant="destructive" onClick={() => setDeleteTarget(d)}>
-                        <Trash2 className="mr-2 h-4 w-4" />
+                      <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteTarget(d)}>
+                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
                         删除
                       </Button>
                     </div>
@@ -382,15 +384,12 @@ export function DownloadersPage() {
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="dl-type">类型</Label>
-            <select
-              id="dl-type"
+            <Label>类型</Label>
+            <Select
               value={form.downloader_type}
-              onChange={(e) => setForm((prev) => ({ ...prev, downloader_type: e.target.value }))}
-              className="flex h-11 w-full rounded-2xl border border-border bg-input px-4 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30"
-            >
-              <option value="qbittorrent">qBittorrent</option>
-            </select>
+              onChange={(val) => setForm((prev) => ({ ...prev, downloader_type: val }))}
+              options={[{ value: "qbittorrent", label: "qBittorrent" }]}
+            />
           </div>
 
           <div className="space-y-2">

@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
@@ -316,73 +317,73 @@ export function BrushTasksPage() {
             ) : (
               <div className="grid gap-3">
                 {tasks.map((task) => (
-                  <div key={task.id} className="rounded-2xl border border-border bg-surface-container/70 p-4">
+                  <div key={task.id} className="rounded-[20px] border border-border bg-surface-container/70 p-3.5 shadow-sm">
                     <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
-                          <span className="font-semibold">{task.name}</span>
+                          <span className="font-semibold text-sm truncate">{task.name}</span>
                           <span
-                            className={`rounded-full px-3 py-1 text-xs font-medium ${
+                            className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
                               task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
                             }`}
                           >
                             {task.enabled ? "运行中" : "已停止"}
                           </span>
                         </div>
-                        <div className="mt-1 text-xs text-muted">#{task.id}</div>
+                        <div className="mt-0.5 text-[11px] text-muted">#{task.id}</div>
                       </div>
                       <div className="flex flex-wrap gap-2">
                         {task.enabled ? (
-                          <Button variant="outline" onClick={() => void handleStop(task.id)}>
-                            <Pause className="mr-2 h-4 w-4" />
+                          <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => void handleStop(task.id)}>
+                            <Pause className="mr-1.5 h-3.5 w-3.5" />
                             停止
                           </Button>
                         ) : (
-                          <Button variant="secondary" onClick={() => void handleStart(task.id)}>
-                            <Play className="mr-2 h-4 w-4" />
+                          <Button variant="secondary" className="h-7 text-[11px] px-2.5" onClick={() => void handleStart(task.id)}>
+                            <Play className="mr-1.5 h-3.5 w-3.5" />
                             启动
                           </Button>
                         )}
-                        <Button variant="outline" onClick={() => void handleRunOnce(task.id)}>
-                          <Zap className="mr-2 h-4 w-4" />
+                        <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => void handleRunOnce(task.id)}>
+                          <Zap className="mr-1.5 h-3.5 w-3.5" />
                           立即执行一次
                         </Button>
-                        <Button variant="outline" onClick={() => openEdit(task)}>
-                          <Edit className="mr-2 h-4 w-4" />
+                        <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openEdit(task)}>
+                          <Edit className="mr-1.5 h-3.5 w-3.5" />
                           编辑
                         </Button>
-                        <Button variant="outline" onClick={() => openTorrents(task)}>
-                          <Eye className="mr-2 h-4 w-4" />
+                        <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openTorrents(task)}>
+                          <Eye className="mr-1.5 h-3.5 w-3.5" />
                           查看种子
                         </Button>
-                        <Button variant="destructive" onClick={() => setDeleteConfirmId(task.id)}>
-                          <Trash2 className="mr-2 h-4 w-4" />
+                        <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteConfirmId(task.id)}>
+                          <Trash2 className="mr-1.5 h-3.5 w-3.5" />
                           删除
                         </Button>
                       </div>
                     </div>
 
-                    <div className="mt-3 grid gap-2 text-sm text-muted sm:grid-cols-2 xl:grid-cols-4">
-                      <div>
-                        <span className="font-medium text-foreground">Cron：</span>
+                    <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2 xl:grid-cols-4">
+                      <div className="truncate">
+                        <span className="font-medium text-foreground">Cron: </span>
                         {task.cron_expression}
                       </div>
-                      <div>
-                        <span className="font-medium text-foreground">站点：</span>
+                      <div className="truncate">
+                        <span className="font-medium text-foreground">站点: </span>
                         {sites.find((site) => site.id === task.site_id)?.name ?? (task.site_id ? `#${task.site_id}` : "未绑定")}
                       </div>
-                      <div>
-                        <span className="font-medium text-foreground">标签：</span>
+                      <div className="truncate">
+                        <span className="font-medium text-foreground">标签: </span>
                         {task.tag}
                       </div>
                       <div className="sm:col-span-2 truncate">
-                        <span className="font-medium text-foreground">RSS：</span>
+                        <span className="font-medium text-foreground">RSS: </span>
                         {task.rss_url}
                       </div>
                     </div>
 
-                    <div className="mt-2 text-xs text-muted">
-                      创建：{formatDate(task.created_at)} · 更新：{formatDate(task.updated_at)}
+                    <div className="mt-2 text-[11px] text-muted">
+                      创建: {formatDate(task.created_at)} · 更新: {formatDate(task.updated_at)}
                     </div>
                   </div>
                 ))}
@@ -430,36 +431,27 @@ export function BrushTasksPage() {
               </div>
               <div className="space-y-2">
                 <Label>站点</Label>
-                <select
-                  className={selectClass}
-                  value={form.site_id ?? ""}
-                  onChange={(e) => setField("site_id", e.target.value === "" ? null : Number(e.target.value))}
-                >
-                  {sites.length === 0 ? <option value="">请先添加站点</option> : null}
-                  {sites.map((site) => (
-                    <option key={site.id} value={site.id}>
-                      {site.name} ({site.site_type})
-                    </option>
-                  ))}
-                </select>
+                <Select
+                  value={form.site_id ? String(form.site_id) : ""}
+                  onChange={(val) => setField("site_id", val === "" ? null : Number(val))}
+                  options={
+                    sites.length === 0
+                      ? [{ value: "", label: "请先添加站点" }]
+                      : sites.map((site) => ({ value: String(site.id), label: `${site.name} (${site.site_type})` }))
+                  }
+                />
               </div>
               <div className="space-y-2">
                 <Label>下载器</Label>
-                <select
-                  className={selectClass}
-                  value={form.downloader_id}
-                  onChange={(e) => setField("downloader_id", Number(e.target.value))}
-                >
-                  {downloaders.length === 0 ? (
-                    <option value={0}>无可用下载器</option>
-                  ) : (
-                    downloaders.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name} ({d.downloader_type})
-                      </option>
-                    ))
-                  )}
-                </select>
+                <Select
+                  value={String(form.downloader_id)}
+                  onChange={(val) => setField("downloader_id", Number(val))}
+                  options={
+                    downloaders.length === 0
+                      ? [{ value: "0", label: "无可用下载器" }]
+                      : downloaders.map((d) => ({ value: String(d.id), label: `${d.name} (${d.downloader_type})` }))
+                  }
+                />
               </div>
               <div className="space-y-2">
                 <Label>标签</Label>
@@ -519,21 +511,20 @@ export function BrushTasksPage() {
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
               <div className="space-y-2">
                 <Label>促销类型</Label>
-                <select
-                  className={selectClass}
+                <Select
                   value={form.promotion ?? "all"}
-                  onChange={(e) => {
-                    const promotion = e.target.value;
-                    setField("promotion", promotion);
-                    if (promotion !== "free") {
+                  onChange={(val) => {
+                    setField("promotion", val);
+                    if (val !== "free") {
                       setField("min_free_hours", null);
                     }
                   }}
-                >
-                  <option value="all">全部</option>
-                  <option value="free">免费</option>
-                  <option value="normal">普通</option>
-                </select>
+                  options={[
+                    { value: "all", label: "全部" },
+                    { value: "free", label: "免费" },
+                    { value: "normal", label: "普通" },
+                  ]}
+                />
               </div>
               <div className="space-y-2">
                 <Label>最大并发数</Label>
@@ -611,14 +602,14 @@ export function BrushTasksPage() {
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
               <div className="space-y-2">
                 <Label>删除模式</Label>
-                <select
-                  className={selectClass}
+                <Select
                   value={form.delete_mode ?? "or"}
-                  onChange={(e) => setField("delete_mode", e.target.value)}
-                >
-                  <option value="or">或（满足任一条件即删除）</option>
-                  <option value="and">与（满足所有条件才删除）</option>
-                </select>
+                  onChange={(val) => setField("delete_mode", val)}
+                  options={[
+                    { value: "or", label: "或（满足任一条件即删除）" },
+                    { value: "and", label: "与（满足所有条件才删除）" },
+                  ]}
+                />
               </div>
               <div className="space-y-2">
                 <Label>最小做种时间 (小时)</Label>

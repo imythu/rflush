@@ -25,6 +25,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Select } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import type {
   DownloaderRecord,
@@ -355,6 +356,12 @@ export function StatsPage() {
     }
   };
 
+  const loadData = async () => {
+    setLoading(true);
+    await Promise.all([fetchOverview(), fetchDownloaders()]);
+    setLoading(false);
+  };
+
   // Fetch trend data for selected task(s)
   const fetchTaskTrend = async (
     taskId: number | -1,
@@ -470,12 +477,7 @@ export function StatsPage() {
 
   // Initial load & auto-refresh
   useEffect(() => {
-    const init = async () => {
-      setLoading(true);
-      await Promise.all([fetchOverview(), fetchDownloaders()]);
-      setLoading(false);
-    };
-    void init();
+    void loadData();
 
     timerRef.current = setInterval(() => {
       void fetchOverview();
@@ -601,25 +603,38 @@ export function StatsPage() {
     .filter((item) => withinWindow(item.timestamp, currentDownloaderWindow));
 
   return (
-    <div className="grid gap-6">
+    <div className="space-y-6">
       {/* ===== Overview Section ===== */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <BarChart3 className="h-5 w-5" />
-            任务概览
-          </CardTitle>
-          <CardDescription>
-            各刷流任务的实时汇总数据，每 30 秒自动刷新。
-          </CardDescription>
+      <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+        <CardHeader className="pb-2">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <BarChart3 className="h-5 w-5 text-primary" />
+                任务概览
+              </CardTitle>
+              <CardDescription className="text-[11px]">
+                各刷流任务的实时汇总数据，每 30 秒自动刷新。
+              </CardDescription>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 text-[11px] px-3 w-fit"
+              onClick={loadData}
+            >
+              <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+              刷新全部
+            </Button>
+          </div>
         </CardHeader>
-        <CardContent>
+        <CardContent className="p-4 pt-2">
           {tasks.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-sm text-muted">
+            <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-8 text-center text-[11px] text-muted">
               暂无任务统计数据。
             </div>
           ) : (
-            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {tasks.map((t) => (
                 <TaskOverviewCard key={t.task_id} task={t} />
               ))}
@@ -628,128 +643,122 @@ export function StatsPage() {
         </CardContent>
       </Card>
 
-      {/* ===== Trend Chart Section ===== */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <TrendingUp className="h-5 w-5" />
-            趋势图表
-          </CardTitle>
-          <CardDescription>
-            查看区间上传/下载增量，以及种子数变化趋势。
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          {/* Controls */}
-          <div className="grid gap-6">
-            <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
-                <ArrowUpDown className="h-4 w-4" />
-                上传 / 下载区间增量
-              </div>
-              <div className="mb-4 flex flex-wrap items-center gap-3">
-                <select
-                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-                  value={selectedTransferTaskId}
-                  onChange={(e) => setSelectedTransferTaskId(Number(e.target.value))}
-                >
-                  <option value={-1}>全部任务</option>
-                  {tasks.map((t) => (
-                    <option key={t.task_id} value={t.task_id}>
-                      {t.task_name}
-                    </option>
-                  ))}
-                </select>
-                <div className="flex gap-1">
-                  {TIME_RANGES.map((r) => (
-                    <Button
-                      key={`transfer-${r.label}`}
-                      variant={transferTrendHours === r.hours ? "default" : "secondary"}
-                      className="h-8 px-3 text-xs"
-                      onClick={() => setTransferTrendHours(r.hours)}
-                    >
-                      {r.label}
-                    </Button>
-                  ))}
+      {/* ===== Global Controls for Trends ===== */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Upload/Download Trend */}
+        <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+          <CardHeader className="pb-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-xl bg-primary/10">
+                  <ArrowUpDown className="h-4 w-4 text-primary" />
                 </div>
-                <div className="flex gap-1">
-                  {(["both", "upload", "download"] as const).map((f) => (
-                    <Button
-                      key={`transfer-filter-${f}`}
-                      variant={transferLineFilter === f ? "default" : "secondary"}
-                      className="h-8 px-3 text-xs"
-                      onClick={() => setTransferLineFilter(f)}
-                    >
-                      {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
-                    </Button>
-                  ))}
+                <div>
+                  <CardTitle className="text-sm font-semibold">上传 / 下载趋势</CardTitle>
+                  <CardDescription className="text-[10px]">增量数据视图</CardDescription>
                 </div>
-                <select
-                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-                  value={transferRefreshSecs}
-                  onChange={(e) => setTransferRefreshSecs(Number(e.target.value))}
-                >
-                  {REFRESH_OPTIONS.map((option) => (
-                    <option key={`transfer-refresh-${option.value}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  variant="outline"
-                  className="h-8 px-3 text-xs"
-                  onClick={() =>
-                    void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading)
-                  }
-                  disabled={transferTrendLoading}
-                >
-                  <RefreshCw className={`mr-1 h-4 w-4 ${transferTrendLoading ? "animate-spin" : ""}`} />
-                  刷新
-                </Button>
               </div>
+              <div className="flex items-center gap-2">
+                <Select
+                  value={String(selectedTransferTaskId)}
+                  onChange={(val) => setSelectedTransferTaskId(Number(val))}
+                  options={[
+                    { value: "-1", label: "全部任务" },
+                    ...tasks.map((t) => ({ value: String(t.task_id), label: t.task_name })),
+                  ]}
+                />
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="p-4 pt-2 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
+              <div className="flex gap-1">
+                {TIME_RANGES.map((r) => (
+                  <button
+                    key={`transfer-${r.label}`}
+                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                      transferTrendHours === r.hours
+                        ? "bg-primary text-primary-foreground shadow-sm"
+                        : "hover:bg-surface-container/80 text-muted-foreground"
+                    }`}
+                    onClick={() => setTransferTrendHours(r.hours)}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+              <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
+              <div className="flex gap-1">
+                {(["both", "upload", "download"] as const).map((f) => (
+                  <button
+                    key={`transfer-filter-${f}`}
+                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                      transferLineFilter === f
+                        ? "bg-surface-container-highest text-foreground shadow-sm ring-1 ring-border"
+                        : "hover:bg-surface-container/80 text-muted-foreground"
+                    }`}
+                    onClick={() => setTransferLineFilter(f)}
+                  >
+                    {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
+                  </button>
+                ))}
+              </div>
+              <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
+              <div className="flex items-center gap-2">
+                <Select
+                  value={String(transferRefreshSecs)}
+                  onChange={(val) => setTransferRefreshSecs(Number(val))}
+                  options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
+                />
+              </div>
+            </div>
+
+            <div className="h-[280px] w-full mt-2">
               {transferTrendLoading && transferData.length === 0 ? (
-                <div className="flex items-center justify-center py-16 text-sm text-muted">
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  加载趋势数据…
+                <div className="flex flex-col items-center justify-center h-full text-muted text-[11px]">
+                  <RefreshCw className="mb-2 h-4 w-4 animate-spin" />
+                  加载中...
                 </div>
               ) : transferData.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
-                  所选时间范围内无数据。
+                <div className="flex items-center justify-center h-full rounded-2xl border border-dashed border-border bg-surface-container/20 text-[11px] text-muted">
+                  无数据
                 </div>
               ) : (
-                <ResponsiveContainer width="100%" height={320}>
+                <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={transferData}>
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      stroke={COLORS.grid}
-                    />
+                    <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} vertical={false} />
                     <XAxis
                       dataKey="timestamp"
                       type="number"
                       scale="time"
                       domain={[currentTransferWindow.start, currentTransferWindow.end]}
                       ticks={transferTicks}
-                      tick={{ fontSize: 12 }}
-                      tickCount={transferAxisProps.tickCount}
-                      minTickGap={transferAxisProps.minTickGap}
+                      tick={{ fontSize: 9, fill: "#94a3b8" }}
+                      tickLine={false}
+                      axisLine={false}
                       tickFormatter={(value: number) => formatAxisTime(value, transferTrendHours)}
                     />
                     <YAxis
-                      tick={{ fontSize: 12 }}
+                      tick={{ fontSize: 9, fill: "#94a3b8" }}
+                      tickLine={false}
+                      axisLine={false}
                       tickFormatter={(v: number) => formatBytes(v)}
-                      width={96}
+                      width={45}
                     />
                     <Tooltip
+                      contentStyle={{
+                        backgroundColor: "rgba(255, 255, 255, 0.8)",
+                        backdropFilter: "blur(8px)",
+                        borderRadius: "12px",
+                        border: "1px solid rgba(0,0,0,0.05)",
+                        fontSize: "11px",
+                        boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1)",
+                      }}
                       formatter={(value, name) => [
                         formatBytes(Number(value)),
                         name === "upload" ? "上传" : "下载",
                       ]}
                       labelFormatter={(label) => `时间: ${formatTooltipTime(label, transferTrendHours)}`}
-                    />
-                    <Legend
-                      formatter={(value: string) =>
-                        value === "upload" ? "上传" : "下载"
-                      }
                     />
                     <Line
                       type="monotone"
@@ -757,7 +766,7 @@ export function StatsPage() {
                       stroke={COLORS.upload}
                       strokeWidth={2}
                       dot={false}
-                      activeDot={{ r: 4 }}
+                      activeDot={{ r: 4, strokeWidth: 0 }}
                       hide={transferLineFilter === "download"}
                     />
                     <Line
@@ -766,104 +775,110 @@ export function StatsPage() {
                       stroke={COLORS.download}
                       strokeWidth={2}
                       dot={false}
-                      activeDot={{ r: 4 }}
+                      activeDot={{ r: 4, strokeWidth: 0 }}
                       hide={transferLineFilter === "upload"}
                     />
                   </LineChart>
                 </ResponsiveContainer>
               )}
             </div>
+          </CardContent>
+        </Card>
 
-            <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-              <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
-                <HardDrive className="h-4 w-4" />
-                种子数历史图
-              </div>
-              <div className="mb-4 flex flex-wrap items-center gap-3">
-                <select
-                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-                  value={selectedTorrentTaskId}
-                  onChange={(e) => setSelectedTorrentTaskId(Number(e.target.value))}
-                >
-                  <option value={-1}>全部任务</option>
-                  {tasks.map((t) => (
-                    <option key={t.task_id} value={t.task_id}>
-                      {t.task_name}
-                    </option>
-                  ))}
-                </select>
-                <div className="flex gap-1">
-                  {TIME_RANGES.map((r) => (
-                    <Button
-                      key={`torrent-${r.label}`}
-                      variant={torrentTrendHours === r.hours ? "default" : "secondary"}
-                      className="h-8 px-3 text-xs"
-                      onClick={() => setTorrentTrendHours(r.hours)}
-                    >
-                      {r.label}
-                    </Button>
-                  ))}
+        {/* Torrent Count Trend */}
+        <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+          <CardHeader className="pb-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-xl bg-violet-500/10">
+                  <HardDrive className="h-4 w-4 text-violet-500" />
                 </div>
-                <select
-                  className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-                  value={torrentRefreshSecs}
-                  onChange={(e) => setTorrentRefreshSecs(Number(e.target.value))}
-                >
-                  {REFRESH_OPTIONS.map((option) => (
-                    <option key={`torrent-refresh-${option.value}`} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-                <Button
-                  variant="outline"
-                  className="h-8 px-3 text-xs"
-                  onClick={() =>
-                    void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading)
-                  }
-                  disabled={torrentTrendLoading}
-                >
-                  <RefreshCw className={`mr-1 h-4 w-4 ${torrentTrendLoading ? "animate-spin" : ""}`} />
-                  刷新
-                </Button>
+                <div>
+                  <CardTitle className="text-sm font-semibold">种子数趋势</CardTitle>
+                  <CardDescription className="text-[10px]">各任务活跃数</CardDescription>
+                </div>
               </div>
+              <div className="flex items-center gap-2">
+                <Select
+                  value={String(selectedTorrentTaskId)}
+                  onChange={(val) => setSelectedTorrentTaskId(Number(val))}
+                  options={[
+                    { value: "-1", label: "全部任务" },
+                    ...tasks.map((t) => ({ value: String(t.task_id), label: t.task_name })),
+                  ]}
+                />
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="p-4 pt-2 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
+              <div className="flex gap-1">
+                {TIME_RANGES.map((r) => (
+                  <button
+                    key={`torrent-${r.label}`}
+                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                      torrentTrendHours === r.hours
+                        ? "bg-primary text-primary-foreground shadow-sm"
+                        : "hover:bg-surface-container/80 text-muted-foreground"
+                    }`}
+                    onClick={() => setTorrentTrendHours(r.hours)}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+              <div className="h-4 w-[1px] bg-border/50 mx-1"></div>
+              <div className="flex items-center gap-2">
+                <Select
+                  value={String(torrentRefreshSecs)}
+                  onChange={(val) => setTorrentRefreshSecs(Number(val))}
+                  options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
+                />
+              </div>
+            </div>
+
+            <div className="h-[280px] w-full mt-2">
               {torrentTrendLoading && torrentData.length === 0 ? (
-                <div className="flex items-center justify-center py-16 text-sm text-muted">
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  加载种子数数据…
+                <div className="flex flex-col items-center justify-center h-full text-muted text-[11px]">
+                  <RefreshCw className="mb-2 h-4 w-4 animate-spin" />
+                  加载中...
                 </div>
               ) : torrentData.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
-                  所选时间范围内无数据。
+                <div className="flex items-center justify-center h-full rounded-2xl border border-dashed border-border bg-surface-container/20 text-[11px] text-muted">
+                  无数据
                 </div>
               ) : (
-                <ResponsiveContainer width="100%" height={320}>
+                <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={torrentData}>
-                    <CartesianGrid
-                      strokeDasharray="3 3"
-                      stroke={COLORS.grid}
-                    />
+                    <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} vertical={false} />
                     <XAxis
                       dataKey="timestamp"
                       type="number"
                       scale="time"
                       domain={[currentTorrentWindow.start, currentTorrentWindow.end]}
                       ticks={torrentTicks}
-                      tick={{ fontSize: 12 }}
-                      tickCount={torrentAxisProps.tickCount}
-                      minTickGap={torrentAxisProps.minTickGap}
+                      tick={{ fontSize: 9, fill: "#94a3b8" }}
+                      tickLine={false}
+                      axisLine={false}
                       tickFormatter={(value: number) => formatAxisTime(value, torrentTrendHours)}
                     />
-                    <YAxis tick={{ fontSize: 12 }} width={50} />
-                    <Tooltip
-                      formatter={(value) => [
-                        String(value),
-                        "种子数",
-                      ]}
-                      labelFormatter={(label) => `时间: ${formatTooltipTime(label, torrentTrendHours)}`}
+                    <YAxis
+                      tick={{ fontSize: 9, fill: "#94a3b8" }}
+                      tickLine={false}
+                      axisLine={false}
+                      width={30}
                     />
-                    <Legend
-                      formatter={() => "种子数"}
+                    <Tooltip
+                      contentStyle={{
+                        backgroundColor: "rgba(255, 255, 255, 0.8)",
+                        backdropFilter: "blur(8px)",
+                        borderRadius: "12px",
+                        border: "1px solid rgba(0,0,0,0.05)",
+                        fontSize: "11px",
+                        boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1)",
+                      }}
+                      formatter={(value) => [String(value), "种子数"]}
+                      labelFormatter={(label) => `时间: ${formatTooltipTime(label, torrentTrendHours)}`}
                     />
                     <Line
                       type="monotone"
@@ -871,131 +886,130 @@ export function StatsPage() {
                       stroke={COLORS.torrent}
                       strokeWidth={2}
                       dot={false}
-                      activeDot={{ r: 4 }}
+                      activeDot={{ r: 4, strokeWidth: 0 }}
                     />
                   </LineChart>
                 </ResponsiveContainer>
               )}
             </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* ===== Downloader Speed Trend ===== */}
+      <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+        <CardHeader className="pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="p-2 rounded-xl bg-sky-500/10">
+                <Activity className="h-5 w-5 text-sky-500" />
+              </div>
+              <div>
+                <CardTitle className="text-sm font-semibold">下载器实时速度</CardTitle>
+                <CardDescription className="text-[10px]">各下载器总宽带占用</CardDescription>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Select
+                value={String(selectedDownloaderId)}
+                onChange={(val) => setSelectedDownloaderId(Number(val))}
+                options={[
+                  { value: "-1", label: "全部下载器" },
+                  ...downloaders.map((d) => ({ value: String(d.id), label: d.name })),
+                ]}
+              />
+            </div>
           </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Activity className="h-5 w-5" />
-            下载器上传 / 下载速度趋势
-          </CardTitle>
-          <CardDescription>
-            查看下载器实时总上传速度和下载速度变化。
-          </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <select
-              className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-              value={selectedDownloaderId}
-              onChange={(e) => setSelectedDownloaderId(Number(e.target.value))}
-            >
-              <option value={-1}>全部下载器</option>
-              {downloaders.map((downloader) => (
-                <option key={downloader.id} value={downloader.id}>
-                  {downloader.name}
-                </option>
-              ))}
-            </select>
-
+        <CardContent className="p-4 pt-2 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
             <div className="flex gap-1">
               {TIME_RANGES.map((r) => (
-                <Button
+                <button
                   key={`downloader-${r.label}`}
-                  variant={downloaderTrendHours === r.hours ? "default" : "secondary"}
-                  className="h-8 px-3 text-xs"
+                  className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                    downloaderTrendHours === r.hours
+                      ? "bg-primary text-primary-foreground shadow-sm"
+                      : "hover:bg-surface-container/80 text-muted-foreground"
+                  }`}
                   onClick={() => setDownloaderTrendHours(r.hours)}
                 >
                   {r.label}
-                </Button>
+                </button>
               ))}
             </div>
+            <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
             <div className="flex gap-1">
               {(["both", "upload", "download"] as const).map((f) => (
-                <Button
+                <button
                   key={`downloader-filter-${f}`}
-                  variant={downloaderLineFilter === f ? "default" : "secondary"}
-                  className="h-8 px-3 text-xs"
+                  className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                    downloaderLineFilter === f
+                      ? "bg-surface-container-highest text-foreground shadow-sm ring-1 ring-border"
+                      : "hover:bg-surface-container/80 text-muted-foreground"
+                  }`}
                   onClick={() => setDownloaderLineFilter(f)}
                 >
                   {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
-                </Button>
+                </button>
               ))}
             </div>
-            <select
-              className="rounded-lg border border-border bg-surface-container/70 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40"
-              value={downloaderRefreshSecs}
-              onChange={(e) => setDownloaderRefreshSecs(Number(e.target.value))}
-            >
-              {REFRESH_OPTIONS.map((option) => (
-                <option key={`downloader-refresh-${option.value}`} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-
-            <Button
-              variant="outline"
-              className="h-8 px-3 text-xs"
-              onClick={() => void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours)}
-              disabled={downloaderTrendLoading}
-            >
-              <RefreshCw
-                className={`mr-1 h-4 w-4 ${downloaderTrendLoading ? "animate-spin" : ""}`}
+            <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
+            <div className="flex items-center gap-2">
+              <Select
+                value={String(downloaderRefreshSecs)}
+                onChange={(val) => setDownloaderRefreshSecs(Number(val))}
+                options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
               />
-              刷新
-            </Button>
+            </div>
           </div>
 
-          {downloaderTrendLoading && downloaderSpeedData.length === 0 ? (
-            <div className="flex items-center justify-center py-16 text-sm text-muted">
-              <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-              加载下载器速度数据…
-            </div>
-          ) : downloaderSpeedData.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-center text-sm text-muted">
-              所选时间范围内无下载器速度数据。
-            </div>
-          ) : (
-            <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
-              <ResponsiveContainer width="100%" height={320}>
+          <div className="h-[320px] w-full">
+            {downloaderTrendLoading && downloaderSpeedData.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-muted text-[11px]">
+                <RefreshCw className="mb-2 h-4 w-4 animate-spin" />
+                加载中...
+              </div>
+            ) : downloaderSpeedData.length === 0 ? (
+              <div className="flex items-center justify-center h-full rounded-2xl border border-dashed border-border bg-surface-container/20 text-[11px] text-muted">
+                无数据
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={downloaderSpeedData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} />
+                  <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} vertical={false} />
                   <XAxis
                     dataKey="timestamp"
                     type="number"
                     scale="time"
                     domain={[currentDownloaderWindow.start, currentDownloaderWindow.end]}
                     ticks={downloaderTicks}
-                    tick={{ fontSize: 12 }}
-                    tickCount={downloaderAxisProps.tickCount}
-                    minTickGap={downloaderAxisProps.minTickGap}
+                    tick={{ fontSize: 9, fill: "#94a3b8" }}
+                    tickLine={false}
+                    axisLine={false}
                     tickFormatter={(value: number) => formatAxisTime(value, downloaderTrendHours)}
                   />
                   <YAxis
-                    tick={{ fontSize: 12 }}
+                    tick={{ fontSize: 9, fill: "#94a3b8" }}
+                    tickLine={false}
+                    axisLine={false}
                     tickFormatter={(v: number) => formatSpeed(v)}
-                    width={96}
+                    width={55}
                   />
                   <Tooltip
+                    contentStyle={{
+                      backgroundColor: "rgba(255, 255, 255, 0.8)",
+                      backdropFilter: "blur(8px)",
+                      borderRadius: "12px",
+                      border: "1px solid rgba(0,0,0,0.05)",
+                      fontSize: "11px",
+                      boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1)",
+                    }}
                     formatter={(value, name) => [
                       formatSpeed(Number(value)),
                       name === "uploadSpeed" ? "上传速度" : "下载速度",
                     ]}
                     labelFormatter={(label) => `时间: ${formatTooltipTime(label, downloaderTrendHours)}`}
-                  />
-                  <Legend
-                    formatter={(value: string) =>
-                      value === "uploadSpeed" ? "上传速度" : "下载速度"
-                    }
                   />
                   <Line
                     type="monotone"
@@ -1003,7 +1017,7 @@ export function StatsPage() {
                     stroke={COLORS.upload}
                     strokeWidth={2}
                     dot={false}
-                    activeDot={{ r: 4 }}
+                    activeDot={{ r: 4, strokeWidth: 0 }}
                     hide={downloaderLineFilter === "download"}
                   />
                   <Line
@@ -1012,13 +1026,13 @@ export function StatsPage() {
                     stroke={COLORS.download}
                     strokeWidth={2}
                     dot={false}
-                    activeDot={{ r: 4 }}
+                    activeDot={{ r: 4, strokeWidth: 0 }}
                     hide={downloaderLineFilter === "upload"}
                   />
                 </LineChart>
               </ResponsiveContainer>
-            </div>
-          )}
+            )}
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -1029,39 +1043,39 @@ export function StatsPage() {
 
 function TaskOverviewCard({ task }: { task: TaskOverview }) {
   return (
-    <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
+    <div className="rounded-xl border border-border bg-surface-container/50 p-3 hover:bg-surface-container/80 transition-colors shadow-sm">
       <div className="flex items-center justify-between gap-2">
-        <div className="text-sm font-semibold truncate">{task.task_name}</div>
+        <div className="text-[13px] font-semibold truncate text-foreground">{task.task_name}</div>
         <span
-          className={`shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ${
+          className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${
             task.enabled
-              ? "bg-emerald-500/15 text-emerald-600"
-              : "bg-neutral-500/15 text-neutral-500"
+              ? "bg-emerald-500/10 text-emerald-600 ring-1 ring-emerald-500/20"
+              : "bg-neutral-500/10 text-neutral-500 ring-1 ring-neutral-500/20"
           }`}
         >
-          {task.enabled ? "启用" : "停用"}
+          {task.enabled ? "运行中" : "已停用"}
         </span>
       </div>
 
-      <div className="mt-3 grid grid-cols-2 gap-3">
+      <div className="mt-2.5 grid grid-cols-2 gap-2">
         <MetricItem
-          icon={<TrendingUp className="h-3.5 w-3.5 text-emerald-500" />}
-          label="上传"
+          icon={<TrendingUp className="h-3 w-3 text-emerald-500" />}
+          label="累计上传"
           value={formatBytes(task.total_uploaded)}
         />
         <MetricItem
-          icon={<TrendingUp className="h-3.5 w-3.5 text-sky-500" />}
-          label="下载"
+          icon={<TrendingUp className="h-3 w-3 text-sky-500" />}
+          label="累计下载"
           value={formatBytes(task.total_downloaded)}
         />
         <MetricItem
-          icon={<HardDrive className="h-3.5 w-3.5 text-violet-500" />}
-          label="种子数"
+          icon={<HardDrive className="h-3 w-3 text-violet-500" />}
+          label="活跃种子"
           value={task.torrent_count.toString()}
         />
         <MetricItem
-          icon={<Activity className="h-3.5 w-3.5 text-amber-500" />}
-          label="分享率"
+          icon={<Activity className="h-3 w-3 text-amber-500" />}
+          label="实时分享率"
           value={ratio(task.total_uploaded, task.total_downloaded)}
         />
       </div>
@@ -1079,12 +1093,12 @@ function MetricItem({
   value: string;
 }) {
   return (
-    <div className="space-y-0.5">
-      <div className="flex items-center gap-1 text-xs text-muted">
+    <div className="space-y-0.5 bg-surface-container-low/40 p-1.5 rounded-lg border border-border/30">
+      <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
         {icon}
         {label}
       </div>
-      <div className="text-sm font-semibold tracking-tight">{value}</div>
+      <div className="text-[12px] font-bold tracking-tight text-foreground">{value}</div>
     </div>
   );
 }

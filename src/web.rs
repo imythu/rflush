@@ -31,6 +31,7 @@ use crate::downloader::factory as downloader_factory;
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
+use crate::net::client_factory;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
 use crate::site_stats::SiteStatsRefresher;
@@ -354,6 +355,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/sites/{id}", put(update_site).delete(delete_site))
         .route("/api/sites/{id}/test", post(test_site))
         .route("/api/sites/{id}/stats", get(get_site_stats))
+        .route("/api/proxy/test", post(test_proxy))
         // 自动签到
         .route(
             "/api/sign-in-tasks",
@@ -811,6 +813,12 @@ struct CreateSiteRequest {
     site_type: String,
     base_url: String,
     auth_config: serde_json::Value,
+    #[serde(default = "default_true")]
+    use_proxy: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 async fn list_sites(
@@ -830,7 +838,7 @@ async fn create_site(
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
     let id = state
         .db
-        .create_site(&body.name, &body.site_type, &body.base_url, &auth_str)
+        .create_site(&body.name, &body.site_type, &body.base_url, &auth_str, body.use_proxy)
         .await?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
@@ -844,7 +852,7 @@ async fn update_site(
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
     state
         .db
-        .update_site(id, &body.name, &body.site_type, &body.base_url, &auth_str)
+        .update_site(id, &body.name, &body.site_type, &body.base_url, &auth_str, body.use_proxy)
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -866,7 +874,10 @@ async fn test_site(
         .get_site(id)
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
-    let adapter = site_factory::create_adapter(&site).map_err(ApiError::bad_request)?;
+    let settings = state.db.get_settings().await?;
+    let client = client_factory::resolve_client(settings.proxy.as_deref(), site.use_proxy)
+        .map_err(|e| ApiError::internal(format!("创建 HTTP 客户端失败: {}", e)))?;
+    let adapter = site_factory::create_adapter(&site, client).map_err(ApiError::bad_request)?;
     let result = adapter
         .test_connection()
         .await
@@ -883,7 +894,10 @@ async fn get_site_stats(
         .get_site(id)
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
-    let adapter = site_factory::create_adapter(&site).map_err(ApiError::bad_request)?;
+    let settings = state.db.get_settings().await?;
+    let client = client_factory::resolve_client(settings.proxy.as_deref(), site.use_proxy)
+        .map_err(|e| ApiError::internal(format!("创建 HTTP 客户端失败: {}", e)))?;
+    let adapter = site_factory::create_adapter(&site, client).map_err(ApiError::bad_request)?;
     let stats = adapter
         .get_user_stats()
         .await
@@ -895,6 +909,27 @@ async fn get_sites_stats_overview(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::site::SiteWithStats>>, ApiError> {
     Ok(Json(state.site_stats_refresher.refresh_all().await?))
+}
+
+// ========== Proxy Test API ==========
+
+#[derive(Debug, Deserialize)]
+struct ProxyTestRequest {
+    proxy: String,
+    test_url: String,
+}
+
+async fn test_proxy(
+    Json(body): Json<ProxyTestRequest>,
+) -> Result<Json<client_factory::ProxyTestResult>, ApiError> {
+    if body.proxy.trim().is_empty() {
+        return Err(ApiError::bad_request("代理地址不能为空"));
+    }
+    if body.test_url.trim().is_empty() {
+        return Err(ApiError::bad_request("测试URL不能为空"));
+    }
+    let result = client_factory::test_proxy(&body.proxy, &body.test_url).await;
+    Ok(Json(result))
 }
 
 // ========== Sign-in API ==========
@@ -982,13 +1017,18 @@ async fn probe_sign_in_task_1_1_1_1(
         .get_sign_in_task(id)
         .await?
         .ok_or_else(|| ApiError::not_found("签到任务不存在"))?;
-    let result = crate::sign_in::probe_lightpanda_1_1_1_1(task)
+    let settings = state.db.get_settings().await?;
+    let result = crate::sign_in::probe_lightpanda_1_1_1_1(
+        task,
+        settings.use_proxy_for_lightpanda,
+    )
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(result))
 }
 
 async fn probe_sign_in_form_1_1_1_1(
+    State(state): State<AppState>,
     Json(mut body): Json<crate::sign_in::SignInTaskRequest>,
 ) -> Result<Json<crate::sign_in::LightpandaProbeResult>, ApiError> {
     body.lightpanda_endpoint = body
@@ -1001,7 +1041,11 @@ async fn probe_sign_in_form_1_1_1_1(
     if body.lightpanda_endpoint.is_none() && body.lightpanda_token.is_empty() {
         return Err(ApiError::bad_request("Lightpanda endpoint 不能为空"));
     }
-    let result = crate::sign_in::probe_lightpanda_request_1_1_1_1(body)
+    let settings = state.db.get_settings().await?;
+    let result = crate::sign_in::probe_lightpanda_request_1_1_1_1(
+        body,
+        settings.use_proxy_for_lightpanda,
+    )
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(result))
@@ -1504,6 +1548,19 @@ fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
         if !ALLOWED_LOG_LEVELS.contains(&log_level) {
             return Err(ApiError::bad_request(
                 "log_level must be one of: trace, debug, info, warn, error",
+            ));
+        }
+    }
+    if let Some(proxy) = settings.proxy.as_deref() {
+        let proxy = proxy.trim();
+        if !proxy.is_empty()
+            && !proxy.starts_with("http://")
+            && !proxy.starts_with("https://")
+            && !proxy.starts_with("socks5://")
+            && !proxy.starts_with("socks5h://")
+        {
+            return Err(ApiError::bad_request(
+                "proxy must start with http://, https://, socks5://, or socks5h://",
             ));
         }
     }

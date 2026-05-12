@@ -11,6 +11,19 @@ export type GlobalConfig = {
   max_concurrent_downloads: number;
   max_concurrent_rss_fetches: number;
   log_level: string | null;
+  proxy: string | null;
+};
+
+export type ProxyTestRequest = {
+  proxy: string;
+  test_url: string;
+};
+
+export type ProxyTestResult = {
+  success: boolean;
+  status_code: number | null;
+  elapsed_ms: number;
+  message: string;
 };
 
 export type RssSubscription = {

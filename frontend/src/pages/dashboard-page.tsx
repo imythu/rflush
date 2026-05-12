@@ -1,6 +1,7 @@
 import { ArrowRight, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { formatDate, statusBadge } from "@/lib/format";
 import type { DownloadRecord, RssSubscription } from "@/types";
 
 export function DashboardPage({
@@ -22,7 +23,7 @@ export function DashboardPage({
 
   return (
     <div className="grid gap-4 xl:gap-6">
-      <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-4">
+      <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4">
         <MetricCard label="RSS 订阅数" value={rss.length} detail="当前已配置订阅" />
         <MetricCard label="历史记录数" value={history.length} detail="来自 SQLite 持久化" />
         <MetricCard label="已启用订阅" value={rss.filter((item) => item.enabled).length} detail="当前启用中的 RSS 任务" />
@@ -34,66 +35,55 @@ export function DashboardPage({
       </div>
 
       <div className="grid gap-4 xl:gap-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>快捷操作</CardTitle>
-            <CardDescription>为大屏和小屏都保留低认知成本的操作入口。</CardDescription>
+        <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-lg">快捷操作</CardTitle>
+            <CardDescription className="text-[11px]">快速触达核心功能。</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3 sm:grid-cols-2">
             <ActionCard
               title="一键全量下载"
-              description="按当前全局配置拉取全部订阅，并共享域名级并发限制。"
+              description="按当前全局配置拉取全部订阅。"
               actionLabel="立即启动"
               onClick={() => void onRunAll()}
             />
             <ActionCard
               title="管理任务"
-              description="新增 RSS 任务、批量暂停/启动，并按任务查看历史。"
+              description="新增 RSS 任务、批量暂停/启动。"
               actionLabel="前往任务页"
               onClick={onGoRss}
-            />
-            <ActionCard
-              title="查看历史"
-              description="手机上看卡片，平板/桌面上看更完整的列表与表格。"
-              actionLabel="前往历史页"
-              onClick={onGoHistory}
-            />
-            <ActionCard
-              title="快速启动首个订阅"
-              description={rss[0] ? `当前首个订阅：${rss[0].name}` : "暂无订阅，先去 RSS 页添加。"}
-              actionLabel={rss[0] ? "启动首个订阅" : "去添加订阅"}
-              onClick={() => (rss[0] ? void onRunOne(rss[0].id) : onGoRss())}
             />
           </CardContent>
         </Card>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>最近历史</CardTitle>
-          <CardDescription>保留更适合手机/平板的卡片式摘要。</CardDescription>
+      <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-lg">最近历史</CardTitle>
+          <CardDescription className="text-[11px]">最新抓取的 RSS 种子记录。</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3">
           {latestRecords.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-sm text-muted">
+            <div className="rounded-2xl border border-dashed border-border bg-surface-container/60 p-5 text-[11px] text-muted">
               还没有历史记录。
             </div>
           ) : (
-            latestRecords.map((record) => (
-              <div key={record.id} className="rounded-2xl border border-border bg-surface-container/70 p-4">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0">
-                    <div className="text-sm font-semibold">{record.title}</div>
-                    <div className="mt-1 text-xs text-muted">
-                      {record.rss_name} · {formatDate(record.finished_at)}
+            <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+              {latestRecords.map((record) => (
+                <div key={record.id} className="rounded-[20px] border border-border bg-surface-container/30 p-3.5 shadow-sm">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[13px] font-semibold truncate text-foreground">{record.rss_name}</div>
+                      <div className="text-[10px] text-muted-foreground mt-0.5">{formatDate(record.finished_at)}</div>
                     </div>
+                    <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${statusBadge(record.final_status)}`}>
+                      {record.final_status}
+                    </span>
                   </div>
-                  <span className={`w-fit rounded-full px-3 py-1 text-xs font-medium ${statusBadge(record.final_status)}`}>
-                    {record.final_status}
-                  </span>
+                  <div className="mt-2.5 text-[11px] leading-relaxed text-foreground line-clamp-2">{record.title}</div>
                 </div>
-              </div>
-            ))
+              ))}
+            </div>
           )}
         </CardContent>
       </Card>

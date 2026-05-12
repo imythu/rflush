@@ -12,6 +12,7 @@ use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
 use crate::downloader::factory;
+use crate::net::client_factory;
 use crate::rss;
 use crate::site::SiteAdapter;
 use crate::site::factory as site_factory;
@@ -483,19 +484,33 @@ async fn execute_brush_task(
                 site_adapter = None;
                 if let Some(site_id) = task.site_id {
                     match db.get_site(site_id).await {
-                        Ok(Some(site)) => match site_factory::create_adapter(&site) {
-                            Ok(adapter) => {
-                                site_adapter = Some(adapter);
+                        Ok(Some(site)) => {
+                            let proxy = db.get_settings().await.ok().and_then(|s| s.proxy);
+                            let client = match client_factory::resolve_client(proxy.as_deref(), site.use_proxy) {
+                                Ok(c) => c,
+                                Err(error) => {
+                                    let message = format!(
+                                        "[刷流][{}] 创建 HTTP 客户端失败: site_id={} err={}",
+                                        task.name, site.id, error
+                                    );
+                                    error!("{}", message);
+                                    return Err(message);
+                                }
+                            };
+                            match site_factory::create_adapter(&site, client) {
+                                Ok(adapter) => {
+                                    site_adapter = Some(adapter);
+                                }
+                                Err(error) => {
+                                    let message = format!(
+                                        "[刷流][{}] 创建站点适配器失败: site_id={} name={} type={} err={}",
+                                        task.name, site.id, site.name, site.site_type, error
+                                    );
+                                    error!("{}", message);
+                                    return Err(message);
+                                }
                             }
-                            Err(error) => {
-                                let message = format!(
-                                    "[刷流][{}] 创建站点适配器失败: site_id={} name={} type={} err={}",
-                                    task.name, site.id, site.name, site.site_type, error
-                                );
-                                error!("{}", message);
-                                return Err(message);
-                            }
-                        },
+                        }
                         Ok(None) => {
                             let message =
                                 format!("[刷流][{}] 站点不存在: site_id={}", task.name, site_id);

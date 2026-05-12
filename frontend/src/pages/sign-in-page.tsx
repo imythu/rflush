@@ -5,13 +5,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate, statusBadge } from "@/lib/format";
 import type { LightpandaProbeResult, SignInRecord, SignInTaskRecord, SignInTaskRequest, SiteRecord } from "@/types";
-
-const selectClass =
-  "flex h-11 w-full rounded-2xl border border-border bg-input px-4 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30";
 
 const SIGN_IN_INTERVAL_HOURS = [6, 8, 12, 16, 20, 24] as const;
 type SignInIntervalHours = (typeof SIGN_IN_INTERVAL_HOURS)[number];
@@ -298,66 +296,66 @@ export function SignInPage() {
           ) : (
             <div className="grid gap-3">
               {tasks.map((task) => (
-                <div key={task.id} className="rounded-2xl border border-border bg-surface-container/70 p-4">
+                <div key={task.id} className="rounded-[20px] border border-border bg-surface-container/70 p-3.5 shadow-sm">
                   <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0">
+                    <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-semibold">{task.name}</span>
+                        <span className="font-semibold text-sm truncate">{task.name}</span>
                         <span
-                          className={`rounded-full px-3 py-1 text-xs font-medium ${
+                          className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
                             task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
                           }`}
                         >
                           {task.enabled ? "已启用" : "已停用"}
                         </span>
-                        <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusBadge(task.last_status ?? "")}`}>
+                        <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${statusBadge(task.last_status ?? "")}`}>
                           {displayStatus(task.last_status)}
                         </span>
                       </div>
-                      <div className="mt-1 text-xs text-muted">#{task.id}</div>
+                      <div className="mt-0.5 text-[11px] text-muted">#{task.id}</div>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <Button variant="outline" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/run`, { method: "POST" }), "已触发运行一次")}>
-                        <Zap className="mr-2 h-4 w-4" />
+                      <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/run`, { method: "POST" }), "已触发运行一次")}>
+                        <Zap className="mr-1.5 h-3.5 w-3.5" />
                         运行一次
                       </Button>
                       {task.enabled ? (
-                        <Button variant="outline" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/stop`, { method: "POST" }), "自动签到任务已停用")}>
-                          <Pause className="mr-2 h-4 w-4" />
+                        <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/stop`, { method: "POST" }), "自动签到任务已停用")}>
+                          <Pause className="mr-1.5 h-3.5 w-3.5" />
                           停用
                         </Button>
                       ) : (
-                        <Button variant="secondary" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/start`, { method: "POST" }), "自动签到任务已启用")}>
-                          <Play className="mr-2 h-4 w-4" />
+                        <Button variant="secondary" className="h-7 text-[11px] px-2.5" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/start`, { method: "POST" }), "自动签到任务已启用")}>
+                          <Play className="mr-1.5 h-3.5 w-3.5" />
                           启用
                         </Button>
                       )}
-                      <Button variant="outline" onClick={() => openEdit(task)}>
-                        <Edit className="mr-2 h-4 w-4" />
+                      <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openEdit(task)}>
+                        <Edit className="mr-1.5 h-3.5 w-3.5" />
                         编辑
                       </Button>
-                      <Button variant="destructive" onClick={() => setDeleteTarget(task)}>
-                        <Trash2 className="mr-2 h-4 w-4" />
+                      <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteTarget(task)}>
+                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
                         删除
                       </Button>
                     </div>
                   </div>
 
-                  <div className="mt-3 grid gap-2 text-sm text-muted sm:grid-cols-2 xl:grid-cols-4">
-                    <div>
-                      <span className="font-medium text-foreground">站点：</span>
+                  <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="truncate">
+                      <span className="font-medium text-foreground">站点: </span>
                       {siteNameById.get(task.site_id) ?? `#${task.site_id}`}
                     </div>
-                    <div>
-                      <span className="font-medium text-foreground">间隔：</span>
+                    <div className="truncate">
+                      <span className="font-medium text-foreground">间隔: </span>
                       每 {cronToInterval(task.cron_expression)} 小时
                     </div>
-                    <div>
-                      <span className="font-medium text-foreground">最近时间：</span>
+                    <div className="truncate">
+                      <span className="font-medium text-foreground">最近时间: </span>
                       {formatDate(task.last_run_at)}
                     </div>
-                    <div className="sm:col-span-2 xl:col-span-4">
-                      <span className="font-medium text-foreground">最近消息：</span>
+                    <div className="sm:col-span-2 xl:col-span-4 truncate">
+                      <span className="font-medium text-foreground">最近消息: </span>
                       {task.last_message || "-"}
                     </div>
                   </div>
@@ -429,23 +427,21 @@ export function SignInPage() {
             {editingId === null && tasks.length > 0 ? (
               <div className="space-y-2 sm:col-span-2">
                 <Label>从已有任务复制</Label>
-                <select
-                  className={selectClass}
-                  defaultValue=""
-                  onChange={(event) => {
-                    if (event.target.value) {
-                      copyFromTask(Number(event.target.value));
-                      event.target.value = "";
+                <Select
+                  value=""
+                  onChange={(val) => {
+                    if (val) {
+                      copyFromTask(Number(val));
                     }
                   }}
-                >
-                  <option value="">选择已有任务复制配置</option>
-                  {tasks.map((task) => (
-                    <option key={task.id} value={task.id}>
-                      {task.name} · 每 {cronToInterval(task.cron_expression)} 小时
-                    </option>
-                  ))}
-                </select>
+                  options={[
+                    { value: "", label: "选择已有任务复制配置" },
+                    ...tasks.map((task) => ({
+                      value: String(task.id),
+                      label: `${task.name} · 每 ${cronToInterval(task.cron_expression)} 小时`,
+                    })),
+                  ]}
+                />
               </div>
             ) : null}
 
@@ -455,32 +451,26 @@ export function SignInPage() {
             </div>
             <div className="space-y-2">
               <Label>站点</Label>
-              <select
-                className={selectClass}
-                value={form.site_id || ""}
-                onChange={(event) => setField("site_id", event.target.value === "" ? 0 : Number(event.target.value))}
-              >
-                {nexusSites.length === 0 ? <option value="">请先添加 NexusPHP 站点</option> : null}
-                {nexusSites.map((site) => (
-                  <option key={site.id} value={site.id}>
-                    {site.name} ({site.site_type})
-                  </option>
-                ))}
-              </select>
+              <Select
+                value={form.site_id ? String(form.site_id) : ""}
+                onChange={(val) => setField("site_id", val === "" ? 0 : Number(val))}
+                options={
+                  nexusSites.length === 0
+                    ? [{ value: "", label: "请先添加 NexusPHP 站点" }]
+                    : nexusSites.map((site) => ({ value: String(site.id), label: `${site.name} (${site.site_type})` }))
+                }
+              />
             </div>
             <div className="space-y-2">
               <Label>执行间隔</Label>
-              <select
-                className={selectClass}
-                value={intervalHours}
-                onChange={(event) => setIntervalHours(Number(event.target.value) as SignInIntervalHours)}
-              >
-                {SIGN_IN_INTERVAL_HOURS.map((hours) => (
-                  <option key={hours} value={hours}>
-                    每 {hours} 小时
-                  </option>
-                ))}
-              </select>
+              <Select
+                value={String(intervalHours)}
+                onChange={(val) => setIntervalHours(Number(val) as SignInIntervalHours)}
+                options={SIGN_IN_INTERVAL_HOURS.map((hours) => ({
+                  value: String(hours),
+                  label: `每 ${hours} 小时`,
+                }))}
+              />
             </div>
             <div className="space-y-2">
               <Label>Lightpanda token</Label>

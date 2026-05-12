@@ -86,7 +86,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let settings = conn
                 .query_row(
-                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs FROM global_settings WHERE id = 1",
+                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda FROM global_settings WHERE id = 1",
                     [],
                     |row| {
                         Ok(GlobalConfig {
@@ -100,6 +100,8 @@ impl Database {
                             max_concurrent_downloads: row.get(5)?,
                             max_concurrent_rss_fetches: row.get(6)?,
                             throttle_interval_secs: row.get(7)?,
+                            proxy: row.get(8)?,
+                            use_proxy_for_lightpanda: row.get::<_, i32>(9).unwrap_or(1) != 0,
                         })
                     },
                 )
@@ -116,7 +118,7 @@ impl Database {
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ? WHERE id = 1",
+                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?, use_proxy_for_lightpanda = ? WHERE id = 1",
                 params![
                     settings.download_rate_limit.requests,
                     settings.download_rate_limit.interval,
@@ -125,7 +127,12 @@ impl Database {
                     settings.log_level,
                     settings.max_concurrent_downloads,
                     settings.max_concurrent_rss_fetches,
-                    settings.throttle_interval_secs
+                    settings.throttle_interval_secs,
+                    settings.proxy.as_deref().and_then(|value| {
+                        let value = value.trim();
+                        (!value.is_empty()).then_some(value)
+                    }),
+                    settings.use_proxy_for_lightpanda as i32
                 ],
             )
             .map_err(sql_error)?;
@@ -537,7 +544,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
-                .prepare("SELECT id, name, site_type, base_url, auth_config, created_at, updated_at FROM sites ORDER BY id")
+                .prepare("SELECT id, name, site_type, base_url, auth_config, use_proxy, created_at, updated_at FROM sites ORDER BY id")
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -547,8 +554,9 @@ impl Database {
                         site_type: row.get(2)?,
                         base_url: row.get(3)?,
                         auth_config: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        use_proxy: row.get::<_, i32>(5).unwrap_or(1) != 0,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 })
                 .map_err(sql_error)?;
@@ -568,7 +576,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.created_at, s.updated_at,
+                    "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.use_proxy, s.created_at, s.updated_at,
                             st.site_id, st.uid, st.username, st.uploaded, st.downloaded, st.ratio, st.bonus,
                             st.seeding_count, st.leeching_count, st.updated_at, st.last_checked_at, st.last_error
                      FROM sites s
@@ -578,36 +586,37 @@ impl Database {
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |row| {
-                    let stats_site_id: Option<i64> = row.get(7)?;
+                    let stats_site_id: Option<i64> = row.get(8)?;
                     Ok(SiteWithStats {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         site_type: row.get(2)?,
                         base_url: row.get(3)?,
                         auth_config: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        use_proxy: row.get::<_, i32>(5).unwrap_or(1) != 0,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                         stats: stats_site_id.map(|site_id| SiteStatsRecord {
                             site_id,
-                            uid: row.get(8).ok().flatten(),
-                            username: row.get(9).ok().flatten(),
-                            uploaded: row.get::<_, Option<i64>>(10).ok().flatten().map(|v| v as u64),
-                            downloaded: row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v as u64),
-                            ratio: row.get(12).ok().flatten(),
-                            bonus: row.get(13).ok().flatten(),
+                            uid: row.get(9).ok().flatten(),
+                            username: row.get(10).ok().flatten(),
+                            uploaded: row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v as u64),
+                            downloaded: row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v as u64),
+                            ratio: row.get(13).ok().flatten(),
+                            bonus: row.get(14).ok().flatten(),
                             seeding_count: row
-                                .get::<_, Option<i64>>(14)
-                                .ok()
-                                .flatten()
-                                .map(|v| v as u32),
-                            leeching_count: row
                                 .get::<_, Option<i64>>(15)
                                 .ok()
                                 .flatten()
                                 .map(|v| v as u32),
-                            updated_at: row.get(16).ok().flatten(),
-                            last_checked_at: row.get(17).unwrap_or_default(),
-                            last_error: row.get(18).ok().flatten(),
+                            leeching_count: row
+                                .get::<_, Option<i64>>(16)
+                                .ok()
+                                .flatten()
+                                .map(|v| v as u32),
+                            updated_at: row.get(17).ok().flatten(),
+                            last_checked_at: row.get(18).unwrap_or_default(),
+                            last_error: row.get(19).ok().flatten(),
                         }),
                     })
                 })
@@ -627,7 +636,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, site_type, base_url, auth_config, created_at, updated_at FROM sites WHERE id = ?",
+                "SELECT id, name, site_type, base_url, auth_config, use_proxy, created_at, updated_at FROM sites WHERE id = ?",
                 params![id],
                 |row| {
                     Ok(SiteRecord {
@@ -636,8 +645,9 @@ impl Database {
                         site_type: row.get(2)?,
                         base_url: row.get(3)?,
                         auth_config: row.get(4)?,
-                        created_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        use_proxy: row.get::<_, i32>(5).unwrap_or(1) != 0,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 },
             )
@@ -654,6 +664,7 @@ impl Database {
         site_type: &str,
         base_url: &str,
         auth_config: &str,
+        use_proxy: bool,
     ) -> Result<i64, AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -666,8 +677,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT INTO sites (name, site_type, base_url, auth_config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                params![name, site_type, base_url, auth_config, now, now],
+                "INSERT INTO sites (name, site_type, base_url, auth_config, use_proxy, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![name, site_type, base_url, auth_config, use_proxy as i32, now, now],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -683,6 +694,7 @@ impl Database {
         site_type: &str,
         base_url: &str,
         auth_config: &str,
+        use_proxy: bool,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -695,8 +707,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE sites SET name = ?, site_type = ?, base_url = ?, auth_config = ?, updated_at = ? WHERE id = ?",
-                params![name, site_type, base_url, auth_config, now, id],
+                "UPDATE sites SET name = ?, site_type = ?, base_url = ?, auth_config = ?, use_proxy = ?, updated_at = ? WHERE id = ?",
+                params![name, site_type, base_url, auth_config, use_proxy as i32, now, id],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -1823,7 +1835,8 @@ impl Database {
                     log_level TEXT,
                     max_concurrent_downloads INTEGER NOT NULL,
                     max_concurrent_rss_fetches INTEGER NOT NULL,
-                    throttle_interval_secs INTEGER NOT NULL
+                    throttle_interval_secs INTEGER NOT NULL,
+                    proxy TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS rss_subscriptions (
@@ -2127,10 +2140,28 @@ impl Database {
                 "file_deleted",
                 "ALTER TABLE download_records ADD COLUMN file_deleted INTEGER NOT NULL DEFAULT 0",
             )?;
+            ensure_column(
+                &conn,
+                "global_settings",
+                "proxy",
+                "ALTER TABLE global_settings ADD COLUMN proxy TEXT",
+            )?;
+            ensure_column(
+                &conn,
+                "global_settings",
+                "use_proxy_for_lightpanda",
+                "ALTER TABLE global_settings ADD COLUMN use_proxy_for_lightpanda INTEGER NOT NULL DEFAULT 1",
+            )?;
+            ensure_column(
+                &conn,
+                "sites",
+                "use_proxy",
+                "ALTER TABLE sites ADD COLUMN use_proxy INTEGER NOT NULL DEFAULT 1",
+            )?;
 
             conn.execute(
-                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![2, 1, "second", 5, "info", 32, 8, 30],
+                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1],
             )
             .map_err(sql_error)?;
             Ok(())

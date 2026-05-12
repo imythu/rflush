@@ -115,8 +115,9 @@ async fn run_and_record(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "站点不存在".to_string())?;
+    let settings = db.get_settings().await.map_err(|e| e.to_string())?;
     let site_name = site.name.clone();
-    let result = execute_task(base_dir, task.clone(), site).await;
+    let result = execute_task(base_dir, task.clone(), site, settings.use_proxy_for_lightpanda).await;
     match result {
         Ok(result) => {
             info!(

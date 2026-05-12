@@ -26,6 +26,7 @@ import {
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import {
   Table,
   TableHeader,
@@ -750,54 +751,48 @@ export function SitesPage() {
                 {sites.map((site) => (
                   <div
                     key={site.id}
-                    className="rounded-2xl border border-border bg-surface-container/70 p-4"
+                    className="rounded-[20px] border border-border bg-surface-container/70 p-3.5"
                   >
                     <div className="flex items-center justify-between">
-                      <span className="font-medium">{site.name}</span>
-                      <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs text-violet-700">
+                      <span className="font-semibold text-sm">{site.name}</span>
+                      <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">
                         {site.site_type}
                       </span>
                     </div>
-                    <p className="mt-1 truncate text-sm text-muted">
+                    <p className="mt-1 truncate text-[11px] text-muted">
                       {site.base_url}
                     </p>
-                    <p className="mt-1 text-xs text-muted">
-                      {formatDate(site.created_at)}
-                    </p>
-                    <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
-                      <div className="rounded-2xl bg-card/70 p-3">
-                        <div className="text-[11px] font-bold text-muted">上传量</div>
-                        <div className="mt-1 font-black">
-                          {site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "待刷新"}
-                        </div>
+                    <div className="mt-2.5 grid grid-cols-2 gap-2 text-sm">
+                      <div className="rounded-xl bg-card/70 p-2">
+                        <div className="text-[10px] font-bold text-muted">上: <span className="font-black text-foreground">{site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "-"}</span></div>
                       </div>
-                      <div className="rounded-2xl bg-card/70 p-3">
-                        <div className="text-[11px] font-bold text-muted">下载量</div>
-                        <div className="mt-1 font-black">
-                          {site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "待刷新"}
-                        </div>
+                      <div className="rounded-xl bg-card/70 p-2">
+                        <div className="text-[10px] font-bold text-muted">下: <span className="font-black text-foreground">{site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "-"}</span></div>
                       </div>
                     </div>
-                    <div className="mt-3 flex flex-wrap gap-2">
+                    <div className="mt-2.5 grid grid-cols-3 gap-2">
                       <Button
                         variant="outline"
+                        className="h-7 px-0 text-[11px]"
                         onClick={() => handleTest(site)}
                       >
-                        <Activity className="mr-2 h-4 w-4" />
-                        测试连接
+                        <Activity className="mr-1 h-3 w-3" />
+                        测试
                       </Button>
                       <Button
                         variant="secondary"
+                        className="h-7 px-0 text-[11px]"
                         onClick={() => openEdit(site)}
                       >
-                        <Pencil className="mr-2 h-4 w-4" />
+                        <Pencil className="mr-1 h-3 w-3" />
                         编辑
                       </Button>
                       <Button
                         variant="destructive"
+                        className="h-7 px-0 text-[11px]"
                         onClick={() => setDeleteTarget(site)}
                       >
-                        <Trash2 className="mr-2 h-4 w-4" />
+                        <Trash2 className="mr-1 h-3 w-3" />
                         删除
                       </Button>
                     </div>
@@ -833,20 +828,20 @@ export function SitesPage() {
 
           <div className="space-y-2">
             <Label>站点类型</Label>
-            <select
-              className="h-10 w-full rounded-full border border-border bg-card px-4 text-sm"
+            <Select
               value={form.site_type}
-              onChange={(e) => {
-                const v = e.target.value as SiteForm["site_type"];
+              onChange={(val) => {
+                const v = val as SiteForm["site_type"];
                 patch({
                   site_type: v,
                   auth_type: v === "mteam" ? "api_key" : "cookie",
                 });
               }}
-            >
-              <option value="nexusphp">NexusPHP</option>
-              <option value="mteam">M-Team</option>
-            </select>
+              options={[
+                { value: "nexusphp", label: "NexusPHP" },
+                { value: "mteam", label: "M-Team" },
+              ]}
+            />
           </div>
 
           <div className="space-y-2">
@@ -1173,28 +1168,28 @@ function OverviewRankCard({ row, rank }: { row: SiteOverviewRow; rank: number })
 function OverviewMobileCard({ row }: { row: SiteOverviewRow }) {
   const stats = row.stats;
   return (
-    <div className="rounded-[26px] border border-border bg-card/85 p-4 shadow-card">
+    <div className="rounded-[20px] border border-border bg-card/85 p-3.5 shadow-card">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <div className="text-lg font-black">{row.site.name}</div>
-          <div className="mt-1 text-xs text-muted">UID {stats?.uid ?? "-"} · {stats?.username ?? "-"}</div>
+          <div className="text-base font-black">{row.site.name}</div>
+          <div className="mt-0.5 text-[11px] text-muted">UID {stats?.uid ?? "-"} · {stats?.username ?? "-"}</div>
         </div>
-        <span className={`rounded-full px-3 py-1 text-xs font-bold ${row.error ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"}`}>
+        <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold ${row.error ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"}`}>
           {row.error ? "失败" : "正常"}
         </span>
       </div>
-      <div className="mt-4 grid grid-cols-3 gap-2 text-sm">
-        <div className="rounded-2xl bg-surface-container/70 p-3">
-          <div className="text-[11px] font-bold text-muted">上传</div>
-          <div className="mt-1 font-black">{stats ? formatBytes(stats.uploaded) : "-"}</div>
+      <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
+        <div className="rounded-xl bg-surface-container/70 p-2.5">
+          <div className="text-[10px] font-bold text-muted">上:</div>
+          <div className="mt-0.5 text-sm font-black truncate">{stats ? formatBytes(stats.uploaded) : "-"}</div>
         </div>
-        <div className="rounded-2xl bg-surface-container/70 p-3">
-          <div className="text-[11px] font-bold text-muted">下载</div>
-          <div className="mt-1 font-black">{stats ? formatBytes(stats.downloaded) : "-"}</div>
+        <div className="rounded-xl bg-surface-container/70 p-2.5">
+          <div className="text-[10px] font-bold text-muted">下:</div>
+          <div className="mt-0.5 text-sm font-black truncate">{stats ? formatBytes(stats.downloaded) : "-"}</div>
         </div>
-        <div className="rounded-2xl bg-surface-container/70 p-3">
-          <div className="text-[11px] font-bold text-muted">分享率</div>
-          <div className="mt-1 font-black">{stats ? formatRatio(stats.uploaded, stats.downloaded) : "-"}</div>
+        <div className="rounded-xl bg-surface-container/70 p-2.5">
+          <div className="text-[10px] font-bold text-muted">率:</div>
+          <div className="mt-0.5 text-sm font-black truncate">{stats ? formatRatio(stats.uploaded, stats.downloaded) : "-"}</div>
         </div>
       </div>
       {row.error ? <p className="mt-3 text-xs text-red-600">{row.error}</p> : null}

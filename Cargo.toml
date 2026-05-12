@@ -12,7 +12,7 @@ cron = "0.15"
 futures = "0.3"
 mime_guess = "2"
 quick-xml = "0.37"
-reqwest = { version = "0.12", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-tls", "zstd"] }
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "deflate", "gzip", "json", "multipart", "rustls-tls", "socks", "zstd"] }
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 rust-embed = "8"
 scraper = "0.24"

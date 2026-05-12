@@ -73,13 +73,15 @@ pub struct LightpandaProbeResult {
 
 pub async fn probe_lightpanda_1_1_1_1(
     task: SignInTaskRecord,
+    use_proxy_for_lightpanda: bool,
 ) -> Result<LightpandaProbeResult, String> {
-    let endpoint = build_lightpanda_endpoint(&task)?;
+    let endpoint = build_lightpanda_endpoint(&task, use_proxy_for_lightpanda)?;
     probe_lightpanda_endpoint_1_1_1_1(endpoint).await
 }
 
 pub async fn probe_lightpanda_request_1_1_1_1(
     request: SignInTaskRequest,
+    use_proxy_for_lightpanda: bool,
 ) -> Result<LightpandaProbeResult, String> {
     let task = SignInTaskRecord {
         id: 0,
@@ -101,7 +103,7 @@ pub async fn probe_lightpanda_request_1_1_1_1(
         created_at: String::new(),
         updated_at: String::new(),
     };
-    let endpoint = build_lightpanda_endpoint(&task)?;
+    let endpoint = build_lightpanda_endpoint(&task, use_proxy_for_lightpanda)?;
     probe_lightpanda_endpoint_1_1_1_1(endpoint).await
 }
 
@@ -117,6 +119,7 @@ pub async fn execute_task(
     _base_dir: std::path::PathBuf,
     task: SignInTaskRecord,
     site: SiteRecord,
+    use_proxy_for_lightpanda: bool,
 ) -> Result<SignInResult, String> {
     if site.site_type != "nexusphp" && site.site_type != "nexus_php" {
         return Err("自动签到目前仅支持 NexusPHP 站点".to_string());
@@ -132,7 +135,7 @@ pub async fn execute_task(
         return Err("Cookie 不能为空".to_string());
     }
 
-    let endpoint = build_lightpanda_endpoint(&task)?;
+    let endpoint = build_lightpanda_endpoint(&task, use_proxy_for_lightpanda)?;
     let base_url = site.base_url.trim_end_matches('/').to_string();
     let started_at = Utc::now().to_rfc3339();
     let output = run_cdp_sign_in(endpoint, base_url, cookie).await?;
@@ -435,7 +438,7 @@ fn evaluate_bool_via_cdp(
         .unwrap_or(false))
 }
 
-fn build_lightpanda_endpoint(task: &SignInTaskRecord) -> Result<String, String> {
+fn build_lightpanda_endpoint(task: &SignInTaskRecord, use_proxy_for_lightpanda: bool) -> Result<String, String> {
     if let Some(endpoint) = task
         .lightpanda_endpoint
         .as_deref()
@@ -459,7 +462,7 @@ fn build_lightpanda_endpoint(task: &SignInTaskRecord) -> Result<String, String> 
         endpoint.push_str("&browser=");
         endpoint.push_str(&urlencoding::encode(task.browser.trim()));
     }
-    if !task.proxy.trim().is_empty() {
+    if use_proxy_for_lightpanda && !task.proxy.trim().is_empty() {
         endpoint.push_str("&proxy=");
         endpoint.push_str(&urlencoding::encode(task.proxy.trim()));
     }

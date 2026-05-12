@@ -60,7 +60,7 @@ export function Dialog({
       <div
         className={cn(
           "w-full max-w-5xl rounded-t-[30px] border border-border bg-card shadow-card backdrop-blur-xl sm:rounded-[30px]",
-          "max-h-[92vh] overflow-hidden",
+          "max-h-[90dvh] overflow-hidden",
           panelClassName,
         )}
         onClick={(event) => event.stopPropagation()}
@@ -78,7 +78,7 @@ export function Dialog({
             <X className="h-4 w-4" />
           </button>
         </div>
-        <div className="max-h-[calc(92vh-88px)] overflow-auto">{children}</div>
+        <div className="max-h-[calc(90dvh-88px)] overflow-auto">{children}</div>
       </div>
     </div>
   );

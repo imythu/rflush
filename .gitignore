@@ -6,6 +6,9 @@
 /frontend/node_modules/
 /frontend/dist/*
 !/frontend/dist/.keep
+/frontend/.tmp-*.log
+__pycache__/
+*.py[cod]
 .claude
 .idea
 

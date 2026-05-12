@@ -16,6 +16,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { API_BASE, APP_VERSION, api, defaultSettings } from "@/lib/api";
 import type { DownloadRecord, GlobalConfig, RssSubscription } from "@/types";
@@ -156,7 +157,7 @@ function readPageFromHash(): AppPage {
   if (valid.includes(raw as AppPage)) {
     return raw as AppPage;
   }
-  return "brush-tasks";
+  return raw === "" ? "dashboard" : "brush-tasks";
 }
 
 function setHash(page: AppPage) {
@@ -484,27 +485,26 @@ export default function App() {
   }
 
   const sidebar = (
-    <aside className="relative flex h-full w-full flex-col gap-4 overflow-hidden rounded-[30px] border border-border bg-card/90 p-4 shadow-card backdrop-blur-xl lg:p-5">
+    <aside className={cn(
+      "relative flex h-full w-full flex-col gap-4 overflow-hidden rounded-[30px] border border-border bg-card/90 p-3 shadow-card backdrop-blur-xl lg:p-4",
+    )}>
       <div className="pointer-events-none absolute -left-12 -top-16 h-40 w-40 rounded-full bg-blossom/15 blur-3xl" />
       <div className="pointer-events-none absolute right-4 top-4 h-20 w-20 rounded-full border border-primary/10" />
 
-      <div className="relative rounded-[26px] border border-border bg-surface/70 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.92)]">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-primary via-[#9a7bff] to-blossom p-2 shadow-glow">
-              <img src="/yunmu-icon.svg" alt="云母" className="h-full w-full rounded-xl" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-[11px] font-bold uppercase tracking-[0.26em] text-primary">YUNMU</p>
-              <h1 className="mt-1 truncate text-2xl font-black tracking-tight text-foreground">云母</h1>
-              <p className="mt-0.5 truncate text-xs font-medium text-muted">站点管理 · 刷流调度</p>
-            </div>
+      <div className="relative rounded-[22px] border border-border bg-surface/70 p-3 lg:p-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.92)] overflow-hidden">
+        <div className="flex items-center gap-3">
+          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary via-[#9a7bff] to-blossom p-1.5 shadow-glow">
+            <img src="/yunmu-icon.svg" alt="云母" className="h-full w-full rounded-lg" />
+          </div>
+          <div className="min-w-0">
+            <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary">YUNMU</p>
+            <h1 className="mt-0.5 truncate text-xl font-black tracking-tight text-foreground">云母</h1>
           </div>
           <a
             href="https://github.com/imythu/rflush"
             target="_blank"
             rel="noopener noreferrer"
-            className="rounded-full border border-border bg-card/80 p-2 text-muted transition hover:border-primary/30 hover:text-primary"
+            className="ml-auto rounded-full border border-border bg-card/80 p-2 text-muted transition hover:border-primary/30 hover:text-primary"
             aria-label="GitHub 源码"
           >
             <GithubIcon className="h-4 w-4" />
@@ -532,55 +532,77 @@ export default function App() {
         navigate={navigate}
       />
 
-      <div className="rounded-[24px] border border-border bg-surface-container/70 p-3">
-        <div className="mb-2 flex items-center justify-between px-2">
-          <span className="text-xs font-black tracking-[0.18em] text-primary">03. 系统</span>
-          <span className="h-px flex-1 bg-border ml-3" />
+        <div className="rounded-[24px] border border-border bg-surface-container/70 p-2 lg:p-1.5">
+          <div className="mb-2 flex items-center justify-between px-2">
+            <span className="text-[10px] font-black tracking-[0.18em] text-primary whitespace-nowrap">03. 系统</span>
+            <span className="h-px flex-1 bg-border ml-3" />
+          </div>
+          <div className="space-y-1.5">
+            {navItems
+              .filter((item) => item.group === "system")
+              .map((item) => {
+                const Icon = item.icon;
+                const active = item.key === page;
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => navigate(item.key)}
+                    title={item.label}
+                    className={cn(
+                      "group/item relative flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-200",
+                      active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
+                    )}
+                  >
+                    <Icon className={cn("h-5 w-5 shrink-0", active ? "text-primary-foreground" : "text-primary")} />
+                    <div className="min-w-0">
+                      <span className="block text-sm font-semibold whitespace-nowrap">{item.label}</span>
+                      <span className={cn("mt-1 block text-[11px] leading-relaxed line-clamp-1", active ? "text-primary-foreground/85" : "text-muted")}>
+                        {item.description}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+          </div>
         </div>
-        {navItems
-          .filter((item) => item.group === "system")
-          .map((item) => {
-            const Icon = item.icon;
-            const active = item.key === page;
-            return (
-              <button
-                key={item.key}
-                type="button"
-                onClick={() => navigate(item.key)}
-                className={cn(
-                  "flex w-full items-start gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-200",
-                  active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
-                )}
-              >
-                <Icon className={cn("mt-0.5 h-5 w-5 shrink-0", active ? "text-primary-foreground" : "text-primary")} />
-                <span className="min-w-0">
-                  <span className="block text-sm font-semibold">{item.label}</span>
-                  <span className={cn("mt-1 block text-xs leading-5", active ? "text-primary-foreground/85" : "text-muted")}>
-                    {item.description}
-                  </span>
-                </span>
-              </button>
-            );
-          })}
-      </div>
 
     </aside>
   );
 
   return (
-    <main className="min-h-screen bg-background px-3 py-3 text-foreground sm:px-4 sm:py-4 lg:px-6 lg:py-6">
-      <div className="mx-auto grid max-w-[1680px] gap-4 lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-6">
-        <div className="hidden lg:block">{sidebar}</div>
+    <main className="min-h-screen bg-background pb-24 lg:pb-0 text-foreground sm:px-4 sm:py-4 lg:px-6 lg:py-6">
+      {/* Mobile Floating Dock */}
+      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 w-[92%] max-w-[440px] lg:hidden">
+        <div className="rounded-[26px] border border-white/20 bg-card/80 p-2 shadow-2xl backdrop-blur-2xl flex items-center justify-between">
+          <DockItem icon={BarChart3} active={page === "stats"} onClick={() => navigate("stats")} label="统计" />
+          <DockItem icon={Download} active={page === "brush-tasks"} onClick={() => navigate("brush-tasks")} label="刷流" />
+          <DockItem icon={Database} active={page === "sites"} onClick={() => navigate("sites")} label="站点" />
+          <button 
+            onClick={() => setMenuOpen(true)}
+            className="flex h-12 w-12 items-center justify-center rounded-2xl text-muted hover:bg-accent transition-colors"
+          >
+            <Menu className="h-6 w-6" />
+          </button>
+        </div>
+      </div>
+
+      <div className="mx-auto grid max-w-[1720px] gap-4 lg:h-[calc(100vh-48px)] lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-6">
+        <div className="hidden h-full lg:block">
+          {sidebar}
+        </div>
 
         {menuOpen ? (
-          <div className="fixed inset-0 z-40 bg-black/35 lg:hidden" onClick={() => setMenuOpen(false)}>
-            <div className="h-full w-[88vw] max-w-[340px] p-3" onClick={(event) => event.stopPropagation()}>
-              {sidebar}
+          <div className="fixed inset-0 z-[60] bg-black/40 backdrop-blur-sm lg:hidden" onClick={() => setMenuOpen(false)}>
+            <div className="h-full w-[85vw] max-w-[320px] p-4" onClick={(event) => event.stopPropagation()}>
+              <div className="h-full animate-in slide-in-from-left duration-300">
+                {sidebar}
+              </div>
             </div>
           </div>
         ) : null}
 
-        <section className="min-w-0">
+        <section className="min-w-0 overflow-y-auto no-scrollbar">
           <header className="relative overflow-hidden rounded-[22px] border border-border bg-card/88 px-3 py-3 shadow-card backdrop-blur-xl sm:px-4 lg:rounded-[30px] lg:px-6 lg:py-5">
             <div className="pointer-events-none absolute inset-y-0 right-0 hidden w-64 bg-[radial-gradient(circle_at_top_right,rgba(255,125,168,0.18),transparent_56%),linear-gradient(135deg,transparent_40%,rgba(125,92,255,0.08))] lg:block" />
             <div className="pointer-events-none absolute bottom-4 right-8 hidden h-px w-40 bg-gradient-to-r from-transparent via-primary/30 to-transparent lg:block" />
@@ -707,17 +729,15 @@ export default function App() {
           <div className="grid gap-3 sm:grid-cols-[220px_minmax(0,1fr)]">
             <div className="space-y-2">
               <div className="flex items-center gap-2">
-                <select
-                  className="flex h-11 w-full rounded-2xl border border-border bg-input px-4 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30"
+                <Select
+                  className="flex-1"
                   value={logLevelFilter}
-                  onChange={(event) => setLogLevelFilter(event.target.value as LogLevel)}
-                >
-                  {selectableLogLevels.map((level) => (
-                    <option key={level} value={level}>
-                      {level.toUpperCase()}
-                    </option>
-                  ))}
-                </select>
+                  onChange={(val) => setLogLevelFilter(val as LogLevel)}
+                  options={selectableLogLevels.map((level) => ({
+                    value: level,
+                    label: level.toUpperCase(),
+                  }))}
+                />
                 <button
                   type="button"
                   className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-border bg-surface-container text-xs font-semibold text-muted transition hover:text-foreground"
@@ -780,16 +800,16 @@ function NavSection({
   navigate: (page: AppPage) => void;
 }) {
   return (
-    <div className="rounded-[24px] border border-border bg-surface-container/70 p-3">
-      <button type="button" onClick={onToggle} className="flex w-full items-center justify-between rounded-2xl px-2 py-1 text-left">
+    <div className="rounded-[24px] border border-border bg-surface-container/70 p-2 lg:p-1.5 overflow-hidden">
+      <button type="button" onClick={onToggle} className="flex w-full items-center justify-between rounded-2xl px-2 py-1.5 text-left transition-colors hover:bg-accent/30">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-black tracking-[0.18em] text-primary">{index}</span>
-          <span className="text-xs font-black tracking-[0.18em] text-primary">{title}</span>
+          <span className="text-[10px] font-black tracking-[0.18em] text-primary">{index}</span>
+          <span className="text-[10px] font-black tracking-[0.18em] text-primary whitespace-nowrap">{title}</span>
         </div>
-        <ChevronDown className={cn("h-4 w-4 text-primary transition-transform", open ? "rotate-180" : "")} />
+        <ChevronDown className={cn("h-3.5 w-3.5 text-primary transition-transform", open ? "rotate-180" : "")} />
       </button>
       {open ? (
-        <nav className="mt-3 flex flex-col gap-2">
+        <nav className="mt-2 flex flex-col gap-1.5">
           {items.map((item) => {
             const Icon = item.icon;
             const active = item.key === page;
@@ -799,7 +819,7 @@ function NavSection({
                 type="button"
                 onClick={() => navigate(item.key)}
                 className={cn(
-                  "group flex w-full items-start gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-200",
+                  "group/item relative flex w-full items-center gap-3 rounded-2xl px-2.5 py-2.5 text-left transition-all duration-200",
                   active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
                 )}
               >
@@ -808,23 +828,49 @@ function NavSection({
                     "flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border transition-colors",
                     active
                       ? "border-white/20 bg-white/15 text-primary-foreground"
-                      : "border-primary/10 bg-card/70 text-primary group-hover:border-primary/30",
+                      : "border-primary/10 bg-card/70 text-primary group-hover/item:border-primary/30",
                   )}
                 >
                   <Icon className="h-4 w-4" />
                 </span>
-                <span className="min-w-0">
-                  <span className="block text-sm font-semibold">{item.label}</span>
-                  <span className={cn("mt-1 block text-xs leading-5", active ? "text-primary-foreground/85" : "text-muted")}>
+                <div className="min-w-0">
+                  <span className="block text-sm font-semibold whitespace-nowrap">{item.label}</span>
+                  <span className={cn("mt-1 block text-[11px] leading-relaxed line-clamp-1", active ? "text-primary-foreground/85" : "text-muted")}>
                     {item.description}
                   </span>
-                </span>
+                </div>
               </button>
             );
           })}
         </nav>
       ) : null}
     </div>
+  );
+}
+
+function DockItem({ 
+  icon: Icon, 
+  active, 
+  onClick, 
+  label 
+}: { 
+  icon: typeof LayoutDashboard; 
+  active: boolean; 
+  onClick: () => void; 
+  label: string 
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex flex-col items-center justify-center h-12 w-12 rounded-2xl transition-all duration-300",
+        active ? "bg-primary text-primary-foreground shadow-glow scale-110" : "text-muted hover:bg-accent/50"
+      )}
+    >
+      <Icon className="h-5 w-5" />
+      <span className={cn("text-[9px] font-bold mt-1", active ? "block" : "hidden")}>{label}</span>
+    </button>
   );
 }
 

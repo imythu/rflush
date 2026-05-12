@@ -18,11 +18,7 @@ pub struct NexusPhpAdapter {
 }
 
 impl NexusPhpAdapter {
-    pub fn new(base_url: String, auth: SiteAuth) -> Self {
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
+    pub fn new(base_url: String, auth: SiteAuth, client: Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,

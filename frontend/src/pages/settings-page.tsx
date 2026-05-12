@@ -2,6 +2,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import type { GlobalConfig, TimeUnit } from "@/types";
 
 export function SettingsPage({
@@ -44,24 +45,24 @@ export function SettingsPage({
         />
 
         <div className="space-y-2">
-          <Label>限流单位</Label>
-          <select
-            className="flex h-11 w-full rounded-2xl border border-border bg-input px-4 py-2 text-sm shadow-sm focus:outline-none focus:ring-2 focus:ring-ring/30"
+          <Label className="text-[11px] text-muted-foreground uppercase tracking-wider">限流单位</Label>
+          <Select
             value={settings.download_rate_limit.unit}
-            onChange={(event) =>
+            onChange={(val) =>
               setSettings((prev) => ({
                 ...prev,
                 download_rate_limit: {
                   ...prev.download_rate_limit,
-                  unit: event.target.value as TimeUnit,
+                  unit: val as TimeUnit,
                 },
               }))
             }
-          >
-            <option value="second">second</option>
-            <option value="minute">minute</option>
-            <option value="hour">hour</option>
-          </select>
+            options={[
+              { value: "second", label: "second" },
+              { value: "minute", label: "minute" },
+              { value: "hour", label: "hour" },
+            ]}
+          />
         </div>
 
         <FormNumber

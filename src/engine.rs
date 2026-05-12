@@ -193,11 +193,10 @@ impl DownloadEngine {
         );
 
         let http = Arc::new(
-            AppHttpClient::new(self.limiter.clone(), policy).map_err(|e| {
-                AppError::InvalidConfig {
+            AppHttpClient::new(self.limiter.clone(), policy, config.global.proxy.as_deref())
+                .map_err(|e| AppError::InvalidConfig {
                     message: format!("failed to build HTTP client: {}", e),
-                }
-            })?,
+                })?,
         );
 
         Ok(AppRuntime {
@@ -224,6 +223,11 @@ fn validate_config(config: &AppConfig) -> Result<(), AppError> {
             message: "global.retry_interval_secs must be >= 1".to_string(),
         });
     }
+    if let Some(proxy) = config.global.proxy.as_deref() {
+        validate_proxy(proxy).map_err(|message| AppError::InvalidConfig {
+            message: format!("global.proxy {}", message),
+        })?;
+    }
 
     let mut seen_names = HashSet::new();
     for rss in &config.rss {
@@ -234,6 +238,21 @@ fn validate_config(config: &AppConfig) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+fn validate_proxy(proxy: &str) -> Result<(), &'static str> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return Ok(());
+    }
+    if proxy.starts_with("http://")
+        || proxy.starts_with("https://")
+        || proxy.starts_with("socks5://")
+        || proxy.starts_with("socks5h://")
+    {
+        return Ok(());
+    }
+    Err("must start with http://, https://, socks5://, or socks5h://")
 }
 
 async fn build_rss_summaries(

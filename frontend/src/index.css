@@ -8,7 +8,7 @@
 
 body {
   margin: 0;
-  min-height: 100vh;
+  min-height: 100dvh;
   background:
     radial-gradient(circle at 8% 4%, rgba(255, 125, 168, 0.18), transparent 26%),
     radial-gradient(circle at 78% 0%, rgba(125, 92, 255, 0.16), transparent 28%),
@@ -80,4 +80,17 @@ button:disabled,
 ::selection {
   color: #ffffff;
   background: #7d5cff;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+html {
+  scroll-behavior: smooth;
 }

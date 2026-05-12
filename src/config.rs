@@ -22,6 +22,10 @@ pub struct GlobalConfig {
     pub max_concurrent_rss_fetches: usize,
     #[serde(default = "default_throttle_interval_secs")]
     pub throttle_interval_secs: u64,
+    #[serde(default)]
+    pub proxy: Option<String>,
+    #[serde(default = "default_true")]
+    pub use_proxy_for_lightpanda: bool,
 }
 
 impl Default for GlobalConfig {
@@ -33,6 +37,8 @@ impl Default for GlobalConfig {
             max_concurrent_downloads: default_max_concurrent_downloads(),
             max_concurrent_rss_fetches: default_max_concurrent_rss_fetches(),
             throttle_interval_secs: default_throttle_interval_secs(),
+            proxy: None,
+            use_proxy_for_lightpanda: true,
         }
     }
 }
@@ -120,4 +126,8 @@ const fn default_max_concurrent_rss_fetches() -> usize {
 
 const fn default_throttle_interval_secs() -> u64 {
     30
+}
+
+const fn default_true() -> bool {
+    true
 }

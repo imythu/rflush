@@ -4,7 +4,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use reqwest::header::{ACCEPT, ACCEPT_ENCODING, HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Proxy, StatusCode};
 use tracing::{debug, warn};
 
 use crate::logging::current_task_context;
@@ -44,6 +44,7 @@ impl AppHttpClient {
     pub fn new(
         rate_limiter: Arc<SharedRateLimiter>,
         policy: RateLimitPolicy,
+        proxy: Option<&str>,
     ) -> Result<Self, reqwest::Error> {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_USER_AGENT));
@@ -53,15 +54,23 @@ impl AppHttpClient {
             HeaderValue::from_static("gzip, deflate, br, zstd"),
         );
 
-        let inner = Client::builder()
+        let mut builder = Client::builder()
             .default_headers(headers)
             .redirect(Policy::limited(REDIRECT_LIMIT))
             .http1_only()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(4)
-            .tcp_keepalive(Duration::from_secs(30))
-            .build()?;
+            .tcp_keepalive(Duration::from_secs(30));
+
+        if let Some(proxy) = proxy.and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then_some(value)
+        }) {
+            builder = builder.proxy(Proxy::all(proxy)?);
+        }
+
+        let inner = builder.build()?;
 
         Ok(Self {
             inner,

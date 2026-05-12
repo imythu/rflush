@@ -20,15 +20,11 @@ pub struct MTeamAdapter {
 }
 
 impl MTeamAdapter {
-    pub fn new(base_url: String, auth: SiteAuth) -> Self {
+    pub fn new(base_url: String, auth: SiteAuth, client: Client) -> Self {
         let api_key = match &auth {
             SiteAuth::ApiKey { api_key } => api_key.clone(),
             _ => String::new(),
         };
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
         let url = if base_url.is_empty() {
             MTEAM_DEFAULT_API.to_string()
         } else {

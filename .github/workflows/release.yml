@@ -1,16 +1,6 @@
 name: Release
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - "src/**"
-      - "frontend/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "docker/**"
-      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -155,9 +145,9 @@ jobs:
             archive: zip
             use_cross: false
 
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
             use_cross: false
 
     steps:

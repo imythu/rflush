@@ -56,6 +56,7 @@ pub struct SiteRecord {
     pub site_type: String,
     pub base_url: String,
     pub auth_config: String,
+    pub use_proxy: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -83,6 +84,7 @@ pub struct SiteWithStats {
     pub site_type: String,
     pub base_url: String,
     pub auth_config: String,
+    pub use_proxy: bool,
     pub created_at: String,
     pub updated_at: String,
     pub stats: Option<SiteStatsRecord>,
