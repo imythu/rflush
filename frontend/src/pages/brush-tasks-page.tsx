@@ -757,27 +757,27 @@ export function BrushTasksPage() {
           ) : (
             <div className="grid gap-3">
               <Table className="table-fixed">
-                <TableHeader className="sticky top-0 z-10 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/85">
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">名称</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">种子ID</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">大小</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">状态</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">HR</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">添加时间</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">移除时间</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">下载量</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">上传量</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">下载耗时</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">平均上传速度</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">分享率</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">移除原因</TableHead>
-                    <TableHead className="w-40 border-b border-border/70 bg-card/90">信息Hash</TableHead>
+                <TableHeader className="sticky top-0 z-10 backdrop-blur">
+                  <TableRow>
+                    <TableHead className="w-40">名称</TableHead>
+                    <TableHead className="w-40">种子ID</TableHead>
+                    <TableHead className="w-40">大小</TableHead>
+                    <TableHead className="w-40">状态</TableHead>
+                    <TableHead className="w-40">HR</TableHead>
+                    <TableHead className="w-40">添加时间</TableHead>
+                    <TableHead className="w-40">移除时间</TableHead>
+                    <TableHead className="w-40">下载量</TableHead>
+                    <TableHead className="w-40">上传量</TableHead>
+                    <TableHead className="w-40">下载耗时</TableHead>
+                    <TableHead className="w-40">平均上传速度</TableHead>
+                    <TableHead className="w-40">分享率</TableHead>
+                    <TableHead className="w-40">移除原因</TableHead>
+                    <TableHead className="w-40">信息Hash</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {torrents.map((t) => (
-                    <TableRow key={t.id} className="odd:bg-card/70 even:bg-surface-container/30 hover:bg-accent/60">
+                    <TableRow key={t.id}>
                       <TableCell className="p-4 text-xs">
                         <div className="truncate font-medium text-foreground" title={t.torrent_name}>
                           {t.torrent_name}

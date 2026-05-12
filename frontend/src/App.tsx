@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState, type SVGProps } from "react";
 import {
   BarChart3,
   ChevronDown,
@@ -484,30 +484,36 @@ export default function App() {
   }
 
   const sidebar = (
-    <aside className="flex h-full w-full flex-col gap-4 rounded-[28px] border border-border/80 bg-card/95 p-4 shadow-card lg:p-5">
-      <div className="px-2 pt-1">
-        <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold uppercase tracking-[0.22em] text-primary">rflush</p>
+    <aside className="relative flex h-full w-full flex-col gap-4 overflow-hidden rounded-[30px] border border-border bg-card/90 p-4 shadow-card backdrop-blur-xl lg:p-5">
+      <div className="pointer-events-none absolute -left-12 -top-16 h-40 w-40 rounded-full bg-blossom/15 blur-3xl" />
+      <div className="pointer-events-none absolute right-4 top-4 h-20 w-20 rounded-full border border-primary/10" />
+
+      <div className="relative rounded-[26px] border border-border bg-surface/70 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.92)]">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-primary via-[#9a7bff] to-blossom p-2 shadow-glow">
+              <img src="/yunmu-icon.svg" alt="云母" className="h-full w-full rounded-xl" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-[0.26em] text-primary">YUNMU</p>
+              <h1 className="mt-1 truncate text-2xl font-black tracking-tight text-foreground">云母</h1>
+              <p className="mt-0.5 truncate text-xs font-medium text-muted">站点管理 · 刷流调度</p>
+            </div>
+          </div>
           <a
             href="https://github.com/imythu/rflush"
             target="_blank"
             rel="noopener noreferrer"
-            className="text-muted transition hover:text-foreground"
+            className="rounded-full border border-border bg-card/80 p-2 text-muted transition hover:border-primary/30 hover:text-primary"
             aria-label="GitHub 源码"
           >
-            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
-              <path d="M12 0C5.37 0 0 5.37 0 12c0 5.303 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.84 1.237 1.84 1.237 1.07 1.834 2.807 1.304 3.492.997.108-.775.418-1.305.762-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.468-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.3 1.23a11.52 11.52 0 0 1 3.003-.404c1.02.005 2.047.138 3.003.404 2.29-1.552 3.297-1.23 3.297-1.23.653 1.652.242 2.873.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.61-2.807 5.625-5.479 5.921.43.372.823 1.102.823 2.222 0 1.606-.015 2.898-.015 3.293 0 .322.216.694.825.576C20.565 21.796 24 17.3 24 12c0-6.63-5.37-12-12-12z" />
-            </svg>
+            <GithubIcon className="h-4 w-4" />
           </a>
         </div>
-        <h1 className="mt-2 text-2xl font-semibold tracking-tight text-foreground">控制台</h1>
-        <p className="mt-1 text-sm leading-6 text-muted">PT 刷流优先展开，RSS 下载和系统配置统一收纳。</p>
-        {APP_VERSION ? (
-          <p className="mt-1 text-xs text-muted/70">v{APP_VERSION}</p>
-        ) : null}
       </div>
 
       <NavSection
+        index="01."
         title="PT 刷流"
         open={groupOpen.brush}
         onToggle={() => toggleGroup("brush")}
@@ -517,6 +523,7 @@ export default function App() {
       />
 
       <NavSection
+        index="02."
         title="RSS 下载"
         open={groupOpen.rss}
         onToggle={() => toggleGroup("rss")}
@@ -525,7 +532,11 @@ export default function App() {
         navigate={navigate}
       />
 
-      <div className="rounded-2xl bg-surface-container px-4 py-3">
+      <div className="rounded-[24px] border border-border bg-surface-container/70 p-3">
+        <div className="mb-2 flex items-center justify-between px-2">
+          <span className="text-xs font-black tracking-[0.18em] text-primary">03. 系统</span>
+          <span className="h-px flex-1 bg-border ml-3" />
+        </div>
         {navItems
           .filter((item) => item.group === "system")
           .map((item) => {
@@ -537,8 +548,8 @@ export default function App() {
                 type="button"
                 onClick={() => navigate(item.key)}
                 className={cn(
-                  "flex w-full items-start gap-3 rounded-2xl px-4 py-3 text-left transition-all",
-                  active ? "bg-primary text-primary-foreground shadow-md" : "hover:bg-accent",
+                  "flex w-full items-start gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-200",
+                  active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
                 )}
               >
                 <Icon className={cn("mt-0.5 h-5 w-5 shrink-0", active ? "text-primary-foreground" : "text-primary")} />
@@ -558,7 +569,7 @@ export default function App() {
 
   return (
     <main className="min-h-screen bg-background px-3 py-3 text-foreground sm:px-4 sm:py-4 lg:px-6 lg:py-6">
-      <div className="mx-auto grid max-w-[1600px] gap-4 lg:grid-cols-[300px_minmax(0,1fr)] lg:gap-6">
+      <div className="mx-auto grid max-w-[1680px] gap-4 lg:grid-cols-[320px_minmax(0,1fr)] lg:gap-6">
         <div className="hidden lg:block">{sidebar}</div>
 
         {menuOpen ? (
@@ -570,37 +581,39 @@ export default function App() {
         ) : null}
 
         <section className="min-w-0">
-          <header className="rounded-[28px] border border-border/80 bg-card/90 px-4 py-4 shadow-card sm:px-6 sm:py-5">
-            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex items-start gap-3">
-                <Button variant="outline" className="lg:hidden" onClick={() => setMenuOpen(true)} aria-label="打开菜单">
+          <header className="relative overflow-hidden rounded-[22px] border border-border bg-card/88 px-3 py-3 shadow-card backdrop-blur-xl sm:px-4 lg:rounded-[30px] lg:px-6 lg:py-5">
+            <div className="pointer-events-none absolute inset-y-0 right-0 hidden w-64 bg-[radial-gradient(circle_at_top_right,rgba(255,125,168,0.18),transparent_56%),linear-gradient(135deg,transparent_40%,rgba(125,92,255,0.08))] lg:block" />
+            <div className="pointer-events-none absolute bottom-4 right-8 hidden h-px w-40 bg-gradient-to-r from-transparent via-primary/30 to-transparent lg:block" />
+            <div className="relative flex items-center justify-between gap-3 lg:items-start">
+              <div className="flex min-w-0 items-center gap-2 lg:items-start lg:gap-3">
+                <Button variant="outline" className="h-9 px-3 lg:hidden" onClick={() => setMenuOpen(true)} aria-label="打开菜单">
                   <Menu className="h-4 w-4" />
                 </Button>
                 <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-full bg-secondary px-3 py-1 text-xs font-medium text-secondary-foreground">
+                  <div className="hidden flex-wrap items-center gap-2 lg:flex">
+                    <span className="rounded-full border border-primary/15 bg-secondary px-3 py-1 text-xs font-bold text-secondary-foreground">
                       {currentNav.label}
                     </span>
                   </div>
-                  <h2 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">{currentNav.description}</h2>
-                  <p className="mt-1 text-sm leading-6 text-muted">右上角可直接查看实时后端日志；系统时间由前端本地持续刷新。</p>
+                  <h2 className="truncate text-base font-black tracking-tight sm:text-lg lg:mt-2 lg:text-3xl">{currentNav.description}</h2>
+                  <p className="mt-1 hidden text-sm leading-6 text-muted lg:block">实时后端日志、系统时间和当前模块状态集中在右侧，页面主体保持高密度操作。</p>
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center justify-end gap-2">
-                <div className="rounded-full border border-border bg-surface-container px-3 py-2 text-sm text-muted">
+              <div className="flex shrink-0 items-center justify-end gap-2">
+                <div className="hidden rounded-full border border-border bg-surface-container/80 px-3 py-2 text-sm font-medium text-muted lg:block">
                   {currentTime.toLocaleString()}
                 </div>
-                <Button variant="outline" onClick={() => setLogsOpen(true)}>
-                  <FileText className="mr-2 h-4 w-4" />
-                  实时日志
+                <Button variant="outline" className="h-9 px-3 lg:h-10 lg:px-5" onClick={() => setLogsOpen(true)}>
+                  <FileText className="h-4 w-4 lg:mr-2" />
+                  <span className="hidden lg:inline">实时日志</span>
                 </Button>
               </div>
             </div>
           </header>
 
           {message ? (
-            <div className="mt-4 rounded-2xl border border-border bg-card px-4 py-3 text-sm shadow-card">
+            <div className="mt-4 rounded-[22px] border border-border bg-card/90 px-4 py-3 text-sm shadow-card backdrop-blur">
               <div className="flex items-start justify-between gap-3">
                 <span>{message}</span>
                 <button
@@ -745,6 +758,7 @@ export default function App() {
 }
 
 function NavSection({
+  index,
   title,
   open,
   onToggle,
@@ -752,6 +766,7 @@ function NavSection({
   page,
   navigate,
 }: {
+  index: string;
   title: string;
   open: boolean;
   onToggle: () => void;
@@ -765,9 +780,12 @@ function NavSection({
   navigate: (page: AppPage) => void;
 }) {
   return (
-    <div className="rounded-2xl bg-surface-container px-4 py-3">
-      <button type="button" onClick={onToggle} className="flex w-full items-center justify-between text-left">
-        <div className="text-xs font-semibold uppercase tracking-[0.2em] text-primary">{title}</div>
+    <div className="rounded-[24px] border border-border bg-surface-container/70 p-3">
+      <button type="button" onClick={onToggle} className="flex w-full items-center justify-between rounded-2xl px-2 py-1 text-left">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-black tracking-[0.18em] text-primary">{index}</span>
+          <span className="text-xs font-black tracking-[0.18em] text-primary">{title}</span>
+        </div>
         <ChevronDown className={cn("h-4 w-4 text-primary transition-transform", open ? "rotate-180" : "")} />
       </button>
       {open ? (
@@ -781,11 +799,20 @@ function NavSection({
                 type="button"
                 onClick={() => navigate(item.key)}
                 className={cn(
-                  "flex w-full items-start gap-3 rounded-2xl px-4 py-3 text-left transition-all",
-                  active ? "bg-primary text-primary-foreground shadow-md" : "hover:bg-accent",
+                  "group flex w-full items-start gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-200",
+                  active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
                 )}
               >
-                <Icon className={cn("mt-0.5 h-5 w-5 shrink-0", active ? "text-primary-foreground" : "text-primary")} />
+                <span
+                  className={cn(
+                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border transition-colors",
+                    active
+                      ? "border-white/20 bg-white/15 text-primary-foreground"
+                      : "border-primary/10 bg-card/70 text-primary group-hover:border-primary/30",
+                  )}
+                >
+                  <Icon className="h-4 w-4" />
+                </span>
                 <span className="min-w-0">
                   <span className="block text-sm font-semibold">{item.label}</span>
                   <span className={cn("mt-1 block text-xs leading-5", active ? "text-primary-foreground/85" : "text-muted")}>
@@ -798,5 +825,13 @@ function NavSection({
         </nav>
       ) : null}
     </div>
+  );
+}
+
+function GithubIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" {...props}>
+      <path d="M12 0C5.37 0 0 5.37 0 12c0 5.303 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.84 1.237 1.84 1.237 1.07 1.834 2.807 1.304 3.492.997.108-.775.418-1.305.762-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.468-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.3 1.23a11.52 11.52 0 0 1 3.003-.404c1.02.005 2.047.138 3.003.404 2.29-1.552 3.297-1.23 3.297-1.23.653 1.652.242 2.873.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.61-2.807 5.625-5.479 5.921.43.372.823 1.102.823 2.222 0 1.606-.015 2.898-.015 3.293 0 .322.216.694.825.576C20.565 21.796 24 17.3 24 12c0-6.63-5.37-12-12-12z" />
+    </svg>
   );
 }

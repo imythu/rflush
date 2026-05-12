@@ -94,6 +94,22 @@ export type SiteRecord = {
   auth_config: string;
   created_at: string;
   updated_at: string;
+  stats: SiteStatsRecord | null;
+};
+
+export type SiteStatsRecord = {
+  site_id: number;
+  uid: string | null;
+  username: string | null;
+  uploaded: number | null;
+  downloaded: number | null;
+  ratio: number | null;
+  bonus: number | null;
+  seeding_count: number | null;
+  leeching_count: number | null;
+  updated_at: string | null;
+  last_checked_at: string;
+  last_error: string | null;
 };
 
 export type SiteTestResult = {
@@ -103,6 +119,7 @@ export type SiteTestResult = {
 };
 
 export type UserStats = {
+  uid: string | null;
   username: string;
   uploaded: number;
   downloaded: number;

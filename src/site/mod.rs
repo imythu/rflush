@@ -39,6 +39,7 @@ impl SiteType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserStats {
+    pub uid: Option<String>,
     pub username: String,
     pub uploaded: u64,
     pub downloaded: u64,
@@ -57,6 +58,34 @@ pub struct SiteRecord {
     pub auth_config: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteStatsRecord {
+    pub site_id: i64,
+    pub uid: Option<String>,
+    pub username: Option<String>,
+    pub uploaded: Option<u64>,
+    pub downloaded: Option<u64>,
+    pub ratio: Option<f64>,
+    pub bonus: Option<f64>,
+    pub seeding_count: Option<u32>,
+    pub leeching_count: Option<u32>,
+    pub updated_at: Option<String>,
+    pub last_checked_at: String,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SiteWithStats {
+    pub id: i64,
+    pub name: String,
+    pub site_type: String,
+    pub base_url: String,
+    pub auth_config: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub stats: Option<SiteStatsRecord>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

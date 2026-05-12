@@ -9,6 +9,7 @@ export function Dialog({
   description,
   children,
   escMode = "single",
+  panelClassName,
 }: {
   open: boolean;
   onClose: () => void;
@@ -16,6 +17,7 @@ export function Dialog({
   description?: string;
   children: React.ReactNode;
   escMode?: "single" | "double";
+  panelClassName?: string;
 }) {
   const lastEscAtRef = useRef(0);
 
@@ -54,17 +56,18 @@ export function Dialog({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-0 sm:items-center sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-night/45 p-0 backdrop-blur-sm sm:items-center sm:p-4" onClick={onClose}>
       <div
         className={cn(
-          "w-full max-w-5xl rounded-t-[28px] border border-border bg-card shadow-card sm:rounded-[28px]",
+          "w-full max-w-5xl rounded-t-[30px] border border-border bg-card shadow-card backdrop-blur-xl sm:rounded-[30px]",
           "max-h-[92vh] overflow-hidden",
+          panelClassName,
         )}
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="flex items-start justify-between gap-4 border-b border-border px-4 py-4 sm:px-6">
+        <div className="flex items-start justify-between gap-4 border-b border-border bg-surface-container/45 px-4 py-4 sm:px-6">
           <div>
-            <h3 className="text-lg font-semibold">{title}</h3>
+            <h3 className="text-lg font-bold">{title}</h3>
             {description ? <p className="mt-1 text-sm text-muted">{description}</p> : null}
           </div>
           <button

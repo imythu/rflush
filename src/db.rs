@@ -10,7 +10,7 @@ use crate::downloader::DownloaderRecord;
 use crate::error::AppError;
 use crate::history::{FinalStatus, RunHistory, TorrentRunRecord};
 use crate::sign_in::{SignInRecord, SignInResult, SignInTaskRecord, SignInTaskRequest};
-use crate::site::SiteRecord;
+use crate::site::{SiteRecord, SiteStatsRecord, SiteWithStats, UserStats};
 use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
 #[derive(Clone)]
@@ -562,6 +562,66 @@ impl Database {
         .map_err(join_error)?
     }
 
+    pub async fn list_sites_with_stats(&self) -> Result<Vec<SiteWithStats>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.created_at, s.updated_at,
+                            st.site_id, st.uid, st.username, st.uploaded, st.downloaded, st.ratio, st.bonus,
+                            st.seeding_count, st.leeching_count, st.updated_at, st.last_checked_at, st.last_error
+                     FROM sites s
+                     LEFT JOIN site_stats st ON st.site_id = s.id
+                     ORDER BY s.id",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let stats_site_id: Option<i64> = row.get(7)?;
+                    Ok(SiteWithStats {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        site_type: row.get(2)?,
+                        base_url: row.get(3)?,
+                        auth_config: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                        stats: stats_site_id.map(|site_id| SiteStatsRecord {
+                            site_id,
+                            uid: row.get(8).ok().flatten(),
+                            username: row.get(9).ok().flatten(),
+                            uploaded: row.get::<_, Option<i64>>(10).ok().flatten().map(|v| v as u64),
+                            downloaded: row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v as u64),
+                            ratio: row.get(12).ok().flatten(),
+                            bonus: row.get(13).ok().flatten(),
+                            seeding_count: row
+                                .get::<_, Option<i64>>(14)
+                                .ok()
+                                .flatten()
+                                .map(|v| v as u32),
+                            leeching_count: row
+                                .get::<_, Option<i64>>(15)
+                                .ok()
+                                .flatten()
+                                .map(|v| v as u32),
+                            updated_at: row.get(16).ok().flatten(),
+                            last_checked_at: row.get(17).unwrap_or_default(),
+                            last_error: row.get(18).ok().flatten(),
+                        }),
+                    })
+                })
+                .map_err(sql_error)?;
+            let mut sites = Vec::new();
+            for row in rows {
+                sites.push(row.map_err(sql_error)?);
+            }
+            Ok(sites)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn get_site(&self, id: i64) -> Result<Option<SiteRecord>, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -651,6 +711,80 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.execute("DELETE FROM sites WHERE id = ?", params![id])
                 .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn upsert_site_stats_success(
+        &self,
+        site_id: i64,
+        stats: &UserStats,
+        checked_at: &str,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let stats = stats.clone();
+        let checked_at = checked_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "INSERT INTO site_stats
+                 (site_id, uid, username, uploaded, downloaded, ratio, bonus, seeding_count, leeching_count, updated_at, last_checked_at, last_error)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                 ON CONFLICT(site_id) DO UPDATE SET
+                   uid = excluded.uid,
+                   username = excluded.username,
+                   uploaded = excluded.uploaded,
+                   downloaded = excluded.downloaded,
+                   ratio = excluded.ratio,
+                   bonus = excluded.bonus,
+                   seeding_count = excluded.seeding_count,
+                   leeching_count = excluded.leeching_count,
+                   updated_at = excluded.updated_at,
+                   last_checked_at = excluded.last_checked_at,
+                   last_error = NULL",
+                params![
+                    site_id,
+                    stats.uid,
+                    stats.username,
+                    clamp_u64_to_i64(stats.uploaded),
+                    clamp_u64_to_i64(stats.downloaded),
+                    stats.ratio,
+                    stats.bonus,
+                    stats.seeding_count.map(|v| v as i64),
+                    stats.leeching_count.map(|v| v as i64),
+                    checked_at,
+                    checked_at,
+                ],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn upsert_site_stats_error(
+        &self,
+        site_id: i64,
+        message: &str,
+        checked_at: &str,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let message = message.to_string();
+        let checked_at = checked_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "INSERT INTO site_stats (site_id, last_checked_at, last_error)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(site_id) DO UPDATE SET
+                   last_checked_at = excluded.last_checked_at,
+                   last_error = excluded.last_error",
+                params![site_id, checked_at, message],
+            )
+            .map_err(sql_error)?;
             Ok(())
         })
         .await
@@ -1742,6 +1876,21 @@ impl Database {
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS site_stats (
+                    site_id INTEGER PRIMARY KEY REFERENCES sites(id) ON DELETE CASCADE,
+                    uid TEXT,
+                    username TEXT,
+                    uploaded INTEGER,
+                    downloaded INTEGER,
+                    ratio REAL,
+                    bonus REAL,
+                    seeding_count INTEGER,
+                    leeching_count INTEGER,
+                    updated_at TEXT,
+                    last_checked_at TEXT NOT NULL,
+                    last_error TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS downloaders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
@@ -1867,6 +2016,7 @@ impl Database {
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_brush_task_torrents_task ON brush_task_torrents(task_id, status);
+                CREATE INDEX IF NOT EXISTS idx_site_stats_checked_at ON site_stats(last_checked_at);
                 CREATE INDEX IF NOT EXISTS idx_task_stats_task ON task_stats_snapshots(task_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_torrent_traffic_lookup ON torrent_traffic(task_id, torrent_hash, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_downloader_speed_snapshots_lookup ON downloader_speed_snapshots(downloader_id, recorded_at);
@@ -2190,6 +2340,10 @@ fn parse_time_unit(value: String) -> TimeUnit {
         "hour" => TimeUnit::Hour,
         _ => TimeUnit::Second,
     }
+}
+
+fn clamp_u64_to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 fn final_status_name(status: FinalStatus) -> &'static str {

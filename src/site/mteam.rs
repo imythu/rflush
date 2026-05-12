@@ -202,6 +202,13 @@ impl SiteAdapter for MTeamAdapter {
                 .unwrap_or("unknown")
                 .to_string();
 
+            let uid = data
+                .get("uid")
+                .or_else(|| data.get("id"))
+                .or_else(|| data.get("userId"))
+                .or_else(|| data.get("memberId"))
+                .and_then(json_value_to_string);
+
             let member_count = data.get("memberCount").unwrap_or(data);
 
             let uploaded = member_count
@@ -247,6 +254,7 @@ impl SiteAdapter for MTeamAdapter {
             });
 
             Ok(UserStats {
+                uid,
                 username,
                 uploaded,
                 downloaded,
@@ -345,6 +353,14 @@ fn simple_random_ms(max_ms: u64) -> u64 {
     // 混入当前线程地址作为额外熵源
     let seed = nanos ^ (nanos >> 32);
     if max_ms == 0 { 0 } else { seed % max_ms }
+}
+
+fn json_value_to_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|n| n.to_string()))
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
 }
 
 fn parse_mteam_datetime(value: &str) -> Option<i64> {

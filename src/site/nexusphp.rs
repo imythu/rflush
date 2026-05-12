@@ -81,6 +81,12 @@ impl NexusPhpAdapter {
             .unwrap_or("unknown")
             .to_string();
 
+        let uid = data
+            .get("uid")
+            .or_else(|| data.get("id"))
+            .or_else(|| data.get("user_id"))
+            .and_then(json_value_to_string);
+
         let uploaded = data
             .get("uploaded")
             .or_else(|| data.get("upload"))
@@ -100,6 +106,7 @@ impl NexusPhpAdapter {
             .and_then(|v| v.as_f64());
 
         Ok(UserStats {
+            uid,
             username,
             uploaded,
             downloaded,
@@ -138,11 +145,13 @@ impl NexusPhpAdapter {
         let username = extract_between(&html, "class=\"User_Name\">", "<")
             .or_else(|| extract_between(&html, "class=\"username\">", "<"))
             .unwrap_or_else(|| "unknown".to_string());
+        let uid = extract_user_id_from_html(&html);
 
         let uploaded = parse_size_from_html(&html, &["上传量", "Uploaded", "上傳量"]);
         let downloaded = parse_size_from_html(&html, &["下载量", "Downloaded", "下載量"]);
 
         Ok(UserStats {
+            uid,
             username,
             uploaded,
             downloaded,
@@ -338,6 +347,28 @@ fn extract_between(text: &str, start: &str, end: &str) -> Option<String> {
     let remaining = &text[start_idx..];
     let end_idx = remaining.find(end)?;
     Some(remaining[..end_idx].to_string())
+}
+
+fn json_value_to_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.as_u64().map(|n| n.to_string()))
+        .or_else(|| value.as_i64().map(|n| n.to_string()))
+}
+
+fn extract_user_id_from_html(html: &str) -> Option<String> {
+    extract_query_param_after(html, "userdetails.php?id=")
+        .or_else(|| extract_query_param_after(html, "user.php?id="))
+}
+
+fn extract_query_param_after(html: &str, needle: &str) -> Option<String> {
+    let start = html.find(needle)? + needle.len();
+    let id: String = html[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if id.is_empty() { None } else { Some(id) }
 }
 
 fn parse_size_from_html(html: &str, keywords: &[&str]) -> u64 {

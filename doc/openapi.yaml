@@ -1,0 +1,673 @@
+openapi: 3.0.3
+info:
+  title: rflush Backend API
+  version: 1.0.0
+servers:
+  - url: http://127.0.0.1:3000
+
+paths:
+  /api/settings:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/GlobalConfig'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    put:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/GlobalConfig'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/GlobalConfig'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/rss:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/RssSubscription'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateRssRequest'}}}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/RssSubscription'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/rss/{id}:
+    delete:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/{id}/start:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/JobInfo'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/{id}/pause:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/{id}/delete:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskBatchRequest'}}}
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/{id}/records:
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/PageSize'}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/TaskRecordsResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/start:
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskBatchRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/JobInfo'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/pause:
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskBatchRequest'}}}
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/delete:
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskBatchRequest'}}}
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/start-all:
+    post:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/JobInfo'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/pause-all:
+    post:
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/tasks/delete-all:
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TaskBatchRequest'}}}
+      responses:
+        '204': {description: No Content}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/history:
+    get:
+      parameters: [{$ref: '#/components/parameters/Limit'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloadHistoryRecord'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/runs:
+    get:
+      parameters: [{$ref: '#/components/parameters/Limit'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloadRunRecord'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/runs/{id}/records:
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/PageSize'}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/PaginatedRunRecords'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/jobs/run-all:
+    post:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/JobInfo'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/jobs/run/{id}:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/JobInfo'}}}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/sites:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteWithStats'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateSiteRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/IdResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sites/{id}:
+    put:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateSiteRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sites/{id}/test:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/SiteTestResult'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sites/{id}/stats:
+    get:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/UserStats'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sites/stats-overview:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteWithStats'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/downloaders:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloaderRecord'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateDownloaderRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/IdResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/downloaders/{id}:
+    put:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateDownloaderRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/downloaders/{id}/test:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/DownloaderTestResult'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/downloaders/{id}/space:
+    get:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/DownloaderSpaceStats'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/brush-tasks:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/BrushTaskRecord'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/BrushTaskRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/IdResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/brush-tasks/{id}:
+    get:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/BrushTaskRecord'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    put:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/BrushTaskRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/brush-tasks/{id}/start:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/brush-tasks/{id}/stop:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/brush-tasks/{id}/run:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/brush-tasks/{id}/torrents:
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/PageSize'}
+        - name: keyword
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/BrushTaskTorrentsResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/system/logs/stream:
+    get:
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema: {type: string}
+              example: |
+                event: log
+                data: {"encoded_line":"hello%20world"}
+
+  /api/stats/overview:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/StatsOverview'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/stats/trend:
+    get:
+      parameters:
+        - {name: task_id, in: query, required: false, schema: {type: integer, format: int64}}
+        - {name: since, in: query, required: false, schema: {type: string}}
+        - {name: until, in: query, required: false, schema: {type: string}}
+        - {name: hours, in: query, required: false, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/TaskStatsSnapshot'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/stats/downloader-speed-trend:
+    get:
+      parameters:
+        - {name: downloader_id, in: query, required: false, schema: {type: integer, format: int64}}
+        - {name: since, in: query, required: false, schema: {type: string}}
+        - {name: until, in: query, required: false, schema: {type: string}}
+        - {name: hours, in: query, required: false, schema: {type: integer, format: int64}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloaderSpeedSnapshot'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+components:
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: {type: integer, format: int64}
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1}
+    Page:
+      name: page
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1}
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      schema: {type: integer, minimum: 1}
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string}
+
+    GlobalConfig:
+      type: object
+      required: [download_rate_limit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs]
+      properties:
+        download_rate_limit:
+          type: object
+          required: [requests, interval, unit]
+          properties:
+            requests: {type: integer, format: int32}
+            interval: {type: integer, format: int64}
+            unit: {type: string, enum: [second, minute, hour]}
+        retry_interval_secs: {type: integer, format: int64}
+        log_level: {type: string, nullable: true, enum: [trace, debug, info, warn, error, null]}
+        max_concurrent_downloads: {type: integer, format: int64}
+        max_concurrent_rss_fetches: {type: integer, format: int64}
+        throttle_interval_secs: {type: integer, format: int64}
+
+    RssSubscription:
+      type: object
+      required: [id, name, url, enabled, created_at, updated_at]
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        url: {type: string}
+        enabled: {type: boolean}
+        created_at: {type: string}
+        updated_at: {type: string}
+
+    CreateRssRequest:
+      type: object
+      required: [name, url]
+      properties:
+        name: {type: string}
+        url: {type: string}
+        auto_start: {type: boolean}
+
+    TaskBatchRequest:
+      type: object
+      required: [ids]
+      properties:
+        ids: {type: array, items: {type: integer, format: int64}}
+        delete_files: {type: boolean, nullable: true}
+
+    RunSummary:
+      type: object
+      properties:
+        total: {type: integer, format: int64}
+        succeeded: {type: integer, format: int64}
+        skipped_existing: {type: integer, format: int64}
+        failed: {type: integer, format: int64}
+
+    JobInfo:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        scope: {type: string}
+        task_id: {type: integer, format: int64, nullable: true}
+        status: {type: string}
+        started_at: {type: string}
+        finished_at: {type: string, nullable: true}
+        run_id: {type: integer, format: int64, nullable: true}
+        summary: {allOf: [{$ref: '#/components/schemas/RunSummary'}], nullable: true}
+        error: {type: string, nullable: true}
+
+    DownloadHistoryRecord:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        run_id: {type: integer, format: int64}
+        task_id: {type: integer, format: int64, nullable: true}
+        finished_at: {type: string}
+        rss_name: {type: string}
+        guid: {type: string}
+        title: {type: string}
+        retry_count: {type: integer, format: int32}
+        refresh_count: {type: integer, format: int32}
+        bytes: {type: integer, format: int64, nullable: true}
+        file_name: {type: string, nullable: true}
+        saved_path: {type: string, nullable: true}
+        final_status: {type: string}
+        final_message: {type: string, nullable: true}
+        file_deleted: {type: boolean}
+
+    DownloadRunRecord:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        started_at: {type: string}
+        finished_at: {type: string}
+        retry_delay_secs: {type: integer, format: int64}
+        total: {type: integer, format: int64}
+        succeeded: {type: integer, format: int64}
+        skipped_existing: {type: integer, format: int64}
+        failed: {type: integer, format: int64}
+
+    PaginatedRunRecords:
+      type: object
+      properties:
+        run: {$ref: '#/components/schemas/DownloadRunRecord'}
+        page: {type: integer, format: int64}
+        page_size: {type: integer, format: int64}
+        total_records: {type: integer, format: int64}
+        records: {type: array, items: {$ref: '#/components/schemas/DownloadHistoryRecord'}}
+
+    TaskRecordsResponse:
+      type: object
+      properties:
+        task: {$ref: '#/components/schemas/RssSubscription'}
+        page: {type: integer, format: int64}
+        page_size: {type: integer, format: int64}
+        total_records: {type: integer, format: int64}
+        records: {type: array, items: {$ref: '#/components/schemas/DownloadHistoryRecord'}}
+
+    SiteRecord:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        site_type: {type: string}
+        base_url: {type: string}
+        auth_config: {type: string}
+        created_at: {type: string}
+        updated_at: {type: string}
+
+    SiteStatsRecord:
+      type: object
+      properties:
+        site_id: {type: integer, format: int64}
+        uid: {type: string, nullable: true}
+        username: {type: string, nullable: true}
+        uploaded: {type: integer, format: int64, nullable: true}
+        downloaded: {type: integer, format: int64, nullable: true}
+        ratio: {type: number, format: double, nullable: true}
+        bonus: {type: number, format: double, nullable: true}
+        seeding_count: {type: integer, format: int32, nullable: true}
+        leeching_count: {type: integer, format: int32, nullable: true}
+        updated_at: {type: string, nullable: true}
+        last_checked_at: {type: string}
+        last_error: {type: string, nullable: true}
+
+    SiteWithStats:
+      allOf:
+        - {$ref: '#/components/schemas/SiteRecord'}
+        - type: object
+          properties:
+            stats: {allOf: [{$ref: '#/components/schemas/SiteStatsRecord'}], nullable: true}
+
+    CreateSiteRequest:
+      type: object
+      required: [name, site_type, base_url, auth_config]
+      properties:
+        name: {type: string}
+        site_type: {type: string}
+        base_url: {type: string}
+        auth_config: {type: object, additionalProperties: true}
+
+    UserStats:
+      type: object
+      properties:
+        uid: {type: string, nullable: true}
+        username: {type: string}
+        uploaded: {type: integer, format: int64}
+        downloaded: {type: integer, format: int64}
+        ratio: {type: number, format: double, nullable: true}
+        bonus: {type: number, format: double, nullable: true}
+        seeding_count: {type: integer, format: int32, nullable: true}
+        leeching_count: {type: integer, format: int32, nullable: true}
+
+    SiteTestResult:
+      type: object
+      properties:
+        success: {type: boolean}
+        message: {type: string}
+        user_stats: {allOf: [{$ref: '#/components/schemas/UserStats'}], nullable: true}
+
+    DownloaderRecord:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        name: {type: string}
+        downloader_type: {type: string}
+        url: {type: string}
+        username: {type: string}
+        password: {type: string}
+        created_at: {type: string}
+        updated_at: {type: string}
+
+    CreateDownloaderRequest:
+      type: object
+      required: [name, downloader_type, url]
+      properties:
+        name: {type: string}
+        downloader_type: {type: string}
+        url: {type: string}
+        username: {type: string, nullable: true}
+        password: {type: string, nullable: true}
+
+    DownloaderTestResult:
+      type: object
+      properties:
+        success: {type: boolean}
+        message: {type: string}
+        version: {type: string, nullable: true}
+        free_space: {type: integer, format: int64, nullable: true}
+
+    DownloaderSpaceStats:
+      type: object
+      properties:
+        free_space: {type: integer, format: int64}
+        pending_download_bytes: {type: integer, format: int64}
+        effective_free_space: {type: integer, format: int64}
+        torrent_count: {type: integer, format: int64}
+        incomplete_count: {type: integer, format: int64}
+
+    BrushTaskRecord:
+      type: object
+      additionalProperties: true
+
+    BrushTaskRequest:
+      type: object
+      required: [name, cron_expression, downloader_id, tag, rss_url]
+      additionalProperties: true
+
+    BrushTorrentRecord:
+      type: object
+      additionalProperties: true
+
+    BrushTaskTorrentsResponse:
+      type: object
+      properties:
+        task: {$ref: '#/components/schemas/BrushTaskRecord'}
+        page: {type: integer, format: int64}
+        page_size: {type: integer, format: int64}
+        total_records: {type: integer, format: int64}
+        records: {type: array, items: {$ref: '#/components/schemas/BrushTorrentRecord'}}
+
+    TaskStatsSnapshot:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        task_id: {type: integer, format: int64}
+        total_uploaded: {type: integer, format: int64}
+        total_downloaded: {type: integer, format: int64}
+        torrent_count: {type: integer, format: int64}
+        recorded_at: {type: string}
+
+    DownloaderSpeedSnapshot:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+        downloader_id: {type: integer, format: int64}
+        upload_speed: {type: integer, format: int64}
+        download_speed: {type: integer, format: int64}
+        recorded_at: {type: string}
+
+    StatsOverview:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items:
+            type: object
+            properties:
+              task_id: {type: integer, format: int64}
+              task_name: {type: string}
+              total_uploaded: {type: integer, format: int64}
+              total_downloaded: {type: integer, format: int64}
+              torrent_count: {type: integer, format: int64}
+              enabled: {type: boolean}
+
+    IdResponse:
+      type: object
+      properties:
+        id: {type: integer, format: int64}
+
+    OkResponse:
+      type: object
+      properties:
+        ok: {type: boolean}

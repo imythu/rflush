@@ -1,9 +1,11 @@
-# rflush
+# 云母
 
 [![GitHub Release](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square)](https://github.com/imythu/rflush/releases/latest)
 [![Docker Image](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square&label=ghcr.io)](https://github.com/imythu/rflush/pkgs/container/rflush)
 
-基于 Web 界面的 RSS 种子下载器，同时包含 PT 刷流任务管理。
+云母是一套面向 PT 使用场景的 Web 管理工具，包含 RSS 种子下载、PT 刷流任务管理、站点账号数据缓存与账号数据总览导出。
+
+当前仓库、二进制、Docker 镜像与数据库文件名仍沿用 `rflush`，对外展示的产品名为“云母”。
 
 现在的运行方式不再依赖 `rss.yaml`。程序启动后会开启一个本地 Web 服务，通过页面管理：
 
@@ -13,6 +15,8 @@
 - 删除任务时可选同步删除已下载种子文件
 - 历史下载记录查看
 - PT 站点配置与连接测试
+- PT 站点上传 / 下载量缓存与账号数据总览
+- 站点账号数据支持导出 PNG、复制到剪贴板，便于求邀或资历展示
 - 下载器配置与连接测试
 - 刷流任务的新增 / 编辑 / 删除 / 启动 / 停止 / 立即执行一次
 - 刷流种子列表、删种状态、缓存状态查看
@@ -27,10 +31,12 @@
 - 内置域名级 FIFO 限流器
 - 遇到“请求过于频繁”自动冻结对应域名并等待恢复
 - 历史记录保存重试次数，不保存每次重试细节
-- React + shadcn 风格前端页面
+- React 前端页面，适配桌面端与移动端
 - PT 刷流任务支持 cron 调度和手动立即执行
 - PT 刷流支持站点绑定、下载器绑定、选种规则和删种规则
 - 免费种 / H&R 判定支持 RSS 扩展属性和站点详情增强两层来源
+- PT 站点账号数据会写入 SQLite，程序启动后异步刷新一次，之后每小时自动刷新
+- 站点总览按站点并发拉取数据，单个站点失败不会影响其它站点，失败项会保留错误状态
 
 ## Get Started
 
@@ -79,6 +85,7 @@
 3. PT 站点
 4. 下载器
 5. 刷流任务
+6. 站点账号数据总览与导出
 
 ### 方式二：使用 Docker
 
@@ -192,6 +199,7 @@ npm run dev
 5. 在“下载历史”或任务弹窗中查看结果
 6. 在“站点管理”和“下载器”中完成 PT 配置
 7. 在“刷流任务”中创建任务，可按计划执行或点击“立即执行一次”
+8. 在“站点管理”的“总览”中查看账号数据，并按需复制或下载图片
 
 ## 前后端开发模式
 
@@ -280,6 +288,7 @@ SQLite 数据库位于：
 - `download_runs`：每次批量执行的概要
 - `download_records`：每个种子的最终下载记录，包含种子文件是否已删除标记
 - `sites`：PT 站点配置
+- `site_stats`：PT 站点账号数据缓存，包含 UID、用户名、上传量、下载量、分享率与最近刷新状态
 - `downloaders`：下载器配置
 - `brush_tasks`：刷流任务配置
 - `brush_task_torrents`：刷流任务下的种子记录
@@ -314,6 +323,7 @@ SQLite 数据库位于：
 - `DELETE /api/sites/:id`
 - `POST /api/sites/:id/test`
 - `GET /api/sites/:id/stats`
+- `GET /api/sites/stats-overview`
 - `GET /api/downloaders`
 - `POST /api/downloaders`
 - `PUT /api/downloaders/:id`

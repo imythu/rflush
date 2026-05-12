@@ -13,6 +13,7 @@ mod net;
 mod rss;
 mod sign_in;
 mod site;
+mod site_stats;
 mod stats;
 mod web;
 
@@ -78,12 +79,19 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         sign_in_scheduler_ref.start().await;
     });
 
+    let site_stats_refresher = std::sync::Arc::new(site_stats::SiteStatsRefresher::new(db.clone()));
+    let site_stats_refresher_ref = site_stats_refresher.clone();
+    let site_stats_handle = tokio::spawn(async move {
+        site_stats_refresher_ref.start().await;
+    });
+
     let web_result = web::serve(
         base_dir,
         listen_addr,
         db,
         scheduler,
         sign_in_scheduler,
+        site_stats_refresher,
         collector,
     )
     .await;
@@ -92,11 +100,13 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     stats_handle.abort();
     scheduler_handle.abort();
     sign_in_scheduler_handle.abort();
+    site_stats_handle.abort();
 
     let _ = collector_handle.await;
     let _ = stats_handle.await;
     let _ = scheduler_handle.await;
     let _ = sign_in_scheduler_handle.await;
+    let _ = site_stats_handle.await;
 
     web_result
 }

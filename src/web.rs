@@ -33,6 +33,7 @@ use crate::error::AppError;
 use crate::history::RunSummary;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
+use crate::site_stats::SiteStatsRefresher;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -42,6 +43,7 @@ pub struct AppState {
     jobs: Arc<JobRegistry>,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
+    site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
 }
 
@@ -139,6 +141,7 @@ impl AppState {
         engine: DownloadEngine,
         scheduler: Arc<BrushScheduler>,
         sign_in_scheduler: Arc<SignInScheduler>,
+        site_stats_refresher: Arc<SiteStatsRefresher>,
         collector: Arc<DownloaderSnapshotCollector>,
     ) -> Self {
         Self {
@@ -148,6 +151,7 @@ impl AppState {
             jobs: Arc::new(JobRegistry::default()),
             scheduler,
             sign_in_scheduler,
+            site_stats_refresher,
             collector,
         }
     }
@@ -287,6 +291,7 @@ pub async fn serve(
     db: Database,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
+    site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
 ) -> Result<(), AppError> {
     let engine = DownloadEngine::new(
@@ -299,6 +304,7 @@ pub async fn serve(
         engine,
         scheduler,
         sign_in_scheduler,
+        site_stats_refresher,
         collector,
     );
     let app = app_router(state);
@@ -344,6 +350,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/jobs/run/{id}", post(run_one))
         // 站点管理
         .route("/api/sites", get(list_sites).post(create_site))
+        .route("/api/sites/stats-overview", get(get_sites_stats_overview))
         .route("/api/sites/{id}", put(update_site).delete(delete_site))
         .route("/api/sites/{id}/test", post(test_site))
         .route("/api/sites/{id}/stats", get(get_site_stats))
@@ -808,8 +815,8 @@ struct CreateSiteRequest {
 
 async fn list_sites(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::site::SiteRecord>>, ApiError> {
-    Ok(Json(state.db.list_sites().await?))
+) -> Result<Json<Vec<crate::site::SiteWithStats>>, ApiError> {
+    Ok(Json(state.db.list_sites_with_stats().await?))
 }
 
 async fn create_site(
@@ -882,6 +889,12 @@ async fn get_site_stats(
         .await
         .map_err(|e| ApiError::internal(e))?;
     Ok(Json(stats))
+}
+
+async fn get_sites_stats_overview(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::site::SiteWithStats>>, ApiError> {
+    Ok(Json(state.site_stats_refresher.refresh_all().await?))
 }
 
 // ========== Sign-in API ==========
