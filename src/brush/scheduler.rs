@@ -13,6 +13,7 @@ use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
 use crate::downloader::factory;
 use crate::net::client_factory;
+use crate::net::http::AppHttpClient;
 use crate::rss;
 use crate::site::SiteAdapter;
 use crate::site::factory as site_factory;
@@ -30,6 +31,7 @@ pub struct BrushScheduler {
     db: Database,
     collector: Arc<DownloaderSnapshotCollector>,
     running_tasks: Arc<RwLock<HashMap<i64, RunningBrushTask>>>,
+    http: Arc<AppHttpClient>,
 }
 
 struct RunningBrushTask {
@@ -38,11 +40,16 @@ struct RunningBrushTask {
 }
 
 impl BrushScheduler {
-    pub fn new(db: Database, collector: Arc<DownloaderSnapshotCollector>) -> Self {
+    pub fn new(
+        db: Database,
+        collector: Arc<DownloaderSnapshotCollector>,
+        http: Arc<AppHttpClient>,
+    ) -> Self {
         Self {
             db,
             collector,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
+            http,
         }
     }
 
@@ -97,10 +104,11 @@ impl BrushScheduler {
                 let task_name = task.name.clone();
                 let config = Arc::new(RwLock::new(task.clone()));
                 let execution_config = config.clone();
+                let http = self.http.clone();
 
                 info!("[刷流][{}] cron 触发，开始调度执行", task_name);
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = execute_brush_task(&db, &collector, execution_config).await {
+                    if let Err(e) = execute_brush_task(&db, &collector, execution_config, &http).await {
                         error!("[刷流][{}] 任务执行失败: {}", task_name, e);
                     }
                     // 从运行列表移除
@@ -139,9 +147,10 @@ impl BrushScheduler {
         let task_name = task.name.clone();
         let config = Arc::new(RwLock::new(task.clone()));
         let execution_config = config.clone();
+        let http = self.http.clone();
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
-            if let Err(e) = execute_brush_task(&db, &collector, execution_config).await {
+            if let Err(e) = execute_brush_task(&db, &collector, execution_config, &http).await {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
             let mut running = running_tasks.write().await;
@@ -231,6 +240,7 @@ async fn execute_brush_task(
     db: &Database,
     collector: &Arc<DownloaderSnapshotCollector>,
     shared_task: Arc<RwLock<BrushTaskRecord>>,
+    http: &AppHttpClient,
 ) -> Result<(), String> {
     let task_start = std::time::Instant::now();
     let task = snapshot_task(&shared_task).await;
@@ -389,10 +399,16 @@ async fn execute_brush_task(
 
     // 6. 获取 RSS
     info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
-    let rss_body = fetch_rss_text(&task.rss_url).await?;
-    let rss_xml =
-        std::str::from_utf8(rss_body.as_bytes()).map_err(|_| "RSS 编码错误".to_string())?;
-    let parsed = rss::parse_feed(rss_xml).map_err(|e| format!("RSS 解析失败: {}", e))?;
+    let rss_resp = http
+        .get("brush-rss", &task.rss_url)
+        .await
+        .map_err(|e| format!("RSS 请求失败: {}", e))?;
+    if !rss_resp.status.is_success() {
+        return Err(format!("RSS HTTP {}", rss_resp.status));
+    }
+    let rss_body = String::from_utf8(rss_resp.body.to_vec())
+        .map_err(|_| "RSS 编码错误".to_string())?;
+    let parsed = rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
     let snapshot = parsed.into_snapshot(task.name.clone(), 1);
 
     info!(
@@ -636,9 +652,21 @@ async fn execute_brush_task(
         }
 
         // 下载种子文件并添加到下载器
-        let torrent_data = fetch_torrent_bytes(&effective_item.download_url).await;
-        match torrent_data {
-            Ok(data) => {
+        let torrent_resp = http
+            .get("brush-torrent", &effective_item.download_url)
+            .await
+            .map_err(|e| format!("下载种子失败: {}", e));
+        match torrent_resp {
+            Ok(resp) => {
+                if !resp.status.is_success() {
+                    let error_msg = format!("HTTP {}", resp.status);
+                    error!(
+                        "[刷流][{}] 下载种子失败: title={} download_url={} err={}",
+                        task.name, effective_item.title, effective_item.download_url, error_msg
+                    );
+                    continue;
+                }
+                let data = resp.body.to_vec();
                 let save_path = task.save_dir.clone().unwrap_or_default();
                 let options = AddTorrentOptions {
                     save_path: if save_path.is_empty() {
@@ -1263,43 +1291,3 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
-async fn fetch_rss_text(url: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
-
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("RSS 请求失败: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("RSS HTTP {}", resp.status()));
-    }
-
-    resp.text().await.map_err(|e| format!("读取RSS失败: {}", e))
-}
-
-async fn fetch_torrent_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("创建HTTP客户端失败: {}", e))?;
-
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("下载种子失败: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("读取种子数据失败: {}", e))
-}

@@ -17,8 +17,13 @@ mod site_stats;
 mod stats;
 mod web;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use clap::Parser;
 use error::AppError;
+use net::http::AppHttpClient;
+use net::rate_limiter::{RateLimitPolicy, SharedRateLimiter};
 use tracing::info;
 
 #[tokio::main]
@@ -60,10 +65,21 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         stats::start_stats_consumer(stats_db, stats_rx).await;
     });
 
+    // 构建共享 HTTP 客户端（代理 + 限流），供刷流调度器使用
+    let proxy = settings.proxy.as_deref();
+    let limiter = Arc::new(SharedRateLimiter::new());
+    let policy = RateLimitPolicy::new(5, Duration::from_secs(1), Duration::from_secs(60));
+    let http = Arc::new(
+        AppHttpClient::new(limiter, policy, proxy).map_err(|e| AppError::InvalidConfig {
+            message: format!("failed to build HTTP client: {}", e),
+        })?,
+    );
+
     // 启动刷流调度器
     let scheduler = std::sync::Arc::new(brush::scheduler::BrushScheduler::new(
         db.clone(),
         collector.clone(),
+        http,
     ));
     let scheduler_ref = scheduler.clone();
     let scheduler_handle = tokio::spawn(async move {
