@@ -258,16 +258,20 @@ fn parse_peer_count(text: &str, marker: &str) -> Option<i32> {
 }
 
 fn parse_detail_free_end(document: &Html) -> Option<i64> {
-    let time_selector = Selector::parse("time").ok()?;
+    let td_selector = Selector::parse("td.rowfollow").ok()?;
     let pro_free_selector = Selector::parse("img.pro_free").ok()?;
+    let time_selector = Selector::parse("time").ok()?;
 
-    // 确保页面有免费标识
-    document.select(&pro_free_selector).next()?;
-
-    for time_el in document.select(&time_selector) {
-        if let Some(title) = time_el.value().attr("title") {
-            if let Some(ts) = parse_datetime_to_timestamp(title) {
-                return Some(ts);
+    // 只在包含 pro_free 图标的 <td> 内查找免费结束时间，避免误匹配发布时间
+    for td in document.select(&td_selector) {
+        if td.select(&pro_free_selector).next().is_none() {
+            continue;
+        }
+        for time_el in td.select(&time_selector) {
+            if let Some(title) = time_el.value().attr("title") {
+                if let Some(ts) = parse_datetime_to_timestamp(title) {
+                    return Some(ts);
+                }
             }
         }
     }
