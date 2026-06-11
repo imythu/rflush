@@ -1195,7 +1195,7 @@ impl Database {
                      delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                      target_ratio, max_upload_gb, download_timeout_hours,
                      min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
-                     enabled, created_at, updated_at
+                     enabled, created_at, updated_at, downloader_ranges
                      FROM brush_tasks ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -1225,7 +1225,7 @@ impl Database {
                  delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
-                 enabled, created_at, updated_at
+                 enabled, created_at, updated_at, downloader_ranges
                  FROM brush_tasks WHERE id = ?",
                 params![id],
                 |row| row_to_brush_task(row),
@@ -1258,18 +1258,18 @@ impl Database {
                  seed_volume_gb, save_dir, active_time_windows,
                  promotion, skip_hit_and_run, max_concurrent,
                  download_speed_limit, upload_speed_limit,
-                 size_ranges, seeder_ranges, min_free_hours,
+                 size_ranges, seeder_ranges, downloader_ranges, min_free_hours,
                  delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                  enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
                     req.name, req.cron_expression, req.site_id, req.downloader_id, req.tag, req.rss_url,
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
-                    req.size_ranges, req.seeder_ranges, min_free_hours,
+                    req.size_ranges, req.seeder_ranges, req.downloader_ranges, min_free_hours,
                     delete_mode, delete_on_free_expiry, req.min_seed_time_hours, req.hr_min_seed_time_hours,
                     req.target_ratio, req.max_upload_gb, req.download_timeout_hours,
                     req.min_avg_upload_speed_kbs, req.max_inactive_hours, req.min_disk_space_gb,
@@ -1304,7 +1304,7 @@ impl Database {
                  seed_volume_gb = ?, save_dir = ?, active_time_windows = ?,
                  promotion = ?, skip_hit_and_run = ?, max_concurrent = ?,
                  download_speed_limit = ?, upload_speed_limit = ?,
-                 size_ranges = ?, seeder_ranges = ?, min_free_hours = ?,
+                 size_ranges = ?, seeder_ranges = ?, downloader_ranges = ?, min_free_hours = ?,
                  delete_mode = ?, delete_on_free_expiry = ?, min_seed_time_hours = ?, hr_min_seed_time_hours = ?,
                  target_ratio = ?, max_upload_gb = ?, download_timeout_hours = ?,
                  min_avg_upload_speed_kbs = ?, max_inactive_hours = ?, min_disk_space_gb = ?,
@@ -1314,7 +1314,7 @@ impl Database {
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
-                    req.size_ranges, req.seeder_ranges, min_free_hours,
+                    req.size_ranges, req.seeder_ranges, req.downloader_ranges, min_free_hours,
                     delete_mode, delete_on_free_expiry, req.min_seed_time_hours, req.hr_min_seed_time_hours,
                     req.target_ratio, req.max_upload_gb, req.download_timeout_hours,
                     req.min_avg_upload_speed_kbs, req.max_inactive_hours, req.min_disk_space_gb,
@@ -2112,6 +2112,12 @@ impl Database {
             )?;
             ensure_column(
                 &conn,
+                "brush_tasks",
+                "downloader_ranges",
+                "ALTER TABLE brush_tasks ADD COLUMN downloader_ranges TEXT",
+            )?;
+            ensure_column(
+                &conn,
                 "rss_subscriptions",
                 "enabled",
                 "ALTER TABLE rss_subscriptions ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
@@ -2190,6 +2196,7 @@ fn row_to_brush_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTaskRecor
         upload_speed_limit: row.get(14)?,
         size_ranges: row.get(15)?,
         seeder_ranges: row.get(16)?,
+        downloader_ranges: row.get(31)?,
         min_free_hours: row.get(17)?,
         delete_mode: row.get(18)?,
         delete_on_free_expiry: row.get::<_, i32>(19)? != 0,

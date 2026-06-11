@@ -1,5 +1,6 @@
 pub mod cleaner;
 pub mod scheduler;
+pub mod u2;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,7 @@ pub struct BrushTaskRecord {
     pub upload_speed_limit: Option<i64>,
     pub size_ranges: Option<String>,
     pub seeder_ranges: Option<String>,
+    pub downloader_ranges: Option<String>,
     pub min_free_hours: Option<f64>,
     // 删种规则
     pub delete_mode: String,
@@ -62,6 +64,7 @@ pub struct BrushTaskRequest {
     pub upload_speed_limit: Option<i64>,
     pub size_ranges: Option<String>,   // JSON array string
     pub seeder_ranges: Option<String>, // JSON array string
+    pub downloader_ranges: Option<String>, // JSON array string
     pub min_free_hours: Option<f64>,
     pub delete_mode: Option<String>,
     pub delete_on_free_expiry: Option<bool>,

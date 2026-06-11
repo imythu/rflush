@@ -60,6 +60,7 @@ const emptyForm: BrushTaskRequest = {
   upload_speed_limit: null,
   size_ranges: null,
   seeder_ranges: null,
+  downloader_ranges: null,
   min_free_hours: null,
   delete_mode: "or",
   delete_on_free_expiry: false,
@@ -91,6 +92,7 @@ function taskToForm(task: BrushTaskRecord): BrushTaskRequest {
     upload_speed_limit: task.upload_speed_limit,
     size_ranges: task.size_ranges,
     seeder_ranges: task.seeder_ranges,
+    downloader_ranges: task.downloader_ranges,
     min_free_hours: task.min_free_hours,
     delete_mode: task.delete_mode,
     delete_on_free_expiry: task.delete_on_free_expiry,
@@ -570,6 +572,15 @@ export function BrushTasksPage() {
                   onChange={(e) => setField("seeder_ranges", e.target.value || null)}
                 />
                 <p className="text-xs text-muted">JSON 数组</p>
+              </div>
+              <div className="space-y-2">
+                <Label>下载人数范围</Label>
+                <Input
+                  placeholder='["0-10"]'
+                  value={form.downloader_ranges ?? ""}
+                  onChange={(e) => setField("downloader_ranges", e.target.value || null)}
+                />
+                <p className="text-xs text-muted">JSON 数组，默认不校验</p>
               </div>
               <div className="space-y-2">
                 <Label>最少 free 时长 (小时)</Label>

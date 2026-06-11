@@ -186,6 +186,7 @@ export type BrushTaskRecord = {
   upload_speed_limit: number | null;
   size_ranges: string | null;
   seeder_ranges: string | null;
+  downloader_ranges: string | null;
   min_free_hours: number | null;
   delete_mode: string;
   delete_on_free_expiry: boolean;

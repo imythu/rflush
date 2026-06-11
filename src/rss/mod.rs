@@ -27,7 +27,9 @@ pub struct TorrentItem {
     pub version: u64,
     pub size_bytes: Option<u64>,
     pub seeders: Option<i32>,
+    pub leechers: Option<i32>,
     pub free_end_timestamp: Option<i64>,
+    pub free_elapsed_seconds: Option<u64>,
     pub download_volume_factor: Option<f64>,
     pub upload_volume_factor: Option<f64>,
     pub minimum_ratio: Option<f64>,
@@ -38,6 +40,23 @@ impl TorrentItem {
     pub fn is_hr(&self) -> bool {
         self.minimum_seed_time.is_some_and(|secs| secs > 0)
             || self.minimum_ratio.is_some_and(|ratio| ratio > 0.0)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_free(&self) -> bool {
+        self.download_volume_factor
+            .is_some_and(|v| v < f64::EPSILON)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_promoted(&self) -> bool {
+        self.is_free()
+            || self
+                .download_volume_factor
+                .is_some_and(|v| (v - 1.0).abs() > f64::EPSILON)
+            || self
+                .upload_volume_factor
+                .is_some_and(|v| (v - 1.0).abs() > f64::EPSILON)
     }
 }
 
@@ -94,7 +113,9 @@ impl ParsedFeed {
                 version,
                 size_bytes: item.size_bytes,
                 seeders: item.seeders,
+                leechers: None,
                 free_end_timestamp: None,
+                free_elapsed_seconds: None,
                 download_volume_factor: item.download_volume_factor,
                 upload_volume_factor: item.upload_volume_factor,
                 minimum_ratio: item.minimum_ratio,

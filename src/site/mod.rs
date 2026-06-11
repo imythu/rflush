@@ -1,6 +1,7 @@
 pub mod factory;
 pub mod mteam;
 pub mod nexusphp;
+pub mod u2_shoutbox;
 
 use serde::{Deserialize, Serialize};
 use std::future::Future;

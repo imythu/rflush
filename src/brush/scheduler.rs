@@ -19,6 +19,7 @@ use crate::site::SiteAdapter;
 use crate::site::factory as site_factory;
 
 use super::cleaner;
+use super::u2;
 
 #[derive(Clone, Copy)]
 enum FilterStage {
@@ -397,22 +398,32 @@ async fn execute_brush_task(
         }
     }
 
-    // 6. 获取 RSS
-    info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
-    let rss_resp = http
-        .get("brush-rss", &task.rss_url)
-        .await
-        .map_err(|e| format!("RSS 请求失败: {}", e))?;
-    if !rss_resp.status.is_success() {
-        return Err(format!("RSS HTTP {}", rss_resp.status));
-    }
-    let rss_body = String::from_utf8(rss_resp.body.to_vec())
-        .map_err(|_| "RSS 编码错误".to_string())?;
-    let parsed = rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
-    let snapshot = parsed.into_snapshot(task.name.clone(), 1);
+    // 6. 获取种子列表（RSS 或 U2 shoutbox）
+    let snapshot = if u2::is_u2_shoutbox_url(&task.rss_url) {
+        info!(
+            "[刷流][{}] 检测到 U2 shoutbox URL，使用 shoutbox 解析器",
+            task.name
+        );
+        let shoutbox_html = u2::fetch_shoutbox_html(&task, db, http).await?;
+        u2::parse_shoutbox_snapshot(&shoutbox_html, &task.name)?
+    } else {
+        info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
+        let rss_resp = http
+            .get("brush-rss", &task.rss_url)
+            .await
+            .map_err(|e| format!("RSS 请求失败: {}", e))?;
+        if !rss_resp.status.is_success() {
+            return Err(format!("RSS HTTP {}", rss_resp.status));
+        }
+        let rss_body = String::from_utf8(rss_resp.body.to_vec())
+            .map_err(|_| "RSS 编码错误".to_string())?;
+        let parsed =
+            rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
+        parsed.into_snapshot(task.name.clone(), 1)
+    };
 
     info!(
-        "[刷流][{}] RSS 解析完成，共 {} 个条目",
+        "[刷流][{}] 解析完成，共 {} 个条目",
         task.name,
         snapshot.items.len()
     );
@@ -457,23 +468,45 @@ async fn execute_brush_task(
             .as_deref()
             .map(parse_ranges)
             .unwrap_or_default();
-        let needs_free_end = task.promotion == "free" && task.min_free_hours.is_some();
-        let needs_site_attrs = task.promotion != "all" || task.skip_hit_and_run || needs_free_end;
+        let downloader_ranges = task
+            .downloader_ranges
+            .as_deref()
+            .map(parse_ranges)
+            .unwrap_or_default();
         checked += 1;
+
+        // 每次循环开始时检查是否还需要继续添加，不需要则立即停止
+        let current_active = active_count as usize + added;
+        if current_active >= task.max_concurrent as usize {
+            info!(
+                "[刷流][{}] 并发已达上限 {}/{}，停止添加",
+                task.name, current_active, task.max_concurrent
+            );
+            break;
+        }
+        if let Some(max_gb) = task.seed_volume_gb {
+            if current_size_gb >= max_gb {
+                info!(
+                    "[刷流][{}] 保种体积已达上限 {:.2}/{:.2} GB，停止添加",
+                    task.name, current_size_gb, max_gb
+                );
+                break;
+            }
+        }
 
         // 跳过已存在的种子
         if existing_hashes.contains(&item.guid) {
             continue;
         }
 
-        // 第一轮过滤：用 RSS 已有属性快速筛选，避免不必要的详情请求
-        // RSS 中通常已有体积、做种数，部分站点也有促销/H&R 信息
+        // 第一轮过滤：用已有属性快速筛选，避免不必要的详情请求
         let pre_filter_item = (*item).clone();
         let pre_filter = check_filter_reason(
             &task,
             &pre_filter_item,
             &size_ranges,
             &seeder_ranges,
+            &downloader_ranges,
             FilterStage::RssPreFilter,
         );
         if let Some(reason) = pre_filter {
@@ -493,92 +526,102 @@ async fn execute_brush_task(
             continue;
         }
 
-        // 详情增强：获取站点属性（只有 RSS 数据不足时才请求）
+        // 预筛选通过后才做详情增强
         let mut effective_item = (*item).clone();
-        if needs_site_attrs {
-            if site_client_binding != Some(task.site_id) {
-                site_adapter = None;
-                if let Some(site_id) = task.site_id {
-                    match db.get_site(site_id).await {
-                        Ok(Some(site)) => {
-                            let proxy = db.get_settings().await.ok().and_then(|s| s.proxy);
-                            let client = match client_factory::resolve_client(proxy.as_deref(), site.use_proxy) {
-                                Ok(c) => c,
-                                Err(error) => {
-                                    let message = format!(
-                                        "[刷流][{}] 创建 HTTP 客户端失败: site_id={} err={}",
-                                        task.name, site.id, error
-                                    );
-                                    error!("{}", message);
-                                    return Err(message);
-                                }
-                            };
-                            match site_factory::create_adapter(&site, client) {
-                                Ok(adapter) => {
-                                    site_adapter = Some(adapter);
-                                }
-                                Err(error) => {
-                                    let message = format!(
-                                        "[刷流][{}] 创建站点适配器失败: site_id={} name={} type={} err={}",
-                                        task.name, site.id, site.name, site.site_type, error
-                                    );
-                                    error!("{}", message);
-                                    return Err(message);
+        let is_u2 = u2::is_u2_shoutbox_url(&task.rss_url);
+
+        if is_u2 {
+            u2::enrich_item(&task, db, http, &mut effective_item).await;
+        }
+
+        // 站点适配器增强（非 U2 场景）
+        {
+            let needs_free_end = task.promotion == "free" && task.min_free_hours.is_some();
+            let needs_site_attrs =
+                task.promotion != "all" || task.skip_hit_and_run || needs_free_end;
+
+            if needs_site_attrs {
+                if site_client_binding != Some(task.site_id) {
+                    site_adapter = None;
+                    if let Some(site_id) = task.site_id {
+                        match db.get_site(site_id).await {
+                            Ok(Some(site)) => {
+                                let proxy = db.get_settings().await.ok().and_then(|s| s.proxy);
+                                let client = match client_factory::resolve_client(proxy.as_deref(), site.use_proxy) {
+                                    Ok(c) => c,
+                                    Err(error) => {
+                                        let message = format!(
+                                            "[刷流][{}] 创建 HTTP 客户端失败: site_id={} err={}",
+                                            task.name, site.id, error
+                                        );
+                                        error!("{}", message);
+                                        return Err(message);
+                                    }
+                                };
+                                match site_factory::create_adapter(&site, client) {
+                                    Ok(adapter) => {
+                                        site_adapter = Some(adapter);
+                                    }
+                                    Err(error) => {
+                                        let message = format!(
+                                            "[刷流][{}] 创建站点适配器失败: site_id={} name={} type={} err={}",
+                                            task.name, site.id, site.name, site.site_type, error
+                                        );
+                                        error!("{}", message);
+                                        return Err(message);
+                                    }
                                 }
                             }
-                        }
-                        Ok(None) => {
-                            let message =
-                                format!("[刷流][{}] 站点不存在: site_id={}", task.name, site_id);
-                            error!("{}", message);
-                            return Err(message);
-                        }
-                        Err(error) => {
-                            let message = format!(
-                                "[刷流][{}] 加载站点失败: site_id={} err={}",
-                                task.name, site_id, error
-                            );
-                            error!("{}", message);
-                            return Err(message);
+                            Ok(None) => {
+                                let message =
+                                    format!("[刷流][{}] 站点不存在: site_id={}", task.name, site_id);
+                                error!("{}", message);
+                                return Err(message);
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "[刷流][{}] 加载站点失败: site_id={} err={}",
+                                    task.name, site_id, error
+                                );
+                                error!("{}", message);
+                                return Err(message);
+                            }
                         }
                     }
+                    site_client_binding = Some(task.site_id);
                 }
-                site_client_binding = Some(task.site_id);
-            }
 
-            // 检查 RSS 数据是否已经足够判断促销/H&R，足够则跳过请求
-            let need_fetch = item.download_volume_factor.is_none()
-                || (task.promotion == "free"
-                    && task.min_free_hours.is_some()
-                    && item.free_end_timestamp.is_none())
-                || (task.skip_hit_and_run
-                    && item.minimum_seed_time.is_none()
-                    && item.minimum_ratio.is_none());
+                // 检查 effective_item（可能已被 U2 详情增强）是否仍需站点适配器
+                let need_fetch = effective_item.download_volume_factor.is_none()
+                    || (task.promotion == "free"
+                        && task.min_free_hours.is_some()
+                        && effective_item.free_end_timestamp.is_none())
+                    || (task.skip_hit_and_run
+                        && effective_item.minimum_seed_time.is_none()
+                        && effective_item.minimum_ratio.is_none());
 
-            if need_fetch {
-                if let Some(ref adapter) = site_adapter {
-                    let detail_url = if task.site_id.is_some() {
-                        item.link
+                if need_fetch {
+                    if let Some(ref adapter) = site_adapter {
+                        let detail_url = effective_item
+                            .link
                             .as_deref()
                             .filter(|s| !s.is_empty())
-                            .unwrap_or(item.guid.as_str())
-                    } else {
-                        item.guid.as_str()
-                    };
-                    match adapter.get_torrent_attributes(detail_url).await {
-                        Ok(attrs) => {
-                            apply_attrs_to_item(&mut effective_item, &attrs);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "[刷流][{}] ✗ id={} 详情获取失败: {} {}",
-                                task.name,
-                                extract_torrent_id(detail_url),
-                                e,
-                                detail_url
-                            );
-                            skipped_attrs += 1;
-                            continue;
+                            .unwrap_or(effective_item.guid.as_str());
+                        match adapter.get_torrent_attributes(detail_url).await {
+                            Ok(attrs) => {
+                                apply_attrs_to_item(&mut effective_item, &attrs);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[刷流][{}] ✗ id={} 详情获取失败: {} {}",
+                                    task.name,
+                                    extract_torrent_id(detail_url),
+                                    e,
+                                    detail_url
+                                );
+                                skipped_attrs += 1;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -591,6 +634,7 @@ async fn execute_brush_task(
             &effective_item,
             &size_ranges,
             &seeder_ranges,
+            &downloader_ranges,
             FilterStage::PostEnhancement,
         );
         if let Some(reason) = post_filter {
@@ -609,27 +653,6 @@ async fn execute_brush_task(
                 reason
             );
             continue;
-        }
-
-        // 检查并发是否还够
-        let current_active = active_count as usize + added;
-        if current_active >= task.max_concurrent as usize {
-            info!(
-                "[刷流][{}] 并发已达上限 {}/{}，停止添加",
-                task.name, current_active, task.max_concurrent
-            );
-            break;
-        }
-
-        // 检查保种体积是否还够
-        if let Some(max_gb) = task.seed_volume_gb {
-            if current_size_gb >= max_gb {
-                info!(
-                    "[刷流][{}] 保种体积已达上限 {:.2}/{:.2} GB，停止添加",
-                    task.name, current_size_gb, max_gb
-                );
-                break;
-            }
         }
 
         if let Some(min_disk_space_gb) = task.min_disk_space_gb {
@@ -652,21 +675,46 @@ async fn execute_brush_task(
         }
 
         // 下载种子文件并添加到下载器
-        let torrent_resp = http
-            .get("brush-torrent", &effective_item.download_url)
-            .await
-            .map_err(|e| format!("下载种子失败: {}", e));
-        match torrent_resp {
-            Ok(resp) => {
-                if !resp.status.is_success() {
-                    let error_msg = format!("HTTP {}", resp.status);
-                    error!(
-                        "[刷流][{}] 下载种子失败: title={} download_url={} err={}",
-                        task.name, effective_item.title, effective_item.download_url, error_msg
+        let torrent_bytes = if is_u2 {
+            // U2 站点需要带上 Cookie 下载种子
+            match u2::download_torrent(&task, db, http, &effective_item.download_url).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!(
+                        "[刷流][{}] ✗ 下载种子文件失败: {} err={}",
+                        task.name, effective_item.title, e
                     );
+                    failed += 1;
                     continue;
                 }
-                let data = resp.body.to_vec();
+            }
+        } else {
+            match http
+                .get("brush-torrent", &effective_item.download_url)
+                .await
+            {
+                Ok(resp) => {
+                    if !resp.status.is_success() {
+                        let error_msg = format!("HTTP {}", resp.status);
+                        error!(
+                            "[刷流][{}] 下载种子失败: title={} download_url={} err={}",
+                            task.name, effective_item.title, effective_item.download_url, error_msg
+                        );
+                        continue;
+                    }
+                    resp.body.to_vec()
+                }
+                Err(e) => {
+                    warn!(
+                        "[刷流][{}] ✗ 下载种子文件失败: {} err={}",
+                        task.name, effective_item.title, e
+                    );
+                    failed += 1;
+                    continue;
+                }
+            }
+        };
+        let data = torrent_bytes;
                 let save_path = task.save_dir.clone().unwrap_or_default();
                 let options = AddTorrentOptions {
                     save_path: if save_path.is_empty() {
@@ -754,15 +802,6 @@ async fn execute_brush_task(
                         break;
                     }
                 }
-            }
-            Err(e) => {
-                warn!(
-                    "[刷流][{}] ✗ 下载种子文件失败: {} err={}",
-                    task.name, effective_item.title, e
-                );
-                failed += 1;
-            }
-        }
     }
 
     let elapsed = task_start.elapsed();
@@ -780,12 +819,14 @@ async fn execute_brush_task(
     Ok(())
 }
 
+
 /// 检查种子是否通过配置过滤条件，返回不通过的原因（通过则返回 None）
 fn check_filter_reason(
     task: &BrushTaskRecord,
     item: &rss::TorrentItem,
     size_ranges: &[(f64, f64)],
     seeder_ranges: &[(f64, f64)],
+    downloader_ranges: &[(f64, f64)],
     stage: FilterStage,
 ) -> Option<String> {
     // 种子体积筛选 (单位 GB)
@@ -807,6 +848,18 @@ fn check_filter_reason(
             Some(s) => {
                 if !in_any_range(s as f64, seeder_ranges) {
                     return Some(format!("做种数{}不在范围", s));
+                }
+            }
+            None => {}
+        }
+    }
+
+    // 下载人数筛选
+    if !downloader_ranges.is_empty() {
+        match item.leechers {
+            Some(l) => {
+                if !in_any_range(l as f64, downloader_ranges) {
+                    return Some(format!("下载数{}不在范围", l));
                 }
             }
             None => {}
@@ -915,6 +968,7 @@ mod tests {
             upload_speed_limit: None,
             size_ranges: None,
             seeder_ranges: None,
+            downloader_ranges: None,
             min_free_hours: None,
             delete_mode: "or".to_string(),
             delete_on_free_expiry: false,
@@ -943,7 +997,9 @@ mod tests {
             version: 1,
             size_bytes: Some(1024),
             seeders: Some(10),
+            leechers: None,
             free_end_timestamp: None,
+            free_elapsed_seconds: None,
             download_volume_factor: None,
             upload_volume_factor: None,
             minimum_ratio: None,
@@ -956,7 +1012,7 @@ mod tests {
         let mut task = task();
         task.promotion = "free".to_string();
 
-        let reason = check_filter_reason(&task, &item(), &[], &[], FilterStage::RssPreFilter);
+        let reason = check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::RssPreFilter);
 
         assert!(reason.is_none());
     }
@@ -966,7 +1022,7 @@ mod tests {
         let mut task = task();
         task.promotion = "free".to_string();
 
-        let reason = check_filter_reason(&task, &item(), &[], &[], FilterStage::PostEnhancement);
+        let reason = check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("缺少免费属性"));
     }
@@ -981,7 +1037,7 @@ mod tests {
         item.download_volume_factor = Some(0.0);
         item.free_end_timestamp = Some(Utc::now().timestamp() + 3600);
 
-        let reason = check_filter_reason(&task, &item, &[], &[], FilterStage::PostEnhancement);
+        let reason = check_filter_reason(&task, &item, &[], &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("剩余free时长1.0h < 2.0h"));
     }
@@ -995,7 +1051,7 @@ mod tests {
         let mut item = item();
         item.download_volume_factor = Some(0.0);
 
-        let reason = check_filter_reason(&task, &item, &[], &[], FilterStage::PostEnhancement);
+        let reason = check_filter_reason(&task, &item, &[], &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("缺少free到期时间"));
     }
@@ -1005,7 +1061,7 @@ mod tests {
         let mut task = task();
         task.skip_hit_and_run = true;
 
-        let reason = check_filter_reason(&task, &item(), &[], &[], FilterStage::RssPreFilter);
+        let reason = check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::RssPreFilter);
 
         assert!(reason.is_none());
     }
@@ -1015,7 +1071,7 @@ mod tests {
         let mut task = task();
         task.skip_hit_and_run = true;
 
-        let reason = check_filter_reason(&task, &item(), &[], &[], FilterStage::PostEnhancement);
+        let reason = check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("缺少H&R属性"));
     }

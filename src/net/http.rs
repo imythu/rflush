@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::redirect::Policy;
 use reqwest::{Client, Proxy, StatusCode};
 use tracing::{debug, warn};
@@ -147,6 +147,80 @@ impl AppHttpClient {
         Ok(AppResponse {
             status,
             headers,
+            body,
+        })
+    }
+
+    /// 与 `get` 相同，但允许附加自定义请求头（如 Cookie）。
+    /// 额外 header 会覆盖同名的默认 header。
+    pub async fn get_with_headers(
+        &self,
+        purpose: &str,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<AppResponse, HttpError> {
+        let key = extract_rate_limit_key(url).map_err(HttpError::InvalidUrl)?;
+        self.rate_limiter.acquire(&key, self.policy).await;
+
+        let mut req = self.inner.get(url);
+        for (name, value) in extra_headers {
+            req = req.header(
+                HeaderName::from_bytes(name.as_bytes()).unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
+                HeaderValue::from_bytes(value.as_bytes())
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+
+        let response = match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    debug!(
+                        task = %current_task_context(),
+                        "HTTP {} ok: purpose=\"{}\" url={}",
+                        status.as_u16(),
+                        purpose,
+                        url
+                    );
+                } else {
+                    warn!(
+                        task = %current_task_context(),
+                        "HTTP {} error: purpose=\"{}\" url={}",
+                        status.as_u16(),
+                        purpose,
+                        url
+                    );
+                }
+                resp
+            }
+            Err(error) => {
+                warn!(
+                    task = %current_task_context(),
+                    "HTTP transport error: purpose=\"{}\" url={} detail={}",
+                    purpose,
+                    url,
+                    error
+                );
+                return Err(HttpError::Transport { source: error });
+            }
+        };
+
+        let status = response.status();
+        let body = response.bytes().await.map_err(|error| {
+            warn!(
+                task = %current_task_context(),
+                "HTTP body read failed: purpose=\"{}\" url={} status={} detail={}",
+                purpose,
+                url,
+                status,
+                error
+            );
+            HttpError::Transport { source: error }
+        })?;
+
+        Ok(AppResponse {
+            status,
+            headers: HeaderMap::new(),
             body,
         })
     }
