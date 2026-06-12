@@ -15,6 +15,13 @@ pub struct U2DetailInfo {
     pub free_end_timestamp: Option<i64>,
 }
 
+/// Peer list 页面 (viewpeerlist.php) 解析结果：经过过滤的真实做种数和下载数。
+#[derive(Debug)]
+pub struct PeerListInfo {
+    pub seeders: i32,
+    pub downloaders: i32,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum U2ShoutboxParseError {
     #[error("HTML selector error: {0}")]
@@ -255,6 +262,184 @@ fn parse_peer_count(text: &str, marker: &str) -> Option<i32> {
         .rev()
         .collect();
     num.parse().ok()
+}
+
+// ── viewpeerlist.php 解析 ───────────────────────────────────────────────
+
+/// 解析 viewpeerlist.php 页面，按 JS 过滤逻辑返回真实做种数和下载数。
+///
+/// 过滤规则：
+/// 1. 空闲时间 > 45 分钟 → 淘汰
+/// 2. 连接 > 30 分钟 且 上传 < 1 MiB 且 平均速度 < 10 B/s → 淘汰（双差生）
+pub fn parse_peer_list_page(html: &str) -> Option<PeerListInfo> {
+    // 1. 查找做种者表格
+    let (seeder_table_html, _total_seeders) = find_table_after_marker(html, "做种者</b>")?;
+
+    // 2. 解析做种者表格并过滤
+    let real_seeders = parse_seeder_table(seeder_table_html);
+
+    // 3. 查找下载者数量
+    let downloaders = extract_count_from_b_tag(html, "下载者</b>");
+
+    Some(PeerListInfo {
+        seeders: real_seeders,
+        downloaders,
+    })
+}
+
+/// 在 HTML 中查找 marker 所在的 `<b>` 标签，提取其前的数字，并返回紧跟的 `<table>` 内容。
+fn find_table_after_marker<'a>(html: &'a str, marker: &str) -> Option<(&'a str, i32)> {
+    let marker_pos = html.find(marker)?;
+
+    // 提取 <b> 中的数字
+    let _total = extract_count_from_b_slice(html, marker, marker_pos);
+
+    // 查找 </b> 后的下一个 <table
+    let after_b = marker_pos + marker.len();
+    let table_start = html[after_b..].find("<table")?;
+    let table_html_start = after_b + table_start;
+    let table_end = html[table_html_start..].find("</table>")? + "</table>".len();
+    let table_html = &html[table_html_start..table_html_start + table_end];
+
+    Some((table_html, _total))
+}
+
+/// 从 `<b>N 下载者</b>` 中提取数字 N。
+fn extract_count_from_b_tag(html: &str, marker: &str) -> i32 {
+    let pos = match html.find(marker) {
+        Some(p) => p,
+        None => return 0,
+    };
+    extract_count_from_b_slice(html, marker, pos)
+}
+
+fn extract_count_from_b_slice(html: &str, marker: &str, marker_pos: usize) -> i32 {
+    let before = &html[..marker_pos];
+    let b_start = match before.rfind("<b>") {
+        Some(p) => p + 3,
+        None => return 0,
+    };
+    let b_content = &html[b_start..marker_pos + marker.len() - "</b>".len()];
+    b_content
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// 解析做种者表格 HTML 片段，返回过滤后的真实做种数。
+fn parse_seeder_table(table_html: &str) -> i32 {
+    use scraper::ElementRef;
+
+    let fragment = Html::parse_fragment(table_html);
+    let tr_selector = match Selector::parse("tr") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let td_selector = match Selector::parse("td") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let mut real_count = 0;
+
+    for (i, tr) in fragment.select(&tr_selector).enumerate() {
+        if i == 0 {
+            continue; // 跳过表头
+        }
+
+        let cells: Vec<ElementRef> = tr.select(&td_selector).collect();
+        if cells.len() < 10 {
+            continue;
+        }
+
+        let upload_text = clean_element_text(&cells[1]);
+        let avg_speed_text = clean_element_text(&cells[2]);
+        let connect_text = clean_element_text(&cells[7]);
+        let idle_text = clean_element_text(&cells[8]);
+
+        let idle_secs = parse_idle_time_to_secs(&idle_text);
+
+        // 规则 1: 空闲 > 45 分钟 (2700 秒)
+        if idle_secs > 2700 {
+            continue;
+        }
+
+        let upload_bytes = parse_human_size(&upload_text).unwrap_or(0);
+        let avg_speed = parse_speed_to_bytes(&avg_speed_text);
+        let connect_secs = parse_connect_time_to_secs(&connect_text);
+
+        // 规则 2: 双差生 — 连接 > 30min 且上传 < 1MiB 且速度 < 10 B/s
+        let is_useless =
+            connect_secs > 1800 && upload_bytes < 1048576 && avg_speed < 10;
+
+        if !is_useless {
+            real_count += 1;
+        }
+    }
+
+    real_count
+}
+
+/// 从 scraper ElementRef 提取文本，过滤软连字符 (U+00AD)。
+fn clean_element_text(el: &scraper::ElementRef) -> String {
+    el.text()
+        .collect::<String>()
+        .chars()
+        .filter(|c| *c != '\u{00AD}')
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 解析速度字符串（如 "142.609 KiB/s"）为 B/s。
+fn parse_speed_to_bytes(s: &str) -> u64 {
+    let s = s.trim();
+    if s.is_empty() || s == "N/A" || s == "---" {
+        return 0;
+    }
+    let without_per_sec = s.strip_suffix("/s").unwrap_or(s).trim();
+    parse_human_size(without_per_sec).unwrap_or(0)
+}
+
+/// 解析空闲时间 "HH:MM:SS" 为秒数。
+fn parse_idle_time_to_secs(s: &str) -> u64 {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.len() != 3 {
+        return 0;
+    }
+    let h: u64 = parts[0].parse().unwrap_or(0);
+    let m: u64 = parts[1].parse().unwrap_or(0);
+    let sec: u64 = parts[2].parse().unwrap_or(0);
+    h * 3600 + m * 60 + sec
+}
+
+/// 解析连接时间（"X天 HH:MM:SS" 或 "HH:MM:SS"）为秒数。
+fn parse_connect_time_to_secs(s: &str) -> u64 {
+    let s = s.trim();
+
+    let (days, time_part) = if let Some(pos) = s.find('天') {
+        let days_str = &s[..pos];
+        let days: u64 = days_str
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        // 跳过 '天' 和可能的空白
+        let after = s[pos + '天'.len_utf8()..].trim();
+        (days, after)
+    } else {
+        (0, s)
+    };
+
+    let parts: Vec<&str> = time_part.split(':').collect();
+    let h: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let m: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let sec: u64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    days * 86400 + h * 3600 + m * 60 + sec
 }
 
 fn parse_detail_free_end(document: &Html) -> Option<i64> {
@@ -714,5 +899,94 @@ mod tests {
         assert!(info.size_bytes.is_some());
         assert_eq!(info.seeders, Some(0));
         assert_eq!(info.free_end_timestamp, None);
+    }
+
+    // ── parse_peer_list_page ─────────────────────────────────────────
+
+    #[test]
+    fn idle_time_parsing() {
+        assert_eq!(parse_idle_time_to_secs("00:19:36"), 19 * 60 + 36);
+        assert_eq!(parse_idle_time_to_secs("01:17:54"), 3600 + 17 * 60 + 54);
+        assert_eq!(parse_idle_time_to_secs("00:00:00"), 0);
+    }
+
+    #[test]
+    fn connect_time_parsing_with_days() {
+        // "36天 00:19:38" → 36*86400 + 19*60 + 38
+        assert_eq!(
+            parse_connect_time_to_secs("36天 00:19:38"),
+            36 * 86400 + 19 * 60 + 38
+        );
+    }
+
+    #[test]
+    fn connect_time_parsing_no_days() {
+        assert_eq!(
+            parse_connect_time_to_secs("17:17:54"),
+            17 * 3600 + 17 * 60 + 54
+        );
+        assert_eq!(parse_connect_time_to_secs("00:07:57"), 7 * 60 + 57);
+    }
+
+    #[test]
+    fn speed_parsing() {
+        // 142.609 KiB/s → 142.609 * 1024 ≈ 146031 B/s
+        assert_eq!(parse_speed_to_bytes("142.609 KiB/s"), (142.609f64 * 1024.0) as u64);
+        assert_eq!(parse_speed_to_bytes("0 B/s"), 0);
+        // 0.115 B/s → 0 (truncated)
+        assert_eq!(parse_speed_to_bytes("0.115 B/s"), 0);
+    }
+
+    /// 第一个种子 (id=18285): 标称 7 做种者，应过滤出 6（排除空闲超 45 分钟的 Hoshino0881118）
+    #[test]
+    fn parses_peer_list_torrent_1() {
+        let html = r#"
+<b>7 做种者</b>
+
+<table class="main-inner" min-width="825px" border="1" cellspacing="0" cellpadding="3"><tr><td class="colhead" align="center" width="1%">用户</td><td class="colhead" align="center" width="1%">上传量</td><td class="colhead" align="center" width="1%">平均速度</td><td class="colhead" align="center" width="1%">瞬时速度</td><td class="colhead" align="center" width="1%">下载量</td><td class="colhead" align="center" width="1%">平均速度</td><td class="colhead" align="center" width="1%">分享率</td><td class="colhead" align="center" width="1%">连接时间</td><td class="colhead" align="center" width="1%">空闲</td><td class="colhead" align="center" width="1%">客户端</td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">TnsSub</td><td class="rowfollow" align="right" width="1%"><nobr>649.218 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>142.609 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>36天 00:19:38</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:19:36</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/4.4.5</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">Waykey</td><td class="rowfollow" align="right" width="1%"><nobr>247.625 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>164.296 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>18天 07:10:04</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:10:03</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/4.3.9</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">whyaltruist</td><td class="rowfollow" align="right" width="1%"><nobr>42.100 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>93.906 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>5天 10:55:05</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:20:04</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/5.2.0</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">Hoshino0881118</td><td class="rowfollow" align="right" width="1%"><nobr>2.395 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>9.520 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>3天 02:05:30</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:48:17</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/5.0.3</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">shoo</td><td class="rowfollow" align="right" width="1%"><nobr>1.823 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>4.194 MiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>45.077 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>103.728 MiB/s</nobr></td><td class="rowfollow" align="center" width="1%">0.040</td><td class="rowfollow" align="right" width="1%"><nobr>00:07:57</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:00:32</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/4.3.8</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">zhangxzh</td><td class="rowfollow" align="right" width="1%"><nobr>1.210 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>2.881 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>43.543 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>5天 02:21:09</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:02:10</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/5.1.4</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">-39-</td><td class="rowfollow" align="right" width="1%"><nobr>732.156 MiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>262.000 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>3天 01:00:58</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:08:46</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/4.3.9</nobr></td></tr>
+</table><b>3 下载者</b>
+
+<table class="main-inner"><tr><td class="colhead">用户</td></tr>
+<tr><td class="rowfollow">cyril2007</td></tr>
+<tr><td class="rowfollow">匿名</td></tr>
+<tr><td class="rowfollow">Baychimo</td></tr>
+</table>"#;
+
+        let result = parse_peer_list_page(html).unwrap();
+        // 标称 7，排除 Hoshino0881118 (空闲 00:48:17 > 45min)
+        assert_eq!(result.seeders, 6);
+        assert_eq!(result.downloaders, 3);
+    }
+
+    /// 第二个种子: 标称 5 做种者，应过滤出 3
+    /// (排除空闲超 45 分钟的 hahahaha6789 + 双差生 天生是凡人)
+    #[test]
+    fn parses_peer_list_torrent_2() {
+        let html = r#"
+<b>5 做种者</b>
+
+<table class="main-inner" min-width="825px" border="1" cellspacing="0" cellpadding="3"><tr><td class="colhead" align="center" width="1%">用户</td><td class="colhead" align="center" width="1%">上传量</td><td class="colhead" align="center" width="1%">平均速度</td><td class="colhead" align="center" width="1%">瞬时速度</td><td class="colhead" align="center" width="1%">下载量</td><td class="colhead" align="center" width="1%">平均速度</td><td class="colhead" align="center" width="1%">分享率</td><td class="colhead" align="center" width="1%">连接时间</td><td class="colhead" align="center" width="1%">空闲</td><td class="colhead" align="center" width="1%">客户端</td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">洛天依</td><td class="rowfollow" align="right" width="1%"><nobr>305.222 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>147.432 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>41.102 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>38.648 MiB/s</nobr></td><td class="rowfollow" align="center" width="1%">7.426</td><td class="rowfollow" align="right" width="1%"><nobr>25天 03:32:30</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:32:15</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/4.3.9</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">whyaltruist</td><td class="rowfollow" align="right" width="1%"><nobr>24.378 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>54.377 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>5天 11:04:28</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:29:32</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/5.2.0</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">Hoshino0881118</td><td class="rowfollow" align="right" width="1%"><nobr>1.596 GiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>6.283 KiB/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>3天 02:13:59</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:13:59</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/5.1.4</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">天生是凡人</td><td class="rowfollow" align="right" width="1%"><nobr>368.292 KiB</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0.115 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">无限</td><td class="rowfollow" align="right" width="1%"><nobr>37天 23:26:06</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>00:24:49</nobr></td><td class=rowfollow align=center width=1%><nobr>Transmission/4.0.5</nobr></td></tr>
+<tr><td class="rowfollow nowrap" align="left" width="1%">hahahaha6789</td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B/s</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>0 B</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>N/A</nobr></td><td class="rowfollow" align="center" width="1%">---</td><td class="rowfollow" align="right" width="1%"><nobr>17:17:54</nobr></td><td class="rowfollow" align="right" width="1%"><nobr>01:17:54</nobr></td><td class=rowfollow align=center width=1%><nobr>qBittorrent/5.0.4</nobr></td></tr>
+</table><b>10 下载者</b>
+
+<table class="main-inner"><tr><td class="colhead">用户</td></tr>
+<tr><td class="rowfollow">shoo</td></tr>
+</table>"#;
+
+        let result = parse_peer_list_page(html).unwrap();
+        // 标称 5: 排除 hahahaha6789 (空闲 01:17:54 > 45min) + 天生是凡人 (双差生: 37天, 368KiB, 0.115 B/s)
+        assert_eq!(result.seeders, 3);
+        assert_eq!(result.downloaders, 10);
     }
 }

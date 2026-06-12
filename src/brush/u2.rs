@@ -200,6 +200,48 @@ pub async fn enrich_item(
         item.minimum_seed_time = Some(0);
     }
 
+    // ── 请求 viewpeerlist.php 获取精准做种/下载数 ─────────────────
+    {
+        let peer_list_url = format!(
+            "https://u2.dmhy.org/viewpeerlist.php?id={}",
+            item.guid
+        );
+        let peer_referer = format!(
+            "https://u2.dmhy.org/details.php?id={}&hits=1",
+            item.guid
+        );
+
+        let mut buf2 = Vec::new();
+        let peer_headers = u2_headers(&cookie, &peer_referer, &mut buf2);
+
+        match http
+            .get_with_headers("u2-peerlist", &peer_list_url, peer_headers)
+            .await
+        {
+            Ok(resp) if resp.status.is_success() => {
+                if let Ok(html) = String::from_utf8(resp.body.to_vec()) {
+                    if let Some(peer_info) = u2_shoutbox::parse_peer_list_page(&html) {
+                        debug!(
+                            "[刷流][{}] peer list 解析: guid={} 真实做种={} 下载={}",
+                            task.name, item.guid, peer_info.seeders, peer_info.downloaders
+                        );
+                        item.seeders = Some(peer_info.seeders);
+                        item.leechers = Some(peer_info.downloaders);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[刷流][{}] U2 peer list 请求失败: guid={} err={}",
+                    task.name, item.guid, e
+                );
+            }
+            _ => {
+                // 非 200 状态码，静默回退到详情页数值
+            }
+        }
+    }
+
     // info 级别打印详情完成
     let free_info = match (item.free_end_timestamp, item.free_elapsed_seconds) {
         (Some(ts), Some(elapsed)) => {
@@ -227,8 +269,8 @@ pub async fn enrich_item(
         .seeders
         .map(|s| s.to_string())
         .unwrap_or_else(|| "?".to_string());
-    let downloaders = detail
-        .downloaders
+    let downloaders = item
+        .leechers
         .map(|d| d.to_string())
         .unwrap_or_else(|| "?".to_string());
 
