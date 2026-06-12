@@ -71,12 +71,20 @@ impl QBittorrentClient {
     }
 
     async fn ensure_cookie(&self) -> Result<String, String> {
-        let lock = self.cookie.lock().await;
-        if let Some(c) = lock.as_ref() {
-            return Ok(c.clone());
+        // 快速路径：cookie 已存在
+        {
+            let lock = self.cookie.lock().await;
+            if let Some(c) = lock.as_ref() {
+                return Ok(c.clone());
+            }
         }
-        drop(lock);
-        self.login().await
+        // 慢路径：需要登录获取 cookie
+        let new_cookie = self.login().await?;
+        // 二次检查：login() 已设置 cookie，但如果并发调用者
+        // 同时执行了 login，我们的 cookie 可能被覆盖。
+        // 从锁中重新读取以获取最终值。
+        let lock = self.cookie.lock().await;
+        Ok(lock.as_ref().cloned().unwrap_or(new_cookie))
     }
 
     async fn api_get(&self, path: &str) -> Result<String, String> {
@@ -158,15 +166,21 @@ impl QBittorrentClient {
             .map_err(|e| format!("读取响应失败: {}", e))
     }
 
-    async fn api_post_multipart(
+    /// 发送 multipart 请求，支持 cookie 过期后重新构建表单并重试。
+    /// `make_form` 是一个可以被多次调用的闭包，用于重建 multipart 表单。
+    async fn post_multipart_with_retry<F>(
         &self,
         path: &str,
-        form: multipart::Form,
-    ) -> Result<String, String> {
+        make_form: F,
+    ) -> Result<String, String>
+    where
+        F: Fn() -> Result<multipart::Form, String> + Send,
+    {
         let cookie = self.ensure_cookie().await?;
         let url = format!("{}{}", self.base_url, path);
         debug!("qBittorrent POST multipart: {}", url);
 
+        let form = make_form()?;
         let resp = self
             .client
             .post(&url)
@@ -182,6 +196,55 @@ impl QBittorrentClient {
                 );
                 format!("请求失败: url={} err={}", url, e)
             })?;
+
+        if resp.status().as_u16() == 403 {
+            // Cookie 过期，重新登录后重试
+            let new_cookie = self.login().await?;
+            let form = make_form()?;
+            let resp = self
+                .client
+                .post(&url)
+                .header(USER_AGENT, BROWSER_UA)
+                .header(COOKIE, &new_cookie)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| {
+                    warn!(
+                        "qBittorrent multipart retry failed: url={} err={}",
+                        url, e
+                    );
+                    format!("请求失败: url={} err={}", url, e)
+                })?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!(
+                    "qBittorrent multipart retry failed: url={} status={} body={}",
+                    url,
+                    status,
+                    truncate_for_log(&body, 300)
+                );
+                return Err(format!(
+                    "HTTP {} url={} body={}",
+                    status,
+                    url,
+                    truncate_for_log(&body, 300)
+                ));
+            }
+
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| format!("读取响应失败: url={} err={}", url, e))?;
+            debug!(
+                "qBittorrent multipart retry succeeded: url={} body={}",
+                url,
+                truncate_for_log(&body, 120)
+            );
+            return Ok(body);
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -253,34 +316,38 @@ impl DownloaderClient for QBittorrentClient {
                 options.download_limit,
                 options.upload_limit
             );
-            let file_part = multipart::Part::bytes(torrent_data)
-                .file_name(filename)
-                .mime_str("application/x-bittorrent")
-                .map_err(|e| format!("构造请求失败: {}", e))?;
 
-            let mut form = multipart::Form::new().part("torrents", file_part);
+            // 使用闭包构建表单，支持 cookie 过期重试时重建表单
+            self.post_multipart_with_retry("/api/v2/torrents/add", || {
+                let file_part = multipart::Part::bytes(torrent_data.clone())
+                    .file_name(filename.clone())
+                    .mime_str("application/x-bittorrent")
+                    .map_err(|e| format!("构造请求失败: {}", e))?;
 
-            if let Some(path) = &options.save_path {
-                form = form.text("savepath", path.clone());
-            }
-            if let Some(tags) = &options.tags {
-                form = form.text("tags", tags.clone());
-            }
-            if let Some(category) = &options.category {
-                form = form.text("category", category.clone());
-            }
-            if let Some(dl) = options.download_limit {
-                form = form.text("dlLimit", dl.to_string());
-            }
-            if let Some(ul) = options.upload_limit {
-                form = form.text("upLimit", ul.to_string());
-            }
-            if options.paused {
-                form = form.text("paused", "true".to_string());
-            }
+                let mut form = multipart::Form::new().part("torrents", file_part);
 
-            self.api_post_multipart("/api/v2/torrents/add", form)
-                .await?;
+                if let Some(path) = &options.save_path {
+                    form = form.text("savepath", path.clone());
+                }
+                if let Some(tags) = &options.tags {
+                    form = form.text("tags", tags.clone());
+                }
+                if let Some(category) = &options.category {
+                    form = form.text("category", category.clone());
+                }
+                if let Some(dl) = options.download_limit {
+                    form = form.text("dlLimit", dl.to_string());
+                }
+                if let Some(ul) = options.upload_limit {
+                    form = form.text("upLimit", ul.to_string());
+                }
+                if options.paused {
+                    form = form.text("paused", "true".to_string());
+                }
+
+                Ok(form)
+            })
+            .await?;
             Ok(())
         })
     }

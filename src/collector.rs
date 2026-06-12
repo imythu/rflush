@@ -4,11 +4,15 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::{Duration, sleep};
-use tracing::{debug, error, info};
+use tracing::{error, info, warn};
 
 use crate::db::Database;
 use crate::downloader::factory;
 use crate::downloader::{DownloaderRecord, TorrentInfo};
+
+/// 快照超过此秒数视为过期，需要强制刷新。
+/// 设置为 3 个采集周期 (3 × 30s = 90s)，留有一定余量。
+const STALE_SNAPSHOT_SECS: i64 = 90;
 
 #[derive(Debug, Clone)]
 pub struct DownloaderSnapshot {
@@ -56,7 +60,14 @@ impl DownloaderSnapshotCollector {
         downloader: &DownloaderRecord,
     ) -> Result<Arc<DownloaderSnapshot>, String> {
         if let Some(snapshot) = self.get_snapshot(downloader.id).await {
-            return Ok(snapshot);
+            let age_secs = snapshot_age_secs(&snapshot);
+            if age_secs < STALE_SNAPSHOT_SECS {
+                return Ok(snapshot);
+            }
+            warn!(
+                "downloader '{}' snapshot is {}s old, forcing refresh",
+                downloader.name, age_secs
+            );
         }
         self.collect_for_downloader(downloader, false).await
     }
@@ -91,7 +102,7 @@ impl DownloaderSnapshotCollector {
             .map_err(|e| e.to_string())?;
         for downloader in &downloaders {
             if let Err(error) = self.collect_for_downloader(downloader, publish).await {
-                debug!(
+                warn!(
                     "failed to collect snapshot for downloader '{}': {}",
                     downloader.name, error
                 );
@@ -129,4 +140,13 @@ fn torrent_has_tag(torrent: &TorrentInfo, tag: &str) -> bool {
         .split(',')
         .map(str::trim)
         .any(|value| !value.is_empty() && value == tag)
+}
+
+fn snapshot_age_secs(snapshot: &DownloaderSnapshot) -> i64 {
+    let recorded = match chrono::DateTime::parse_from_rfc3339(&snapshot.recorded_at) {
+        Ok(t) => t.with_timezone(&Utc),
+        Err(_) => return i64::MAX,
+    };
+    let now = Utc::now();
+    (now - recorded).num_seconds().max(0)
 }

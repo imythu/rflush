@@ -318,16 +318,52 @@ async fn execute_brush_task(
                 )
                 .await;
         }
-        if let Err(e) = client.delete_torrent(hash, true).await {
-            warn!(
-                "[刷流][{}] 删种失败: hash={} err={}",
-                task.name,
-                &hash[..8.min(hash.len())],
-                e
-            );
+
+        let final_reason: Option<String>;
+        match client.delete_torrent(hash, true).await {
+            Ok(()) => {
+                // 删除成功，使用 cleaner 评估的原因
+                final_reason = Some(reason.clone());
+            }
+            Err(delete_err) => {
+                warn!(
+                    "[刷流][{}] 删种失败: hash={} err={}",
+                    task.name,
+                    &hash[..8.min(hash.len())],
+                    delete_err
+                );
+                // 检查种子是否已被用户手动从下载器中删除
+                match client.list_torrents(None).await {
+                    Ok(all_torrents) => {
+                        if all_torrents.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
+                            // 种子仍在下载器中，是真正的删除失败，保持 active 下次重试
+                            warn!(
+                                "[刷流][{}] 种子仍存在于下载器中，保持 active 状态，下次重试",
+                                task.name
+                            );
+                            continue;
+                        }
+                        // 种子已不在下载器中（用户手动删除），标记为已移除
+                        info!(
+                            "[刷流][{}] 种子已不在下载器中，标记为已移除 (可能被用户手动删除)",
+                            task.name
+                        );
+                        final_reason = Some(format!("{} (下载器中已不存在)", reason));
+                    }
+                    Err(list_err) => {
+                        // 无法检查种子是否存在，保守处理：保持 active 状态
+                        warn!(
+                            "[刷流][{}] 无法检查种子是否存在: {}，保持 active 状态，下次重试",
+                            task.name, list_err
+                        );
+                        continue;
+                    }
+                }
+            }
         }
+
         let _ = db
-            .update_brush_torrent_status(task.id, hash, "removed", Some(reason))
+            .update_brush_torrent_status(task.id, hash, "removed", final_reason.as_deref())
             .await;
     }
 
@@ -750,8 +786,23 @@ async fn execute_brush_task(
                             .or_else(|| Some(extract_torrent_id(&effective_item.guid)))
                             .map(str::to_string)
                             .filter(|value| !value.is_empty());
-                        let info_hash =
-                            extract_info_hash(&data).unwrap_or_else(|| effective_item.guid.clone());
+                        let info_hash = match extract_info_hash(&data) {
+                            Some(h) => h,
+                            None => {
+                                let preview = String::from_utf8_lossy(
+                                    if data.len() > 200 { &data[..200] } else { &data }
+                                );
+                                warn!(
+                                    "[刷流][{}] ✗ 无法从种子文件提取 info hash，数据可能不是有效种子文件: title={} preview={}",
+                                    task.name,
+                                    effective_item.title,
+                                    preview
+                                );
+                                failed += 1;
+                                // 不在 DB 中记录种子，避免用 GUID 当 hash 导致后续追踪断裂
+                                continue;
+                            }
+                        };
                         let _ = db
                             .add_brush_torrent(
                                 task.id,
