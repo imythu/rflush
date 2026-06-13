@@ -436,18 +436,47 @@ export function StatsPage() {
             ),
           ),
         );
-        const map = new Map<string, { upload_speed: number; download_speed: number }>();
+        // Backend already aggregates by time bucket for > 1h ranges,
+        // so we just sum across downloaders per bucket.
+        // For ≤ 1h (raw data), average within same minute per downloader first.
+        const needsMinuteDedup = downloaderTrendHours <= 1;
+        const perDownloaderBuckets = new Map<string, Map<string, { sum_up: number; sum_down: number; count: number }>>();
         for (const arr of allData) {
           for (const snapshot of arr) {
+            const did = String(snapshot.downloader_id);
             const bucket = minuteBucket(snapshot.recorded_at);
+            let byMinute = perDownloaderBuckets.get(did);
+            if (!byMinute) {
+              byMinute = new Map();
+              perDownloaderBuckets.set(did, byMinute);
+            }
+            const existing = byMinute.get(bucket);
+            if (existing) {
+              existing.sum_up += snapshot.upload_speed;
+              existing.sum_down += snapshot.download_speed;
+              existing.count += 1;
+            } else {
+              byMinute.set(bucket, {
+                sum_up: snapshot.upload_speed,
+                sum_down: snapshot.download_speed,
+                count: 1,
+              });
+            }
+          }
+        }
+        const map = new Map<string, { upload_speed: number; download_speed: number }>();
+        for (const byMinute of perDownloaderBuckets.values()) {
+          for (const [bucket, agg] of byMinute) {
+            const avgUp = needsMinuteDedup ? agg.sum_up / agg.count : agg.sum_up;
+            const avgDown = needsMinuteDedup ? agg.sum_down / agg.count : agg.sum_down;
             const existing = map.get(bucket);
             if (existing) {
-              existing.upload_speed += snapshot.upload_speed;
-              existing.download_speed += snapshot.download_speed;
+              existing.upload_speed += avgUp;
+              existing.download_speed += avgDown;
             } else {
               map.set(bucket, {
-                upload_speed: snapshot.upload_speed,
-                download_speed: snapshot.download_speed,
+                upload_speed: avgUp,
+                download_speed: avgDown,
               });
             }
           }

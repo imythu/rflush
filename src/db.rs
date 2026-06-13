@@ -1466,6 +1466,81 @@ impl Database {
         .map_err(join_error)?
     }
 
+    /// 批量通过 hash 查询活跃种子记录及其所属任务配置
+    pub async fn batch_find_active_torrents_by_hashes(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<(BrushTorrentRecord, BrushTaskRecord)>, AppError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path = self.path.clone();
+        let hashes: Vec<String> = hashes.iter().map(|h| h.to_lowercase()).collect();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT bt.id, bt.task_id, bt.torrent_id, bt.torrent_link, bt.torrent_hash, bt.torrent_name,
+                        bt.added_at, bt.size_bytes, bt.is_hr, bt.free_end_timestamp, bt.status, bt.removed_at,
+                        bt.remove_reason, bt.uploaded_bytes, bt.downloaded_bytes, bt.download_duration_secs,
+                        bt.avg_upload_speed, bt.ratio, bt.last_stats_at,
+                        t.id, t.name, t.cron_expression, t.site_id, t.downloader_id, t.tag, t.rss_url,
+                        t.seed_volume_gb, t.save_dir, t.active_time_windows,
+                        t.promotion, t.skip_hit_and_run, t.max_concurrent,
+                        t.download_speed_limit, t.upload_speed_limit,
+                        t.size_ranges, t.seeder_ranges, t.min_free_hours,
+                        t.delete_mode, t.delete_on_free_expiry, t.min_seed_time_hours, t.hr_min_seed_time_hours,
+                        t.target_ratio, t.max_upload_gb, t.download_timeout_hours,
+                        t.min_avg_upload_speed_kbs, t.max_inactive_hours, t.min_disk_space_gb,
+                        t.enabled, t.created_at, t.updated_at, t.downloader_ranges
+                 FROM brush_task_torrents bt
+                 INNER JOIN brush_tasks t ON bt.task_id = t.id
+                 WHERE bt.status = 'active' AND bt.torrent_hash IN ({})",
+                placeholders.join(", ")
+            );
+            let mut stmt = conn.prepare(&sql).map_err(sql_error)?;
+            let params: Vec<Box<dyn rusqlite::types::ToSql>> = hashes
+                .iter()
+                .map(|h| Box::new(h.clone()) as Box<dyn rusqlite::types::ToSql>)
+                .collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt
+                .query_map(param_refs.as_slice(), |row| {
+                    let torrent = BrushTorrentRecord {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        torrent_id: row.get(2)?,
+                        torrent_link: row.get(3)?,
+                        torrent_hash: row.get(4)?,
+                        torrent_name: row.get(5)?,
+                        added_at: row.get(6)?,
+                        size_bytes: row.get(7)?,
+                        is_hr: row.get::<_, i32>(8)? != 0,
+                        free_end_timestamp: row.get(9)?,
+                        status: row.get(10)?,
+                        removed_at: row.get(11)?,
+                        remove_reason: row.get(12)?,
+                        uploaded_bytes: row.get(13)?,
+                        downloaded_bytes: row.get(14)?,
+                        download_duration_secs: row.get(15)?,
+                        avg_upload_speed: row.get(16)?,
+                        ratio: row.get(17)?,
+                        last_stats_at: row.get(18)?,
+                    };
+                    let task = row_to_brush_task_at(row, 19)?;
+                    Ok((torrent, task))
+                })
+                .map_err(sql_error)?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(sql_error)?);
+            }
+            Ok(list)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn add_brush_torrent(
         &self,
         task_id: i64,
@@ -1635,11 +1710,85 @@ impl Database {
         downloader_id: Option<i64>,
         since: &str,
         until: &str,
+        bucket_secs: Option<i64>,
     ) -> Result<Vec<DownloaderSpeedSnapshot>, AppError> {
         let path = self.path.clone();
         let (since, until) = (since.to_string(), until.to_string());
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
+
+            // When bucket_secs is set, aggregate (AVG) within time buckets per downloader.
+            // Buckets are computed by truncating recorded_at to the nearest interval.
+            if let Some(bs) = bucket_secs.filter(|&bs| bs > 0) {
+                // Build a strftime format string that truncates to the given interval.
+                // 10s: seconds digit is 0, 60s: seconds are :00, 300s: round to 5min, 3600s: round to hour
+                let bucket_expr = if bs < 60 {
+                    // Sub-minute: truncate seconds to nearest bucket (e.g., 10s → floor to 0,10,20,…)
+                    format!(
+                        "strftime('%Y-%m-%dT%H:%M:', recorded_at) || printf('%02d', (CAST(strftime('%S', recorded_at) AS INTEGER) / {bs}) * {bs}) || 'Z'"
+                    )
+                } else if bs < 3600 {
+                    let mins = bs / 60;
+                    format!(
+                        "strftime('%Y-%m-%dT%H:', recorded_at) || printf('%02d', (CAST(strftime('%M', recorded_at) AS INTEGER) / {mins}) * {mins}) || ':00Z'"
+                    )
+                } else {
+                    let hours = bs / 3600;
+                    format!(
+                        "strftime('%Y-%m-%dT', recorded_at) || printf('%02d', (CAST(strftime('%H', recorded_at) AS INTEGER) / {hours}) * {hours}) || ':00:00Z'"
+                    )
+                };
+
+                let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+                    if let Some(did) = downloader_id {
+                        (
+                            format!(
+                                "SELECT 0, downloader_id, CAST(avg(upload_speed) AS INTEGER), CAST(avg(download_speed) AS INTEGER), {bucket_expr} AS bucket
+                                 FROM downloader_speed_snapshots
+                                 WHERE downloader_id = ?
+                                   AND datetime(recorded_at) >= datetime(?)
+                                   AND datetime(recorded_at) <= datetime(?)
+                                 GROUP BY downloader_id, bucket
+                                 ORDER BY bucket"
+                            ),
+                            vec![Box::new(did), Box::new(since), Box::new(until)],
+                        )
+                    } else {
+                        (
+                            format!(
+                                "SELECT 0, downloader_id, CAST(avg(upload_speed) AS INTEGER), CAST(avg(download_speed) AS INTEGER), {bucket_expr} AS bucket
+                                 FROM downloader_speed_snapshots
+                                 WHERE datetime(recorded_at) >= datetime(?)
+                                   AND datetime(recorded_at) <= datetime(?)
+                                 GROUP BY downloader_id, bucket
+                                 ORDER BY bucket"
+                            ),
+                            vec![Box::new(since), Box::new(until)],
+                        )
+                    };
+
+                let mut stmt = conn.prepare(&sql).map_err(sql_error)?;
+                let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params_vec.iter().map(|p| p.as_ref()).collect();
+                let rows = stmt
+                    .query_map(params_refs.as_slice(), |row| {
+                        Ok(DownloaderSpeedSnapshot {
+                            id: row.get(0)?,
+                            downloader_id: row.get(1)?,
+                            upload_speed: row.get(2)?,
+                            download_speed: row.get(3)?,
+                            recorded_at: row.get(4)?,
+                        })
+                    })
+                    .map_err(sql_error)?;
+                let mut list = Vec::new();
+                for row in rows {
+                    list.push(row.map_err(sql_error)?);
+                }
+                return Ok(list);
+            }
+
+            // Raw query (no aggregation)
             let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
                 if let Some(downloader_id) = downloader_id {
                     (
@@ -1808,6 +1957,27 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.execute(
                 "DELETE FROM torrent_traffic WHERE datetime(recorded_at) < datetime(?)",
+                params![cutoff],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn cleanup_old_speed_snapshots(&self, days: i64) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "DELETE FROM downloader_speed_snapshots WHERE datetime(recorded_at) < datetime(?)",
+                params![cutoff],
+            )
+            .map_err(sql_error)?;
+            conn.execute(
+                "DELETE FROM task_stats_snapshots WHERE datetime(recorded_at) < datetime(?)",
                 params![cutoff],
             )
             .map_err(sql_error)?;
@@ -2178,39 +2348,43 @@ impl Database {
 }
 
 fn row_to_brush_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTaskRecord> {
+    row_to_brush_task_at(row, 0)
+}
+
+fn row_to_brush_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<BrushTaskRecord> {
     Ok(BrushTaskRecord {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        cron_expression: row.get(2)?,
-        site_id: row.get(3)?,
-        downloader_id: row.get(4)?,
-        tag: row.get(5)?,
-        rss_url: row.get(6)?,
-        seed_volume_gb: row.get(7)?,
-        save_dir: row.get(8)?,
-        active_time_windows: row.get(9)?,
-        promotion: row.get(10)?,
-        skip_hit_and_run: row.get::<_, i32>(11)? != 0,
-        max_concurrent: row.get(12)?,
-        download_speed_limit: row.get(13)?,
-        upload_speed_limit: row.get(14)?,
-        size_ranges: row.get(15)?,
-        seeder_ranges: row.get(16)?,
-        downloader_ranges: row.get(31)?,
-        min_free_hours: row.get(17)?,
-        delete_mode: row.get(18)?,
-        delete_on_free_expiry: row.get::<_, i32>(19)? != 0,
-        min_seed_time_hours: row.get(20)?,
-        hr_min_seed_time_hours: row.get(21)?,
-        target_ratio: row.get(22)?,
-        max_upload_gb: row.get(23)?,
-        download_timeout_hours: row.get(24)?,
-        min_avg_upload_speed_kbs: row.get(25)?,
-        max_inactive_hours: row.get(26)?,
-        min_disk_space_gb: row.get(27)?,
-        enabled: row.get::<_, i32>(28)? != 0,
-        created_at: row.get(29)?,
-        updated_at: row.get(30)?,
+        id: row.get(offset)?,
+        name: row.get(offset + 1)?,
+        cron_expression: row.get(offset + 2)?,
+        site_id: row.get(offset + 3)?,
+        downloader_id: row.get(offset + 4)?,
+        tag: row.get(offset + 5)?,
+        rss_url: row.get(offset + 6)?,
+        seed_volume_gb: row.get(offset + 7)?,
+        save_dir: row.get(offset + 8)?,
+        active_time_windows: row.get(offset + 9)?,
+        promotion: row.get(offset + 10)?,
+        skip_hit_and_run: row.get::<_, i32>(offset + 11)? != 0,
+        max_concurrent: row.get(offset + 12)?,
+        download_speed_limit: row.get(offset + 13)?,
+        upload_speed_limit: row.get(offset + 14)?,
+        size_ranges: row.get(offset + 15)?,
+        seeder_ranges: row.get(offset + 16)?,
+        min_free_hours: row.get(offset + 17)?,
+        delete_mode: row.get(offset + 18)?,
+        delete_on_free_expiry: row.get::<_, i32>(offset + 19)? != 0,
+        min_seed_time_hours: row.get(offset + 20)?,
+        hr_min_seed_time_hours: row.get(offset + 21)?,
+        target_ratio: row.get(offset + 22)?,
+        max_upload_gb: row.get(offset + 23)?,
+        download_timeout_hours: row.get(offset + 24)?,
+        min_avg_upload_speed_kbs: row.get(offset + 25)?,
+        max_inactive_hours: row.get(offset + 26)?,
+        min_disk_space_gb: row.get(offset + 27)?,
+        enabled: row.get::<_, i32>(offset + 28)? != 0,
+        created_at: row.get(offset + 29)?,
+        updated_at: row.get(offset + 30)?,
+        downloader_ranges: row.get(offset + 31)?,
     })
 }
 

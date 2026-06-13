@@ -1521,9 +1521,23 @@ async fn downloader_speed_trend(
     let since = q.since.unwrap_or_else(|| {
         (Utc::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
     });
+    // Choose aggregation bucket based on time range to avoid returning excessive raw data:
+    //   ≤ 1h  → raw 10s data (max ~360 pts/downloader)
+    //   ≤ 6h  → 1-minute buckets (max ~360 pts)
+    //   ≤ 24h → 5-minute buckets (max ~288 pts)
+    //   > 24h → 1-hour buckets   (max ~168 pts for 7d)
+    let bucket_secs = if hours <= 1 {
+        None
+    } else if hours <= 6 {
+        Some(60)
+    } else if hours <= 24 {
+        Some(300)
+    } else {
+        Some(3600)
+    };
     let data = state
         .db
-        .get_downloader_speed_snapshots(q.downloader_id, &since, &until)
+        .get_downloader_speed_snapshots(q.downloader_id, &since, &until, bucket_secs)
         .await?;
     Ok(Json(data))
 }

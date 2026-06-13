@@ -106,6 +106,7 @@ async fn process_snapshot(db: &Database, snapshot: &DownloaderSnapshot) -> Resul
     }
 
     let _ = db.cleanup_old_torrent_traffic(7).await;
+    let _ = db.cleanup_old_speed_snapshots(7).await;
 
     Ok(())
 }
