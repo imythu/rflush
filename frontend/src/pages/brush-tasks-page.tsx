@@ -43,6 +43,16 @@ function formatDuration(totalSeconds: number): string {
   return `${secs}s`;
 }
 
+function formatHoursLabel(hours: number | null): string {
+  if (hours == null || !Number.isFinite(hours) || hours <= 0) return "";
+  const totalMinutes = Math.round(hours * 60);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  if (h > 0 && m > 0) return `= ${h}小时${m}分钟`;
+  if (h > 0) return `= ${h}小时`;
+  return `= ${m}分钟`;
+}
+
 const emptyForm: BrushTaskRequest = {
   name: "",
   cron_expression: "",
@@ -626,19 +636,23 @@ export function BrushTasksPage() {
                 <Label>最小做种时间 (小时)</Label>
                 <Input
                   type="number"
+                  step="0.1"
                   placeholder="不限"
                   value={form.min_seed_time_hours ?? ""}
                   onChange={(e) => setField("min_seed_time_hours", numOrNull(e.target.value))}
                 />
+                <p className="text-xs text-muted">{formatHoursLabel(form.min_seed_time_hours)}</p>
               </div>
               <div className="space-y-2">
                 <Label>HR 最小做种时间 (小时)</Label>
                 <Input
                   type="number"
+                  step="0.1"
                   placeholder="不限"
                   value={form.hr_min_seed_time_hours ?? ""}
                   onChange={(e) => setField("hr_min_seed_time_hours", numOrNull(e.target.value))}
                 />
+                <p className="text-xs text-muted">{formatHoursLabel(form.hr_min_seed_time_hours)}</p>
               </div>
               <div className="flex items-end pb-2">
                 <label className="flex items-center gap-3 text-sm text-muted">
@@ -674,10 +688,12 @@ export function BrushTasksPage() {
                 <Label>下载超时 (小时)</Label>
                 <Input
                   type="number"
+                  step="0.1"
                   placeholder="不限"
                   value={form.download_timeout_hours ?? ""}
                   onChange={(e) => setField("download_timeout_hours", numOrNull(e.target.value))}
                 />
+                <p className="text-xs text-muted">{formatHoursLabel(form.download_timeout_hours)}</p>
               </div>
               <div className="space-y-2">
                 <Label>最低平均上传速度 (KB/s)</Label>
@@ -692,10 +708,12 @@ export function BrushTasksPage() {
                 <Label>最大不活跃时间 (小时)</Label>
                 <Input
                   type="number"
+                  step="0.1"
                   placeholder="不限"
                   value={form.max_inactive_hours ?? ""}
                   onChange={(e) => setField("max_inactive_hours", numOrNull(e.target.value))}
                 />
+                <p className="text-xs text-muted">{formatHoursLabel(form.max_inactive_hours)}</p>
               </div>
               <div className="space-y-2">
                 <Label>最小磁盘空间 (GB)</Label>
