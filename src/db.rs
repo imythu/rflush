@@ -66,6 +66,32 @@ pub struct PaginatedBrushTorrents {
     pub records: Vec<BrushTorrentRecord>,
 }
 
+/// 一次下载器采集快照的统计写入批次（在单事务中提交）。
+pub struct SnapshotStatsBatch {
+    pub downloader_id: i64,
+    pub upload_speed: i64,
+    pub download_speed: i64,
+    pub tasks: Vec<TaskSnapshotStats>,
+    pub torrents: Vec<TorrentSnapshotStats>,
+}
+
+pub struct TaskSnapshotStats {
+    pub task_id: i64,
+    pub total_uploaded: i64,
+    pub total_downloaded: i64,
+    pub torrent_count: i64,
+}
+
+pub struct TorrentSnapshotStats {
+    pub task_id: i64,
+    pub hash: String,
+    pub uploaded: i64,
+    pub downloaded: i64,
+    pub download_duration_secs: i64,
+    pub avg_upload_speed: f64,
+    pub ratio: f64,
+}
+
 impl Database {
     pub async fn open(data_dir: &Path) -> Result<Self, AppError> {
         tokio::fs::create_dir_all(&data_dir)
@@ -1599,43 +1625,55 @@ impl Database {
 
     // ========== Stats Snapshots ==========
 
-    pub async fn save_task_stats_snapshot(
-        &self,
-        task_id: i64,
-        total_uploaded: i64,
-        total_downloaded: i64,
-        torrent_count: i64,
-    ) -> Result<(), AppError> {
+    /// 在单个连接 + 单个事务中写入一次采集快照的全部统计数据。
+    /// 替代此前每个种子各开一个连接的 N+1 写法，显著降低高频采集下的开销。
+    pub async fn record_snapshot_stats(&self, batch: SnapshotStatsBatch) -> Result<(), AppError> {
         let path = self.path.clone();
-        let now = Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "INSERT INTO task_stats_snapshots (task_id, total_uploaded, total_downloaded, torrent_count, recorded_at) VALUES (?, ?, ?, ?, ?)",
-                params![task_id, total_uploaded, total_downloaded, torrent_count, now],
-            )
-            .map_err(sql_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(join_error)?
-    }
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let mut conn = open_connection(&path)?;
+            let now = Utc::now().to_rfc3339();
+            let tx = conn.transaction().map_err(sql_error)?;
 
-    pub async fn save_downloader_speed_snapshot(
-        &self,
-        downloader_id: i64,
-        upload_speed: i64,
-        download_speed: i64,
-    ) -> Result<(), AppError> {
-        let path = self.path.clone();
-        let now = Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
+            tx.execute(
                 "INSERT INTO downloader_speed_snapshots (downloader_id, upload_speed, download_speed, recorded_at) VALUES (?, ?, ?, ?)",
-                params![downloader_id, upload_speed, download_speed, now],
+                params![batch.downloader_id, batch.upload_speed, batch.download_speed, now],
             )
             .map_err(sql_error)?;
+
+            for task in &batch.tasks {
+                tx.execute(
+                    "INSERT INTO task_stats_snapshots (task_id, total_uploaded, total_downloaded, torrent_count, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                    params![task.task_id, task.total_uploaded, task.total_downloaded, task.torrent_count, now],
+                )
+                .map_err(sql_error)?;
+            }
+
+            for torrent in &batch.torrents {
+                tx.execute(
+                    "INSERT INTO torrent_traffic (task_id, torrent_hash, uploaded_bytes, downloaded_bytes, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                    params![torrent.task_id, torrent.hash, torrent.uploaded, torrent.downloaded, now],
+                )
+                .map_err(sql_error)?;
+                tx.execute(
+                    "UPDATE brush_task_torrents
+                     SET uploaded_bytes = ?, downloaded_bytes = ?, download_duration_secs = ?,
+                         avg_upload_speed = ?, ratio = ?, last_stats_at = ?
+                     WHERE task_id = ? AND torrent_hash = ?",
+                    params![
+                        torrent.uploaded,
+                        torrent.downloaded,
+                        torrent.download_duration_secs,
+                        torrent.avg_upload_speed,
+                        torrent.ratio,
+                        now,
+                        torrent.task_id,
+                        torrent.hash
+                    ],
+                )
+                .map_err(sql_error)?;
+            }
+
+            tx.commit().map_err(sql_error)?;
             Ok(())
         })
         .await
@@ -1955,8 +1993,10 @@ impl Database {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
+            // recorded_at 全部为同格式 UTC RFC3339 字符串，字典序即时间序，
+            // 直接比较裸列可命中 recorded_at 索引，避免 datetime() 包裹导致的全表扫描。
             conn.execute(
-                "DELETE FROM torrent_traffic WHERE datetime(recorded_at) < datetime(?)",
+                "DELETE FROM torrent_traffic WHERE recorded_at < ?",
                 params![cutoff],
             )
             .map_err(sql_error)?;
@@ -1972,12 +2012,12 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "DELETE FROM downloader_speed_snapshots WHERE datetime(recorded_at) < datetime(?)",
+                "DELETE FROM downloader_speed_snapshots WHERE recorded_at < ?",
                 params![cutoff],
             )
             .map_err(sql_error)?;
             conn.execute(
-                "DELETE FROM task_stats_snapshots WHERE datetime(recorded_at) < datetime(?)",
+                "DELETE FROM task_stats_snapshots WHERE recorded_at < ?",
                 params![cutoff],
             )
             .map_err(sql_error)?;
@@ -2204,6 +2244,10 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_torrent_traffic_lookup ON torrent_traffic(task_id, torrent_hash, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_downloader_speed_snapshots_lookup ON downloader_speed_snapshots(downloader_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_sign_in_records_lookup ON sign_in_records(task_id, finished_at);
+                -- 保留期清理按 recorded_at 范围删除，需单列索引才能避免全表扫描。
+                CREATE INDEX IF NOT EXISTS idx_torrent_traffic_recorded_at ON torrent_traffic(recorded_at);
+                CREATE INDEX IF NOT EXISTS idx_task_stats_recorded_at ON task_stats_snapshots(recorded_at);
+                CREATE INDEX IF NOT EXISTS idx_downloader_speed_recorded_at ON downloader_speed_snapshots(recorded_at);
                 ",
             )
             .map_err(sql_error)?;
@@ -2507,7 +2551,21 @@ fn map_brush_torrent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTo
 }
 
 fn open_connection(path: &Path) -> Result<Connection, AppError> {
-    Connection::open(path).map_err(sql_error)
+    let conn = Connection::open(path).map_err(sql_error)?;
+    // 这些 PRAGMA 是按连接生效的。由于每个操作都新开连接，必须在此逐一设置，
+    // 否则 foreign_keys 会静默关闭、并发写入会立刻返回 SQLITE_BUSY。
+    // - busy_timeout: 写锁争用时等待而非立即失败（高频采集 + Web 请求并发写）。
+    // - foreign_keys: 启用外键级联（ON DELETE CASCADE / SET NULL）。
+    // - journal_mode=WAL + synchronous=NORMAL: 读写并发，且仍有合理的持久性。
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(sql_error)?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(sql_error)?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(sql_error)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(sql_error)?;
+    Ok(conn)
 }
 
 fn join_error(error: tokio::task::JoinError) -> AppError {

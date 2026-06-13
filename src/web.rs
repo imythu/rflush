@@ -298,11 +298,9 @@ pub async fn serve(
     site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
+    rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
 ) -> Result<(), AppError> {
-    let engine = DownloadEngine::new(
-        base_dir.clone(),
-        Arc::new(crate::net::rate_limiter::SharedRateLimiter::new()),
-    );
+    let engine = DownloadEngine::new(base_dir.clone(), rate_limiter);
     let state = AppState::new(
         base_dir,
         db,
@@ -1611,26 +1609,8 @@ fn apply_live_torrent(
     record.uploaded_bytes = live.uploaded;
     record.downloaded_bytes = live.downloaded;
     record.download_duration_secs = live.time_active.max(0);
-    record.avg_upload_speed = average_upload_speed(live.uploaded, live.time_active);
-    record.ratio = calculate_ratio(live.uploaded, live.downloaded, live.ratio);
-}
-
-fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
-    if duration_secs <= 0 {
-        0.0
-    } else {
-        uploaded_bytes as f64 / duration_secs as f64
-    }
-}
-
-fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
-    if downloaded_bytes > 0 {
-        uploaded_bytes as f64 / downloaded_bytes as f64
-    } else if uploaded_bytes > 0 {
-        fallback.max(0.0)
-    } else {
-        0.0
-    }
+    record.avg_upload_speed = crate::brush::average_upload_speed(live.uploaded, live.time_active);
+    record.ratio = crate::brush::calculate_ratio(live.uploaded, live.downloaded, live.ratio);
 }
 
 fn looks_like_info_hash(value: &str) -> bool {

@@ -76,6 +76,7 @@ struct PartialItem {
     download_url: Option<String>,
     size_bytes: Option<u64>,
     seeders: Option<i32>,
+    leechers: Option<i32>,
     categories: Vec<String>,
     download_volume_factor: Option<f64>,
     upload_volume_factor: Option<f64>,
@@ -113,7 +114,7 @@ impl ParsedFeed {
                 version,
                 size_bytes: item.size_bytes,
                 seeders: item.seeders,
-                leechers: None,
+                leechers: item.leechers,
                 free_end_timestamp: None,
                 free_elapsed_seconds: None,
                 download_volume_factor: item.download_volume_factor,
@@ -190,6 +191,9 @@ pub fn parse_feed(xml: &str) -> Result<ParsedFeed, RssParseError> {
                                 }
                                 b"seeders" | b"seeds" | b"seeder" => {
                                     item.seeders = text.trim().parse().ok();
+                                }
+                                b"peers" | b"leechers" | b"leecher" => {
+                                    item.leechers = text.trim().parse().ok();
                                 }
                                 b"size" | b"contentLength" | b"filesize" => {
                                     item.size_bytes = text.trim().parse().ok();
@@ -293,6 +297,10 @@ fn fill_attr(item: &mut PartialItem, event: &BytesStart<'_>) {
     match name {
         "seeders" | "seeds" | "seed" => {
             item.seeders = value.trim().parse().ok();
+        }
+        "peers" | "leechers" | "leech" => {
+            // torznab 中 peers 即下载人数（leechers）。
+            item.leechers = value.trim().parse().ok();
         }
         "size" => {
             item.size_bytes = value.trim().parse().ok();
@@ -433,6 +441,7 @@ mod tests {
       <guid>abc</guid>
       <enclosure url="https://example.test/download" length="1024" />
       <torznab:attr name="seeders" value="12" />
+      <torznab:attr name="peers" value="5" />
       <torznab:attr name="downloadvolumefactor" value="0" />
       <torznab:attr name="uploadvolumefactor" value="2" />
       <torznab:attr name="minimumratio" value="1.5" />
@@ -446,6 +455,7 @@ mod tests {
         let item = snapshot.items.get("abc").expect("item should exist");
 
         assert_eq!(item.seeders, Some(12));
+        assert_eq!(item.leechers, Some(5));
         assert_eq!(item.size_bytes, Some(1024));
         assert_eq!(item.download_volume_factor, Some(0.0));
         assert_eq!(item.upload_volume_factor, Some(2.0));

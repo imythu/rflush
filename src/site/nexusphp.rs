@@ -288,6 +288,7 @@ impl NexusPhpAdapter {
             two_x_free: has_two_x_free,
             hit_and_run,
             seeder_count: None,
+            leecher_count: None,
             free_end_timestamp,
             download_volume_factor,
             upload_volume_factor,
@@ -454,13 +455,17 @@ fn detect_free_end_timestamp(html: &str) -> Option<i64> {
 }
 
 fn extract_datetime_to_utc8(text: &str) -> Option<i64> {
+    let tz = FixedOffset::east_opt(8 * 3600)?;
     for window in text.as_bytes().windows(19) {
-        let candidate = std::str::from_utf8(window).ok()?;
+        // 窗口可能切在多字节 UTF-8 字符中间，此时跳过而不是中止整个扫描。
+        let Ok(candidate) = std::str::from_utf8(window) else {
+            continue;
+        };
         if looks_like_datetime(candidate) {
-            let naive = NaiveDateTime::parse_from_str(candidate, "%Y-%m-%d %H:%M:%S").ok()?;
-            let tz = FixedOffset::east_opt(8 * 3600)?;
-            if let Some(datetime) = tz.from_local_datetime(&naive).single() {
-                return Some(datetime.timestamp());
+            if let Ok(naive) = NaiveDateTime::parse_from_str(candidate, "%Y-%m-%d %H:%M:%S") {
+                if let Some(datetime) = tz.from_local_datetime(&naive).single() {
+                    return Some(datetime.timestamp());
+                }
             }
         }
     }

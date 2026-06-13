@@ -13,6 +13,6 @@ pub fn create_client(
             record.username.clone(),
             record.password.clone(),
             proxy,
-        )),
+        )?),
     })
 }

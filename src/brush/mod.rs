@@ -189,3 +189,23 @@ pub fn is_in_active_window(windows_json: Option<&str>) -> bool {
 
     false
 }
+
+/// 平均上传速度 (bytes/s)。做种时长非正时返回 0。
+pub fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
+    if duration_secs <= 0 {
+        0.0
+    } else {
+        uploaded_bytes as f64 / duration_secs as f64
+    }
+}
+
+/// 分享率。有下载量时按 上传/下载 计算；无下载但有上传时回退到下载器上报值。
+pub fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
+    if downloaded_bytes > 0 {
+        uploaded_bytes as f64 / downloaded_bytes as f64
+    } else if uploaded_bytes > 0 {
+        fallback.max(0.0)
+    } else {
+        0.0
+    }
+}

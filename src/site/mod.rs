@@ -101,6 +101,8 @@ pub struct TorrentAttributes {
     pub hit_and_run: bool,
     /// 做种数。
     pub seeder_count: Option<i32>,
+    /// 下载数（leechers）。
+    pub leecher_count: Option<i32>,
     /// Free 促销结束时间的 Unix 时间戳（秒）。
     pub free_end_timestamp: Option<i64>,
     /// 下载系数，`0.0` 表示免费，`1.0` 表示原价下载。

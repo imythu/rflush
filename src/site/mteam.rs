@@ -147,13 +147,17 @@ impl MTeamAdapter {
     }
 
     fn parse_discount(discount: Option<&str>) -> (Option<f64>, Option<f64>) {
+        // 取值对应 M-Team API 的 discount 枚举（见 /api/v3/api-docs）：
+        // NORMAL, PERCENT_70, PERCENT_50, FREE, _2X_FREE, _2X, _2X_PERCENT_50
+        // 返回 (下载系数, 上传系数)。
         match discount.unwrap_or_default() {
             "FREE" => (Some(0.0), Some(1.0)),
-            "FREE_2XUP" | "TWOFREE" => (Some(0.0), Some(2.0)),
+            "_2X_FREE" | "FREE_2XUP" | "TWOFREE" => (Some(0.0), Some(2.0)),
+            "_2X" | "TWOUP" => (Some(1.0), Some(2.0)),
             "PERCENT_50" => (Some(0.5), Some(1.0)),
-            "PERCENT_50_2XUP" => (Some(0.5), Some(2.0)),
+            "_2X_PERCENT_50" | "PERCENT_50_2XUP" => (Some(0.5), Some(2.0)),
             "PERCENT_70" => (Some(0.3), Some(1.0)),
-            "PERCENT_70_2XUP" => (Some(0.3), Some(2.0)),
+            "_2X_PERCENT_70" | "PERCENT_70_2XUP" => (Some(0.3), Some(2.0)),
             "NORMAL" | "" => (Some(1.0), Some(1.0)),
             other => {
                 debug!("未识别的 M-Team 促销类型: {:?}", other);
@@ -303,6 +307,15 @@ impl SiteAdapter for MTeamAdapter {
                                 .and_then(|s| s.parse::<i32>().ok())
                                 .or_else(|| v.as_i64().map(|n| n as i32))
                         });
+                        // M-Team status 中下载人数字段为 leechers（字符串或整数）。
+                        let leecher_count = status
+                            .get("leechers")
+                            .or_else(|| status.get("leecher"))
+                            .and_then(|v| {
+                                v.as_str()
+                                    .and_then(|s| s.parse::<i32>().ok())
+                                    .or_else(|| v.as_i64().map(|n| n as i32))
+                            });
                         let free_end_timestamp = status
                             .get("discountEndTime")
                             .or_else(|| data.get("discountEndTime"))
@@ -315,6 +328,7 @@ impl SiteAdapter for MTeamAdapter {
                                 && upload_volume_factor.is_some_and(|factor| factor >= 2.0),
                             hit_and_run: false,
                             seeder_count,
+                            leecher_count,
                             free_end_timestamp,
                             download_volume_factor,
                             upload_volume_factor,
@@ -340,13 +354,14 @@ impl SiteAdapter for MTeamAdapter {
     }
 }
 
-/// 简单的伪随机数生成，基于当前时间纳秒，返回 [0, max_ms) 范围内的毫秒数
+/// 简单的伪随机数生成，基于当前时间纳秒，返回 [0, max_ms) 范围内的毫秒数。
+/// 仅用于请求抖动，不需要密码学强度的随机性。
 fn simple_random_ms(max_ms: u64) -> u64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    // 混入当前线程地址作为额外熵源
+    // 折叠高低位增加低位熵
     let seed = nanos ^ (nanos >> 32);
     if max_ms == 0 { 0 } else { seed % max_ms }
 }
@@ -365,4 +380,56 @@ fn parse_mteam_datetime(value: &str) -> Option<i64> {
     tz.from_local_datetime(&naive)
         .single()
         .map(|dt| dt.timestamp())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MTeamAdapter;
+
+    #[test]
+    fn parse_discount_maps_current_api_enum() {
+        // 对应 swagger 枚举：NORMAL, PERCENT_70, PERCENT_50, FREE, _2X_FREE, _2X, _2X_PERCENT_50
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("NORMAL")),
+            (Some(1.0), Some(1.0))
+        );
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("FREE")),
+            (Some(0.0), Some(1.0))
+        );
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("_2X_FREE")),
+            (Some(0.0), Some(2.0))
+        );
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("_2X")),
+            (Some(1.0), Some(2.0))
+        );
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("PERCENT_50")),
+            (Some(0.5), Some(1.0))
+        );
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("_2X_PERCENT_50")),
+            (Some(0.5), Some(2.0))
+        );
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("PERCENT_70")),
+            (Some(0.3), Some(1.0))
+        );
+        // 缺省与未知都按原价处理
+        assert_eq!(MTeamAdapter::parse_discount(None), (Some(1.0), Some(1.0)));
+        assert_eq!(
+            MTeamAdapter::parse_discount(Some("WHATEVER")),
+            (Some(1.0), Some(1.0))
+        );
+    }
+
+    #[test]
+    fn extract_torrent_id_takes_last_number() {
+        assert_eq!(
+            MTeamAdapter::extract_torrent_id("https://kp.m-team.cc/detail/1165802"),
+            Some("1165802".to_string())
+        );
+    }
 }

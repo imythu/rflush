@@ -22,21 +22,30 @@ pub struct QBittorrentClient {
 }
 
 impl QBittorrentClient {
-    pub fn new(base_url: String, username: String, password: String, proxy: Option<&str>) -> Self {
+    pub fn new(
+        base_url: String,
+        username: String,
+        password: String,
+        proxy: Option<&str>,
+    ) -> Result<Self, String> {
         let mut builder = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none());
         if let Some(proxy_url) = proxy.map(str::trim).filter(|v| !v.is_empty()) {
-            builder = builder.proxy(reqwest::Proxy::all(proxy_url).expect("invalid proxy URL"));
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .map_err(|e| format!("无效的代理地址 '{}': {}", proxy_url, e))?;
+            builder = builder.proxy(proxy);
         }
-        let client = builder.build().expect("failed to build reqwest client");
-        Self {
+        let client = builder
+            .build()
+            .map_err(|e| format!("构建 qBittorrent HTTP 客户端失败: {}", e))?;
+        Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             username,
             password,
             client,
             cookie: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     async fn login(&self) -> Result<String, String> {
@@ -454,6 +463,11 @@ fn truncate_for_log(input: &str, max_len: usize) -> String {
     if input.len() <= max_len {
         input.to_string()
     } else {
-        format!("{}...", &input[..max_len])
+        // 找到不超过 max_len 的最大字符边界，避免在多字节 UTF-8 序列中间切断。
+        let mut end = max_len;
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &input[..end])
     }
 }

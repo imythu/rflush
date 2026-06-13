@@ -72,7 +72,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let limiter = Arc::new(SharedRateLimiter::new());
     let policy = RateLimitPolicy::new(5, Duration::from_secs(1), Duration::from_secs(60));
     let http = Arc::new(
-        AppHttpClient::new(limiter, policy, proxy).map_err(|e| AppError::InvalidConfig {
+        AppHttpClient::new(limiter.clone(), policy, proxy).map_err(|e| AppError::InvalidConfig {
             message: format!("failed to build HTTP client: {}", e),
         })?,
     );
@@ -113,6 +113,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         site_stats_refresher,
         collector,
         pool,
+        limiter,
     )
     .await;
 

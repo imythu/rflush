@@ -10,7 +10,7 @@ use crate::db::Database;
 use crate::downloader::{DownloaderClientPool, DownloaderRecord, TorrentInfo};
 
 /// 快照超过此秒数视为过期，需要强制刷新。
-/// 设置为 3 个采集周期 (3 × 30s = 90s)，留有一定余量。
+/// 采集循环每 10s 运行一次，90s 约等于 9 个采集周期的容差。
 const STALE_SNAPSHOT_SECS: i64 = 90;
 
 #[derive(Debug, Clone)]

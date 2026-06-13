@@ -40,6 +40,10 @@ pub async fn start_stats_consumer(
                         snapshot.downloader_id, snapshot.recorded_at, error
                     );
                 }
+                // 保留期清理：DELETE 已改为可命中 recorded_at 索引的范围删除，
+                // 每条快照执行的成本很低（几乎只删今天之前到期的少量行）。
+                let _ = db.cleanup_old_torrent_traffic(7).await;
+                let _ = db.cleanup_old_speed_snapshots(7).await;
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 debug!("stats consumer lagged, skipped {} snapshot(s)", skipped);
@@ -63,50 +67,63 @@ async fn process_snapshot(db: &Database, snapshot: &DownloaderSnapshot) -> Resul
         .iter()
         .map(|torrent| torrent.download_speed)
         .sum();
-    let _ = db
-        .save_downloader_speed_snapshot(snapshot.downloader_id, upload_speed, download_speed)
-        .await;
 
     let tasks = db.list_brush_tasks().await.map_err(|e| e.to_string())?;
+
+    let mut task_stats = Vec::new();
+    let mut torrent_stats = Vec::new();
     for task in tasks
         .into_iter()
         .filter(|task| task.downloader_id == snapshot.downloader_id)
     {
-        let torrents: Vec<_> = snapshot
+        let torrents = snapshot
             .torrents
             .iter()
-            .filter(|torrent| torrent_has_tag(&torrent.tags, &task.tag))
-            .cloned()
-            .collect();
+            .filter(|torrent| torrent_has_tag(&torrent.tags, &task.tag));
 
-        let total_uploaded: i64 = torrents.iter().map(|torrent| torrent.uploaded).sum();
-        let total_downloaded: i64 = torrents.iter().map(|torrent| torrent.downloaded).sum();
-        let count = torrents.len() as i64;
-
-        let _ = db
-            .save_task_stats_snapshot(task.id, total_uploaded, total_downloaded, count)
-            .await;
-
-        for torrent in &torrents {
-            let _ = db
-                .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
-                .await;
-            let _ = db
-                .update_brush_torrent_stats(
-                    task.id,
-                    &torrent.hash,
+        let mut total_uploaded = 0i64;
+        let mut total_downloaded = 0i64;
+        let mut count = 0i64;
+        for torrent in torrents {
+            total_uploaded += torrent.uploaded;
+            total_downloaded += torrent.downloaded;
+            count += 1;
+            torrent_stats.push(crate::db::TorrentSnapshotStats {
+                task_id: task.id,
+                hash: torrent.hash.clone(),
+                uploaded: torrent.uploaded,
+                downloaded: torrent.downloaded,
+                download_duration_secs: torrent.time_active.max(0),
+                avg_upload_speed: crate::brush::average_upload_speed(
+                    torrent.uploaded,
+                    torrent.time_active,
+                ),
+                ratio: crate::brush::calculate_ratio(
                     torrent.uploaded,
                     torrent.downloaded,
-                    torrent.time_active.max(0),
-                    average_upload_speed(torrent.uploaded, torrent.time_active),
-                    calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
-                )
-                .await;
+                    torrent.ratio,
+                ),
+            });
         }
+
+        task_stats.push(crate::db::TaskSnapshotStats {
+            task_id: task.id,
+            total_uploaded,
+            total_downloaded,
+            torrent_count: count,
+        });
     }
 
-    let _ = db.cleanup_old_torrent_traffic(7).await;
-    let _ = db.cleanup_old_speed_snapshots(7).await;
+    // 整次快照的统计在单个事务中写入，避免 N+1 次新建连接。
+    db.record_snapshot_stats(crate::db::SnapshotStatsBatch {
+        downloader_id: snapshot.downloader_id,
+        upload_speed,
+        download_speed,
+        tasks: task_stats,
+        torrents: torrent_stats,
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -115,22 +132,4 @@ fn torrent_has_tag(tags: &str, tag: &str) -> bool {
     tags.split(',')
         .map(str::trim)
         .any(|value| !value.is_empty() && value == tag)
-}
-
-fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
-    if duration_secs <= 0 {
-        0.0
-    } else {
-        uploaded_bytes as f64 / duration_secs as f64
-    }
-}
-
-fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
-    if downloaded_bytes > 0 {
-        uploaded_bytes as f64 / downloaded_bytes as f64
-    } else if uploaded_bytes > 0 {
-        fallback.max(0.0)
-    } else {
-        0.0
-    }
 }

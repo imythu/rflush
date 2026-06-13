@@ -8,7 +8,10 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
-use crate::brush::{BrushTaskRecord, in_any_range, is_in_active_window, parse_ranges};
+use crate::brush::{
+    BrushTaskRecord, average_upload_speed, calculate_ratio, in_any_range, is_in_active_window,
+    parse_ranges,
+};
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
@@ -745,8 +748,12 @@ async fn execute_brush_task(
         // 站点适配器增强（非 U2 场景）
         {
             let needs_free_end = task.promotion == "free" && task.min_free_hours.is_some();
-            let needs_site_attrs =
-                task.promotion != "all" || task.skip_hit_and_run || needs_free_end;
+            // 配置了下载人数(leechers)范围但 RSS 未提供该字段时，需要拉详情补齐。
+            let needs_leechers = !downloader_ranges.is_empty() && effective_item.leechers.is_none();
+            let needs_site_attrs = task.promotion != "all"
+                || task.skip_hit_and_run
+                || needs_free_end
+                || needs_leechers;
 
             if needs_site_attrs {
                 if site_client_binding != Some(task.site_id) {
@@ -806,7 +813,8 @@ async fn execute_brush_task(
                         && effective_item.free_end_timestamp.is_none())
                     || (task.skip_hit_and_run
                         && effective_item.minimum_seed_time.is_none()
-                        && effective_item.minimum_ratio.is_none());
+                        && effective_item.minimum_ratio.is_none())
+                    || (!downloader_ranges.is_empty() && effective_item.leechers.is_none());
 
                 if need_fetch {
                     if let Some(ref adapter) = site_adapter {
@@ -1473,24 +1481,6 @@ fn format_size(bytes: Option<u64>) -> String {
     }
 }
 
-fn average_upload_speed(uploaded_bytes: i64, duration_secs: i64) -> f64 {
-    if duration_secs <= 0 {
-        0.0
-    } else {
-        uploaded_bytes as f64 / duration_secs as f64
-    }
-}
-
-fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64) -> f64 {
-    if downloaded_bytes > 0 {
-        uploaded_bytes as f64 / downloaded_bytes as f64
-    } else if uploaded_bytes > 0 {
-        fallback.max(0.0)
-    } else {
-        0.0
-    }
-}
-
 fn gb_to_bytes(gb: f64) -> u64 {
     if gb <= 0.0 {
         0
@@ -1521,6 +1511,9 @@ fn apply_attrs_to_item(item: &mut rss::TorrentItem, attrs: &crate::site::Torrent
     }
     if attrs.seeder_count.is_some() {
         item.seeders = attrs.seeder_count;
+    }
+    if attrs.leecher_count.is_some() {
+        item.leechers = attrs.leecher_count;
     }
     if attrs.free_end_timestamp.is_some() {
         item.free_end_timestamp = attrs.free_end_timestamp;

@@ -96,19 +96,28 @@ pub async fn evaluate_delete_rules(
 
         // 规则 3: 分享率
         if let Some(target_ratio) = task.target_ratio {
-            let passed = dl_info.ratio >= target_ratio;
+            // qBittorrent 在下载量为 0 时用 ratio = -1 表示「无限分享率」。
+            // 直接比较会让这类种子永远无法满足规则，需归一化为无穷大。
+            let effective_ratio = if dl_info.ratio < 0.0 {
+                f64::INFINITY
+            } else {
+                dl_info.ratio
+            };
+            let passed = effective_ratio >= target_ratio;
             rule_results.push(passed);
+            let ratio_text = if effective_ratio.is_infinite() {
+                "∞".to_string()
+            } else {
+                format!("{:.2}", effective_ratio)
+            };
             rule_details.push(format!(
-                "分享率 {:.2} {} {:.2}",
-                dl_info.ratio,
+                "分享率 {} {} {:.2}",
+                ratio_text,
                 if passed { ">=" } else { "<" },
                 target_ratio
             ));
             if passed {
-                reasons.push(format!(
-                    "分享率 {:.2} >= {:.2}",
-                    dl_info.ratio, target_ratio
-                ));
+                reasons.push(format!("分享率 {} >= {:.2}", ratio_text, target_ratio));
             }
         }
 
@@ -128,25 +137,35 @@ pub async fn evaluate_delete_rules(
             }
         }
 
-        // 规则 5: 下载耗时
+        // 规则 5: 下载耗时（仅针对未完成的卡死下载）
         if let Some(timeout_hours) = task.download_timeout_hours {
-            if dl_info.completion_on <= 0 {
+            // 仅凭 completion_on 判断是否完成不可靠：不同 qBittorrent / libtorrent
+            // 版本对未完成种子的 completion_on 取值不一（-1、0，甚至 u32::MAX 这类
+            // 很大的正数），后者会被误判为「已完成」从而跳过本规则。
+            // 这里以 已下载字节 < 种子大小 作为「未完成」的可靠判据。
+            let is_incomplete = is_torrent_incomplete(dl_info);
+            if is_incomplete {
                 let added_secs = dl_info.added_on;
                 let now_secs = Utc::now().timestamp();
                 let elapsed_hours = (now_secs - added_secs) as f64 / 3600.0;
-                let passed = elapsed_hours >= timeout_hours;
-                rule_results.push(passed);
-                rule_details.push(format!(
-                    "下载耗时 {:.1}h {} {:.1}h (未完成)",
-                    elapsed_hours,
-                    if passed { ">=" } else { "<" },
-                    timeout_hours
-                ));
-                if passed {
-                    reasons.push(format!(
-                        "下载耗时 {:.1}h >= {:.1}h，未完成",
-                        elapsed_hours, timeout_hours
+                // added_on 缺失 (<=0) 时无法计算存活时长，跳过以免误删。
+                if added_secs > 0 {
+                    let passed = elapsed_hours >= timeout_hours;
+                    rule_results.push(passed);
+                    rule_details.push(format!(
+                        "下载耗时 {:.1}h {} {:.1}h (未完成)",
+                        elapsed_hours,
+                        if passed { ">=" } else { "<" },
+                        timeout_hours
                     ));
+                    if passed {
+                        reasons.push(format!(
+                            "下载耗时 {:.1}h >= {:.1}h，未完成",
+                            elapsed_hours, timeout_hours
+                        ));
+                    }
+                } else {
+                    rule_details.push("缺少添加时间，跳过超时规则".to_string());
                 }
             } else {
                 rule_details.push("下载已完成，跳过超时规则".to_string());
@@ -155,29 +174,36 @@ pub async fn evaluate_delete_rules(
 
         // 规则 6: 最近10分钟平均上传速度
         if let Some(min_speed) = task.min_avg_upload_speed_kbs {
-            let avg_speed = get_recent_avg_upload_speed(db, task.id, &record.torrent_hash).await;
-            let avg_kbs = avg_speed / 1024.0;
             let active_enough = dl_info.time_active > 600;
-            let passed = avg_kbs < min_speed && active_enough;
-            rule_results.push(passed);
-            if active_enough {
-                rule_details.push(format!(
-                    "近10min上传 {:.1}KB/s {} {:.1}KB/s",
-                    avg_kbs,
-                    if passed { "<" } else { ">=" },
-                    min_speed
-                ));
-            } else {
-                rule_details.push(format!(
-                    "活跃 {:.0}s < 600s，跳过速度规则",
-                    dl_info.time_active
-                ));
-            }
-            if passed {
-                reasons.push(format!(
-                    "近10分钟平均上传 {:.1}KB/s < {:.1}KB/s",
-                    avg_kbs, min_speed
-                ));
+            match get_recent_avg_upload_speed(db, task.id, &record.torrent_hash).await {
+                // 仅在有足够流量样本时才评估该规则，避免重启/采集滞后导致
+                // 速度被当成 0 从而误删正常做种的种子。
+                Some(avg_speed) if active_enough => {
+                    let avg_kbs = avg_speed / 1024.0;
+                    let passed = avg_kbs < min_speed;
+                    rule_results.push(passed);
+                    rule_details.push(format!(
+                        "近10min上传 {:.1}KB/s {} {:.1}KB/s",
+                        avg_kbs,
+                        if passed { "<" } else { ">=" },
+                        min_speed
+                    ));
+                    if passed {
+                        reasons.push(format!(
+                            "近10分钟平均上传 {:.1}KB/s < {:.1}KB/s",
+                            avg_kbs, min_speed
+                        ));
+                    }
+                }
+                Some(_) => {
+                    rule_details.push(format!(
+                        "活跃 {:.0}s < 600s，跳过速度规则",
+                        dl_info.time_active
+                    ));
+                }
+                None => {
+                    rule_details.push("流量样本不足，跳过速度规则".to_string());
+                }
             }
         }
 
@@ -248,6 +274,18 @@ pub async fn evaluate_delete_rules(
     to_remove
 }
 
+/// 判断下载器中的种子是否「未完成下载」。
+/// 不同 qBittorrent/libtorrent 版本对未完成种子的 `completion_on` 取值不一致
+/// （-1、0 或很大的正数），因此以「已下载 < 大小」作为可靠判据，
+/// 仅当大小未知 (<=0) 时回退到 `completion_on`。
+fn is_torrent_incomplete(dl_info: &TorrentInfo) -> bool {
+    if dl_info.size > 0 {
+        dl_info.downloaded < dl_info.size
+    } else {
+        dl_info.completion_on <= 0
+    }
+}
+
 fn find_matching_downloader_torrent<'a>(
     record: &BrushTorrentRecord,
     downloader_torrents: &'a [TorrentInfo],
@@ -262,8 +300,9 @@ fn find_matching_downloader_torrent<'a>(
         })
 }
 
-/// 获取最近10分钟的平均上传速度 (bytes/s)
-async fn get_recent_avg_upload_speed(db: &Database, task_id: i64, hash: &str) -> f64 {
+/// 获取最近10分钟的平均上传速度 (bytes/s)。
+/// 流量样本不足 (< 2) 或时间戳无法解析时返回 `None`，调用方应跳过该规则而非按 0 处理。
+async fn get_recent_avg_upload_speed(db: &Database, task_id: i64, hash: &str) -> Option<f64> {
     match db.get_recent_torrent_traffic(task_id, hash, 10).await {
         Ok(snapshots) if snapshots.len() >= 2 => {
             let first = &snapshots[0];
@@ -271,15 +310,60 @@ async fn get_recent_avg_upload_speed(db: &Database, task_id: i64, hash: &str) ->
             let bytes_diff = (last.0 - first.0).max(0) as f64;
 
             // 解析时间差
-            let first_time = chrono::DateTime::parse_from_rfc3339(&first.2).ok();
-            let last_time = chrono::DateTime::parse_from_rfc3339(&last.2).ok();
-            if let (Some(ft), Some(lt)) = (first_time, last_time) {
-                let secs = (lt - ft).num_seconds().max(1) as f64;
-                bytes_diff / secs
-            } else {
-                0.0
-            }
+            let first_time = chrono::DateTime::parse_from_rfc3339(&first.2).ok()?;
+            let last_time = chrono::DateTime::parse_from_rfc3339(&last.2).ok()?;
+            let secs = (last_time - first_time).num_seconds().max(1) as f64;
+            Some(bytes_diff / secs)
         }
-        _ => 0.0,
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_torrent_incomplete;
+    use crate::downloader::TorrentInfo;
+
+    fn torrent(size: i64, downloaded: i64, completion_on: i64) -> TorrentInfo {
+        TorrentInfo {
+            hash: "h".to_string(),
+            name: "n".to_string(),
+            size,
+            uploaded: 0,
+            downloaded,
+            upload_speed: 0,
+            download_speed: 0,
+            ratio: 0.0,
+            state: String::new(),
+            added_on: 0,
+            completion_on,
+            num_seeds: 0,
+            num_leechs: 0,
+            save_path: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            time_active: 0,
+            last_activity: 0,
+        }
+    }
+
+    #[test]
+    fn incomplete_by_downloaded_less_than_size() {
+        // 即便 completion_on 是很大的正数（某些 qB 版本对未完成种子的取值），
+        // 只要 已下载 < 大小 就应判为未完成，确保超时规则能生效。
+        assert!(is_torrent_incomplete(&torrent(1000, 400, 4_294_967_295)));
+        assert!(is_torrent_incomplete(&torrent(1000, 999, -1)));
+    }
+
+    #[test]
+    fn complete_when_downloaded_reaches_size() {
+        assert!(!is_torrent_incomplete(&torrent(1000, 1000, 0)));
+        assert!(!is_torrent_incomplete(&torrent(1000, 1200, 0)));
+    }
+
+    #[test]
+    fn falls_back_to_completion_on_when_size_unknown() {
+        assert!(is_torrent_incomplete(&torrent(0, 0, -1)));
+        assert!(!is_torrent_incomplete(&torrent(0, 0, 12345)));
     }
 }
