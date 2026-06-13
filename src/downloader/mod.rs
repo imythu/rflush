@@ -42,6 +42,8 @@ pub struct AddTorrentOptions {
     pub category: Option<String>,
     pub download_limit: Option<i64>,
     pub upload_limit: Option<i64>,
+    pub ratio_limit: Option<f64>,
+    pub inactive_seeding_time_limit: Option<i64>,
     pub paused: bool,
 }
 

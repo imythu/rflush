@@ -306,7 +306,7 @@ impl DownloaderClient for QBittorrentClient {
         let options = options.clone();
         Box::pin(async move {
             debug!(
-                "qBittorrent add_torrent: filename={} size={} save_path={:?} tags={:?} category={:?} paused={} dl_limit={:?} ul_limit={:?}",
+                "qBittorrent add_torrent: filename={} size={} save_path={:?} tags={:?} category={:?} paused={} dl_limit={:?} ul_limit={:?} ratio_limit={:?} inactive_seeding_time_limit={:?}",
                 filename,
                 torrent_data.len(),
                 options.save_path,
@@ -314,7 +314,9 @@ impl DownloaderClient for QBittorrentClient {
                 options.category,
                 options.paused,
                 options.download_limit,
-                options.upload_limit
+                options.upload_limit,
+                options.ratio_limit,
+                options.inactive_seeding_time_limit
             );
 
             // 使用闭包构建表单，支持 cookie 过期重试时重建表单
@@ -340,6 +342,12 @@ impl DownloaderClient for QBittorrentClient {
                 }
                 if let Some(ul) = options.upload_limit {
                     form = form.text("upLimit", ul.to_string());
+                }
+                if let Some(rl) = options.ratio_limit {
+                    form = form.text("ratioLimit", rl.to_string());
+                }
+                if let Some(istl) = options.inactive_seeding_time_limit {
+                    form = form.text("inactiveSeedingTimeLimit", istl.to_string());
                 }
                 if options.paused {
                     form = form.text("paused", "true".to_string());
