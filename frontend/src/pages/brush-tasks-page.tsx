@@ -780,19 +780,19 @@ export function BrushTasksPage() {
                 <TableHeader className="sticky top-0 z-10 backdrop-blur">
                   <TableRow>
                     <TableHead className="w-40">名称</TableHead>
-                    <TableHead className="w-40">种子ID</TableHead>
-                    <TableHead className="w-40">大小</TableHead>
-                    <TableHead className="w-40">状态</TableHead>
-                    <TableHead className="w-40">HR</TableHead>
-                    <TableHead className="w-40">添加时间</TableHead>
-                    <TableHead className="w-40">移除时间</TableHead>
-                    <TableHead className="w-40">下载量</TableHead>
-                    <TableHead className="w-40">上传量</TableHead>
-                    <TableHead className="w-40">下载耗时</TableHead>
-                    <TableHead className="w-40">平均上传速度</TableHead>
-                    <TableHead className="w-40">分享率</TableHead>
-                    <TableHead className="w-40">移除原因</TableHead>
-                    <TableHead className="w-40">信息Hash</TableHead>
+                    <TableHead className="w-28">种子ID</TableHead>
+                    <TableHead className="w-20">大小</TableHead>
+                    <TableHead className="w-20">上传量</TableHead>
+                    <TableHead className="w-20">下载量</TableHead>
+                    <TableHead className="w-20">状态</TableHead>
+                    <TableHead className="w-14">HR</TableHead>
+                    <TableHead className="w-28">添加时间</TableHead>
+                    <TableHead className="w-28">移除时间</TableHead>
+                    <TableHead className="w-20">下载耗时</TableHead>
+                    <TableHead className="w-24">平均上传速度</TableHead>
+                    <TableHead className="w-14">分享率</TableHead>
+                    <TableHead className="w-24">移除原因</TableHead>
+                    <TableHead className="w-28">信息Hash</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -824,6 +824,12 @@ export function BrushTasksPage() {
                       <TableCell className="truncate p-4 text-xs text-muted" title={t.size_bytes != null ? formatBytes(t.size_bytes) : "-"}>
                         {t.size_bytes != null ? formatBytes(t.size_bytes) : "-"}
                       </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={formatBytes(t.uploaded_bytes)}>
+                        {formatBytes(t.uploaded_bytes)}
+                      </TableCell>
+                      <TableCell className="truncate p-4 text-xs text-muted" title={formatBytes(t.downloaded_bytes)}>
+                        {formatBytes(t.downloaded_bytes)}
+                      </TableCell>
                       <TableCell className="p-4 text-xs">
                         <span
                           className={`rounded-full px-3 py-1 text-xs font-medium ${
@@ -853,12 +859,6 @@ export function BrushTasksPage() {
                       </TableCell>
                       <TableCell className="truncate p-4 text-xs text-muted" title={t.removed_at ?? "-"}>
                         {t.removed_at ? formatDate(t.removed_at) : "-"}
-                      </TableCell>
-                      <TableCell className="truncate p-4 text-xs text-muted" title={formatBytes(t.downloaded_bytes)}>
-                        {formatBytes(t.downloaded_bytes)}
-                      </TableCell>
-                      <TableCell className="truncate p-4 text-xs text-muted" title={formatBytes(t.uploaded_bytes)}>
-                        {formatBytes(t.uploaded_bytes)}
                       </TableCell>
                       <TableCell className="truncate p-4 text-xs text-muted" title={formatDuration(t.download_duration_secs)}>
                         {formatDuration(t.download_duration_secs)}
