@@ -54,15 +54,87 @@ impl BrushScheduler {
         }
     }
 
-    /// 启动调度器，周期性检查所有启用的刷流任务
-    pub async fn start(self: Arc<Self>) {
+    /// 启动调度器，周期性检查所有启用的刷流任务 + 高频删种循环
+    pub async fn start(self: &Arc<Self>) {
         info!("brush scheduler started");
 
-        loop {
-            if let Err(e) = self.check_and_schedule().await {
-                error!("brush scheduler error: {}", e);
+        // 并行运行主调度循环和删种循环
+        let s1 = Arc::clone(self);
+        let s2 = Arc::clone(self);
+        tokio::join!(
+            async {
+                loop {
+                    if let Err(e) = s1.check_and_schedule().await {
+                        error!("brush scheduler error: {}", e);
+                    }
+                    sleep(Duration::from_secs(15)).await;
+                }
+            },
+            async {
+                loop {
+                    s2.cleaner_loop().await;
+                    sleep(Duration::from_secs(10)).await;
+                }
             }
-            sleep(Duration::from_secs(15)).await;
+        );
+    }
+
+    /// 高频删种循环：扫描所有任务，独立于 cron 触发
+    async fn cleaner_loop(&self) {
+        let tasks = match self.db.list_brush_tasks().await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                error!("cleaner loop: failed to list brush tasks: {}", e);
+                return;
+            }
+        };
+
+        for task in &tasks {
+            // 跳过没有配任何删种规则的任务
+            if task.target_ratio.is_none()
+                && task.min_seed_time_hours.is_none()
+                && task.hr_min_seed_time_hours.is_none()
+                && task.max_upload_gb.is_none()
+                && task.download_timeout_hours.is_none()
+                && task.min_avg_upload_speed_kbs.is_none()
+                && task.max_inactive_hours.is_none()
+                && !task.delete_on_free_expiry
+            {
+                continue;
+            }
+
+            // 检查任务是否有运行中的删种操作，避免并发冲突
+            {
+                let running = self.running_tasks.read().await;
+                if running.contains_key(&task.id) {
+                    // 主任务正在运行，它自己会执行删种，跳过
+                    continue;
+                }
+            }
+
+            let downloader_record = match self.db.get_downloader(task.downloader_id).await {
+                Ok(Some(d)) => d,
+                Ok(None) => {
+                    warn!("[cleaner][{}] 下载器不存在 (id={})", task.name, task.downloader_id);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("[cleaner][{}] 获取下载器失败: {}", task.name, e);
+                    continue;
+                }
+            };
+
+            let client = match factory::create_client(&downloader_record) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[cleaner][{}] 创建下载器客户端失败: {}", task.name, e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = execute_cleaner(&self.db, &self.collector, task, &client).await {
+                warn!("[cleaner][{}] 删种执行失败: {}", task.name, e);
+            }
         }
     }
 
@@ -281,98 +353,17 @@ async fn execute_brush_task(
 
     // 3. 执行删种规则
     let task = snapshot_task(&shared_task).await;
-    let to_remove =
-        cleaner::evaluate_delete_rules(&task, &managed_torrents, &downloader_torrents, db).await;
-    if to_remove.is_empty() {
-        info!("[刷流][{}] 删种检查: 无需删除种子", task.name);
-    } else {
-        info!(
-            "[刷流][{}] 删种检查: 准备删除 {} 个种子",
-            task.name,
-            to_remove.len()
-        );
-    }
-    for (hash, reason) in &to_remove {
-        info!(
-            "[刷流][{}] 删种: hash={} 原因={}",
-            task.name,
-            &hash[..8.min(hash.len())],
-            reason
-        );
-        if let Some(torrent) = downloader_torrents
-            .iter()
-            .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
-        {
-            let _ = db
-                .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
-                .await;
-            let _ = db
-                .update_brush_torrent_stats(
-                    task.id,
-                    &torrent.hash,
-                    torrent.uploaded,
-                    torrent.downloaded,
-                    torrent.time_active.max(0),
-                    average_upload_speed(torrent.uploaded, torrent.time_active),
-                    calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
-                )
-                .await;
-        }
-
-        let final_reason: Option<String>;
-        match client.delete_torrent(hash, true).await {
-            Ok(()) => {
-                // 删除成功，使用 cleaner 评估的原因
-                final_reason = Some(reason.clone());
-            }
-            Err(delete_err) => {
-                warn!(
-                    "[刷流][{}] 删种失败: hash={} err={}",
-                    task.name,
-                    &hash[..8.min(hash.len())],
-                    delete_err
-                );
-                // 检查种子是否已被用户手动从下载器中删除
-                match client.list_torrents(None).await {
-                    Ok(all_torrents) => {
-                        if all_torrents.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
-                            // 种子仍在下载器中，是真正的删除失败，保持 active 下次重试
-                            warn!(
-                                "[刷流][{}] 种子仍存在于下载器中，保持 active 状态，下次重试",
-                                task.name
-                            );
-                            continue;
-                        }
-                        // 种子已不在下载器中（用户手动删除），标记为已移除
-                        info!(
-                            "[刷流][{}] 种子已不在下载器中，标记为已移除 (可能被用户手动删除)",
-                            task.name
-                        );
-                        final_reason = Some(format!("{} (下载器中已不存在)", reason));
-                    }
-                    Err(list_err) => {
-                        // 无法检查种子是否存在，保守处理：保持 active 状态
-                        warn!(
-                            "[刷流][{}] 无法检查种子是否存在: {}，保持 active 状态，下次重试",
-                            task.name, list_err
-                        );
-                        continue;
-                    }
-                }
-            }
-        }
-
-        let _ = db
-            .update_brush_torrent_status(task.id, hash, "removed", final_reason.as_deref())
-            .await;
-    }
+    let deleted_count = execute_cleaner(db, collector, &task, &client).await?;
 
     // 4. 检查是否可以添加新种子
+    let managed_torrents = db
+        .list_active_brush_torrents(task.id)
+        .await
+        .map_err(|e| e.to_string())?;
     let active_count = managed_torrents
         .iter()
         .filter(|t| t.status == "active")
-        .count() as i32
-        - to_remove.len() as i32;
+        .count() as i32;
 
     let can_add = (task.max_concurrent - active_count.max(0)).max(0) as usize;
     info!(
@@ -761,6 +752,8 @@ async fn execute_brush_task(
                     tags: Some(task.tag.clone()),
                     download_limit: task.download_speed_limit.map(|v| v * 1024),
                     upload_limit: task.upload_speed_limit.map(|v| v * 1024),
+                    ratio_limit: task.target_ratio,
+                    inactive_seeding_time_limit: task.max_inactive_hours.map(|h| (h * 60.0) as i64),
                     ..Default::default()
                 };
 
@@ -860,7 +853,7 @@ async fn execute_brush_task(
         "[刷流][{}] 任务完成: 新增 {} 个, 删除 {} 个, 失败 {} 个, 跳过(详情失败) {} 个, 共检查 {} 个, 耗时 {:.1}s",
         task.name,
         added,
-        to_remove.len(),
+        deleted_count,
         failed,
         skipped_attrs,
         checked,
@@ -868,6 +861,118 @@ async fn execute_brush_task(
     );
 
     Ok(())
+}
+
+/// 共享删种逻辑：对一个任务执行删种规则并返回删除的种子数量
+async fn execute_cleaner(
+    db: &Database,
+    collector: &Arc<DownloaderSnapshotCollector>,
+    task: &BrushTaskRecord,
+    client: &Box<dyn crate::downloader::DownloaderClient>,
+) -> Result<usize, String> {
+    let managed_torrents = db
+        .list_active_brush_torrents(task.id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if managed_torrents.is_empty() {
+        return Ok(0);
+    }
+
+    let downloader_record = db
+        .get_downloader(task.downloader_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "下载器不存在".to_string())?;
+
+    let downloader_torrents = collector
+        .get_tagged_torrents(&downloader_record, &task.tag)
+        .await?;
+
+    let to_remove =
+        cleaner::evaluate_delete_rules(task, &managed_torrents, &downloader_torrents, db).await;
+
+    if to_remove.is_empty() {
+        return Ok(0);
+    }
+
+    info!(
+        "[删种][{}] 准备删除 {} 个种子",
+        task.name,
+        to_remove.len()
+    );
+
+    for (hash, reason) in &to_remove {
+        info!(
+            "[删种][{}] hash={} 原因={}",
+            task.name,
+            &hash[..8.min(hash.len())],
+            reason
+        );
+        if let Some(torrent) = downloader_torrents
+            .iter()
+            .find(|torrent| torrent.hash.eq_ignore_ascii_case(hash))
+        {
+            let _ = db
+                .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
+                .await;
+            let _ = db
+                .update_brush_torrent_stats(
+                    task.id,
+                    &torrent.hash,
+                    torrent.uploaded,
+                    torrent.downloaded,
+                    torrent.time_active.max(0),
+                    average_upload_speed(torrent.uploaded, torrent.time_active),
+                    calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
+                )
+                .await;
+        }
+
+        let final_reason: Option<String>;
+        match client.delete_torrent(hash, true).await {
+            Ok(()) => {
+                final_reason = Some(reason.clone());
+            }
+            Err(delete_err) => {
+                warn!(
+                    "[删种][{}] 删除失败: hash={} err={}",
+                    task.name,
+                    &hash[..8.min(hash.len())],
+                    delete_err
+                );
+                match client.list_torrents(None).await {
+                    Ok(all_torrents) => {
+                        if all_torrents.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
+                            warn!(
+                                "[删种][{}] 种子仍存在于下载器中，保持 active 状态，下次重试",
+                                task.name
+                            );
+                            continue;
+                        }
+                        info!(
+                            "[删种][{}] 种子已不在下载器中，标记为已移除 (可能被用户手动删除)",
+                            task.name
+                        );
+                        final_reason = Some(format!("{} (下载器中已不存在)", reason));
+                    }
+                    Err(list_err) => {
+                        warn!(
+                            "[删种][{}] 无法检查种子是否存在: {}，保持 active 状态，下次重试",
+                            task.name, list_err
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let _ = db
+            .update_brush_torrent_status(task.id, hash, "removed", final_reason.as_deref())
+            .await;
+    }
+
+    Ok(to_remove.len())
 }
 
 
