@@ -26,8 +26,8 @@ use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
 use crate::db::{Database, DownloadHistoryRecord, DownloadRunRecord, PaginatedRunRecords};
 use crate::download::naming::sanitize_component;
+use crate::downloader::DownloaderClientPool;
 use crate::downloader::DownloaderSpaceStats;
-use crate::downloader::factory as downloader_factory;
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
@@ -46,6 +46,7 @@ pub struct AppState {
     sign_in_scheduler: Arc<SignInScheduler>,
     site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
+    pool: Arc<DownloaderClientPool>,
 }
 
 struct JobRegistry {
@@ -144,6 +145,7 @@ impl AppState {
         sign_in_scheduler: Arc<SignInScheduler>,
         site_stats_refresher: Arc<SiteStatsRefresher>,
         collector: Arc<DownloaderSnapshotCollector>,
+        pool: Arc<DownloaderClientPool>,
     ) -> Self {
         Self {
             base_dir,
@@ -154,6 +156,7 @@ impl AppState {
             sign_in_scheduler,
             site_stats_refresher,
             collector,
+            pool,
         }
     }
 
@@ -294,6 +297,7 @@ pub async fn serve(
     sign_in_scheduler: Arc<SignInScheduler>,
     site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
+    pool: Arc<DownloaderClientPool>,
 ) -> Result<(), AppError> {
     let engine = DownloadEngine::new(
         base_dir.clone(),
@@ -307,6 +311,7 @@ pub async fn serve(
         sign_in_scheduler,
         site_stats_refresher,
         collector,
+        pool,
     );
     let app = app_router(state);
     let listener = TcpListener::bind(addr)
@@ -1200,8 +1205,7 @@ async fn test_downloader(
         .get_downloader(id)
         .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
-    let proxy = state.db.get_settings().await.ok().and_then(|s| s.proxy);
-    let client = downloader_factory::create_client(&dl, proxy.as_deref()).map_err(ApiError::bad_request)?;
+    let client = state.pool.get(&dl).await.map_err(ApiError::bad_request)?;
     let result = client
         .test_connection()
         .await
@@ -1218,8 +1222,7 @@ async fn get_downloader_space_stats(
         .get_downloader(id)
         .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
-    let proxy = state.db.get_settings().await.ok().and_then(|s| s.proxy);
-    let client = downloader_factory::create_client(&dl, proxy.as_deref()).map_err(ApiError::bad_request)?;
+    let client = state.pool.get(&dl).await.map_err(ApiError::bad_request)?;
     let torrents = state
         .collector
         .get_all_torrents(&dl)

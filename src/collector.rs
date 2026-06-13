@@ -7,8 +7,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
 use crate::db::Database;
-use crate::downloader::factory;
-use crate::downloader::{DownloaderRecord, TorrentInfo};
+use crate::downloader::{DownloaderClientPool, DownloaderRecord, TorrentInfo};
 
 /// 快照超过此秒数视为过期，需要强制刷新。
 /// 设置为 3 个采集周期 (3 × 30s = 90s)，留有一定余量。
@@ -23,15 +22,17 @@ pub struct DownloaderSnapshot {
 
 pub struct DownloaderSnapshotCollector {
     db: Database,
+    pool: Arc<DownloaderClientPool>,
     latest: RwLock<HashMap<i64, Arc<DownloaderSnapshot>>>,
     tx: broadcast::Sender<Arc<DownloaderSnapshot>>,
 }
 
 impl DownloaderSnapshotCollector {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, pool: Arc<DownloaderClientPool>) -> Self {
         let (tx, _) = broadcast::channel(64);
         Self {
             db,
+            pool,
             latest: RwLock::new(HashMap::new()),
             tx,
         }
@@ -116,13 +117,7 @@ impl DownloaderSnapshotCollector {
         downloader: &DownloaderRecord,
         publish: bool,
     ) -> Result<Arc<DownloaderSnapshot>, String> {
-        let proxy = self
-            .db
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.proxy);
-        let client = factory::create_client(downloader, proxy.as_deref())?;
+        let client = self.pool.get(downloader).await?;
         let torrents = client.list_torrents(None).await?;
         let snapshot = Arc::new(DownloaderSnapshot {
             downloader_id: downloader.id,

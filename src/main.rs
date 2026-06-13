@@ -53,7 +53,9 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         db_dir.display()
     );
 
-    let collector = std::sync::Arc::new(collector::DownloaderSnapshotCollector::new(db.clone()));
+    let pool = downloader::DownloaderClientPool::new(db.clone());
+
+    let collector = std::sync::Arc::new(collector::DownloaderSnapshotCollector::new(db.clone(), pool.clone()));
     let collector_ref = collector.clone();
     let collector_handle = tokio::spawn(async move {
         collector_ref.start().await;
@@ -79,6 +81,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let scheduler = std::sync::Arc::new(brush::scheduler::BrushScheduler::new(
         db.clone(),
         collector.clone(),
+        pool.clone(),
         http,
     ));
     let scheduler_ref = scheduler.clone();
@@ -109,6 +112,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         sign_in_scheduler,
         site_stats_refresher,
         collector,
+        pool,
     )
     .await;
 

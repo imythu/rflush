@@ -12,7 +12,7 @@ use crate::brush::{BrushTaskRecord, in_any_range, is_in_active_window, parse_ran
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
-use crate::downloader::factory;
+use crate::downloader::DownloaderClientPool;
 use crate::net::client_factory;
 use crate::net::http::AppHttpClient;
 use crate::rss;
@@ -66,6 +66,7 @@ enum FilterStage {
 pub struct BrushScheduler {
     db: Database,
     collector: Arc<DownloaderSnapshotCollector>,
+    pool: Arc<DownloaderClientPool>,
     running_tasks: Arc<RwLock<HashMap<i64, RunningBrushTask>>>,
     http: Arc<AppHttpClient>,
     task_cache: Arc<TaskConfigCache>,
@@ -80,11 +81,13 @@ impl BrushScheduler {
     pub fn new(
         db: Database,
         collector: Arc<DownloaderSnapshotCollector>,
+        pool: Arc<DownloaderClientPool>,
         http: Arc<AppHttpClient>,
     ) -> Self {
         Self {
             db,
             collector,
+            pool,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
             http,
             task_cache: Arc::new(TaskConfigCache::new()),
@@ -118,12 +121,6 @@ impl BrushScheduler {
 
     /// 高频删种循环：扫描所有下载器中的全部种子，按 hash 匹配数据库记录后执行删种
     async fn cleaner_loop(&self) {
-        let proxy = self
-            .db
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.proxy);
         let downloaders = match self.db.list_downloaders().await {
             Ok(d) => d,
             Err(e) => {
@@ -177,7 +174,7 @@ impl BrushScheduler {
             drop(running);
 
             // 同一个下载器只创建一次客户端，复用连接
-            let client = match factory::create_client(downloader, proxy.as_deref()) {
+            let client = match self.pool.get(downloader).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("[cleaner] 创建下载器客户端失败: {}", e);
@@ -326,6 +323,7 @@ impl BrushScheduler {
             if should_trigger(&task) {
                 let db = self.db.clone();
                 let collector = self.collector.clone();
+                let pool = self.pool.clone();
                 let running_tasks = self.running_tasks.clone();
                 let task_id = task.id;
                 let task_name = task.name.clone();
@@ -335,7 +333,7 @@ impl BrushScheduler {
 
                 info!("[刷流][{}] cron 触发，开始调度执行", task_name);
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = execute_brush_task(&db, &collector, execution_config, &http).await {
+                    if let Err(e) = execute_brush_task(&db, &collector, &pool, execution_config, &http).await {
                         error!("[刷流][{}] 任务执行失败: {}", task_name, e);
                     }
                     // 从运行列表移除
@@ -362,6 +360,7 @@ impl BrushScheduler {
 
         let db = self.db.clone();
         let collector = self.collector.clone();
+        let pool = self.pool.clone();
         let running_tasks = self.running_tasks.clone();
 
         // 检查是否已有运行中
@@ -377,7 +376,7 @@ impl BrushScheduler {
         let http = self.http.clone();
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
-            if let Err(e) = execute_brush_task(&db, &collector, execution_config, &http).await {
+            if let Err(e) = execute_brush_task(&db, &collector, &pool, execution_config, &http).await {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
             let mut running = running_tasks.write().await;
@@ -477,6 +476,7 @@ fn snapshot_task(
 async fn execute_brush_task(
     db: &Database,
     collector: &Arc<DownloaderSnapshotCollector>,
+    pool: &Arc<DownloaderClientPool>,
     shared_task: Arc<RwLock<BrushTaskRecord>>,
     http: &AppHttpClient,
 ) -> Result<(), String> {
@@ -496,12 +496,7 @@ async fn execute_brush_task(
         task.name, downloader_record.name, downloader_record.url
     );
 
-    let proxy = db
-        .get_settings()
-        .await
-        .ok()
-        .and_then(|s| s.proxy);
-    let client = factory::create_client(&downloader_record, proxy.as_deref())?;
+    let client = pool.get(&downloader_record).await?;
 
     // 2. 获取当前管理的种子列表
     let managed_torrents = db
@@ -523,7 +518,7 @@ async fn execute_brush_task(
 
     // 3. 执行删种规则
     let task = snapshot_task(&shared_task).await;
-    let deleted_count = execute_cleaner(db, collector, &task, &client).await?;
+    let deleted_count = execute_cleaner(db, collector, &task, &*client).await?;
 
     // 4. 检查是否可以添加新种子
     let managed_torrents = db
@@ -1038,7 +1033,7 @@ async fn execute_cleaner(
     db: &Database,
     collector: &Arc<DownloaderSnapshotCollector>,
     task: &BrushTaskRecord,
-    client: &Box<dyn crate::downloader::DownloaderClient>,
+    client: &dyn crate::downloader::DownloaderClient,
 ) -> Result<usize, String> {
     let managed_torrents = db
         .list_active_brush_torrents(task.id)

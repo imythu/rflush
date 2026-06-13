@@ -2,8 +2,14 @@ pub mod factory;
 pub mod qbittorrent;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::debug;
+
+use crate::db::Database;
 
 /// 下载器类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,4 +158,65 @@ pub fn calculate_pending_download_bytes(torrents: &[TorrentInfo]) -> u64 {
             (torrent.size - torrent.downloaded).max(0) as u64
         })
         .sum()
+}
+
+struct CachedClient {
+    record: DownloaderRecord,
+    proxy: Option<String>,
+    client: Arc<dyn DownloaderClient>,
+}
+
+/// 下载器客户端连接池，按 downloader_id 缓存，配置或代理变更时自动重建
+pub struct DownloaderClientPool {
+    db: Database,
+    cache: Mutex<HashMap<i64, CachedClient>>,
+}
+
+impl DownloaderClientPool {
+    pub fn new(db: Database) -> Arc<Self> {
+        Arc::new(Self {
+            db,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// 获取下载器客户端，配置未变时复用已有连接
+    pub async fn get(
+        &self,
+        record: &DownloaderRecord,
+    ) -> Result<Arc<dyn DownloaderClient>, String> {
+        let proxy = self
+            .db
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.proxy);
+
+        let mut cache = self.cache.lock().await;
+        if let Some(cached) = cache.get(&record.id) {
+            if cached.record.url == record.url
+                && cached.record.username == record.username
+                && cached.record.password == record.password
+                && cached.proxy == proxy
+            {
+                return Ok(Arc::clone(&cached.client));
+            }
+            debug!(
+                "downloader '{}' (id={}) config or proxy changed, recreating client",
+                record.name, record.id
+            );
+        }
+
+        let client: Arc<dyn DownloaderClient> =
+            Arc::from(factory::create_client(record, proxy.as_deref())?);
+        cache.insert(
+            record.id,
+            CachedClient {
+                record: record.clone(),
+                proxy,
+                client: Arc::clone(&client),
+            },
+        );
+        Ok(client)
+    }
 }
