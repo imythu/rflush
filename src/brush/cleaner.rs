@@ -1,4 +1,5 @@
 use chrono::Utc;
+use tracing::info;
 
 use crate::brush::BrushTaskRecord;
 use crate::brush::BrushTorrentRecord;
@@ -20,14 +21,21 @@ pub async fn evaluate_delete_rules(
             continue;
         }
 
+        let short_hash = &record.torrent_hash[..8.min(record.torrent_hash.len())];
+        let torrent_name = &record.torrent_name;
+
         // 查找对应的下载器种子信息
         let Some(dl_info) = find_matching_downloader_torrent(record, downloader_torrents) else {
-            // 下载器中不存在的种子，标记为已移除
+            info!(
+                "[删种评估][{}] hash={} name={} → 下载器中不存在，标记移除",
+                task.name, short_hash, torrent_name
+            );
             to_remove.push((record.torrent_hash.clone(), "下载器中不存在".to_string()));
             continue;
         };
 
         let mut reasons = Vec::new();
+        let mut rule_details = Vec::new();
         let mut rule_results = Vec::new();
 
         // 规则 1: 最小做种时长
@@ -35,6 +43,12 @@ pub async fn evaluate_delete_rules(
             let seed_hours = dl_info.time_active as f64 / 3600.0;
             let passed = seed_hours >= min_hours;
             rule_results.push(passed);
+            rule_details.push(format!(
+                "做种时间 {:.1}h {} {:.1}h",
+                seed_hours,
+                if passed { ">=" } else { "<" },
+                min_hours
+            ));
             if passed {
                 reasons.push(format!("做种时间 {:.1}h >= {:.1}h", seed_hours, min_hours));
             }
@@ -46,6 +60,13 @@ pub async fn evaluate_delete_rules(
                 let now_secs = Utc::now().timestamp();
                 let passed = now_secs >= free_end_timestamp;
                 rule_results.push(passed);
+                rule_details.push(if passed {
+                    "free已到期".to_string()
+                } else {
+                    let remaining_hours =
+                        (free_end_timestamp - now_secs) as f64 / 3600.0;
+                    format!("free未到期，剩余 {:.1}h", remaining_hours)
+                });
                 if passed {
                     reasons.push("free已到期".to_string());
                 }
@@ -58,6 +79,12 @@ pub async fn evaluate_delete_rules(
                 let seed_hours = dl_info.time_active as f64 / 3600.0;
                 let passed = seed_hours >= hr_min_hours;
                 rule_results.push(passed);
+                rule_details.push(format!(
+                    "H&R做种 {:.1}h {} {:.1}h",
+                    seed_hours,
+                    if passed { ">=" } else { "<" },
+                    hr_min_hours
+                ));
                 if passed {
                     reasons.push(format!(
                         "H&R做种时间 {:.1}h >= {:.1}h",
@@ -71,6 +98,12 @@ pub async fn evaluate_delete_rules(
         if let Some(target_ratio) = task.target_ratio {
             let passed = dl_info.ratio >= target_ratio;
             rule_results.push(passed);
+            rule_details.push(format!(
+                "分享率 {:.2} {} {:.2}",
+                dl_info.ratio,
+                if passed { ">=" } else { "<" },
+                target_ratio
+            ));
             if passed {
                 reasons.push(format!(
                     "分享率 {:.2} >= {:.2}",
@@ -84,6 +117,12 @@ pub async fn evaluate_delete_rules(
             let uploaded_gb = dl_info.uploaded as f64 / (1024.0 * 1024.0 * 1024.0);
             let passed = uploaded_gb >= max_gb;
             rule_results.push(passed);
+            rule_details.push(format!(
+                "上传量 {:.2}GB {} {:.2}GB",
+                uploaded_gb,
+                if passed { ">=" } else { "<" },
+                max_gb
+            ));
             if passed {
                 reasons.push(format!("上传量 {:.2}GB >= {:.2}GB", uploaded_gb, max_gb));
             }
@@ -92,18 +131,25 @@ pub async fn evaluate_delete_rules(
         // 规则 5: 下载耗时
         if let Some(timeout_hours) = task.download_timeout_hours {
             if dl_info.completion_on <= 0 {
-                // 尚未完成下载
                 let added_secs = dl_info.added_on;
                 let now_secs = Utc::now().timestamp();
                 let elapsed_hours = (now_secs - added_secs) as f64 / 3600.0;
                 let passed = elapsed_hours >= timeout_hours;
                 rule_results.push(passed);
+                rule_details.push(format!(
+                    "下载耗时 {:.1}h {} {:.1}h (未完成)",
+                    elapsed_hours,
+                    if passed { ">=" } else { "<" },
+                    timeout_hours
+                ));
                 if passed {
                     reasons.push(format!(
                         "下载耗时 {:.1}h >= {:.1}h，未完成",
                         elapsed_hours, timeout_hours
                     ));
                 }
+            } else {
+                rule_details.push("下载已完成，跳过超时规则".to_string());
             }
         }
 
@@ -111,8 +157,22 @@ pub async fn evaluate_delete_rules(
         if let Some(min_speed) = task.min_avg_upload_speed_kbs {
             let avg_speed = get_recent_avg_upload_speed(db, task.id, &record.torrent_hash).await;
             let avg_kbs = avg_speed / 1024.0;
-            let passed = avg_kbs < min_speed && dl_info.time_active > 600;
+            let active_enough = dl_info.time_active > 600;
+            let passed = avg_kbs < min_speed && active_enough;
             rule_results.push(passed);
+            if active_enough {
+                rule_details.push(format!(
+                    "近10min上传 {:.1}KB/s {} {:.1}KB/s",
+                    avg_kbs,
+                    if passed { "<" } else { ">=" },
+                    min_speed
+                ));
+            } else {
+                rule_details.push(format!(
+                    "活跃 {:.0}s < 600s，跳过速度规则",
+                    dl_info.time_active
+                ));
+            }
             if passed {
                 reasons.push(format!(
                     "近10分钟平均上传 {:.1}KB/s < {:.1}KB/s",
@@ -128,12 +188,20 @@ pub async fn evaluate_delete_rules(
                 let inactive_hours = (now_secs - dl_info.last_activity) as f64 / 3600.0;
                 let passed = inactive_hours >= max_hours;
                 rule_results.push(passed);
+                rule_details.push(format!(
+                    "未活跃 {:.1}h {} {:.1}h",
+                    inactive_hours,
+                    if passed { ">=" } else { "<" },
+                    max_hours
+                ));
                 if passed {
                     reasons.push(format!(
                         "未活跃 {:.1}h >= {:.1}h",
                         inactive_hours, max_hours
                     ));
                 }
+            } else {
+                rule_details.push("无活跃记录，跳过不活跃规则".to_string());
             }
         }
 
@@ -142,6 +210,10 @@ pub async fn evaluate_delete_rules(
 
         // 根据模式判断是否需要删除
         if rule_results.is_empty() {
+            info!(
+                "[删种评估][{}] hash={} name={} → 未配置删种规则，跳过",
+                task.name, short_hash, torrent_name
+            );
             continue;
         }
 
@@ -152,7 +224,24 @@ pub async fn evaluate_delete_rules(
         };
 
         if should_remove && !reasons.is_empty() {
+            info!(
+                "[删种评估][{}] hash={} name={} → 删除 [{}] {}",
+                task.name,
+                short_hash,
+                torrent_name,
+                if is_and_mode { "AND" } else { "OR" },
+                reasons.join("; ")
+            );
             to_remove.push((record.torrent_hash.clone(), reasons.join("; ")));
+        } else {
+            info!(
+                "[删种评估][{}] hash={} name={} → 保留 [{}] {}",
+                task.name,
+                short_hash,
+                torrent_name,
+                if is_and_mode { "AND" } else { "OR" },
+                rule_details.join("; ")
+            );
         }
     }
 
