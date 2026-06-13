@@ -118,6 +118,12 @@ impl BrushScheduler {
 
     /// 高频删种循环：扫描所有下载器中的全部种子，按 hash 匹配数据库记录后执行删种
     async fn cleaner_loop(&self) {
+        let proxy = self
+            .db
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.proxy);
         let downloaders = match self.db.list_downloaders().await {
             Ok(d) => d,
             Err(e) => {
@@ -171,7 +177,7 @@ impl BrushScheduler {
             drop(running);
 
             // 同一个下载器只创建一次客户端，复用连接
-            let client = match factory::create_client(downloader) {
+            let client = match factory::create_client(downloader, proxy.as_deref()) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("[cleaner] 创建下载器客户端失败: {}", e);
@@ -490,7 +496,12 @@ async fn execute_brush_task(
         task.name, downloader_record.name, downloader_record.url
     );
 
-    let client = factory::create_client(&downloader_record)?;
+    let proxy = db
+        .get_settings()
+        .await
+        .ok()
+        .and_then(|s| s.proxy);
+    let client = factory::create_client(&downloader_record, proxy.as_deref())?;
 
     // 2. 获取当前管理的种子列表
     let managed_torrents = db

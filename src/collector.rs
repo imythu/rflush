@@ -116,7 +116,13 @@ impl DownloaderSnapshotCollector {
         downloader: &DownloaderRecord,
         publish: bool,
     ) -> Result<Arc<DownloaderSnapshot>, String> {
-        let client = factory::create_client(downloader)?;
+        let proxy = self
+            .db
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|s| s.proxy);
+        let client = factory::create_client(downloader, proxy.as_deref())?;
         let torrents = client.list_torrents(None).await?;
         let snapshot = Arc::new(DownloaderSnapshot {
             downloader_id: downloader.id,

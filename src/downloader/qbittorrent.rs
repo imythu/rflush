@@ -22,12 +22,14 @@ pub struct QBittorrentClient {
 }
 
 impl QBittorrentClient {
-    pub fn new(base_url: String, username: String, password: String) -> Self {
-        let client = Client::builder()
+    pub fn new(base_url: String, username: String, password: String, proxy: Option<&str>) -> Self {
+        let mut builder = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build reqwest client");
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(proxy_url) = proxy.map(str::trim).filter(|v| !v.is_empty()) {
+            builder = builder.proxy(reqwest::Proxy::all(proxy_url).expect("invalid proxy URL"));
+        }
+        let client = builder.build().expect("failed to build reqwest client");
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             username,
