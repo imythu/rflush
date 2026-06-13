@@ -186,16 +186,18 @@ impl BrushScheduler {
 
             for (task_id, records) in &groups {
                 if running_ids.contains(task_id) {
+                    info!("[cleaner] task_id={} 主任务运行中，跳过", task_id);
                     continue;
                 }
 
                 let Some(task) = self.task_cache.get_or_load(&self.db, *task_id).await else {
-                    warn!("[cleaner] task_id={} 不存在，跳过", task_id);
+                    warn!("[cleaner] task_id={} 不存在或加载失败，跳过", task_id);
                     continue;
                 };
 
                 // 跳过没有配任何删种规则的任务
                 if !has_delete_rules(&task) {
+                    info!("[cleaner][{}] 无删种规则，跳过", task.name);
                     continue;
                 }
 
