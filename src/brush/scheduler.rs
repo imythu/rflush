@@ -173,6 +173,14 @@ impl BrushScheduler {
             let running_ids: std::collections::HashSet<i64> = running.keys().copied().collect();
             drop(running);
 
+            info!(
+                "[cleaner] 下载器 '{}': 分组为 {} 个任务 (task_ids={:?}), 其中运行中={:?}",
+                downloader.name,
+                groups.len(),
+                groups.keys().collect::<Vec<_>>(),
+                running_ids,
+            );
+
             // 同一个下载器只创建一次客户端，复用连接
             let client = match self.pool.get(downloader).await {
                 Ok(c) => c,
@@ -184,6 +192,7 @@ impl BrushScheduler {
             // 种子快照也只拉一次
             let dl_torrents = all_torrents;
 
+            let mut total_removed: usize = 0;
             for (task_id, records) in &groups {
                 if running_ids.contains(task_id) {
                     info!("[cleaner] task_id={} 主任务运行中，跳过", task_id);
@@ -205,8 +214,11 @@ impl BrushScheduler {
                     cleaner::evaluate_delete_rules(&task, records, &dl_torrents, &self.db).await;
 
                 if to_remove.is_empty() {
+                    info!("[cleaner][{}] 评估完成，无需删种", task.name);
                     continue;
                 }
+
+                total_removed += to_remove.len();
 
                 info!("[删种][{}] 准备删除 {} 个种子", task.name, to_remove.len());
 
@@ -283,12 +295,14 @@ impl BrushScheduler {
                         .await;
                 }
             }
-        }
 
-        debug!(
-            "[cleaner] 本轮完成, 任务配置缓存大小: {}",
-            self.task_cache.size().await
-        );
+            info!(
+                "[cleaner] 下载器 '{}': 本轮删种 {} 个, 任务配置缓存大小: {}",
+                downloader.name,
+                total_removed,
+                self.task_cache.size().await
+            );
+        }
     }
 
     async fn check_and_schedule(&self) -> Result<(), String> {
