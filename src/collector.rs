@@ -42,12 +42,12 @@ impl DownloaderSnapshotCollector {
     }
 
     pub async fn start(self: Arc<Self>) {
-        info!("downloader snapshot collector started (interval: 30s)");
+        info!("downloader snapshot collector started (interval: 10s)");
         loop {
             if let Err(error) = self.collect_all(true).await {
                 error!("downloader snapshot collection error: {}", error);
             }
-            sleep(Duration::from_secs(30)).await;
+            sleep(Duration::from_secs(10)).await;
         }
     }
 
