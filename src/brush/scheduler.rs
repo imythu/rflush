@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cached::{Cached, TimedCache};
 use chrono::Utc;
 use cron::Schedule;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
@@ -21,6 +22,40 @@ use crate::site::factory as site_factory;
 use super::cleaner;
 use super::u2;
 
+/// 任务配置缓存，有效期 10 秒，避免高频查库
+struct TaskConfigCache {
+    cache: Mutex<TimedCache<i64, BrushTaskRecord>>,
+}
+
+impl TaskConfigCache {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(TimedCache::with_lifespan(10)),
+        }
+    }
+
+    async fn get_or_load(&self, db: &Database, task_id: i64) -> Option<BrushTaskRecord> {
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some(task) = cache.cache_get(&task_id) {
+                return Some(task.clone());
+            }
+        }
+        match db.get_brush_task(task_id).await {
+            Ok(Some(task)) => {
+                let mut cache = self.cache.lock().await;
+                cache.cache_set(task_id, task.clone());
+                Some(task)
+            }
+            _ => None,
+        }
+    }
+
+    async fn size(&self) -> usize {
+        self.cache.lock().await.cache_size()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum FilterStage {
     RssPreFilter,
@@ -33,6 +68,7 @@ pub struct BrushScheduler {
     collector: Arc<DownloaderSnapshotCollector>,
     running_tasks: Arc<RwLock<HashMap<i64, RunningBrushTask>>>,
     http: Arc<AppHttpClient>,
+    task_cache: Arc<TaskConfigCache>,
 }
 
 struct RunningBrushTask {
@@ -51,6 +87,7 @@ impl BrushScheduler {
             collector,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
             http,
+            task_cache: Arc::new(TaskConfigCache::new()),
         }
     }
 
@@ -79,63 +116,179 @@ impl BrushScheduler {
         );
     }
 
-    /// 高频删种循环：扫描所有任务，独立于 cron 触发
+    /// 高频删种循环：扫描所有下载器中的全部种子，按 hash 匹配数据库记录后执行删种
     async fn cleaner_loop(&self) {
-        let tasks = match self.db.list_brush_tasks().await {
-            Ok(tasks) => tasks,
+        let downloaders = match self.db.list_downloaders().await {
+            Ok(d) => d,
             Err(e) => {
-                error!("cleaner loop: failed to list brush tasks: {}", e);
+                error!("cleaner loop: failed to list downloaders: {}", e);
                 return;
             }
         };
 
-        for task in &tasks {
-            // 跳过没有配任何删种规则的任务
-            if task.target_ratio.is_none()
-                && task.min_seed_time_hours.is_none()
-                && task.hr_min_seed_time_hours.is_none()
-                && task.max_upload_gb.is_none()
-                && task.download_timeout_hours.is_none()
-                && task.min_avg_upload_speed_kbs.is_none()
-                && task.max_inactive_hours.is_none()
-                && !task.delete_on_free_expiry
-            {
+        for downloader in &downloaders {
+            let all_torrents = match self.collector.get_all_torrents(downloader).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("[cleaner] 获取下载器 '{}' 种子列表失败: {}", downloader.name, e);
+                    continue;
+                }
+            };
+
+            if all_torrents.is_empty() {
                 continue;
             }
 
-            // 检查任务是否有运行中的删种操作，避免并发冲突
-            {
-                let running = self.running_tasks.read().await;
-                if running.contains_key(&task.id) {
-                    // 主任务正在运行，它自己会执行删种，跳过
+            let hashes: Vec<String> = all_torrents.iter().map(|t| t.hash.clone()).collect();
+
+            let matched = match self.db.batch_find_active_torrents_by_hashes(&hashes).await {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("[cleaner] 批量查询种子记录失败: {}", e);
                     continue;
                 }
+            };
+
+            if matched.is_empty() {
+                continue;
             }
 
-            let downloader_record = match self.db.get_downloader(task.downloader_id).await {
-                Ok(Some(d)) => d,
-                Ok(None) => {
-                    warn!("[cleaner][{}] 下载器不存在 (id={})", task.name, task.downloader_id);
-                    continue;
-                }
-                Err(e) => {
-                    warn!("[cleaner][{}] 获取下载器失败: {}", task.name, e);
-                    continue;
-                }
-            };
+            info!(
+                "[cleaner] 下载器 '{}': 扫描 {} 个种子, 匹配到 {} 条活跃记录",
+                downloader.name,
+                all_torrents.len(),
+                matched.len()
+            );
 
-            let client = match factory::create_client(&downloader_record) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("[cleaner][{}] 创建下载器客户端失败: {}", task.name, e);
+            // 按 task_id 分组
+            let mut groups: HashMap<i64, Vec<_>> = HashMap::new();
+            for (record, _task) in matched {
+                groups.entry(record.task_id).or_default().push(record);
+            }
+
+            let running = self.running_tasks.read().await;
+            let running_ids: std::collections::HashSet<i64> = running.keys().copied().collect();
+            drop(running);
+
+            for (task_id, records) in &groups {
+                if running_ids.contains(task_id) {
                     continue;
                 }
-            };
 
-            if let Err(e) = execute_cleaner(&self.db, &self.collector, task, &client).await {
-                warn!("[cleaner][{}] 删种执行失败: {}", task.name, e);
+                let Some(task) = self.task_cache.get_or_load(&self.db, *task_id).await else {
+                    warn!("[cleaner] task_id={} 不存在，跳过", task_id);
+                    continue;
+                };
+
+                // 跳过没有配任何删种规则的任务
+                if !has_delete_rules(&task) {
+                    continue;
+                }
+
+                let client = match factory::create_client(downloader) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("[cleaner][{}] 创建下载器客户端失败: {}", task.name, e);
+                        continue;
+                    }
+                };
+
+                let dl_torrents = match self.collector.get_all_torrents(downloader).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("[cleaner][{}] 获取种子快照失败: {}", task.name, e);
+                        continue;
+                    }
+                };
+
+                let to_remove =
+                    cleaner::evaluate_delete_rules(&task, records, &dl_torrents, &self.db).await;
+
+                if to_remove.is_empty() {
+                    continue;
+                }
+
+                info!("[删种][{}] 准备删除 {} 个种子", task.name, to_remove.len());
+
+                for (hash, reason) in &to_remove {
+                    info!(
+                        "[删种][{}] hash={} 原因={}",
+                        task.name,
+                        &hash[..8.min(hash.len())],
+                        reason
+                    );
+                    if let Some(torrent) = dl_torrents
+                        .iter()
+                        .find(|t| t.hash.eq_ignore_ascii_case(hash))
+                    {
+                        let _ = self
+                            .db
+                            .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
+                            .await;
+                        let _ = self
+                            .db
+                            .update_brush_torrent_stats(
+                                task.id,
+                                &torrent.hash,
+                                torrent.uploaded,
+                                torrent.downloaded,
+                                torrent.time_active.max(0),
+                                average_upload_speed(torrent.uploaded, torrent.time_active),
+                                calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
+                            )
+                            .await;
+                    }
+
+                    let final_reason: Option<String>;
+                    match client.delete_torrent(hash, true).await {
+                        Ok(()) => {
+                            final_reason = Some(reason.clone());
+                        }
+                        Err(delete_err) => {
+                            warn!(
+                                "[删种][{}] 删除失败: hash={} err={}",
+                                task.name,
+                                &hash[..8.min(hash.len())],
+                                delete_err
+                            );
+                            match client.list_torrents(None).await {
+                                Ok(all) => {
+                                    if all.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
+                                        warn!(
+                                            "[删种][{}] 种子仍存在，保持 active 状态",
+                                            task.name
+                                        );
+                                        continue;
+                                    }
+                                    info!(
+                                        "[删种][{}] 种子已不在下载器中，标记为已移除",
+                                        task.name
+                                    );
+                                    final_reason = Some(format!("{} (下载器中已不存在)", reason));
+                                }
+                                Err(list_err) => {
+                                    warn!(
+                                        "[删种][{}] 无法检查种子是否存在: {}，保持 active 状态",
+                                        task.name, list_err
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    let _ = self
+                        .db
+                        .update_brush_torrent_status(task.id, hash, "removed", final_reason.as_deref())
+                        .await;
+                }
             }
         }
+
+        debug!(
+            "[cleaner] 本轮完成, 任务配置缓存大小: {}",
+            self.task_cache.size().await
+        );
     }
 
     async fn check_and_schedule(&self) -> Result<(), String> {
@@ -267,6 +420,17 @@ impl BrushScheduler {
 
         Ok(())
     }
+}
+
+fn has_delete_rules(task: &BrushTaskRecord) -> bool {
+    task.target_ratio.is_some()
+        || task.min_seed_time_hours.is_some()
+        || task.hr_min_seed_time_hours.is_some()
+        || task.max_upload_gb.is_some()
+        || task.download_timeout_hours.is_some()
+        || task.min_avg_upload_speed_kbs.is_some()
+        || task.max_inactive_hours.is_some()
+        || task.delete_on_free_expiry
 }
 
 fn should_trigger(task: &BrushTaskRecord) -> bool {

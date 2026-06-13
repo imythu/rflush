@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
+cached = { version = "0.55", features = ["async"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive", "env"] }
