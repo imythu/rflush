@@ -942,7 +942,6 @@ async fn execute_brush_task(
                     download_limit: task.download_speed_limit.map(|v| v * 1024),
                     upload_limit: task.upload_speed_limit.map(|v| v * 1024),
                     ratio_limit: task.target_ratio,
-                    inactive_seeding_time_limit: task.max_inactive_hours.map(|h| (h * 60.0) as i64),
                     ..Default::default()
                 };
 
