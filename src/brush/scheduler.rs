@@ -170,6 +170,17 @@ impl BrushScheduler {
             let running_ids: std::collections::HashSet<i64> = running.keys().copied().collect();
             drop(running);
 
+            // 同一个下载器只创建一次客户端，复用连接
+            let client = match factory::create_client(downloader) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[cleaner] 创建下载器客户端失败: {}", e);
+                    continue;
+                }
+            };
+            // 种子快照也只拉一次
+            let dl_torrents = all_torrents;
+
             for (task_id, records) in &groups {
                 if running_ids.contains(task_id) {
                     continue;
@@ -184,22 +195,6 @@ impl BrushScheduler {
                 if !has_delete_rules(&task) {
                     continue;
                 }
-
-                let client = match factory::create_client(downloader) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("[cleaner][{}] 创建下载器客户端失败: {}", task.name, e);
-                        continue;
-                    }
-                };
-
-                let dl_torrents = match self.collector.get_all_torrents(downloader).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!("[cleaner][{}] 获取种子快照失败: {}", task.name, e);
-                        continue;
-                    }
-                };
 
                 let to_remove =
                     cleaner::evaluate_delete_rules(&task, records, &dl_torrents, &self.db).await;
