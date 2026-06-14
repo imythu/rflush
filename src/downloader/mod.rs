@@ -112,6 +112,22 @@ pub trait DownloaderClient: Send + Sync {
         tag: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + '_>>;
 
+    fn list_torrents_by_hashes<'a>(
+        &'a self,
+        hashes: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            if hashes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let all = self.list_torrents(None).await?;
+            Ok(all
+                .into_iter()
+                .filter(|torrent| hashes.iter().any(|hash| torrent.hash.eq_ignore_ascii_case(hash)))
+                .collect())
+        })
+    }
+
     fn delete_torrent(
         &self,
         hash: &str,

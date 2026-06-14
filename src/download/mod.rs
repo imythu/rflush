@@ -241,6 +241,21 @@ async fn try_download_once(
         ));
     }
 
+    // 验证下载的数据是有效的 bencode 文件（种子文件以 'd' 开头）
+    if response.body.first() != Some(&b'd') {
+        let preview = String::from_utf8_lossy(
+            if response.body.len() > 200 { &response.body[..200] } else { &response.body }
+        );
+        warn!(
+            task = %current_task_context(),
+            "downloaded data is not a valid torrent file: purpose=\"{}\" url={} preview={}",
+            purpose, download_url, preview
+        );
+        return Err(DownloadAttemptError::Retriable(
+            format!("response is not a valid torrent file (starts with {:?})", response.body.first())
+        ));
+    }
+
     let original_name = extract_original_filename(&response.headers);
     let file_name = build_target_file_name(original_name.as_deref(), item);
     let output_path = runtime.output_dir.join(&file_name);

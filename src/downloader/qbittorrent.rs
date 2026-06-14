@@ -383,38 +383,26 @@ impl DownloaderClient for QBittorrentClient {
             };
 
             let text = self.api_get(&path).await?;
-            let items: Vec<Value> =
-                serde_json::from_str(&text).map_err(|_| "解析种子列表失败".to_string())?;
+            parse_torrent_info_list(&text)
+        })
+    }
 
-            let mut result = Vec::with_capacity(items.len());
-            for item in &items {
-                result.push(TorrentInfo {
-                    hash: item["hash"].as_str().unwrap_or_default().to_string(),
-                    name: item["name"].as_str().unwrap_or_default().to_string(),
-                    size: item["size"].as_i64().unwrap_or(0),
-                    uploaded: item["uploaded"].as_i64().unwrap_or(0),
-                    downloaded: item["downloaded"].as_i64().unwrap_or(0),
-                    upload_speed: item["upspeed"].as_i64().unwrap_or(0),
-                    download_speed: item["dlspeed"].as_i64().unwrap_or(0),
-                    ratio: item["ratio"].as_f64().unwrap_or(0.0),
-                    state: item["state"].as_str().unwrap_or_default().to_string(),
-                    added_on: item["added_on"].as_i64().unwrap_or(0),
-                    completion_on: item["completion_on"].as_i64().unwrap_or(0),
-                    num_seeds: item["num_seeds"].as_i64().unwrap_or(0) as i32,
-                    num_leechs: item["num_leechs"].as_i64().unwrap_or(0) as i32,
-                    save_path: item["save_path"]
-                        .as_str()
-                        .or_else(|| item["content_path"].as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tags: item["tags"].as_str().unwrap_or_default().to_string(),
-                    category: item["category"].as_str().unwrap_or_default().to_string(),
-                    time_active: item["time_active"].as_i64().unwrap_or(0),
-                    last_activity: item["last_activity"].as_i64().unwrap_or(0),
-                });
+    fn list_torrents_by_hashes<'a>(
+        &'a self,
+        hashes: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            if hashes.is_empty() {
+                return Ok(Vec::new());
             }
+            let joined_hashes = hashes.join("|");
+            let path = format!(
+                "/api/v2/torrents/info?hashes={}",
+                urlencoding::encode(&joined_hashes)
+            );
 
-            Ok(result)
+            let text = self.api_get(&path).await?;
+            parse_torrent_info_list(&text)
         })
     }
 
@@ -457,6 +445,40 @@ impl DownloaderClient for QBittorrentClient {
             Ok(free)
         })
     }
+}
+
+fn parse_torrent_info_list(text: &str) -> Result<Vec<TorrentInfo>, String> {
+    let items: Vec<Value> = serde_json::from_str(text).map_err(|_| "解析种子列表失败".to_string())?;
+
+    let mut result = Vec::with_capacity(items.len());
+    for item in &items {
+        result.push(TorrentInfo {
+            hash: item["hash"].as_str().unwrap_or_default().to_string(),
+            name: item["name"].as_str().unwrap_or_default().to_string(),
+            size: item["size"].as_i64().unwrap_or(0),
+            uploaded: item["uploaded"].as_i64().unwrap_or(0),
+            downloaded: item["downloaded"].as_i64().unwrap_or(0),
+            upload_speed: item["upspeed"].as_i64().unwrap_or(0),
+            download_speed: item["dlspeed"].as_i64().unwrap_or(0),
+            ratio: item["ratio"].as_f64().unwrap_or(0.0),
+            state: item["state"].as_str().unwrap_or_default().to_string(),
+            added_on: item["added_on"].as_i64().unwrap_or(0),
+            completion_on: item["completion_on"].as_i64().unwrap_or(0),
+            num_seeds: item["num_seeds"].as_i64().unwrap_or(0) as i32,
+            num_leechs: item["num_leechs"].as_i64().unwrap_or(0) as i32,
+            save_path: item["save_path"]
+                .as_str()
+                .or_else(|| item["content_path"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+            tags: item["tags"].as_str().unwrap_or_default().to_string(),
+            category: item["category"].as_str().unwrap_or_default().to_string(),
+            time_active: item["time_active"].as_i64().unwrap_or(0),
+            last_activity: item["last_activity"].as_i64().unwrap_or(0),
+        });
+    }
+
+    Ok(result)
 }
 
 fn truncate_for_log(input: &str, max_len: usize) -> String {

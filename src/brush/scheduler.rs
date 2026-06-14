@@ -9,13 +9,13 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::brush::{
-    BrushTaskRecord, average_upload_speed, calculate_ratio, in_any_range, is_in_active_window,
+    BrushTaskRecord, BrushTorrentRecord, average_upload_speed, calculate_ratio, in_any_range, is_in_active_window,
     parse_ranges,
 };
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
-use crate::downloader::DownloaderClientPool;
+use crate::downloader::{DownloaderClientPool, DownloaderRecord};
 use crate::net::client_factory;
 use crate::net::http::AppHttpClient;
 use crate::rss;
@@ -122,69 +122,53 @@ impl BrushScheduler {
         );
     }
 
-    /// 高频删种循环：扫描所有下载器中的全部种子，按 hash 匹配数据库记录后执行删种
+    /// 高频删种循环：先查询数据库中所有非 removed 种子，再按下载器批量查询下载器信息后执行删种评估
     async fn cleaner_loop(&self) {
-        let downloaders = match self.db.list_downloaders().await {
-            Ok(d) => d,
+        let all_records = match self.db.list_non_removed_brush_torrents_with_tasks().await {
+            Ok(records) => records,
             Err(e) => {
-                error!("cleaner loop: failed to list downloaders: {}", e);
+                error!("cleaner loop: 查询活跃刷流种子失败: {}", e);
                 return;
             }
         };
 
-        for downloader in &downloaders {
-            let all_torrents = match self.collector.get_all_torrents(downloader).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("[cleaner] 获取下载器 '{}' 种子列表失败: {}", downloader.name, e);
+        if all_records.is_empty() {
+            return;
+        }
+
+        let downloaders = match self.db.list_downloaders().await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("cleaner loop: 查询下载器列表失败: {}", e);
+                return;
+            }
+        };
+        let downloader_map: HashMap<i64, DownloaderRecord> =
+            downloaders.into_iter().map(|d| (d.id, d)).collect();
+
+        // 按 downloader_id -> task_id -> records 分组
+        let mut downloader_groups: HashMap<i64, HashMap<i64, Vec<BrushTorrentRecord>>> =
+            HashMap::new();
+        for (record, task) in all_records {
+            downloader_groups
+                .entry(task.downloader_id)
+                .or_default()
+                .entry(task.id)
+                .or_default()
+                .push(record);
+        }
+
+        let mut total_removed: usize = 0;
+
+        for (downloader_id, task_groups) in downloader_groups {
+            let downloader = match downloader_map.get(&downloader_id) {
+                Some(d) => d,
+                None => {
+                    warn!("[cleaner] downloader_id={} 不存在，跳过关联任务", downloader_id);
                     continue;
                 }
             };
 
-            if all_torrents.is_empty() {
-                continue;
-            }
-
-            let hashes: Vec<String> = all_torrents.iter().map(|t| t.hash.clone()).collect();
-
-            let matched = match self.db.batch_find_active_torrents_by_hashes(&hashes).await {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("[cleaner] 批量查询种子记录失败: {}", e);
-                    continue;
-                }
-            };
-
-            if matched.is_empty() {
-                continue;
-            }
-
-            info!(
-                "[cleaner] 下载器 '{}': 扫描 {} 个种子, 匹配到 {} 条活跃记录",
-                downloader.name,
-                all_torrents.len(),
-                matched.len()
-            );
-
-            // 按 task_id 分组
-            let mut groups: HashMap<i64, Vec<_>> = HashMap::new();
-            for (record, _task) in matched {
-                groups.entry(record.task_id).or_default().push(record);
-            }
-
-            let running = self.running_tasks.read().await;
-            let running_ids: std::collections::HashSet<i64> = running.keys().copied().collect();
-            drop(running);
-
-            info!(
-                "[cleaner] 下载器 '{}': 分组为 {} 个任务 (task_ids={:?}), 其中运行中={:?}",
-                downloader.name,
-                groups.len(),
-                groups.keys().collect::<Vec<_>>(),
-                running_ids,
-            );
-
-            // 同一个下载器只创建一次客户端，复用连接
             let client = match self.pool.get(downloader).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -192,29 +176,47 @@ impl BrushScheduler {
                     continue;
                 }
             };
-            // 种子快照也只拉一次
-            let dl_torrents = all_torrents;
 
-            let mut total_removed: usize = 0;
-            for (task_id, records) in &groups {
-                if running_ids.contains(task_id) {
-                    info!("[cleaner] task_id={} 主任务运行中，跳过", task_id);
+            let mut downloader_hashes: Vec<String> = Vec::new();
+            for records in task_groups.values() {
+                for record in records {
+                    downloader_hashes.push(record.torrent_hash.clone());
+                }
+            }
+            downloader_hashes.sort();
+            downloader_hashes.dedup();
+
+            let dl_torrents = match client.list_torrents_by_hashes(&downloader_hashes).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("[cleaner] 查询下载器 '{}' 指定种子信息失败: {}", downloader.name, e);
                     continue;
                 }
+            };
 
-                let Some(task) = self.task_cache.get_or_load(&self.db, *task_id).await else {
+            info!(
+                "[cleaner] 下载器 '{}': 本次评估任务 {} 个、数据库种子 {} 条、下载器返回 {} 条",
+                downloader.name,
+                task_groups.len(),
+                downloader_hashes.len(),
+                dl_torrents.len()
+            );
+
+            for (task_id, records) in task_groups.into_iter() {
+
+
+                let Some(task) = self.task_cache.get_or_load(&self.db, task_id).await else {
                     warn!("[cleaner] task_id={} 不存在或加载失败，跳过", task_id);
                     continue;
                 };
 
-                // 跳过没有配任何删种规则的任务
                 if !has_delete_rules(&task) {
                     info!("[cleaner][{}] 无删种规则，跳过", task.name);
                     continue;
                 }
 
                 let to_remove =
-                    cleaner::evaluate_delete_rules(&task, records, &dl_torrents, &self.db).await;
+                    cleaner::evaluate_delete_rules(&task, &records, &dl_torrents, &self.db).await;
 
                 if to_remove.is_empty() {
                     info!("[cleaner][{}] 评估完成，无需删种", task.name);
@@ -931,6 +933,26 @@ async fn execute_brush_task(
             }
         };
         let data = torrent_bytes;
+
+        // 在发送到下载器之前验证种子文件有效性
+        let info_hash = match extract_info_hash(&data) {
+            Some(h) => h,
+            None => {
+                let preview = String::from_utf8_lossy(
+                    if data.len() > 200 { &data[..200] } else { &data }
+                );
+                warn!(
+                    "[刷流][{}] ✗ 下载到的数据不是有效种子文件，跳过: title={} download_url={} preview={}",
+                    task.name,
+                    effective_item.title,
+                    effective_item.download_url,
+                    preview
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
                 let save_path = task.save_dir.clone().unwrap_or_default();
                 let options = AddTorrentOptions {
                     save_path: if save_path.is_empty() {
@@ -967,23 +989,6 @@ async fn execute_brush_task(
                             .or_else(|| Some(extract_torrent_id(&effective_item.guid)))
                             .map(str::to_string)
                             .filter(|value| !value.is_empty());
-                        let info_hash = match extract_info_hash(&data) {
-                            Some(h) => h,
-                            None => {
-                                let preview = String::from_utf8_lossy(
-                                    if data.len() > 200 { &data[..200] } else { &data }
-                                );
-                                warn!(
-                                    "[刷流][{}] ✗ 无法从种子文件提取 info hash，数据可能不是有效种子文件: title={} preview={}",
-                                    task.name,
-                                    effective_item.title,
-                                    preview
-                                );
-                                failed += 1;
-                                // 不在 DB 中记录种子，避免用 GUID 当 hash 导致后续追踪断裂
-                                continue;
-                            }
-                        };
                         let _ = db
                             .add_brush_torrent(
                                 task.id,

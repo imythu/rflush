@@ -1492,67 +1492,35 @@ impl Database {
         .map_err(join_error)?
     }
 
-    /// 批量通过 hash 查询活跃种子记录及其所属任务配置
-    pub async fn batch_find_active_torrents_by_hashes(
+    pub async fn list_non_removed_brush_torrents_with_tasks(
         &self,
-        hashes: &[String],
     ) -> Result<Vec<(BrushTorrentRecord, BrushTaskRecord)>, AppError> {
-        if hashes.is_empty() {
-            return Ok(Vec::new());
-        }
         let path = self.path.clone();
-        let hashes: Vec<String> = hashes.iter().map(|h| h.to_lowercase()).collect();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
-            let placeholders: Vec<&str> = hashes.iter().map(|_| "?").collect();
-            let sql = format!(
-                "SELECT bt.id, bt.task_id, bt.torrent_id, bt.torrent_link, bt.torrent_hash, bt.torrent_name,
-                        bt.added_at, bt.size_bytes, bt.is_hr, bt.free_end_timestamp, bt.status, bt.removed_at,
-                        bt.remove_reason, bt.uploaded_bytes, bt.downloaded_bytes, bt.download_duration_secs,
-                        bt.avg_upload_speed, bt.ratio, bt.last_stats_at,
-                        t.id, t.name, t.cron_expression, t.site_id, t.downloader_id, t.tag, t.rss_url,
-                        t.seed_volume_gb, t.save_dir, t.active_time_windows,
-                        t.promotion, t.skip_hit_and_run, t.max_concurrent,
-                        t.download_speed_limit, t.upload_speed_limit,
-                        t.size_ranges, t.seeder_ranges, t.min_free_hours,
-                        t.delete_mode, t.delete_on_free_expiry, t.min_seed_time_hours, t.hr_min_seed_time_hours,
-                        t.target_ratio, t.max_upload_gb, t.download_timeout_hours,
-                        t.min_avg_upload_speed_kbs, t.max_inactive_hours, t.min_disk_space_gb,
-                        t.enabled, t.created_at, t.updated_at, t.downloader_ranges
-                 FROM brush_task_torrents bt
-                 INNER JOIN brush_tasks t ON bt.task_id = t.id
-                 WHERE bt.status = 'active' AND bt.torrent_hash IN ({})",
-                placeholders.join(", ")
-            );
-            let mut stmt = conn.prepare(&sql).map_err(sql_error)?;
-            let params: Vec<Box<dyn rusqlite::types::ToSql>> = hashes
-                .iter()
-                .map(|h| Box::new(h.clone()) as Box<dyn rusqlite::types::ToSql>)
-                .collect();
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT bt.id, bt.task_id, bt.torrent_id, bt.torrent_link, bt.torrent_hash, bt.torrent_name,
+                            bt.added_at, bt.size_bytes, bt.is_hr, bt.free_end_timestamp, bt.status, bt.removed_at,
+                            bt.remove_reason, bt.uploaded_bytes, bt.downloaded_bytes, bt.download_duration_secs,
+                            bt.avg_upload_speed, bt.ratio, bt.last_stats_at,
+                            t.id, t.name, t.cron_expression, t.site_id, t.downloader_id, t.tag, t.rss_url,
+                            t.seed_volume_gb, t.save_dir, t.active_time_windows,
+                            t.promotion, t.skip_hit_and_run, t.max_concurrent,
+                            t.download_speed_limit, t.upload_speed_limit,
+                            t.size_ranges, t.seeder_ranges, t.min_free_hours,
+                            t.delete_mode, t.delete_on_free_expiry, t.min_seed_time_hours, t.hr_min_seed_time_hours,
+                            t.target_ratio, t.max_upload_gb, t.download_timeout_hours,
+                            t.min_avg_upload_speed_kbs, t.max_inactive_hours, t.min_disk_space_gb,
+                            t.enabled, t.created_at, t.updated_at, t.downloader_ranges
+                     FROM brush_task_torrents bt
+                     INNER JOIN brush_tasks t ON bt.task_id = t.id
+                     WHERE bt.status != 'removed'",
+                )
+                .map_err(sql_error)?;
             let rows = stmt
-                .query_map(param_refs.as_slice(), |row| {
-                    let torrent = BrushTorrentRecord {
-                        id: row.get(0)?,
-                        task_id: row.get(1)?,
-                        torrent_id: row.get(2)?,
-                        torrent_link: row.get(3)?,
-                        torrent_hash: row.get(4)?,
-                        torrent_name: row.get(5)?,
-                        added_at: row.get(6)?,
-                        size_bytes: row.get(7)?,
-                        is_hr: row.get::<_, i32>(8)? != 0,
-                        free_end_timestamp: row.get(9)?,
-                        status: row.get(10)?,
-                        removed_at: row.get(11)?,
-                        remove_reason: row.get(12)?,
-                        uploaded_bytes: row.get(13)?,
-                        downloaded_bytes: row.get(14)?,
-                        download_duration_secs: row.get(15)?,
-                        avg_upload_speed: row.get(16)?,
-                        ratio: row.get(17)?,
-                        last_stats_at: row.get(18)?,
-                    };
+                .query_map([], |row| {
+                    let torrent = map_brush_torrent_record(row)?;
                     let task = row_to_brush_task_at(row, 19)?;
                     Ok((torrent, task))
                 })
@@ -1589,7 +1557,18 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT OR IGNORE INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                "INSERT INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                 ON CONFLICT(task_id, torrent_hash) DO UPDATE SET
+                    torrent_id = excluded.torrent_id,
+                    torrent_link = excluded.torrent_link,
+                    torrent_name = excluded.torrent_name,
+                    added_at = excluded.added_at,
+                    size_bytes = excluded.size_bytes,
+                    is_hr = excluded.is_hr,
+                    free_end_timestamp = excluded.free_end_timestamp,
+                    status = 'active',
+                    removed_at = NULL,
+                    remove_reason = NULL",
                 params![task_id, torrent_id, torrent_link, hash, name, now, size_bytes, is_hr as i32, free_end_timestamp],
             )
             .map_err(sql_error)?;
@@ -1613,7 +1592,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE brush_task_torrents SET status = ?, removed_at = ?, remove_reason = ? WHERE task_id = ? AND torrent_hash = ?",
+                "UPDATE brush_task_torrents SET status = ?, removed_at = ?, remove_reason = ? WHERE task_id = ? AND torrent_hash = ? AND status = 'active'",
                 params![status, now, reason, task_id, hash],
             )
             .map_err(sql_error)?;
