@@ -9,8 +9,8 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::brush::{
-    BrushTaskRecord, BrushTorrentRecord, average_upload_speed, calculate_ratio, in_any_range, is_in_active_window,
-    parse_ranges,
+    BrushTaskRecord, BrushTorrentRecord, average_upload_speed, calculate_ratio, in_any_range,
+    is_in_active_window, parse_ranges,
 };
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
@@ -164,7 +164,10 @@ impl BrushScheduler {
             let downloader = match downloader_map.get(&downloader_id) {
                 Some(d) => d,
                 None => {
-                    warn!("[cleaner] downloader_id={} 不存在，跳过关联任务", downloader_id);
+                    warn!(
+                        "[cleaner] downloader_id={} 不存在，跳过关联任务",
+                        downloader_id
+                    );
                     continue;
                 }
             };
@@ -189,7 +192,10 @@ impl BrushScheduler {
             let dl_torrents = match client.list_torrents_by_hashes(&downloader_hashes).await {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!("[cleaner] 查询下载器 '{}' 指定种子信息失败: {}", downloader.name, e);
+                    warn!(
+                        "[cleaner] 查询下载器 '{}' 指定种子信息失败: {}",
+                        downloader.name, e
+                    );
                     continue;
                 }
             };
@@ -203,8 +209,6 @@ impl BrushScheduler {
             );
 
             for (task_id, records) in task_groups.into_iter() {
-
-
                 let Some(task) = self.task_cache.get_or_load(&self.db, task_id).await else {
                     warn!("[cleaner] task_id={} 不存在或加载失败，跳过", task_id);
                     continue;
@@ -240,7 +244,12 @@ impl BrushScheduler {
                     {
                         let _ = self
                             .db
-                            .save_torrent_traffic(task.id, &torrent.hash, torrent.uploaded, torrent.downloaded)
+                            .save_torrent_traffic(
+                                task.id,
+                                &torrent.hash,
+                                torrent.uploaded,
+                                torrent.downloaded,
+                            )
                             .await;
                         let _ = self
                             .db
@@ -251,16 +260,18 @@ impl BrushScheduler {
                                 torrent.downloaded,
                                 torrent.time_active.max(0),
                                 average_upload_speed(torrent.uploaded, torrent.time_active),
-                                calculate_ratio(torrent.uploaded, torrent.downloaded, torrent.ratio),
+                                calculate_ratio(
+                                    torrent.uploaded,
+                                    torrent.downloaded,
+                                    torrent.ratio,
+                                ),
                             )
                             .await;
                     }
 
-                    let final_reason: Option<String>;
-                    match client.delete_torrent(hash, true).await {
-                        Ok(()) => {
-                            final_reason = Some(reason.clone());
-                        }
+                    let delete_result = client.delete_torrent(hash, true).await;
+                    let final_reason = match delete_result {
+                        Ok(()) => reason.clone(),
                         Err(delete_err) => {
                             warn!(
                                 "[删种][{}] 删除失败: hash={} err={}",
@@ -268,35 +279,30 @@ impl BrushScheduler {
                                 &hash[..8.min(hash.len())],
                                 delete_err
                             );
-                            match client.list_torrents(None).await {
-                                Ok(all) => {
-                                    if all.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
-                                        warn!(
-                                            "[删种][{}] 种子仍存在，保持 active 状态",
-                                            task.name
-                                        );
-                                        continue;
-                                    }
-                                    info!(
-                                        "[删种][{}] 种子已不在下载器中，标记为已移除",
-                                        task.name
-                                    );
-                                    final_reason = Some(format!("{} (下载器中已不存在)", reason));
-                                }
-                                Err(list_err) => {
-                                    warn!(
-                                        "[删种][{}] 无法检查种子是否存在: {}，保持 active 状态",
-                                        task.name, list_err
-                                    );
-                                    continue;
-                                }
+                            format!("{} (删除接口返回错误: {})", reason, delete_err)
+                        }
+                    };
+
+                    match client.list_torrents(None).await {
+                        Ok(all) => {
+                            if all.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
+                                warn!("[删种][{}] 删除后种子仍存在，保持 active 状态", task.name);
+                                continue;
                             }
+                            info!("[删种][{}] 确认种子已不在下载器中，标记为已移除", task.name);
+                        }
+                        Err(list_err) => {
+                            warn!(
+                                "[删种][{}] 无法确认种子是否仍存在: {}，保持 active 状态",
+                                task.name, list_err
+                            );
+                            continue;
                         }
                     }
 
                     let _ = self
                         .db
-                        .update_brush_torrent_status(task.id, hash, "removed", final_reason.as_deref())
+                        .update_brush_torrent_status(task.id, hash, "removed", Some(&final_reason))
                         .await;
                 }
             }
@@ -354,7 +360,9 @@ impl BrushScheduler {
 
                 info!("[刷流][{}] cron 触发，开始调度执行", task_name);
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = execute_brush_task(&db, &collector, &pool, execution_config, &http).await {
+                    if let Err(e) =
+                        execute_brush_task(&db, &collector, &pool, execution_config, &http).await
+                    {
                         error!("[刷流][{}] 任务执行失败: {}", task_name, e);
                     }
                     // 从运行列表移除
@@ -397,7 +405,9 @@ impl BrushScheduler {
         let http = self.http.clone();
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
-            if let Err(e) = execute_brush_task(&db, &collector, &pool, execution_config, &http).await {
+            if let Err(e) =
+                execute_brush_task(&db, &collector, &pool, execution_config, &http).await
+            {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
             let mut running = running_tasks.write().await;
@@ -519,11 +529,55 @@ async fn execute_brush_task(
 
     let client = pool.get(&downloader_record).await?;
 
-    // 2. 获取当前管理的种子列表
-    let managed_torrents = db
+    // 2. 获取当前管理的种子列表，并先同步下载器中已不存在的记录
+    let mut managed_torrents = db
         .list_active_brush_torrents(task.id)
         .await
         .map_err(|e| e.to_string())?;
+
+    if !managed_torrents.is_empty() {
+        let managed_hashes: Vec<String> = managed_torrents
+            .iter()
+            .map(|torrent| torrent.torrent_hash.clone())
+            .collect();
+        let existing_torrents = client
+            .list_torrents_by_hashes(&managed_hashes)
+            .await
+            .map_err(|e| format!("检查下载器现有种子失败: {}", e))?;
+
+        let mut missing_count = 0usize;
+        for record in &managed_torrents {
+            if existing_torrents
+                .iter()
+                .any(|torrent| torrent.hash.eq_ignore_ascii_case(&record.torrent_hash))
+            {
+                continue;
+            }
+
+            missing_count += 1;
+            info!(
+                "[刷流][{}] active 种子已不在下载器中，标记为 removed: hash={} name={}",
+                task.name,
+                &record.torrent_hash[..8.min(record.torrent_hash.len())],
+                record.torrent_name
+            );
+            let _ = db
+                .update_brush_torrent_status(
+                    task.id,
+                    &record.torrent_hash,
+                    "removed",
+                    Some("刷流任务启动检查：下载器中不存在"),
+                )
+                .await;
+        }
+
+        if missing_count > 0 {
+            managed_torrents = db
+                .list_active_brush_torrents(task.id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     let downloader_torrents = collector
         .get_tagged_torrents(&downloader_record, &task.tag)
@@ -628,10 +682,9 @@ async fn execute_brush_task(
         if !rss_resp.status.is_success() {
             return Err(format!("RSS HTTP {}", rss_resp.status));
         }
-        let rss_body = String::from_utf8(rss_resp.body.to_vec())
-            .map_err(|_| "RSS 编码错误".to_string())?;
-        let parsed =
-            rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
+        let rss_body =
+            String::from_utf8(rss_resp.body.to_vec()).map_err(|_| "RSS 编码错误".to_string())?;
+        let parsed = rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
         parsed.into_snapshot(task.name.clone(), 1)
     };
 
@@ -764,7 +817,10 @@ async fn execute_brush_task(
                         match db.get_site(site_id).await {
                             Ok(Some(site)) => {
                                 let proxy = db.get_settings().await.ok().and_then(|s| s.proxy);
-                                let client = match client_factory::resolve_client(proxy.as_deref(), site.use_proxy) {
+                                let client = match client_factory::resolve_client(
+                                    proxy.as_deref(),
+                                    site.use_proxy,
+                                ) {
                                     Ok(c) => c,
                                     Err(error) => {
                                         let message = format!(
@@ -790,8 +846,10 @@ async fn execute_brush_task(
                                 }
                             }
                             Ok(None) => {
-                                let message =
-                                    format!("[刷流][{}] 站点不存在: site_id={}", task.name, site_id);
+                                let message = format!(
+                                    "[刷流][{}] 站点不存在: site_id={}",
+                                    task.name, site_id
+                                );
                                 error!("{}", message);
                                 return Err(message);
                             }
@@ -938,107 +996,118 @@ async fn execute_brush_task(
         let info_hash = match extract_info_hash(&data) {
             Some(h) => h,
             None => {
-                let preview = String::from_utf8_lossy(
-                    if data.len() > 200 { &data[..200] } else { &data }
-                );
+                let preview = String::from_utf8_lossy(if data.len() > 200 {
+                    &data[..200]
+                } else {
+                    &data
+                });
                 warn!(
                     "[刷流][{}] ✗ 下载到的数据不是有效种子文件，跳过: title={} download_url={} preview={}",
-                    task.name,
-                    effective_item.title,
-                    effective_item.download_url,
-                    preview
+                    task.name, effective_item.title, effective_item.download_url, preview
                 );
                 failed += 1;
                 continue;
             }
         };
 
-                let save_path = task.save_dir.clone().unwrap_or_default();
-                let options = AddTorrentOptions {
-                    save_path: if save_path.is_empty() {
-                        None
-                    } else {
-                        Some(save_path)
-                    },
-                    tags: Some(task.tag.clone()),
-                    download_limit: task.download_speed_limit.map(|v| v * 1024),
-                    upload_limit: task.upload_speed_limit.map(|v| v * 1024),
-                    ratio_limit: task.target_ratio,
-                    ..Default::default()
-                };
+        let save_path = task.save_dir.clone().unwrap_or_default();
+        let options = AddTorrentOptions {
+            save_path: if save_path.is_empty() {
+                None
+            } else {
+                Some(save_path)
+            },
+            tags: Some(task.tag.clone()),
+            download_limit: task.download_speed_limit.map(|v| v * 1024),
+            upload_limit: task.upload_speed_limit.map(|v| v * 1024),
+            ratio_limit: task.target_ratio,
+            ..Default::default()
+        };
 
-                let filename = format!("{}.torrent", effective_item.guid);
-                debug!(
-                    "[刷流][{}] 准备添加到下载器: title={} filename={} download_url={} save_path={:?} tag={} dl_limit={:?} ul_limit={:?} torrent_bytes={}",
+        let filename = format!("{}.torrent", effective_item.guid);
+        debug!(
+            "[刷流][{}] 准备添加到下载器: title={} filename={} download_url={} save_path={:?} tag={} dl_limit={:?} ul_limit={:?} torrent_bytes={}",
+            task.name,
+            effective_item.title,
+            filename,
+            effective_item.download_url,
+            options.save_path,
+            task.tag,
+            options.download_limit,
+            options.upload_limit,
+            data.len()
+        );
+        match client.add_torrent(data.clone(), &filename, &options).await {
+            Ok(()) => {
+                let torrent_id = effective_item
+                    .link
+                    .as_deref()
+                    .map(extract_torrent_id)
+                    .or_else(|| Some(extract_torrent_id(&effective_item.guid)))
+                    .map(str::to_string)
+                    .filter(|value| !value.is_empty());
+                match db
+                    .add_brush_torrent(
+                        task.id,
+                        torrent_id.as_deref(),
+                        effective_item.link.as_deref(),
+                        &info_hash,
+                        &effective_item.title,
+                        effective_item.size_bytes.map(|size| size as i64),
+                        effective_item.is_hr(),
+                        effective_item.free_end_timestamp,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!(
+                            "[刷流][{}] ✗ 数据库记录失败: title={} hash={} err={}",
+                            task.name,
+                            effective_item.title,
+                            &info_hash[..8.min(info_hash.len())],
+                            e
+                        );
+                    }
+                }
+                info!(
+                    "[刷流][{}] ✓ 添加成功: {} id={} size={} seeders={} dl={:?} ul={:?} hr={}",
+                    task.name,
+                    effective_item.title,
+                    extract_torrent_id(&effective_item.guid),
+                    format_size(effective_item.size_bytes),
+                    effective_item
+                        .seeders
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    effective_item.download_volume_factor,
+                    effective_item.upload_volume_factor,
+                    effective_item.is_hr()
+                );
+                added += 1;
+                if let Some(bytes) = effective_item.size_bytes {
+                    current_size_gb += bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                    if let Some(free_space) = effective_free_space_bytes.as_mut() {
+                        *free_space = free_space.saturating_sub(bytes);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[刷流][{}] ✗ 添加到下载器失败: title={} filename={} download_url={} save_path={:?} tag={} err={}",
                     task.name,
                     effective_item.title,
                     filename,
                     effective_item.download_url,
                     options.save_path,
                     task.tag,
-                    options.download_limit,
-                    options.upload_limit,
-                    data.len()
+                    e
                 );
-                match client.add_torrent(data.clone(), &filename, &options).await {
-                    Ok(()) => {
-                        let torrent_id = effective_item
-                            .link
-                            .as_deref()
-                            .map(extract_torrent_id)
-                            .or_else(|| Some(extract_torrent_id(&effective_item.guid)))
-                            .map(str::to_string)
-                            .filter(|value| !value.is_empty());
-                        let _ = db
-                            .add_brush_torrent(
-                                task.id,
-                                torrent_id.as_deref(),
-                                effective_item.link.as_deref(),
-                                &info_hash,
-                                &effective_item.title,
-                                effective_item.size_bytes.map(|size| size as i64),
-                                effective_item.is_hr(),
-                                effective_item.free_end_timestamp,
-                            )
-                            .await;
-                        info!(
-                            "[刷流][{}] ✓ 添加成功: {} id={} size={} seeders={} dl={:?} ul={:?} hr={}",
-                            task.name,
-                            effective_item.title,
-                            extract_torrent_id(&effective_item.guid),
-                            format_size(effective_item.size_bytes),
-                            effective_item
-                                .seeders
-                                .map(|s| s.to_string())
-                                .unwrap_or_else(|| "?".into()),
-                            effective_item.download_volume_factor,
-                            effective_item.upload_volume_factor,
-                            effective_item.is_hr()
-                        );
-                        added += 1;
-                        if let Some(bytes) = effective_item.size_bytes {
-                            current_size_gb += bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                            if let Some(free_space) = effective_free_space_bytes.as_mut() {
-                                *free_space = free_space.saturating_sub(bytes);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "[刷流][{}] ✗ 添加到下载器失败: title={} filename={} download_url={} save_path={:?} tag={} err={}",
-                            task.name,
-                            effective_item.title,
-                            filename,
-                            effective_item.download_url,
-                            options.save_path,
-                            task.tag,
-                            e
-                        );
-                        failed += 1;
-                        info!("[刷流][{}] 下载器返回错误，停止本次添加", task.name);
-                        break;
-                    }
-                }
+                failed += 1;
+                info!("[刷流][{}] 下载器返回错误，停止本次添加", task.name);
+                break;
+            }
+        }
     }
 
     let elapsed = task_start.elapsed();
@@ -1089,11 +1158,7 @@ async fn execute_cleaner(
         return Ok(0);
     }
 
-    info!(
-        "[删种][{}] 准备删除 {} 个种子",
-        task.name,
-        to_remove.len()
-    );
+    info!("[删种][{}] 准备删除 {} 个种子", task.name, to_remove.len());
 
     for (hash, reason) in &to_remove {
         info!(
@@ -1136,7 +1201,10 @@ async fn execute_cleaner(
                 );
                 match client.list_torrents(None).await {
                     Ok(all_torrents) => {
-                        if all_torrents.iter().any(|t| t.hash.eq_ignore_ascii_case(hash)) {
+                        if all_torrents
+                            .iter()
+                            .any(|t| t.hash.eq_ignore_ascii_case(hash))
+                        {
                             warn!(
                                 "[删种][{}] 种子仍存在于下载器中，保持 active 状态，下次重试",
                                 task.name
@@ -1167,7 +1235,6 @@ async fn execute_cleaner(
 
     Ok(to_remove.len())
 }
-
 
 /// 检查种子是否通过配置过滤条件，返回不通过的原因（通过则返回 None）
 fn check_filter_reason(
@@ -1371,7 +1438,8 @@ mod tests {
         let mut task = task();
         task.promotion = "free".to_string();
 
-        let reason = check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::PostEnhancement);
+        let reason =
+            check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("缺少免费属性"));
     }
@@ -1420,7 +1488,8 @@ mod tests {
         let mut task = task();
         task.skip_hit_and_run = true;
 
-        let reason = check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::PostEnhancement);
+        let reason =
+            check_filter_reason(&task, &item(), &[], &[], &[], FilterStage::PostEnhancement);
 
         assert_eq!(reason.as_deref(), Some("缺少H&R属性"));
     }
@@ -1680,4 +1749,3 @@ fn hex_encode(bytes: &[u8]) -> String {
     }
     output
 }
-
