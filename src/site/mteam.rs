@@ -2,7 +2,7 @@ use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
 use std::future::Future;
@@ -275,81 +275,60 @@ impl SiteAdapter for MTeamAdapter {
             let torrent_id = Self::extract_torrent_id(&detail_url)
                 .ok_or_else(|| format!("无法从链接提取 M-Team 种子 ID: {detail_url}"))?;
 
-            // 重试循环：遇到"請求過於頻繁"时自动退避重试
-            let max_retries = 3;
-            let mut last_err = String::new();
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    let backoff_ms = 10000 * attempt as u64;
-                    debug!(
-                        "M-Team 重试 {}/{} 等待 {}ms: {}",
-                        attempt, max_retries, backoff_ms, &detail_url
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                } else {
-                    // 首次请求前也加延迟，防止并发触发限流
-                    let delay_ms = MTEAM_REQUEST_INTERVAL_MS + simple_random_ms(4000);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
+            // 首次请求前加延迟，防止并发触发限流
+            let delay_ms = MTEAM_REQUEST_INTERVAL_MS + simple_random_ms(4000);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
-                let form = [("id", torrent_id.as_str())];
-                match self.api_post_form("/api/torrent/detail", &form).await {
-                    Ok(json) => {
-                        let data = json
-                            .get("data")
-                            .ok_or_else(|| "响应缺少 data 字段".to_string())?;
-                        let status = data.get("status").unwrap_or(data);
-                        let discount = status.get("discount").and_then(|v| v.as_str());
-                        let (download_volume_factor, upload_volume_factor) =
-                            Self::parse_discount(discount);
-                        let seeder_count = status.get("seeders").and_then(|v| {
+            let form = [("id", torrent_id.as_str())];
+            match self.api_post_form("/api/torrent/detail", &form).await {
+                Ok(json) => {
+                    let data = json
+                        .get("data")
+                        .ok_or_else(|| "响应缺少 data 字段".to_string())?;
+                    let status = data.get("status").unwrap_or(data);
+                    let discount = status.get("discount").and_then(|v| v.as_str());
+                    let (download_volume_factor, upload_volume_factor) =
+                        Self::parse_discount(discount);
+                    let seeder_count = status.get("seeders").and_then(|v| {
+                        v.as_str()
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .or_else(|| v.as_i64().map(|n| n as i32))
+                    });
+                    // M-Team status 中下载人数字段为 leechers（字符串或整数）。
+                    let leecher_count = status
+                        .get("leechers")
+                        .or_else(|| status.get("leecher"))
+                        .and_then(|v| {
                             v.as_str()
                                 .and_then(|s| s.parse::<i32>().ok())
                                 .or_else(|| v.as_i64().map(|n| n as i32))
                         });
-                        // M-Team status 中下载人数字段为 leechers（字符串或整数）。
-                        let leecher_count = status
-                            .get("leechers")
-                            .or_else(|| status.get("leecher"))
-                            .and_then(|v| {
-                                v.as_str()
-                                    .and_then(|s| s.parse::<i32>().ok())
-                                    .or_else(|| v.as_i64().map(|n| n as i32))
-                            });
-                        let free_end_timestamp = status
-                            .get("discountEndTime")
-                            .or_else(|| data.get("discountEndTime"))
-                            .and_then(|v| v.as_str())
-                            .and_then(parse_mteam_datetime);
+                    let free_end_timestamp = status
+                        .get("discountEndTime")
+                        .or_else(|| data.get("discountEndTime"))
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_mteam_datetime);
 
-                        return Ok(TorrentAttributes {
-                            free: download_volume_factor == Some(0.0),
-                            two_x_free: download_volume_factor == Some(0.0)
-                                && upload_volume_factor.is_some_and(|factor| factor >= 2.0),
-                            hit_and_run: false,
-                            seeder_count,
-                            leecher_count,
-                            free_end_timestamp,
-                            download_volume_factor,
-                            upload_volume_factor,
-                        });
-                    }
-                    Err(e) => {
-                        if e.contains("頻繁") {
-                            last_err = e;
-                            debug!(
-                                "M-Team 限流，准备重试 {}/{}: {}",
-                                attempt + 1,
-                                max_retries,
-                                &detail_url
-                            );
-                            continue;
-                        }
+                    Ok(TorrentAttributes {
+                        free: download_volume_factor == Some(0.0),
+                        two_x_free: download_volume_factor == Some(0.0)
+                            && upload_volume_factor.is_some_and(|factor| factor >= 2.0),
+                        hit_and_run: false,
+                        seeder_count,
+                        leecher_count,
+                        free_end_timestamp,
+                        download_volume_factor,
+                        upload_volume_factor,
+                    })
+                }
+                Err(e) => {
+                    if e.contains("頻繁") {
+                        warn!("M-Team 限流，跳过当前条目: {} {}", &detail_url, e);
                         return Err(e);
                     }
+                    Err(e)
                 }
             }
-            Err(last_err)
         })
     }
 }

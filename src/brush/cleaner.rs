@@ -172,37 +172,51 @@ pub async fn evaluate_delete_rules(
             }
         }
 
-        // 规则 6: 最近10分钟平均上传速度
+        // 规则 6: 最近10分钟与1分钟平均上传速度均低于阈值
         if let Some(min_speed) = task.min_avg_upload_speed_kbs {
             let active_enough = dl_info.time_active > 600;
-            match get_recent_avg_upload_speed(db, task.id, &record.torrent_hash).await {
+            let avg_10min = get_recent_avg_upload_speed(db, task.id, &record.torrent_hash, 10).await;
+            let avg_1min = get_recent_avg_upload_speed(db, task.id, &record.torrent_hash, 1).await;
+            match (avg_10min, avg_1min) {
                 // 仅在有足够流量样本时才评估该规则，避免重启/采集滞后导致
                 // 速度被当成 0 从而误删正常做种的种子。
-                Some(avg_speed) if active_enough => {
-                    let avg_kbs = avg_speed / 1024.0;
-                    let passed = avg_kbs < min_speed;
+                (Some(avg_10min), Some(avg_1min)) if active_enough => {
+                    let avg_10min_kbs = avg_10min / 1024.0;
+                    let avg_1min_kbs = avg_1min / 1024.0;
+                    let passed_10min = avg_10min_kbs < min_speed;
+                    let passed_1min = avg_1min_kbs < min_speed;
+                    let passed = passed_10min && passed_1min;
                     rule_results.push(passed);
                     rule_details.push(format!(
-                        "近10min上传 {:.1}KB/s {} {:.1}KB/s",
-                        avg_kbs,
-                        if passed { "<" } else { ">=" },
+                        "近10min上传 {:.1}KB/s {} {:.1}KB/s，近1min上传 {:.1}KB/s {} {:.1}KB/s",
+                        avg_10min_kbs,
+                        if passed_10min { "<" } else { ">=" },
+                        min_speed,
+                        avg_1min_kbs,
+                        if passed_1min { "<" } else { ">=" },
                         min_speed
                     ));
                     if passed {
                         reasons.push(format!(
-                            "近10分钟平均上传 {:.1}KB/s < {:.1}KB/s",
-                            avg_kbs, min_speed
+                            "近10分钟平均上传 {:.1}KB/s < {:.1}KB/s 且近1分钟平均上传 {:.1}KB/s < {:.1}KB/s",
+                            avg_10min_kbs, min_speed, avg_1min_kbs, min_speed
                         ));
                     }
                 }
-                Some(_) => {
+                (Some(_), Some(_)) => {
                     rule_details.push(format!(
                         "活跃 {:.0}s < 600s，跳过速度规则",
                         dl_info.time_active
                     ));
                 }
-                None => {
-                    rule_details.push("流量样本不足，跳过速度规则".to_string());
+                (None, Some(_)) => {
+                    rule_details.push("近10分钟流量样本不足，跳过速度规则".to_string());
+                }
+                (Some(_), None) => {
+                    rule_details.push("近1分钟流量样本不足，跳过速度规则".to_string());
+                }
+                (None, None) => {
+                    rule_details.push("近10分钟和近1分钟流量样本不足，跳过速度规则".to_string());
                 }
             }
         }
@@ -300,10 +314,15 @@ fn find_matching_downloader_torrent<'a>(
         })
 }
 
-/// 获取最近10分钟的平均上传速度 (bytes/s)。
+/// 获取最近指定分钟数的平均上传速度 (bytes/s)。
 /// 流量样本不足 (< 2) 或时间戳无法解析时返回 `None`，调用方应跳过该规则而非按 0 处理。
-async fn get_recent_avg_upload_speed(db: &Database, task_id: i64, hash: &str) -> Option<f64> {
-    match db.get_recent_torrent_traffic(task_id, hash, 10).await {
+async fn get_recent_avg_upload_speed(
+    db: &Database,
+    task_id: i64,
+    hash: &str,
+    minutes: i64,
+) -> Option<f64> {
+    match db.get_recent_torrent_traffic(task_id, hash, minutes).await {
         Ok(snapshots) if snapshots.len() >= 2 => {
             let first = &snapshots[0];
             let last = &snapshots[snapshots.len() - 1];
