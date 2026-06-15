@@ -406,6 +406,18 @@ impl DownloaderClient for QBittorrentClient {
         })
     }
 
+    fn pause_torrent(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let hash = hash.to_string();
+        Box::pin(async move {
+            self.api_post_form("/api/v2/torrents/pause", &[("hashes", hash.as_str())])
+                .await?;
+            Ok(())
+        })
+    }
+
     fn delete_torrent(
         &self,
         hash: &str,

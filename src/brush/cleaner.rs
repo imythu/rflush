@@ -296,7 +296,7 @@ pub async fn evaluate_delete_rules(
 /// 不同 qBittorrent/libtorrent 版本对未完成种子的 `completion_on` 取值不一致
 /// （-1、0 或很大的正数），因此以「已下载 < 大小」作为可靠判据，
 /// 仅当大小未知 (<=0) 时回退到 `completion_on`。
-fn is_torrent_incomplete(dl_info: &TorrentInfo) -> bool {
+pub(crate) fn is_torrent_incomplete(dl_info: &TorrentInfo) -> bool {
     if dl_info.size > 0 {
         dl_info.downloaded < dl_info.size
     } else {

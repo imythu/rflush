@@ -128,6 +128,11 @@ pub trait DownloaderClient: Send + Sync {
         })
     }
 
+    fn pause_torrent(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
     fn delete_torrent(
         &self,
         hash: &str,
