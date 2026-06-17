@@ -125,6 +125,32 @@ pub async fn evaluate_delete_rules(
             }
         }
 
+        // 规则 3.5: 未完成种子的上传量阈值
+        // 对于未完成种子，分享率无法直接计算，改用 上传量 >= 目标分享率 × 种子大小 判断。
+        // 注意：这里比较的是上传量与 threshold（target_ratio * size），而非实际分享率。
+        if let Some(target_ratio) = task.target_ratio {
+            if is_torrent_incomplete(dl_info) && dl_info.size > 0 {
+                let threshold_bytes = (target_ratio * dl_info.size as f64) as i64;
+                let passed = dl_info.uploaded >= threshold_bytes;
+                rule_results.push(passed);
+                let uploaded_gb = dl_info.uploaded as f64 / (1024.0 * 1024.0 * 1024.0);
+                let threshold_gb = threshold_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                rule_details.push(format!(
+                    "未完成上传量 {:.2}GB {} {:.2}GB (分享率{:.2}×大小)",
+                    uploaded_gb,
+                    if passed { ">=" } else { "<" },
+                    threshold_gb,
+                    target_ratio
+                ));
+                if passed {
+                    reasons.push(format!(
+                        "未完成种子上传量 {:.2}GB >= {:.2}GB (分享率{:.2}×大小)",
+                        uploaded_gb, threshold_gb, target_ratio
+                    ));
+                }
+            }
+        }
+
         // 规则 4: 上传量
         if let Some(max_gb) = task.max_upload_gb {
             let uploaded_gb = dl_info.uploaded as f64 / (1024.0 * 1024.0 * 1024.0);

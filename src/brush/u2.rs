@@ -67,6 +67,33 @@ pub async fn get_u2_site_cookie(
     })
 }
 
+/// 使用站点 Cookie 预热 U2 会话，访问 /index.php 保持登录状态。
+async fn warmup_session(
+    task: &BrushTaskRecord,
+    cookie: &str,
+    http: &AppHttpClient,
+) {
+    let url = "https://u2.dmhy.org/index.php";
+    let referer = "https://u2.dmhy.org/index.php";
+    let mut buf = Vec::new();
+    let headers = u2_headers(cookie, referer, &mut buf);
+
+    match http.get_with_headers("u2-warmup", url, headers).await {
+        Ok(resp) if resp.status.is_success() => {
+            debug!("[刷流][{}] U2 会话预热成功", task.name);
+        }
+        Ok(resp) => {
+            warn!(
+                "[刷流][{}] U2 会话预热 HTTP {}",
+                task.name, resp.status.as_u16()
+            );
+        }
+        Err(e) => {
+            warn!("[刷流][{}] U2 会话预热失败: {}", task.name, e);
+        }
+    }
+}
+
 /// 使用站点 Cookie 拉取 U2 shoutbox HTML。
 pub async fn fetch_shoutbox_html(
     task: &BrushTaskRecord,
@@ -74,6 +101,9 @@ pub async fn fetch_shoutbox_html(
     http: &AppHttpClient,
 ) -> Result<String, String> {
     let cookie = get_u2_site_cookie(task, db).await?;
+
+    // 预热会话：先访问 /index.php 保持 Cookie 有效
+    warmup_session(task, &cookie, http).await;
 
     info!(
         "[刷流][{}] 使用站点 Cookie 拉取 U2 shoutbox: {}",

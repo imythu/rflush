@@ -15,7 +15,7 @@ use crate::brush::{
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
 use crate::downloader::AddTorrentOptions;
-use crate::downloader::{DownloaderClientPool, DownloaderRecord, TorrentInfo};
+use crate::downloader::{DownloaderClient, DownloaderClientPool, DownloaderRecord};
 use crate::net::client_factory;
 use crate::net::http::AppHttpClient;
 use crate::rss;
@@ -83,6 +83,110 @@ struct RunningBrushTask {
 }
 
 impl BrushScheduler {
+    /// 启动删种协程：先尝试暂停种子，暂停成功则等待 30s 后删除；暂停失败则直接结束。
+    /// 外层调用方立即返回，不阻塞。
+    fn spawn_delete_torrent(
+        &self,
+        client: Arc<dyn DownloaderClient>,
+        downloader: DownloaderRecord,
+        task_id: i64,
+        task_name: String,
+        hash: String,
+        reason: String,
+    ) {
+        let db = self.db.clone();
+        let pool = self.pool.clone();
+        let pending = self.pending_deletions.clone();
+
+        tokio::spawn(async move {
+            // 标记为冷却中
+            pending
+                .write()
+                .await
+                .insert((task_id, hash.clone()));
+
+            let short_hash = &hash[..8.min(hash.len())];
+
+            // 尝试暂停种子
+            info!(
+                "[删种][{}] hash={} → 尝试暂停种子",
+                task_name, short_hash
+            );
+            if let Err(e) = client.pause_torrent(&hash).await {
+                warn!(
+                    "[删种][{}] hash={} 暂停失败: {}，放弃本次删除",
+                    task_name, short_hash, e
+                );
+                pending.write().await.remove(&(task_id, hash));
+                return;
+            }
+
+            // 暂停成功，等待 30s 冷却
+            info!(
+                "[删种][{}] hash={} 暂停成功，等待 30s 后删除",
+                task_name, short_hash
+            );
+            sleep(Duration::from_secs(30)).await;
+
+            // 获取客户端（可能已过期，重新获取）
+            let client = match pool.get(&downloader).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        "[删种][{}] 冷却结束但获取客户端失败: hash={} err={}",
+                        task_name, short_hash, e
+                    );
+                    pending.write().await.remove(&(task_id, hash));
+                    return;
+                }
+            };
+
+            // 执行删除
+            let final_reason = match client.delete_torrent(&hash, true).await {
+                Ok(()) => reason,
+                Err(delete_err) => {
+                    warn!(
+                        "[删种][{}] 删除失败: hash={} err={}",
+                        task_name, short_hash, delete_err
+                    );
+                    format!("{} (删除接口返回错误: {})", reason, delete_err)
+                }
+            };
+
+            // 验证种子已不在下载器中
+            match client.list_torrents(None).await {
+                Ok(all) => {
+                    if all.iter().any(|t| t.hash.eq_ignore_ascii_case(&hash)) {
+                        warn!(
+                            "[删种][{}] 删除后种子仍存在，保持 active 状态",
+                            task_name
+                        );
+                        pending.write().await.remove(&(task_id, hash));
+                        return;
+                    }
+                    info!(
+                        "[删种][{}] 确认种子已不在下载器中，标记为已移除",
+                        task_name
+                    );
+                }
+                Err(list_err) => {
+                    warn!(
+                        "[删种][{}] 无法确认种子是否仍存在: {}，保持 active 状态",
+                        task_name, list_err
+                    );
+                    pending.write().await.remove(&(task_id, hash));
+                    return;
+                }
+            }
+
+            let _ = db
+                .update_brush_torrent_status(task_id, &hash, "removed", Some(&final_reason))
+                .await;
+
+            pending.write().await.remove(&(task_id, hash));
+        });
+    }
+
     pub fn new(
         db: Database,
         collector: Arc<DownloaderSnapshotCollector>,
@@ -253,6 +357,7 @@ impl BrushScheduler {
                         &hash[..8.min(hash.len())],
                         reason
                     );
+                    // 保存当前流量快照
                     if let Some(torrent) = dl_torrents
                         .iter()
                         .find(|t| t.hash.eq_ignore_ascii_case(hash))
@@ -282,115 +387,16 @@ impl BrushScheduler {
                                 ),
                             )
                             .await;
-
-                        // 若种子尚未停止，先暂停
-                        if !is_torrent_paused(torrent) {
-                            if let Err(e) = client.pause_torrent(hash).await {
-                                warn!(
-                                    "[删种][{}] 暂停种子失败: hash={} err={}，仍将等待冷却后尝试删除",
-                                    task.name,
-                                    &hash[..8.min(hash.len())],
-                                    e
-                                );
-                            }
-                        }
                     }
 
-                    // 标记为冷却中，避免下轮重复暂停
-                    self.pending_deletions
-                        .write()
-                        .await
-                        .insert((task.id, hash.clone()));
-
-                    // 启动后台任务：等待 30-60s 后删除
-                    let db = self.db.clone();
-                    let pool = self.pool.clone();
-                    let downloader = downloader.clone();
-                    let pending = self.pending_deletions.clone();
-                    let hash = hash.clone();
-                    let reason = reason.clone();
-                    let task_name = task.name.clone();
-                    let task_id = task.id;
-                    // 利用纳秒时间戳取模得到 30-60s 的伪随机延迟
-                    let delay_secs = (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos()
-                        % 31
-                        + 30) as u64;
-
-                    tokio::spawn(async move {
-                        info!(
-                            "[删种][{}] hash={} 等待 {}s 后删除",
-                            task_name,
-                            &hash[..8.min(hash.len())],
-                            delay_secs
-                        );
-                        sleep(Duration::from_secs(delay_secs)).await;
-
-                        let client = match pool.get(&downloader).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!(
-                                    "[删种][{}] 冷却结束但获取客户端失败: hash={} err={}",
-                                    task_name,
-                                    &hash[..8.min(hash.len())],
-                                    e
-                                );
-                                pending.write().await.remove(&(task_id, hash));
-                                return;
-                            }
-                        };
-
-                        let final_reason = match client.delete_torrent(&hash, true).await {
-                            Ok(()) => reason,
-                            Err(delete_err) => {
-                                warn!(
-                                    "[删种][{}] 删除失败: hash={} err={}",
-                                    task_name,
-                                    &hash[..8.min(hash.len())],
-                                    delete_err
-                                );
-                                format!("{} (删除接口返回错误: {})", reason, delete_err)
-                            }
-                        };
-
-                        match client.list_torrents(None).await {
-                            Ok(all) => {
-                                if all.iter().any(|t| t.hash.eq_ignore_ascii_case(&hash)) {
-                                    warn!(
-                                        "[删种][{}] 删除后种子仍存在，保持 active 状态",
-                                        task_name
-                                    );
-                                    pending.write().await.remove(&(task_id, hash));
-                                    return;
-                                }
-                                info!(
-                                    "[删种][{}] 确认种子已不在下载器中，标记为已移除",
-                                    task_name
-                                );
-                            }
-                            Err(list_err) => {
-                                warn!(
-                                    "[删种][{}] 无法确认种子是否仍存在: {}，保持 active 状态",
-                                    task_name, list_err
-                                );
-                                pending.write().await.remove(&(task_id, hash));
-                                return;
-                            }
-                        }
-
-                        let _ = db
-                            .update_brush_torrent_status(
-                                task_id,
-                                &hash,
-                                "removed",
-                                Some(&final_reason),
-                            )
-                            .await;
-
-                        pending.write().await.remove(&(task_id, hash));
-                    });
+                    self.spawn_delete_torrent(
+                        client.clone(),
+                        downloader.clone(),
+                        task.id,
+                        task.name.clone(),
+                        hash.clone(),
+                        reason.clone(),
+                    );
                 }
             }
 
@@ -538,14 +544,6 @@ impl BrushScheduler {
 
         Ok(())
     }
-}
-
-/// 判断种子是否已处于暂停/停止状态（qBittorrent 状态码）
-fn is_torrent_paused(torrent: &TorrentInfo) -> bool {
-    matches!(
-        torrent.state.as_str(),
-        "pausedUP" | "pausedDL" | "stoppedUP" | "stoppedDL" | "missingFiles"
-    )
 }
 
 fn has_delete_rules(task: &BrushTaskRecord) -> bool {
