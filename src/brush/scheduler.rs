@@ -83,7 +83,7 @@ struct RunningBrushTask {
 }
 
 impl BrushScheduler {
-    /// 启动删种协程：先尝试暂停种子，暂停成功则等待 30s 后删除；暂停失败则直接结束。
+    /// 启动删种协程：先尝试暂停种子，暂停成功则等待 60s 后删除；暂停失败则直接结束。
     /// 外层调用方立即返回，不阻塞。
     fn spawn_delete_torrent(
         &self,
@@ -121,12 +121,12 @@ impl BrushScheduler {
                 return;
             }
 
-            // 暂停成功，等待 30s 冷却
+            // 暂停成功，等待 60s 冷却
             info!(
-                "[删种][{}] hash={} 暂停成功，等待 30s 后删除",
+                "[删种][{}] hash={} 暂停成功，等待 60s 后删除",
                 task_name, short_hash
             );
-            sleep(Duration::from_secs(30)).await;
+            sleep(Duration::from_secs(60)).await;
 
             // 获取客户端（可能已过期，重新获取）
             let client = match pool.get(&downloader).await {
