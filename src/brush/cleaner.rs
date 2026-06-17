@@ -94,30 +94,34 @@ pub async fn evaluate_delete_rules(
             }
         }
 
-        // 规则 3: 分享率
+        // 规则 3: 分享率（仅针对已完成的种子）
         if let Some(target_ratio) = task.target_ratio {
-            // qBittorrent 在下载量为 0 时用 ratio = -1 表示「无限分享率」。
-            // 直接比较会让这类种子永远无法满足规则，需归一化为无穷大。
-            let effective_ratio = if dl_info.ratio < 0.0 {
-                f64::INFINITY
+            if is_torrent_incomplete(dl_info) {
+                rule_details.push("未完成下载，跳过分享率规则".to_string());
             } else {
-                dl_info.ratio
-            };
-            let passed = effective_ratio >= target_ratio;
-            rule_results.push(passed);
-            let ratio_text = if effective_ratio.is_infinite() {
-                "∞".to_string()
-            } else {
-                format!("{:.2}", effective_ratio)
-            };
-            rule_details.push(format!(
-                "分享率 {} {} {:.2}",
-                ratio_text,
-                if passed { ">=" } else { "<" },
-                target_ratio
-            ));
-            if passed {
-                reasons.push(format!("分享率 {} >= {:.2}", ratio_text, target_ratio));
+                // qBittorrent 在下载量为 0 时用 ratio = -1 表示「无限分享率」。
+                // 直接比较会让这类种子永远无法满足规则，需归一化为无穷大。
+                let effective_ratio = if dl_info.ratio < 0.0 {
+                    f64::INFINITY
+                } else {
+                    dl_info.ratio
+                };
+                let passed = effective_ratio >= target_ratio;
+                rule_results.push(passed);
+                let ratio_text = if effective_ratio.is_infinite() {
+                    "∞".to_string()
+                } else {
+                    format!("{:.2}", effective_ratio)
+                };
+                rule_details.push(format!(
+                    "分享率 {} {} {:.2}",
+                    ratio_text,
+                    if passed { ">=" } else { "<" },
+                    target_ratio
+                ));
+                if passed {
+                    reasons.push(format!("分享率 {} >= {:.2}", ratio_text, target_ratio));
+                }
             }
         }
 
