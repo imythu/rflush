@@ -129,7 +129,10 @@ impl QBittorrentClient {
         }
 
         if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let body_preview = truncate_for_log(&body, 200);
+            return Err(format!("HTTP {} url={} body={}", status, url, body_preview));
         }
 
         resp.text()
@@ -169,7 +172,10 @@ impl QBittorrentClient {
         }
 
         if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            let body_preview = truncate_for_log(&body, 200);
+            return Err(format!("HTTP {} url={} body={}", status, url, body_preview));
         }
 
         resp.text()
