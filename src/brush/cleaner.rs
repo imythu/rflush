@@ -306,7 +306,8 @@ pub async fn evaluate_delete_rules(
                 if is_and_mode { "AND" } else { "OR" },
                 reasons.join("; ")
             );
-            to_remove.push((record.torrent_hash.clone(), reasons.join("; ")));
+            // 使用下载器中的实际 hash，避免数据库 hash 与下载器 hash 不一致导致暂停/删除 404
+            to_remove.push((dl_info.hash.clone(), reasons.join("; ")));
         } else {
             info!(
                 "[删种评估][{}] hash={} name={} → 保留 [{}] {}",
