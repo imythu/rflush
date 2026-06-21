@@ -194,7 +194,7 @@ impl DownloaderClient for QBittorrentClient {
             let free = sync_data
                 .server_state
                 .as_ref()
-                .and_then(|s| s.get("free_spaceon_disk"))
+                .and_then(|s| s.get("free_space_on_disk"))
                 .and_then(|v| {
                     // serde_value::Value -> u64
                     serde_json::to_value(v).ok()?.as_u64()
