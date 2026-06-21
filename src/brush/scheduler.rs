@@ -83,7 +83,7 @@ struct RunningBrushTask {
 }
 
 impl BrushScheduler {
-    /// 启动删种协程：先尝试暂停种子，暂停成功则等待 60s 后删除；暂停失败则直接结束。
+    /// 启动删种协程：先尝试暂停种子，暂停成功则等待 60s 后删除；暂停返回 404 则种子已不存在，直接标记已移除；其他失败则放弃。
     /// 外层调用方立即返回，不阻塞。
     fn spawn_delete_torrent(
         &self,
@@ -112,13 +112,28 @@ impl BrushScheduler {
                 "[删种][{}] hash={} → 尝试暂停种子",
                 task_name, short_hash
             );
-            if let Err(e) = client.pause_torrent(&hash).await {
-                warn!(
-                    "[删种][{}] hash={} 暂停失败: {}，放弃本次删除",
-                    task_name, short_hash, e
-                );
-                pending.write().await.remove(&(task_id, hash));
-                return;
+            match client.pause_torrent(&hash).await {
+                Ok(()) => {}
+                Err(e) if e.contains("404") => {
+                    // 种子已不在下载器中，跳过暂停和冷却，直接标记为已移除
+                    info!(
+                        "[删种][{}] hash={} 暂停返回404（种子已不存在），直接标记为已移除",
+                        task_name, short_hash
+                    );
+                    let _ = db
+                        .update_brush_torrent_status(task_id, &hash, "removed", Some(&reason))
+                        .await;
+                    pending.write().await.remove(&(task_id, hash));
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "[删种][{}] hash={} 暂停失败: {}，放弃本次删除",
+                        task_name, short_hash, e
+                    );
+                    pending.write().await.remove(&(task_id, hash));
+                    return;
+                }
             }
 
             // 暂停成功，等待 60s 冷却
@@ -240,6 +255,7 @@ impl BrushScheduler {
         };
 
         if all_records.is_empty() {
+            info!("[cleaner] 无活跃种子记录，跳过本轮");
             return;
         }
 
