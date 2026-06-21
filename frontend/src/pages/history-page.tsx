@@ -29,14 +29,6 @@ export function HistoryPage({ history }: { history: DownloadRecord[] }) {
                   <div className="text-[9px] uppercase tracking-wider text-muted-foreground">重试 / 刷新</div>
                   <div className="text-[11px] font-medium text-foreground">{record.retry_count} / {record.refresh_count}</div>
                 </div>
-                <div className="space-y-0.5">
-                  <div className="text-[9px] uppercase tracking-wider text-muted-foreground">种子状态</div>
-                  <div className="text-[11px] font-medium text-foreground">{record.file_deleted ? "已删除" : "未删除"}</div>
-                </div>
-                <div className="col-span-2 space-y-0.5">
-                  <div className="text-[9px] uppercase tracking-wider text-muted-foreground">保存路径</div>
-                  <div className="text-[11px] font-medium text-foreground truncate">{record.saved_path ?? "-"}</div>
-                </div>
               </div>
             </div>
           ))}

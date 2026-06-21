@@ -1,15 +1,12 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
-use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::config::{AppConfig, RssConfig};
-use crate::download::naming::sanitize_component;
 use crate::engine::{AppRuntime, RssRuntime};
 use crate::error::AppError;
 use crate::logging::{TASK_LOG_CONTEXT, current_task_context, next_async_task_id};
@@ -18,13 +15,11 @@ use crate::rss::FeedSnapshot;
 
 pub async fn fetch_all_rss(
     config: &AppConfig,
-    cwd: &Path,
     app_runtime: &AppRuntime,
 ) -> Result<(Vec<Arc<RssRuntime>>, Vec<crate::history::RssRunSummary>), AppError> {
     let concurrency = config.global.max_concurrent_rss_fetches;
     let outcomes = stream::iter(config.rss.iter().cloned())
         .map(|rss_config| {
-            let cwd = cwd.to_path_buf();
             let app_runtime = app_runtime.clone();
             let task_context = format!(
                 "rss_fetch_task#{} rss={}",
@@ -32,20 +27,11 @@ pub async fn fetch_all_rss(
                 rss_config.name
             );
             TASK_LOG_CONTEXT.scope(task_context, async move {
-                let output_dir = cwd.join(sanitize_component(&rss_config.name));
-                fs::create_dir_all(&output_dir)
-                    .await
-                    .map_err(|source| AppError::CreateDir {
-                        path: output_dir.display().to_string(),
-                        source,
-                    })?;
-
                 let (snapshot, fetch_attempts) =
                     fetch_feed_snapshot_until_success(&rss_config, 1, &app_runtime).await;
 
                 Ok(Arc::new(RssRuntime {
                     config: rss_config,
-                    output_dir,
                     snapshot: Arc::new(RwLock::new(snapshot)),
                     refresh_lock: Arc::new(Mutex::new(())),
                     initial_fetch_attempts: fetch_attempts,

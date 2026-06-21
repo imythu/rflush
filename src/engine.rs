@@ -1,21 +1,20 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
-use tokio::fs;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::{AppConfig, GlobalConfig, RssConfig};
+use crate::db::Database;
 use crate::download::download_torrent;
-use crate::download::naming::{extract_guid_key_from_file_name, guid_key};
+use crate::downloader::DownloaderClientPool;
 use crate::error::AppError;
 use crate::history::{OutputLogger, RssRunSummary, RunHistory, RunSummary, TorrentRunRecord};
-use crate::logging::{TASK_LOG_CONTEXT, current_task_context, next_async_task_id};
+use crate::logging::{TASK_LOG_CONTEXT, next_async_task_id};
 use crate::net::http::AppHttpClient;
 use crate::net::rate_limiter::{RateLimitPolicy, SharedRateLimiter};
 use crate::rss::FeedSnapshot;
@@ -24,7 +23,6 @@ use crate::rss::feed::fetch_all_rss;
 #[derive(Clone)]
 pub struct RssRuntime {
     pub config: RssConfig,
-    pub output_dir: PathBuf,
     pub snapshot: Arc<RwLock<FeedSnapshot>>,
     pub refresh_lock: Arc<Mutex<()>>,
     pub initial_fetch_attempts: u32,
@@ -35,25 +33,28 @@ pub struct AppRuntime {
     pub global: GlobalConfig,
     pub http: Arc<AppHttpClient>,
     pub shutdown: Arc<AtomicBool>,
+    pub pool: Option<Arc<DownloaderClientPool>>,
+    pub db: Option<Database>,
 }
 
 #[derive(Clone)]
 pub struct DownloadEngine {
-    base_dir: PathBuf,
     limiter: Arc<SharedRateLimiter>,
 }
 
 impl DownloadEngine {
-    pub fn new(base_dir: PathBuf, limiter: Arc<SharedRateLimiter>) -> Self {
-        Self { base_dir, limiter }
+    pub fn new(limiter: Arc<SharedRateLimiter>) -> Self {
+        Self { limiter }
     }
 
     pub async fn run_with_shutdown(
         &self,
         config: AppConfig,
         shutdown: Arc<AtomicBool>,
+        pool: Option<Arc<DownloaderClientPool>>,
+        db: Option<Database>,
     ) -> Result<RunHistory, AppError> {
-        let app_runtime = self.build_app_runtime(&config, shutdown)?;
+        let app_runtime = self.build_app_runtime(&config, shutdown, pool, db)?;
         let run_started_at = Utc::now();
         let run_start_instant = std::time::Instant::now();
 
@@ -64,51 +65,23 @@ impl DownloadEngine {
         );
 
         let (runtimes, mut rss_summaries) =
-            fetch_all_rss(&config, &self.base_dir, &app_runtime).await?;
+            fetch_all_rss(&config, &app_runtime).await?;
 
         let mut torrent_records = Vec::new();
         let mut download_jobs = Vec::new();
         for runtime in &runtimes {
-            let downloaded_guid_keys = scan_downloaded_guid_keys(&runtime.output_dir).await?;
             let snapshot = runtime.snapshot.read().await;
             let mut items = snapshot.items.values().cloned().collect::<Vec<_>>();
             items.sort_by(|left, right| left.guid.cmp(&right.guid));
             let total_in_feed = items.len();
             drop(snapshot);
 
-            let mut skipped = 0usize;
-            let mut queued = 0usize;
             for item in items {
-                let key = guid_key(&item.guid);
-                if downloaded_guid_keys.contains(&key) {
-                    debug!(
-                        task = %current_task_context(),
-                        "[RSS下载][{}] 跳过已存在: guid={} title={}",
-                        runtime.config.name, item.guid, item.title
-                    );
-                    let mut record = TorrentRunRecord::new(
-                        runtime.config.name.clone(),
-                        item.guid.clone(),
-                        item.title.clone(),
-                    );
-                    record.final_status = crate::history::FinalStatus::SkippedExisting;
-                    record.final_message =
-                        Some("skipped because guid already exists in target directory".to_string());
-                    torrent_records.push(record);
-                    skipped += 1;
-                } else {
-                    debug!(
-                        task = %current_task_context(),
-                        "[RSS下载][{}] 加入下载队列: guid={} title={}",
-                        runtime.config.name, item.guid, item.title
-                    );
-                    download_jobs.push((runtime.clone(), item));
-                    queued += 1;
-                }
+                download_jobs.push((runtime.clone(), item));
             }
             info!(
-                "[RSS下载][{}] Feed 解析完成: 共 {} 条, 待下载 {}, 已跳过 {}",
-                runtime.config.name, total_in_feed, queued, skipped
+                "[RSS下载][{}] Feed 解析完成: 共 {} 条",
+                runtime.config.name, total_in_feed
             );
         }
 
@@ -184,6 +157,8 @@ impl DownloadEngine {
         &self,
         config: &AppConfig,
         shutdown: Arc<AtomicBool>,
+        pool: Option<Arc<DownloaderClientPool>>,
+        db: Option<Database>,
     ) -> Result<AppRuntime, AppError> {
         validate_config(config)?;
         let policy = RateLimitPolicy::new(
@@ -203,6 +178,8 @@ impl DownloadEngine {
             global: config.global.clone(),
             http,
             shutdown,
+            pool,
+            db,
         })
     }
 }
@@ -284,42 +261,4 @@ async fn build_rss_summaries(
         ));
     }
     summaries
-}
-
-async fn scan_downloaded_guid_keys(output_dir: &Path) -> Result<HashSet<String>, AppError> {
-    let mut keys = HashSet::new();
-    let mut entries = fs::read_dir(output_dir)
-        .await
-        .map_err(|source| AppError::ReadDir {
-            path: output_dir.display().to_string(),
-            source,
-        })?;
-
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|source| AppError::ReadDir {
-            path: output_dir.display().to_string(),
-            source,
-        })?
-    {
-        let file_type = entry
-            .file_type()
-            .await
-            .map_err(|source| AppError::ReadDir {
-                path: output_dir.display().to_string(),
-                source,
-            })?;
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if let Some(key) = extract_guid_key_from_file_name(&file_name) {
-            keys.insert(key);
-        }
-    }
-
-    Ok(keys)
 }

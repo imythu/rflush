@@ -1,14 +1,13 @@
 pub mod naming;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use tokio::fs;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
+use crate::downloader::AddTorrentOptions;
 use crate::engine::{AppRuntime, RssRuntime};
 use crate::history::{FinalStatus, TorrentRunRecord};
 use crate::logging::current_task_context;
@@ -70,28 +69,72 @@ pub async fn download_torrent(
         match try_download_once(&runtime, &item, &current_url, &app_runtime).await {
             Ok(success) => {
                 record.retry_count = attempt.saturating_sub(1);
-                record.saved_path = Some(success.saved_path.display().to_string());
-                record.file_name = Some(success.file_name.clone());
-                record.final_status = if success.skipped {
-                    FinalStatus::SkippedExisting
-                } else {
-                    FinalStatus::Success
-                };
+                record.final_status = FinalStatus::Success;
                 record.bytes = Some(success.bytes as u64);
-                if success.skipped {
-                    info!(
-                        task = %current_task_context(),
-                        "[RSS下载][{}] 跳过(文件已存在): guid={} file={}",
-                        runtime.config.name, item.guid, success.file_name
-                    );
-                } else {
-                    info!(
-                        task = %current_task_context(),
-                        "[RSS下载][{}] ✓ 下载成功: guid={} file={} size={}B 重试{}次",
-                        runtime.config.name, item.guid, success.file_name,
-                        success.bytes, attempt.saturating_sub(1)
-                    );
+                info!(
+                    task = %current_task_context(),
+                    "[RSS下载][{}] ✓ 下载成功: guid={} title={} size={}B 重试{}次",
+                    runtime.config.name, item.guid, item.title,
+                    success.bytes, attempt.saturating_sub(1)
+                );
+
+                // 将种子添加到 qBittorrent
+                if let Some(downloader_id) = runtime.config.downloader_id {
+                    if let (Some(pool), Some(db)) = (&app_runtime.pool, &app_runtime.db) {
+                        match db.get_downloader(downloader_id).await {
+                            Ok(Some(downloader_record)) => {
+                                match pool.get(&downloader_record).await {
+                                    Ok(client) => {
+                                        let filename = success.file_name.clone();
+                                        let options = AddTorrentOptions {
+                                            tags: Some("rflush-rss".to_string()),
+                                            paused: false,
+                                            ..Default::default()
+                                        };
+                                        match client.add_torrent(success.torrent_data, &filename, &options).await {
+                                            Ok(()) => {
+                                                info!(
+                                                    task = %current_task_context(),
+                                                    "[RSS下载][{}] ✓ 已添加到下载器: downloader_id={} guid={} file={}",
+                                                    runtime.config.name, downloader_id, item.guid, filename
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    task = %current_task_context(),
+                                                    "[RSS下载][{}] 添加到下载器失败: downloader_id={} guid={} err={}",
+                                                    runtime.config.name, downloader_id, item.guid, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            task = %current_task_context(),
+                                            "[RSS下载][{}] 获取下载器客户端失败: downloader_id={} err={}",
+                                            runtime.config.name, downloader_id, e
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    task = %current_task_context(),
+                                    "[RSS下载][{}] 下载器不存在: downloader_id={}",
+                                    runtime.config.name, downloader_id
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    task = %current_task_context(),
+                                    "[RSS下载][{}] 查询下载器失败: downloader_id={} err={}",
+                                    runtime.config.name, downloader_id, e
+                                );
+                            }
+                        }
+                    }
                 }
+
                 return record;
             }
             Err(DownloadAttemptError::ExpiredLink(_message)) => {
@@ -179,9 +222,8 @@ pub async fn download_torrent(
 
 struct DownloadSuccess {
     file_name: String,
-    saved_path: PathBuf,
     bytes: usize,
-    skipped: bool,
+    torrent_data: Vec<u8>,
 }
 
 async fn try_download_once(
@@ -258,33 +300,10 @@ async fn try_download_once(
 
     let original_name = extract_original_filename(&response.headers);
     let file_name = build_target_file_name(original_name.as_deref(), item);
-    let output_path = runtime.output_dir.join(&file_name);
-
-    if fs::try_exists(&output_path)
-        .await
-        .map_err(|error| DownloadAttemptError::Fatal(error.to_string()))?
-    {
-        return Ok(DownloadSuccess {
-            file_name,
-            saved_path: output_path,
-            bytes: response.body.len(),
-            skipped: true,
-        });
-    }
-
-    // Atomic write: write to .tmp then rename to prevent partial files.
-    let tmp_path = output_path.with_extension("torrent.tmp");
-    fs::write(&tmp_path, &response.body)
-        .await
-        .map_err(|error| DownloadAttemptError::Fatal(error.to_string()))?;
-    fs::rename(&tmp_path, &output_path)
-        .await
-        .map_err(|error| DownloadAttemptError::Fatal(error.to_string()))?;
 
     Ok(DownloadSuccess {
         file_name,
-        saved_path: output_path,
         bytes: response.body.len(),
-        skipped: false,
+        torrent_data: response.body.to_vec(),
     })
 }

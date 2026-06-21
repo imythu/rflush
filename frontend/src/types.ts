@@ -31,6 +31,7 @@ export type RssSubscription = {
   name: string;
   url: string;
   enabled: boolean;
+  downloader_id: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -46,11 +47,8 @@ export type DownloadRecord = {
   retry_count: number;
   refresh_count: number;
   bytes: number | null;
-  file_name: string | null;
-  saved_path: string | null;
   final_status: string;
   final_message: string | null;
-  file_deleted: boolean;
 };
 
 export type JobInfo = {

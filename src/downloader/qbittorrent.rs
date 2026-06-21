@@ -1,24 +1,16 @@
-use std::sync::Arc;
-
-use reqwest::Client;
-use reqwest::header::{COOKIE, USER_AGENT};
-use reqwest::multipart;
-use serde_json::Value;
-use tokio::sync::Mutex;
-use tracing::{debug, warn};
-
-use super::{AddTorrentOptions, DownloaderClient, DownloaderTestResult, TorrentInfo};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+use qbit_rs::model::{AddTorrentArg, GetTorrentListArg, TorrentSource, TorrentFile};
+use qbit_rs::Qbit;
+use reqwest::Client;
+use tracing::debug;
+
+use super::{AddTorrentOptions, DownloaderClient, DownloaderTestResult, TorrentInfo};
 
 pub struct QBittorrentClient {
-    base_url: String,
-    username: String,
-    password: String,
-    client: Client,
-    cookie: Arc<Mutex<Option<String>>>,
+    qb: Qbit,
 }
 
 impl QBittorrentClient {
@@ -29,7 +21,7 @@ impl QBittorrentClient {
         proxy: Option<&str>,
     ) -> Result<Self, String> {
         let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none());
         if let Some(proxy_url) = proxy.map(str::trim).filter(|v| !v.is_empty()) {
             let proxy = reqwest::Proxy::all(proxy_url)
@@ -39,257 +31,12 @@ impl QBittorrentClient {
         let client = builder
             .build()
             .map_err(|e| format!("构建 qBittorrent HTTP 客户端失败: {}", e))?;
-        Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            username,
-            password,
-            client,
-            cookie: Arc::new(Mutex::new(None)),
-        })
-    }
 
-    async fn login(&self) -> Result<String, String> {
-        let url = format!("{}/api/v2/auth/login", self.base_url);
-        debug!("qBittorrent login: {}", url);
+        let endpoint = base_url.trim_end_matches('/');
+        let credential = qbit_rs::model::Credential::new(username, password);
+        let qb = Qbit::new_with_client(endpoint, credential, client);
 
-        let resp = self
-            .client
-            .post(&url)
-            .header(USER_AGENT, BROWSER_UA)
-            .form(&[
-                ("username", self.username.as_str()),
-                ("password", self.password.as_str()),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("连接失败: {}", e))?;
-
-        let cookie_header = resp
-            .headers()
-            .get_all("set-cookie")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .find(|s| s.contains("SID="))
-            .map(|s| s.split(';').next().unwrap_or(s).to_string())
-            .ok_or_else(|| {
-                let body = "用户名或密码错误".to_string();
-                body
-            })?;
-
-        let mut lock = self.cookie.lock().await;
-        *lock = Some(cookie_header.clone());
-        Ok(cookie_header)
-    }
-
-    async fn ensure_cookie(&self) -> Result<String, String> {
-        // 快速路径：cookie 已存在
-        {
-            let lock = self.cookie.lock().await;
-            if let Some(c) = lock.as_ref() {
-                return Ok(c.clone());
-            }
-        }
-        // 慢路径：需要登录获取 cookie
-        let new_cookie = self.login().await?;
-        // 二次检查：login() 已设置 cookie，但如果并发调用者
-        // 同时执行了 login，我们的 cookie 可能被覆盖。
-        // 从锁中重新读取以获取最终值。
-        let lock = self.cookie.lock().await;
-        Ok(lock.as_ref().cloned().unwrap_or(new_cookie))
-    }
-
-    async fn api_get(&self, path: &str) -> Result<String, String> {
-        let cookie = self.ensure_cookie().await?;
-        let url = format!("{}{}", self.base_url, path);
-
-        let resp = self
-            .client
-            .get(&url)
-            .header(USER_AGENT, BROWSER_UA)
-            .header(COOKIE, &cookie)
-            .send()
-            .await
-            .map_err(|e| format!("请求失败: {}", e))?;
-
-        if resp.status().as_u16() == 403 {
-            // Cookie 过期，重新登录
-            let new_cookie = self.login().await?;
-            let resp = self
-                .client
-                .get(&url)
-                .header(USER_AGENT, BROWSER_UA)
-                .header(COOKIE, &new_cookie)
-                .send()
-                .await
-                .map_err(|e| format!("请求失败: {}", e))?;
-            return resp
-                .text()
-                .await
-                .map_err(|e| format!("读取响应失败: {}", e));
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let body_preview = truncate_for_log(&body, 200);
-            return Err(format!("HTTP {} url={} body={}", status, url, body_preview));
-        }
-
-        resp.text()
-            .await
-            .map_err(|e| format!("读取响应失败: {}", e))
-    }
-
-    async fn api_post_form(&self, path: &str, params: &[(&str, &str)]) -> Result<String, String> {
-        let cookie = self.ensure_cookie().await?;
-        let url = format!("{}{}", self.base_url, path);
-
-        let resp = self
-            .client
-            .post(&url)
-            .header(USER_AGENT, BROWSER_UA)
-            .header(COOKIE, &cookie)
-            .form(params)
-            .send()
-            .await
-            .map_err(|e| format!("请求失败: {}", e))?;
-
-        if resp.status().as_u16() == 403 {
-            let new_cookie = self.login().await?;
-            let resp = self
-                .client
-                .post(&url)
-                .header(USER_AGENT, BROWSER_UA)
-                .header(COOKIE, &new_cookie)
-                .form(params)
-                .send()
-                .await
-                .map_err(|e| format!("请求失败: {}", e))?;
-            return resp
-                .text()
-                .await
-                .map_err(|e| format!("读取响应失败: {}", e));
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            let body_preview = truncate_for_log(&body, 200);
-            return Err(format!("HTTP {} url={} body={}", status, url, body_preview));
-        }
-
-        resp.text()
-            .await
-            .map_err(|e| format!("读取响应失败: {}", e))
-    }
-
-    /// 发送 multipart 请求，支持 cookie 过期后重新构建表单并重试。
-    /// `make_form` 是一个可以被多次调用的闭包，用于重建 multipart 表单。
-    async fn post_multipart_with_retry<F>(
-        &self,
-        path: &str,
-        make_form: F,
-    ) -> Result<String, String>
-    where
-        F: Fn() -> Result<multipart::Form, String> + Send,
-    {
-        let cookie = self.ensure_cookie().await?;
-        let url = format!("{}{}", self.base_url, path);
-        debug!("qBittorrent POST multipart: {}", url);
-
-        let form = make_form()?;
-        let resp = self
-            .client
-            .post(&url)
-            .header(USER_AGENT, BROWSER_UA)
-            .header(COOKIE, &cookie)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| {
-                warn!(
-                    "qBittorrent multipart request failed: url={} err={}",
-                    url, e
-                );
-                format!("请求失败: url={} err={}", url, e)
-            })?;
-
-        if resp.status().as_u16() == 403 {
-            // Cookie 过期，重新登录后重试
-            let new_cookie = self.login().await?;
-            let form = make_form()?;
-            let resp = self
-                .client
-                .post(&url)
-                .header(USER_AGENT, BROWSER_UA)
-                .header(COOKIE, &new_cookie)
-                .multipart(form)
-                .send()
-                .await
-                .map_err(|e| {
-                    warn!(
-                        "qBittorrent multipart retry failed: url={} err={}",
-                        url, e
-                    );
-                    format!("请求失败: url={} err={}", url, e)
-                })?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!(
-                    "qBittorrent multipart retry failed: url={} status={} body={}",
-                    url,
-                    status,
-                    truncate_for_log(&body, 300)
-                );
-                return Err(format!(
-                    "HTTP {} url={} body={}",
-                    status,
-                    url,
-                    truncate_for_log(&body, 300)
-                ));
-            }
-
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| format!("读取响应失败: url={} err={}", url, e))?;
-            debug!(
-                "qBittorrent multipart retry succeeded: url={} body={}",
-                url,
-                truncate_for_log(&body, 120)
-            );
-            return Ok(body);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!(
-                "qBittorrent multipart request failed: url={} status={} body={}",
-                url,
-                status,
-                truncate_for_log(&body, 300)
-            );
-            return Err(format!(
-                "HTTP {} url={} body={}",
-                status,
-                url,
-                truncate_for_log(&body, 300)
-            ));
-        }
-
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| format!("读取响应失败: url={} err={}", url, e))?;
-        debug!(
-            "qBittorrent multipart request succeeded: url={} body={}",
-            url,
-            truncate_for_log(&body, 120)
-        );
-        Ok(body)
+        Ok(Self { qb })
     }
 }
 
@@ -298,11 +45,12 @@ impl DownloaderClient for QBittorrentClient {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<DownloaderTestResult, String>> + Send + '_>> {
         Box::pin(async move {
-            self.login().await?;
+            self.qb.login(false).await.map_err(|e| format!("登录失败: {}", e))?;
             let version = self
-                .api_get("/api/v2/app/version")
+                .qb
+                .get_version()
                 .await
-                .unwrap_or_default();
+                .map_err(|e| format!("获取版本失败: {}", e))?;
             let free_space = self.get_free_space(None).await.ok();
             Ok(DownloaderTestResult {
                 success: true,
@@ -323,56 +71,41 @@ impl DownloaderClient for QBittorrentClient {
         let options = options.clone();
         Box::pin(async move {
             debug!(
-                "qBittorrent add_torrent: filename={} size={} save_path={:?} tags={:?} category={:?} paused={} dl_limit={:?} ul_limit={:?} ratio_limit={:?} inactive_seeding_time_limit={:?}",
+                "qBittorrent add_torrent: filename={} size={} save_path={:?} tags={:?} category={:?} paused={}",
                 filename,
                 torrent_data.len(),
                 options.save_path,
                 options.tags,
                 options.category,
                 options.paused,
-                options.download_limit,
-                options.upload_limit,
-                options.ratio_limit,
-                options.inactive_seeding_time_limit
             );
 
-            // 使用闭包构建表单，支持 cookie 过期重试时重建表单
-            self.post_multipart_with_retry("/api/v2/torrents/add", || {
-                let file_part = multipart::Part::bytes(torrent_data.clone())
-                    .file_name(filename.clone())
-                    .mime_str("application/x-bittorrent")
-                    .map_err(|e| format!("构造请求失败: {}", e))?;
+            let arg = AddTorrentArg {
+                source: TorrentSource::TorrentFiles {
+                    torrents: vec![TorrentFile {
+                        filename,
+                        data: torrent_data,
+                    }],
+                },
+                savepath: options.save_path,
+                tags: options.tags,
+                category: options.category,
+                download_limit: options.download_limit,
+                up_limit: options.upload_limit,
+                ratio_limit: options.ratio_limit,
+                seeding_time_limit: options.inactive_seeding_time_limit,
+                paused: if options.paused {
+                    Some("true".to_string())
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
 
-                let mut form = multipart::Form::new().part("torrents", file_part);
-
-                if let Some(path) = &options.save_path {
-                    form = form.text("savepath", path.clone());
-                }
-                if let Some(tags) = &options.tags {
-                    form = form.text("tags", tags.clone());
-                }
-                if let Some(category) = &options.category {
-                    form = form.text("category", category.clone());
-                }
-                if let Some(dl) = options.download_limit {
-                    form = form.text("dlLimit", dl.to_string());
-                }
-                if let Some(ul) = options.upload_limit {
-                    form = form.text("upLimit", ul.to_string());
-                }
-                if let Some(rl) = options.ratio_limit {
-                    form = form.text("ratioLimit", rl.to_string());
-                }
-                if let Some(istl) = options.inactive_seeding_time_limit {
-                    form = form.text("inactiveSeedingTimeLimit", istl.to_string());
-                }
-                if options.paused {
-                    form = form.text("paused", "true".to_string());
-                }
-
-                Ok(form)
-            })
-            .await?;
+            self.qb
+                .add_torrent(arg)
+                .await
+                .map_err(|e| format!("添加种子失败: {}", e))?;
             Ok(())
         })
     }
@@ -383,13 +116,16 @@ impl DownloaderClient for QBittorrentClient {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + '_>> {
         let tag = tag.map(|t| t.to_string());
         Box::pin(async move {
-            let path = match &tag {
-                Some(t) => format!("/api/v2/torrents/info?tag={}", urlencoding::encode(t)),
-                None => "/api/v2/torrents/info".to_string(),
+            let arg = GetTorrentListArg {
+                tag,
+                ..Default::default()
             };
-
-            let text = self.api_get(&path).await?;
-            parse_torrent_info_list(&text)
+            let torrents = self
+                .qb
+                .get_torrent_list(arg)
+                .await
+                .map_err(|e| format!("获取种子列表失败: {}", e))?;
+            Ok(torrents.into_iter().map(TorrentInfo::from).collect())
         })
     }
 
@@ -402,13 +138,16 @@ impl DownloaderClient for QBittorrentClient {
                 return Ok(Vec::new());
             }
             let joined_hashes = hashes.join("|");
-            let path = format!(
-                "/api/v2/torrents/info?hashes={}",
-                urlencoding::encode(&joined_hashes)
-            );
-
-            let text = self.api_get(&path).await?;
-            parse_torrent_info_list(&text)
+            let arg = GetTorrentListArg {
+                hashes: Some(joined_hashes),
+                ..Default::default()
+            };
+            let torrents = self
+                .qb
+                .get_torrent_list(arg)
+                .await
+                .map_err(|e| format!("获取种子列表失败: {}", e))?;
+            Ok(torrents.into_iter().map(TorrentInfo::from).collect())
         })
     }
 
@@ -418,8 +157,10 @@ impl DownloaderClient for QBittorrentClient {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         let hash = hash.to_string();
         Box::pin(async move {
-            self.api_post_form("/api/v2/torrents/pause", &[("hashes", hash.as_str())])
-                .await?;
+            self.qb
+                .stop_torrents(vec![hash])
+                .await
+                .map_err(|e| format!("暂停种子失败: {}", e))?;
             Ok(())
         })
     }
@@ -431,33 +172,33 @@ impl DownloaderClient for QBittorrentClient {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         let hash = hash.to_string();
         Box::pin(async move {
-            self.api_post_form(
-                "/api/v2/torrents/delete",
-                &[
-                    ("hashes", hash.as_str()),
-                    ("deleteFiles", if delete_files { "true" } else { "false" }),
-                ],
-            )
-            .await?;
+            self.qb
+                .delete_torrents(vec![hash], delete_files)
+                .await
+                .map_err(|e| format!("删除种子失败: {}", e))?;
             Ok(())
         })
     }
 
     fn get_free_space(
         &self,
-        path: Option<&str>,
+        _path: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>> {
-        let _path = path.map(|p| p.to_string());
         Box::pin(async move {
-            let query = "/api/v2/sync/maindata?rid=0";
-            let text = self.api_get(query).await?;
-            let json: Value =
-                serde_json::from_str(&text).map_err(|_| "解析响应失败".to_string())?;
+            let sync_data = self
+                .qb
+                .sync(None)
+                .await
+                .map_err(|e| format!("获取同步数据失败: {}", e))?;
 
-            let free = json
-                .get("server_state")
-                .and_then(|s| s.get("free_space_on_disk"))
-                .and_then(|v| v.as_u64())
+            let free = sync_data
+                .server_state
+                .as_ref()
+                .and_then(|s| s.get("free_spaceon_disk"))
+                .and_then(|v| {
+                    // serde_value::Value -> u64
+                    serde_json::to_value(v).ok()?.as_u64()
+                })
                 .unwrap_or(0);
 
             Ok(free)
@@ -465,49 +206,35 @@ impl DownloaderClient for QBittorrentClient {
     }
 }
 
-fn parse_torrent_info_list(text: &str) -> Result<Vec<TorrentInfo>, String> {
-    let items: Vec<Value> = serde_json::from_str(text).map_err(|_| "解析种子列表失败".to_string())?;
-
-    let mut result = Vec::with_capacity(items.len());
-    for item in &items {
-        result.push(TorrentInfo {
-            hash: item["hash"].as_str().unwrap_or_default().to_string(),
-            name: item["name"].as_str().unwrap_or_default().to_string(),
-            size: item["size"].as_i64().unwrap_or(0),
-            uploaded: item["uploaded"].as_i64().unwrap_or(0),
-            downloaded: item["downloaded"].as_i64().unwrap_or(0),
-            upload_speed: item["upspeed"].as_i64().unwrap_or(0),
-            download_speed: item["dlspeed"].as_i64().unwrap_or(0),
-            ratio: item["ratio"].as_f64().unwrap_or(0.0),
-            state: item["state"].as_str().unwrap_or_default().to_string(),
-            added_on: item["added_on"].as_i64().unwrap_or(0),
-            completion_on: item["completion_on"].as_i64().unwrap_or(0),
-            num_seeds: item["num_seeds"].as_i64().unwrap_or(0) as i32,
-            num_leechs: item["num_leechs"].as_i64().unwrap_or(0) as i32,
-            save_path: item["save_path"]
-                .as_str()
-                .or_else(|| item["content_path"].as_str())
-                .unwrap_or_default()
-                .to_string(),
-            tags: item["tags"].as_str().unwrap_or_default().to_string(),
-            category: item["category"].as_str().unwrap_or_default().to_string(),
-            time_active: item["time_active"].as_i64().unwrap_or(0),
-            last_activity: item["last_activity"].as_i64().unwrap_or(0),
-        });
-    }
-
-    Ok(result)
-}
-
-fn truncate_for_log(input: &str, max_len: usize) -> String {
-    if input.len() <= max_len {
-        input.to_string()
-    } else {
-        // 找到不超过 max_len 的最大字符边界，避免在多字节 UTF-8 序列中间切断。
-        let mut end = max_len;
-        while end > 0 && !input.is_char_boundary(end) {
-            end -= 1;
+impl From<qbit_rs::model::Torrent> for TorrentInfo {
+    fn from(t: qbit_rs::model::Torrent) -> Self {
+        TorrentInfo {
+            hash: t.hash.unwrap_or_default(),
+            name: t.name.unwrap_or_default(),
+            size: t.size.unwrap_or(0),
+            uploaded: t.uploaded.unwrap_or(0),
+            downloaded: t.downloaded.unwrap_or(0),
+            upload_speed: t.upspeed.unwrap_or(0),
+            download_speed: t.dlspeed.unwrap_or(0),
+            ratio: t.ratio.unwrap_or(0.0),
+            state: t
+                .state
+                .and_then(|s| serde_json::to_value(&s).ok())
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            added_on: t.added_on.unwrap_or(0),
+            completion_on: t.completion_on.unwrap_or(0),
+            num_seeds: t.num_seeds.unwrap_or(0) as i32,
+            num_leechs: t.num_leechs.unwrap_or(0) as i32,
+            save_path: t
+                .save_path
+                .clone()
+                .or_else(|| t.content_path.clone())
+                .unwrap_or_default(),
+            tags: t.tags.unwrap_or_default(),
+            category: t.category.unwrap_or_default(),
+            time_active: t.time_active.unwrap_or(0),
+            last_activity: t.last_activity.unwrap_or(0),
         }
-        format!("{}...", &input[..end])
     }
 }

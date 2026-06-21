@@ -92,6 +92,8 @@ impl TimeUnit {
 pub struct RssConfig {
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub downloader_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,7 @@ pub struct RssSubscription {
     pub name: String,
     pub url: String,
     pub enabled: bool,
+    pub downloader_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }

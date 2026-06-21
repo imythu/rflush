@@ -30,11 +30,8 @@ pub struct DownloadHistoryRecord {
     pub retry_count: u32,
     pub refresh_count: u32,
     pub bytes: Option<u64>,
-    pub file_name: Option<String>,
-    pub saved_path: Option<String>,
     pub final_status: String,
     pub final_message: Option<String>,
-    pub file_deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,7 +171,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, url, enabled, created_at, updated_at FROM rss_subscriptions ORDER BY id DESC",
+                    "SELECT id, name, url, enabled, downloader_id, created_at, updated_at FROM rss_subscriptions ORDER BY id DESC",
                 )
                 .map_err(sql_error)?;
             let rows = stmt
@@ -197,7 +194,7 @@ impl Database {
         tokio::task::spawn_blocking(move || -> Result<Option<RssSubscription>, AppError> {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, url, enabled, created_at, updated_at FROM rss_subscriptions WHERE id = ?",
+                "SELECT id, name, url, enabled, downloader_id, created_at, updated_at FROM rss_subscriptions WHERE id = ?",
                 [id],
                 map_rss_subscription,
             )
@@ -218,13 +215,13 @@ impl Database {
             let conn = open_connection(&path)?;
             let now = Utc::now().to_rfc3339();
             conn.execute(
-                "INSERT INTO rss_subscriptions (name, url, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                params![rss.name, rss.url, if enabled { 1 } else { 0 }, now, now],
+                "INSERT INTO rss_subscriptions (name, url, enabled, downloader_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                params![rss.name, rss.url, if enabled { 1 } else { 0 }, rss.downloader_id, now, now],
             )
             .map_err(sql_error)?;
             let id = conn.last_insert_rowid();
             conn.query_row(
-                "SELECT id, name, url, enabled, created_at, updated_at FROM rss_subscriptions WHERE id = ?",
+                "SELECT id, name, url, enabled, downloader_id, created_at, updated_at FROM rss_subscriptions WHERE id = ?",
                 [id],
                 map_rss_subscription,
             )
@@ -496,30 +493,6 @@ impl Database {
                 )
                 .map_err(sql_error)?;
             Ok(total as usize)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn mark_task_records_deleted(&self, task_ids: &[i64]) -> Result<(), AppError> {
-        if task_ids.is_empty() {
-            return Ok(());
-        }
-
-        let path = self.path.clone();
-        let task_ids = task_ids.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction().map_err(sql_error)?;
-            for task_id in task_ids {
-                tx.execute(
-                    "UPDATE download_records SET file_deleted = 1 WHERE task_id = ? AND saved_path IS NOT NULL",
-                    [task_id],
-                )
-                .map_err(sql_error)?;
-            }
-            tx.commit().map_err(sql_error)?;
-            Ok(())
         })
         .await
         .map_err(join_error)?
@@ -2475,6 +2448,12 @@ impl Database {
             )?;
             ensure_column(
                 &conn,
+                "rss_subscriptions",
+                "downloader_id",
+                "ALTER TABLE rss_subscriptions ADD COLUMN downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL",
+            )?;
+            ensure_column(
+                &conn,
                 "download_runs",
                 "task_id",
                 "ALTER TABLE download_runs ADD COLUMN task_id INTEGER REFERENCES rss_subscriptions(id) ON DELETE SET NULL",
@@ -2588,8 +2567,8 @@ fn insert_record(
             record.retry_count as i64,
             record.refresh_count as i64,
             record.bytes.map(|v| v as i64),
-            record.file_name,
-            record.saved_path,
+            None::<String>,
+            None::<String>,
             final_status_name(record.final_status),
             record.final_message,
         ],
@@ -2604,8 +2583,9 @@ fn map_rss_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSubscrip
         name: row.get(1)?,
         url: row.get(2)?,
         enabled: row.get::<_, i64>(3)? != 0,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
+        downloader_id: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -2655,11 +2635,8 @@ fn map_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadHisto
         retry_count: row.get::<_, i64>(7)? as u32,
         refresh_count: row.get::<_, i64>(8)? as u32,
         bytes: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-        file_name: row.get(10)?,
-        saved_path: row.get(11)?,
         final_status: row.get(12)?,
         final_message: row.get(13)?,
-        file_deleted: row.get::<_, i64>(14)? != 0,
     })
 }
 

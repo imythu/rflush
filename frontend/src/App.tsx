@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { API_BASE, APP_VERSION, api, defaultSettings } from "@/lib/api";
-import type { DownloadRecord, GlobalConfig, RssSubscription } from "@/types";
+import type { DownloadRecord, DownloaderRecord, GlobalConfig, RssSubscription } from "@/types";
 
 const MAX_LOG_LINES = 500;
 const LOG_FLUSH_INTERVAL_MS = 250;
@@ -203,9 +203,9 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
-  const [taskForm, setTaskForm] = useState({ name: "", url: "", autoStart: true });
+  const [taskForm, setTaskForm] = useState({ name: "", url: "", autoStart: true, downloaderId: 0 });
+  const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
-  const [deleteFiles, setDeleteFiles] = useState(false);
   const [currentTime, setCurrentTime] = useState(() => new Date());
   const [groupOpen, setGroupOpen] = useState<Record<"brush" | "rss", boolean>>({
     brush: true,
@@ -246,8 +246,12 @@ export default function App() {
         break;
       }
       case "tasks": {
-        const rss = await api<RssSubscription[]>("/api/rss");
+        const [rss, dl] = await Promise.all([
+          api<RssSubscription[]>("/api/rss"),
+          api<DownloaderRecord[]>("/api/downloaders"),
+        ]);
         setTasks(rss);
+        setDownloaders(dl);
         break;
       }
       case "history": {
@@ -409,11 +413,12 @@ export default function App() {
           name: taskForm.name,
           url: taskForm.url,
           auto_start: taskForm.autoStart,
+          downloader_id: taskForm.downloaderId || null,
         }),
       }),
       taskForm.autoStart ? "任务已添加并自动启动" : "任务已添加",
     );
-    setTaskForm({ name: "", url: "", autoStart: true });
+    setTaskForm({ name: "", url: "", autoStart: true, downloaderId: 0 });
   }
 
   async function startTask(id: number) {
@@ -428,9 +433,9 @@ export default function App() {
     await refreshWithMessage(
       api(`/api/tasks/${id}/delete`, {
         method: "POST",
-        body: JSON.stringify({ ids: [id], delete_files: deleteFiles }),
+        body: JSON.stringify({ ids: [id] }),
       }),
-      deleteFiles ? "任务与种子文件已删除" : "任务已删除",
+      "任务已删除",
     );
   }
 
@@ -458,9 +463,9 @@ export default function App() {
     await refreshWithMessage(
       api("/api/tasks/delete", {
         method: "POST",
-        body: JSON.stringify({ ids: selectedIds, delete_files: deleteFiles }),
+        body: JSON.stringify({ ids: selectedIds }),
       }),
-      deleteFiles ? "所选任务和种子文件已删除" : "所选任务已删除",
+      "所选任务已删除",
     );
     setSelectedIds([]);
   }
@@ -477,9 +482,9 @@ export default function App() {
     await refreshWithMessage(
       api("/api/tasks/delete-all", {
         method: "POST",
-        body: JSON.stringify({ ids: [], delete_files: deleteFiles }),
+        body: JSON.stringify({ ids: [] }),
       }),
-      deleteFiles ? "全部任务和种子文件已删除" : "全部任务已删除",
+      "全部任务已删除",
     );
     setSelectedIds([]);
   }
@@ -683,10 +688,9 @@ export default function App() {
                   tasks={tasks}
                   form={taskForm}
                   setForm={setTaskForm}
+                  downloaders={downloaders}
                   selectedIds={selectedIds}
                   setSelectedIds={setSelectedIds}
-                  deleteFiles={deleteFiles}
-                  setDeleteFiles={setDeleteFiles}
                   onAddTask={addTask}
                   onStartTask={startTask}
                   onPauseTask={pauseTask}

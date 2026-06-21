@@ -26,10 +26,6 @@ pub fn sanitize_component(value: &str) -> String {
     }
 }
 
-pub fn guid_key(guid: &str) -> String {
-    sanitize_component(guid)
-}
-
 pub fn extract_original_filename(headers: &HeaderMap) -> Option<String> {
     let header_value = headers.get(CONTENT_DISPOSITION)?.to_str().ok()?;
     let parts = header_value.split(';').map(str::trim);
@@ -46,22 +42,6 @@ pub fn extract_original_filename(headers: &HeaderMap) -> Option<String> {
     }
 
     None
-}
-
-pub fn extract_guid_key_from_file_name(file_name: &str) -> Option<String> {
-    let path = Path::new(file_name);
-    let extension = path.extension()?.to_string_lossy();
-    if !extension.eq_ignore_ascii_case("torrent") {
-        return None;
-    }
-
-    let stem = path.file_stem()?.to_string_lossy();
-    let (_, guid_key) = stem.rsplit_once('-')?;
-    if guid_key.is_empty() {
-        return None;
-    }
-
-    Some(guid_key.to_string())
 }
 
 pub fn build_target_file_name(original_name: Option<&str>, item: &TorrentItem) -> String {

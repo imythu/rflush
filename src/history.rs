@@ -33,8 +33,6 @@ pub struct TorrentRunRecord {
     pub retry_count: u32,
     pub refresh_count: u32,
     pub bytes: Option<u64>,
-    pub file_name: Option<String>,
-    pub saved_path: Option<String>,
     pub final_status: FinalStatus,
     pub final_message: Option<String>,
 }
@@ -48,8 +46,6 @@ impl TorrentRunRecord {
             retry_count: 0,
             refresh_count: 0,
             bytes: None,
-            file_name: None,
-            saved_path: None,
             final_status: FinalStatus::Failed,
             final_message: None,
         }
@@ -204,10 +200,6 @@ fn log_torrent(torrent: &TorrentRunRecord) {
         torrent.refresh_count
     );
     log_by_status!(s, "  guid={}", torrent.guid);
-
-    if let Some(path) = &torrent.saved_path {
-        log_by_status!(s, "  file={}", path);
-    }
 
     if let Some(message) = &torrent.final_message {
         log_by_status!(s, "  final_message={}", message);

@@ -4,25 +4,26 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate, statusBadge } from "@/lib/format";
-import type { DownloadRecord, RssSubscription, TaskRecordsResponse } from "@/types";
+import type { DownloadRecord, DownloaderRecord, RssSubscription, TaskRecordsResponse } from "@/types";
 
 type TaskForm = {
   name: string;
   url: string;
   autoStart: boolean;
+  downloaderId: number;
 };
 
 export function TasksPage({
   tasks,
   form,
   setForm,
+  downloaders,
   selectedIds,
   setSelectedIds,
-  deleteFiles,
-  setDeleteFiles,
   onAddTask,
   onStartTask,
   onPauseTask,
@@ -37,10 +38,9 @@ export function TasksPage({
   tasks: RssSubscription[];
   form: TaskForm;
   setForm: React.Dispatch<React.SetStateAction<TaskForm>>;
+  downloaders: DownloaderRecord[];
   selectedIds: number[];
   setSelectedIds: React.Dispatch<React.SetStateAction<number[]>>;
-  deleteFiles: boolean;
-  setDeleteFiles: React.Dispatch<React.SetStateAction<boolean>>;
   onAddTask: () => Promise<void>;
   onStartTask: (id: number) => Promise<void>;
   onPauseTask: (id: number) => Promise<void>;
@@ -99,7 +99,7 @@ export function TasksPage({
             <CardDescription className="text-[11px]">配置 RSS 订阅任务及其自动化策略。</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[200px_1fr_auto]">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[200px_1fr_200px_auto]">
               <Input
                 className="h-10 rounded-xl bg-background/50 border-border/50 text-[13px]"
                 placeholder="任务名称"
@@ -111,6 +111,15 @@ export function TasksPage({
                 placeholder="RSS 地址"
                 value={form.url}
                 onChange={(event) => setForm((prev) => ({ ...prev, url: event.target.value }))}
+              />
+              <Select
+                className="h-10"
+                value={String(form.downloaderId)}
+                onChange={(val) => setForm((prev) => ({ ...prev, downloaderId: Number(val) }))}
+                options={[
+                  { value: "0", label: "仅下载种子文件" },
+                  ...downloaders.map((dl) => ({ value: String(dl.id), label: dl.name })),
+                ]}
               />
               <Button className="h-10 rounded-xl px-6 font-semibold shadow-glow sm:col-span-2 lg:col-span-1" onClick={() => void onAddTask()}>
                 <Plus className="mr-2 h-4 w-4" />
@@ -157,19 +166,7 @@ export function TasksPage({
             </div>
 
             <div className="space-y-3 pt-2 border-t border-border/30">
-              <div className="flex items-center justify-between px-1">
-                <div className="text-[10px] font-black uppercase tracking-wider text-primary/70">勾选控制 ({selectedIds.length})</div>
-                <label className="flex items-center gap-2 cursor-pointer group">
-                  <input
-                    type="checkbox"
-                    className="h-3.5 w-3.5 rounded border border-border accent-[hsl(var(--primary))] transition-all group-hover:scale-110"
-                    checked={deleteFiles}
-                    onChange={(event) => setDeleteFiles(event.target.checked)}
-                  />
-                  <span className="text-[10px] text-muted-foreground group-hover:text-foreground transition-colors">同时删除种子文件</span>
-                </label>
-              </div>
-              
+              <div className="text-[10px] font-black uppercase tracking-wider text-primary/70 px-1">勾选控制 ({selectedIds.length})</div>
               <div className="flex flex-wrap gap-2">
                 <Button 
                   size="sm" 
@@ -246,6 +243,11 @@ export function TasksPage({
                     </div>
                     
                     <div className="mt-2.5 break-all text-[11px] text-muted-foreground line-clamp-1">{task.url}</div>
+                    {task.downloader_id ? (
+                      <div className="mt-1.5 text-[10px] text-primary/80">
+                        下载到：{downloaders.find((dl) => dl.id === task.downloader_id)?.name ?? `QB #${task.downloader_id}`}
+                      </div>
+                    ) : null}
                     <div className="mt-1.5 text-[10px] text-muted-foreground">更新：{formatDate(task.updated_at)}</div>
                     
                     <div className="mt-3.5 flex flex-wrap gap-1.5">
@@ -320,8 +322,6 @@ export function TasksPage({
                     <div className="mt-3 grid gap-2 text-xs text-muted sm:grid-cols-2">
                       <div>重试次数：{record.retry_count}</div>
                       <div>刷新次数：{record.refresh_count}</div>
-                      <div>种子文件：{record.file_deleted ? "已删除" : "保留/未知"}</div>
-                      <div className="break-all">保存路径：{record.saved_path ?? "-"}</div>
                     </div>
                   </div>
                 ))}

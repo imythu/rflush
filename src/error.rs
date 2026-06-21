@@ -24,18 +24,6 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to read directory {path}: {source}")]
-    ReadDir {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to remove path {path}: {source}")]
-    RemovePath {
-        path: String,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("database error: {message}")]
     Database { message: String },
     #[error("RSS `{name}` rate-limited by remote server")]

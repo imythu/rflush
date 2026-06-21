@@ -25,7 +25,6 @@ use crate::brush::scheduler::BrushScheduler;
 use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
 use crate::db::{Database, DownloadHistoryRecord, DownloadRunRecord, PaginatedRunRecords};
-use crate::download::naming::sanitize_component;
 use crate::downloader::DownloaderClientPool;
 use crate::downloader::DownloaderSpaceStats;
 use crate::engine::DownloadEngine;
@@ -39,7 +38,6 @@ use crate::site_stats::SiteStatsRefresher;
 
 #[derive(Clone)]
 pub struct AppState {
-    base_dir: PathBuf,
     db: Database,
     engine: DownloadEngine,
     jobs: Arc<JobRegistry>,
@@ -108,6 +106,7 @@ struct CreateRssRequest {
     name: String,
     url: String,
     auto_start: Option<bool>,
+    downloader_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,7 +139,6 @@ struct FrontendAssets;
 
 impl AppState {
     pub fn new(
-        base_dir: PathBuf,
         db: Database,
         engine: DownloadEngine,
         scheduler: Arc<BrushScheduler>,
@@ -151,7 +149,6 @@ impl AppState {
         monitor: Arc<SystemMonitor>,
     ) -> Self {
         Self {
-            base_dir,
             db,
             engine,
             jobs: Arc::new(JobRegistry::default()),
@@ -175,6 +172,7 @@ impl AppState {
             .map(|item| RssConfig {
                 name: item.name,
                 url: item.url,
+                downloader_id: item.downloader_id,
             })
             .collect();
         Ok(AppConfig {
@@ -189,6 +187,7 @@ impl AppState {
             rss: vec![RssConfig {
                 name: task.name.clone(),
                 url: task.url.clone(),
+                downloader_id: task.downloader_id,
             }],
         })
     }
@@ -294,7 +293,7 @@ impl JobRegistry {
 }
 
 pub async fn serve(
-    base_dir: PathBuf,
+    _base_dir: PathBuf,
     addr: SocketAddr,
     db: Database,
     scheduler: Arc<BrushScheduler>,
@@ -305,9 +304,8 @@ pub async fn serve(
     rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
     monitor: Arc<SystemMonitor>,
 ) -> Result<(), AppError> {
-    let engine = DownloadEngine::new(base_dir.clone(), rate_limiter);
+    let engine = DownloadEngine::new(rate_limiter);
     let state = AppState::new(
-        base_dir,
         db,
         engine,
         scheduler,
@@ -481,6 +479,7 @@ async fn create_rss(
             RssConfig {
                 name: payload.name.trim().to_string(),
                 url: payload.url.trim().to_string(),
+                downloader_id: payload.downloader_id,
             },
             auto_start,
         )
@@ -719,7 +718,7 @@ async fn spawn_job(state: AppState, scope: String, task_id: Option<i64>, config:
         state.jobs.mark_running(job_id).await;
         match state
             .engine
-            .run_with_shutdown(config, shutdown.clone())
+            .run_with_shutdown(config, shutdown.clone(), Some(state.pool.clone()), Some(state.db.clone()))
             .await
         {
             Ok(history) => match state
@@ -754,7 +753,7 @@ async fn spawn_job(state: AppState, scope: String, task_id: Option<i64>, config:
 async fn delete_tasks_inner(
     state: &AppState,
     tasks: Vec<RssSubscription>,
-    delete_files: bool,
+    _delete_files: bool,
 ) -> Result<(), ApiError> {
     if tasks.is_empty() {
         return Ok(());
@@ -763,27 +762,6 @@ async fn delete_tasks_inner(
     let ids = tasks.iter().map(|task| task.id).collect::<Vec<_>>();
     state.db.update_rss_enabled(&ids, false).await?;
     state.jobs.stop_tasks(&ids).await;
-
-    if delete_files {
-        for task in &tasks {
-            let task_dir = state.base_dir.join(sanitize_component(&task.name));
-            if tokio::fs::try_exists(&task_dir)
-                .await
-                .map_err(|source| AppError::ReadDir {
-                    path: task_dir.display().to_string(),
-                    source,
-                })?
-            {
-                tokio::fs::remove_dir_all(&task_dir)
-                    .await
-                    .map_err(|source| AppError::RemovePath {
-                        path: task_dir.display().to_string(),
-                        source,
-                    })?;
-            }
-        }
-        state.db.mark_task_records_deleted(&ids).await?;
-    }
 
     state.db.delete_rss_batch(&ids).await?;
     Ok(())
