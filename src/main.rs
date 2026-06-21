@@ -9,6 +9,7 @@ mod engine;
 mod error;
 mod history;
 mod logging;
+mod monitor;
 mod net;
 mod rss;
 mod sign_in;
@@ -104,6 +105,12 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         site_stats_refresher_ref.start().await;
     });
 
+    let monitor = std::sync::Arc::new(monitor::SystemMonitor::new(db.clone()));
+    let monitor_ref = monitor.clone();
+    let monitor_handle = tokio::spawn(async move {
+        monitor_ref.start().await;
+    });
+
     let web_result = web::serve(
         base_dir,
         listen_addr,
@@ -114,6 +121,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         collector,
         pool,
         limiter,
+        monitor,
     )
     .await;
 
@@ -122,12 +130,14 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     scheduler_handle.abort();
     sign_in_scheduler_handle.abort();
     site_stats_handle.abort();
+    monitor_handle.abort();
 
     let _ = collector_handle.await;
     let _ = stats_handle.await;
     let _ = scheduler_handle.await;
     let _ = sign_in_scheduler_handle.await;
     let _ = site_stats_handle.await;
+    let _ = monitor_handle.await;
 
     web_result
 }

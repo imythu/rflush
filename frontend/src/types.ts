@@ -333,6 +333,31 @@ export type StatsOverview = {
   tasks: TaskOverview[];
 };
 
+// ========== 系统监控 ==========
+
+export type SystemSnapshot = {
+  recorded_at: string;
+  process_cpu_usage: number;
+  process_memory_bytes: number;
+  process_memory_mb: number;
+  system_cpu_usage: number;
+  system_total_memory_bytes: number;
+  system_used_memory_bytes: number;
+  system_available_memory_bytes: number;
+  system_memory_usage_percent: number;
+};
+
+export type SystemSnapshotRecord = {
+  id: number;
+  process_cpu_usage: number;
+  process_memory_bytes: number;
+  system_cpu_usage: number;
+  system_total_memory_bytes: number;
+  system_used_memory_bytes: number;
+  system_available_memory_bytes: number;
+  recorded_at: string;
+};
+
 export type TaskOverview = {
   task_id: number;
   task_name: string;

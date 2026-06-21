@@ -35,6 +35,7 @@ type LogLevel = keyof typeof LOG_LEVEL_PRIORITY;
 const LOG_LEVELS: LogLevel[] = ["trace", "debug", "info", "warn", "error"];
 
 type AppPage =
+  | "system-overview"
   | "dashboard"
   | "tasks"
   | "settings"
@@ -59,6 +60,9 @@ const SignInPage = lazy(() => import("@/pages/sign-in-page").then((module) => ({
 const StatsPage = lazy(() => import("@/pages/stats-page").then((module) => ({ default: module.StatsPage })));
 const SystemSettingsPage = lazy(() =>
   import("@/pages/system-settings-page").then((module) => ({ default: module.SystemSettingsPage })),
+);
+const SystemOverviewPage = lazy(() =>
+  import("@/pages/system-overview-page").then((module) => ({ default: module.SystemOverviewPage })),
 );
 
 const navItems: Array<{
@@ -143,6 +147,7 @@ const navItems: Array<{
 function readPageFromHash(): AppPage {
   const raw = window.location.hash.replace(/^#\/?/, "");
   const valid: AppPage[] = [
+    "system-overview",
     "dashboard",
     "tasks",
     "settings",
@@ -157,11 +162,11 @@ function readPageFromHash(): AppPage {
   if (valid.includes(raw as AppPage)) {
     return raw as AppPage;
   }
-  return raw === "" ? "dashboard" : "brush-tasks";
+  return raw === "" ? "system-overview" : "brush-tasks";
 }
 
 function setHash(page: AppPage) {
-  const next = page === "dashboard" ? "#/" : `#/${page}`;
+  const next = page === "system-overview" ? "#/" : `#/${page}`;
   if (window.location.hash !== next) {
     window.location.hash = next;
   }
@@ -214,7 +219,10 @@ export default function App() {
   const logsViewportRef = useRef<HTMLDivElement | null>(null);
   const pendingLogsRef = useRef<string[]>([]);
 
-  const currentNav = navItems.find((item) => item.key === page) ?? navItems[0];
+  const currentNav =
+    page === "system-overview"
+      ? { key: "system-overview" as AppPage, label: "系统总览", description: "CPU、内存使用率实时监控与历史趋势", icon: LayoutDashboard, group: "system" as NavGroup }
+      : navItems.find((item) => item.key === page) ?? navItems[0];
   const effectiveLogLevel = getEffectiveLogLevel(settings);
   const selectableLogLevels = LOG_LEVELS.filter(
     (level) => LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[effectiveLogLevel],
@@ -493,13 +501,19 @@ export default function App() {
 
       <div className="relative rounded-[22px] border border-border bg-surface/70 p-3 lg:p-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.92)] overflow-hidden">
         <div className="flex items-center gap-3">
-          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary via-[#9a7bff] to-blossom p-1.5 shadow-glow">
-            <img src="/yunmu-icon.svg" alt="云母" className="h-full w-full rounded-lg" />
-          </div>
-          <div className="min-w-0">
-            <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary">YUNMU</p>
-            <h1 className="mt-0.5 truncate text-xl font-black tracking-tight text-foreground">云母</h1>
-          </div>
+          <button
+            type="button"
+            onClick={() => navigate("system-overview")}
+            className="flex items-center gap-3 min-w-0 text-left transition-opacity hover:opacity-80"
+          >
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary via-[#9a7bff] to-blossom p-1.5 shadow-glow">
+              <img src="/yunmu-icon.svg" alt="云母" className="h-full w-full rounded-lg" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-primary">YUNMU</p>
+              <h1 className="mt-0.5 truncate text-xl font-black tracking-tight text-foreground">云母</h1>
+            </div>
+          </button>
           <a
             href="https://github.com/imythu/rflush"
             target="_blank"
@@ -651,6 +665,8 @@ export default function App() {
 
           <Suspense fallback={<div className="mt-4 rounded-2xl border border-border bg-card px-4 py-6 text-sm text-muted shadow-card">页面加载中...</div>}>
             <div className="mt-4">
+              {page === "system-overview" ? <SystemOverviewPage /> : null}
+
               {page === "dashboard" ? (
                 <DashboardPage
                   rss={tasks}

@@ -31,6 +31,7 @@ use crate::downloader::DownloaderSpaceStats;
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
+use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
@@ -47,6 +48,7 @@ pub struct AppState {
     site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
+    monitor: Arc<SystemMonitor>,
 }
 
 struct JobRegistry {
@@ -146,6 +148,7 @@ impl AppState {
         site_stats_refresher: Arc<SiteStatsRefresher>,
         collector: Arc<DownloaderSnapshotCollector>,
         pool: Arc<DownloaderClientPool>,
+        monitor: Arc<SystemMonitor>,
     ) -> Self {
         Self {
             base_dir,
@@ -157,6 +160,7 @@ impl AppState {
             site_stats_refresher,
             collector,
             pool,
+            monitor,
         }
     }
 
@@ -299,6 +303,7 @@ pub async fn serve(
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
+    monitor: Arc<SystemMonitor>,
 ) -> Result<(), AppError> {
     let engine = DownloadEngine::new(base_dir.clone(), rate_limiter);
     let state = AppState::new(
@@ -310,6 +315,7 @@ pub async fn serve(
         site_stats_refresher,
         collector,
         pool,
+        monitor,
     );
     let app = app_router(state);
     let listener = TcpListener::bind(addr)
@@ -420,6 +426,9 @@ fn app_router(state: AppState) -> Router {
             "/api/stats/downloader-speed-trend",
             get(downloader_speed_trend),
         )
+        // 系统监控
+        .route("/api/system/stats", get(get_system_stats))
+        .route("/api/system/stats/history", get(get_system_stats_history))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state(state)
@@ -1541,6 +1550,47 @@ async fn downloader_speed_trend(
     let data = state
         .db
         .get_downloader_speed_snapshots(q.downloader_id, &since, &until, bucket_secs)
+        .await?;
+    Ok(Json(data))
+}
+
+async fn get_system_stats(
+    State(state): State<AppState>,
+) -> Result<Json<SystemSnapshot>, StatusCode> {
+    match state.monitor.latest().await {
+        Some(snapshot) => Ok(Json(snapshot)),
+        None => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemStatsQuery {
+    since: Option<String>,
+    until: Option<String>,
+    hours: Option<i64>,
+}
+
+async fn get_system_stats_history(
+    State(state): State<AppState>,
+    Query(q): Query<SystemStatsQuery>,
+) -> Result<Json<Vec<SystemSnapshotRecord>>, ApiError> {
+    let hours = q.hours.unwrap_or(24);
+    let until = q.until.unwrap_or_else(|| Utc::now().to_rfc3339());
+    let since = q.since.unwrap_or_else(|| {
+        (Utc::now() - chrono::Duration::hours(hours) - chrono::Duration::minutes(2)).to_rfc3339()
+    });
+    let bucket_secs = if hours <= 1 {
+        None
+    } else if hours <= 6 {
+        Some(60)
+    } else if hours <= 24 {
+        Some(300)
+    } else {
+        Some(3600)
+    };
+    let data = state
+        .db
+        .get_system_snapshots(&since, &until, bucket_secs)
         .await?;
     Ok(Json(data))
 }

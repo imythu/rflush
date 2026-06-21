@@ -2006,6 +2006,152 @@ impl Database {
         .map_err(join_error)?
     }
 
+    pub async fn insert_system_snapshot(
+        &self,
+        snap: &crate::monitor::SystemSnapshotRecord,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let snap = snap.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "INSERT INTO system_snapshots (process_cpu_usage, process_memory_bytes, system_cpu_usage, system_total_memory_bytes, system_used_memory_bytes, system_available_memory_bytes, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    snap.process_cpu_usage,
+                    snap.process_memory_bytes,
+                    snap.system_cpu_usage,
+                    snap.system_total_memory_bytes,
+                    snap.system_used_memory_bytes,
+                    snap.system_available_memory_bytes,
+                    snap.recorded_at,
+                ],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn get_system_snapshots(
+        &self,
+        since: &str,
+        until: &str,
+        bucket_secs: Option<i64>,
+    ) -> Result<Vec<crate::monitor::SystemSnapshotRecord>, AppError> {
+        let path = self.path.clone();
+        let since = since.to_string();
+        let until = until.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+
+            if let Some(bs) = bucket_secs.filter(|&bs| bs > 0) {
+                let bucket_expr = if bs < 60 {
+                    format!(
+                        "strftime('%Y-%m-%dT%H:%M:', recorded_at) || printf('%02d', (CAST(strftime('%S', recorded_at) AS INTEGER) / {bs}) * {bs}) || 'Z'"
+                    )
+                } else if bs < 3600 {
+                    let mins = bs / 60;
+                    format!(
+                        "strftime('%Y-%m-%dT%H:', recorded_at) || printf('%02d', (CAST(strftime('%M', recorded_at) AS INTEGER) / {mins}) * {mins}) || ':00Z'"
+                    )
+                } else {
+                    let hours = bs / 3600;
+                    format!(
+                        "strftime('%Y-%m-%dT', recorded_at) || printf('%02d', (CAST(strftime('%H', recorded_at) AS INTEGER) / {hours}) * {hours}) || ':00:00Z'"
+                    )
+                };
+
+                let sql = format!(
+                    "SELECT 0,
+                            CAST(avg(process_cpu_usage) AS REAL),
+                            CAST(avg(process_memory_bytes) AS INTEGER),
+                            CAST(avg(system_cpu_usage) AS REAL),
+                            CAST(avg(system_total_memory_bytes) AS INTEGER),
+                            CAST(avg(system_used_memory_bytes) AS INTEGER),
+                            CAST(avg(system_available_memory_bytes) AS INTEGER),
+                            {bucket_expr} AS bucket
+                     FROM system_snapshots
+                     WHERE datetime(recorded_at) >= datetime(?)
+                       AND datetime(recorded_at) <= datetime(?)
+                     GROUP BY bucket
+                     ORDER BY bucket"
+                );
+
+                let mut stmt = conn.prepare(&sql).map_err(sql_error)?;
+                let rows = stmt
+                    .query_map(params![since, until], |row| {
+                        Ok(crate::monitor::SystemSnapshotRecord {
+                            id: row.get(0)?,
+                            process_cpu_usage: row.get(1)?,
+                            process_memory_bytes: row.get(2)?,
+                            system_cpu_usage: row.get(3)?,
+                            system_total_memory_bytes: row.get(4)?,
+                            system_used_memory_bytes: row.get(5)?,
+                            system_available_memory_bytes: row.get(6)?,
+                            recorded_at: row.get(7)?,
+                        })
+                    })
+                    .map_err(sql_error)?;
+                let mut list = Vec::new();
+                for row in rows {
+                    list.push(row.map_err(sql_error)?);
+                }
+                return Ok(list);
+            }
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, process_cpu_usage, process_memory_bytes,
+                            system_cpu_usage, system_total_memory_bytes,
+                            system_used_memory_bytes, system_available_memory_bytes,
+                            recorded_at
+                     FROM system_snapshots
+                     WHERE datetime(recorded_at) >= datetime(?)
+                       AND datetime(recorded_at) <= datetime(?)
+                     ORDER BY datetime(recorded_at)",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map(params![since, until], |row| {
+                    Ok(crate::monitor::SystemSnapshotRecord {
+                        id: row.get(0)?,
+                        process_cpu_usage: row.get(1)?,
+                        process_memory_bytes: row.get(2)?,
+                        system_cpu_usage: row.get(3)?,
+                        system_total_memory_bytes: row.get(4)?,
+                        system_used_memory_bytes: row.get(5)?,
+                        system_available_memory_bytes: row.get(6)?,
+                        recorded_at: row.get(7)?,
+                    })
+                })
+                .map_err(sql_error)?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(sql_error)?);
+            }
+            Ok(list)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn cleanup_old_system_snapshots(&self, days: i64) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "DELETE FROM system_snapshots WHERE recorded_at < ?",
+                params![cutoff],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     async fn init(&self) -> Result<(), AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
@@ -2221,12 +2367,24 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_site_stats_checked_at ON site_stats(last_checked_at);
                 CREATE INDEX IF NOT EXISTS idx_task_stats_task ON task_stats_snapshots(task_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_torrent_traffic_lookup ON torrent_traffic(task_id, torrent_hash, recorded_at);
+                CREATE TABLE IF NOT EXISTS system_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    process_cpu_usage REAL NOT NULL,
+                    process_memory_bytes INTEGER NOT NULL,
+                    system_cpu_usage REAL NOT NULL,
+                    system_total_memory_bytes INTEGER NOT NULL,
+                    system_used_memory_bytes INTEGER NOT NULL,
+                    system_available_memory_bytes INTEGER NOT NULL,
+                    recorded_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_downloader_speed_snapshots_lookup ON downloader_speed_snapshots(downloader_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_sign_in_records_lookup ON sign_in_records(task_id, finished_at);
                 -- 保留期清理按 recorded_at 范围删除，需单列索引才能避免全表扫描。
                 CREATE INDEX IF NOT EXISTS idx_torrent_traffic_recorded_at ON torrent_traffic(recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_task_stats_recorded_at ON task_stats_snapshots(recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_downloader_speed_recorded_at ON downloader_speed_snapshots(recorded_at);
+                CREATE INDEX IF NOT EXISTS idx_system_snapshots_recorded_at ON system_snapshots(recorded_at);
                 ",
             )
             .map_err(sql_error)?;
