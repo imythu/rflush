@@ -40,6 +40,8 @@ jobs:
       channel_tag: ${{ steps.meta.outputs.channel_tag }}
       sha_short: ${{ steps.meta.outputs.sha_short }}
       published_at: ${{ steps.meta.outputs.published_at }}
+      matrix_json: ${{ steps.meta.outputs.matrix_json }}
+      docker_matrix_json: ${{ steps.meta.outputs.docker_matrix_json }}
     steps:
       - uses: actions/checkout@v6
 
@@ -91,6 +93,17 @@ jobs:
           echo "sha_short=$SHA_SHORT" >> "$GITHUB_OUTPUT"
           echo "published_at=$PUBLISHED_AT" >> "$GITHUB_OUTPUT"
 
+          # Snapshot 只构建 linux/amd64，正式版构建全部平台
+          if [[ "$RELEASE_KIND" == "snapshot" ]]; then
+            MATRIX='[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","archive":"tar.gz","use_cross":true}]'
+            DOCKER_MATRIX='[{"target":"x86_64-unknown-linux-musl","platform":"linux/amd64","suffix":"linux-amd64"}]'
+          else
+            MATRIX='[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl","archive":"tar.gz","use_cross":true},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-musl","archive":"tar.gz","use_cross":true},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","archive":"zip","use_cross":false},{"os":"macos-latest","target":"aarch64-apple-darwin","archive":"tar.gz","use_cross":false}]'
+            DOCKER_MATRIX='[{"target":"x86_64-unknown-linux-musl","platform":"linux/amd64","suffix":"linux-amd64"},{"target":"aarch64-unknown-linux-musl","platform":"linux/arm64","suffix":"linux-arm64"}]'
+          fi
+          echo "matrix_json=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "docker_matrix_json=$DOCKER_MATRIX" >> "$GITHUB_OUTPUT"
+
   frontend:
     name: Build frontend
     needs: prepare
@@ -129,26 +142,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            archive: tar.gz
-            use_cross: true
-
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            archive: tar.gz
-            use_cross: true
-
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
-            use_cross: false
-
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: tar.gz
-            use_cross: false
+        include: ${{ fromJson(needs.prepare.outputs.matrix_json) }}
 
     steps:
       - uses: actions/checkout@v6
@@ -213,14 +207,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            platform: linux/amd64
-            suffix: linux-amd64
-
-          - target: aarch64-unknown-linux-musl
-            platform: linux/arm64
-            suffix: linux-arm64
+        include: ${{ fromJson(needs.prepare.outputs.docker_matrix_json) }}
 
     steps:
       - uses: actions/checkout@v6
@@ -290,25 +277,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create multi-arch linux manifest
+      - name: Create linux manifest
         shell: bash
+        env:
+          DOCKER_MATRIX: ${{ needs.prepare.outputs.docker_matrix_json }}
         run: |
           set -euo pipefail
-          docker buildx imagetools create \
-            -t "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}" \
-            "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-amd64" \
-            "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-arm64"
 
-          if [[ -n "${{ needs.prepare.outputs.channel_tag }}" ]]; then
+          IMAGE="${{ needs.prepare.outputs.image }}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          CHANNEL_TAG="${{ needs.prepare.outputs.channel_tag }}"
+
+          # 从构建矩阵中提取实际构建的架构后缀
+          SOURCES=()
+          for suffix in $(echo "$DOCKER_MATRIX" | jq -r '.[].suffix'); do
+            SOURCES+=("${IMAGE}:${VERSION}-${suffix}")
+          done
+
+          echo "Creating manifest from: ${SOURCES[*]}"
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            "${SOURCES[@]}"
+
+          if [[ -n "$CHANNEL_TAG" ]]; then
             docker buildx imagetools create \
-              -t "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.channel_tag }}" \
-              "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-amd64" \
-              "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-linux-arm64"
+              -t "${IMAGE}:${CHANNEL_TAG}" \
+              "${SOURCES[@]}"
           fi
 
   release:
     name: Create Release
     needs: [prepare, build, docker-linux-manifest]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
