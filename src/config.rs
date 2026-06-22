@@ -26,6 +26,8 @@ pub struct GlobalConfig {
     pub proxy: Option<String>,
     #[serde(default = "default_true")]
     pub use_proxy_for_lightpanda: bool,
+    #[serde(default = "default_tag_rule_scan_interval_mins")]
+    pub tag_rule_scan_interval_mins: u64,
 }
 
 impl Default for GlobalConfig {
@@ -39,6 +41,7 @@ impl Default for GlobalConfig {
             throttle_interval_secs: default_throttle_interval_secs(),
             proxy: None,
             use_proxy_for_lightpanda: true,
+            tag_rule_scan_interval_mins: default_tag_rule_scan_interval_mins(),
         }
     }
 }
@@ -133,4 +136,8 @@ const fn default_throttle_interval_secs() -> u64 {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_tag_rule_scan_interval_mins() -> u64 {
+    7
 }

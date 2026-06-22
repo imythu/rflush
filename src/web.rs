@@ -445,7 +445,6 @@ fn app_router(state: AppState) -> Router {
                 .delete(delete_tag_rule),
         )
         .route("/api/tag-rules/scan", post(scan_tag_rules))
-        .route("/api/tag-rules/{id}/tag-count", get(get_tag_rule_tag_count))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state(state)
@@ -1736,45 +1735,6 @@ async fn scan_tag_rules(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-async fn get_tag_rule_tag_count(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let rule = state
-        .db
-        .get_tag_rule(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("标签规则不存在"))?;
-
-    let target_downloader_ids: Option<Vec<i64>> = rule
-        .downloader_ids
-        .as_ref()
-        .and_then(|s| serde_json::from_str(s).ok());
-
-    let downloaders = state.db.list_downloaders().await?;
-    let mut total_count: usize = 0;
-
-    for downloader in &downloaders {
-        if let Some(ref ids) = target_downloader_ids {
-            if !ids.is_empty() && !ids.contains(&downloader.id) {
-                continue;
-            }
-        }
-        let client = match state.pool.get(downloader).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        match client.list_torrents(Some(&rule.tag_name)).await {
-            Ok(torrents) => {
-                total_count += torrents.len();
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Ok(Json(serde_json::json!({ "count": total_count })))
 }
 
 fn validate_tag_rule(req: &crate::tag_rule::TagRuleRequest) -> Result<(), ApiError> {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Edit, Loader2, Plus, Tag, Trash2, Zap } from "lucide-react";
+import { Clock, Edit, Loader2, Plus, Tag, Trash2, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -53,6 +53,14 @@ function ruleToForm(rule: TagRuleRecord): TagRuleRequest {
   };
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const val = bytes / Math.pow(1024, i);
+  return `${val.toFixed(i > 1 ? 1 : 0)} ${units[i]}`;
+}
+
 function matchTypeLabel(type: string) {
   return MATCH_TYPES.find((m) => m.value === type)?.label ?? type;
 }
@@ -70,8 +78,8 @@ export function TagRulesPage() {
   const [deleteTarget, setDeleteTarget] = useState<TagRuleRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [scanning, setScanning] = useState(false);
-  const [tagCounts, setTagCounts] = useState<Record<number, number>>({});
-  const [tagCountsLoading, setTagCountsLoading] = useState<Record<number, boolean>>({});
+  const [scanInterval, setScanInterval] = useState<number>(7);
+  const [savingInterval, setSavingInterval] = useState(false);
 
   const downloaderNameById = useMemo(
     () => new Map(downloaders.map((d) => [d.id, d.name])),
@@ -80,32 +88,34 @@ export function TagRulesPage() {
 
   function loadData() {
     setLoading(true);
-    setTagCounts({});
     Promise.all([
       api<TagRuleRecord[]>("/api/tag-rules"),
       api<DownloaderRecord[]>("/api/downloaders"),
+      api<import("@/types").GlobalConfig>("/api/settings"),
     ])
-      .then(([rulesData, downloadersData]) => {
+      .then(([rulesData, downloadersData, settings]) => {
         setRules(rulesData);
         setDownloaders(downloadersData);
-        // 逐个查询标签种子数
-        for (const rule of rulesData) {
-          fetchTagCount(rule.id);
-        }
+        setScanInterval(settings.tag_rule_scan_interval_mins ?? 7);
       })
       .catch((err: Error) => setMessage(err.message))
       .finally(() => setLoading(false));
   }
 
-  async function fetchTagCount(ruleId: number) {
-    setTagCountsLoading((prev) => ({ ...prev, [ruleId]: true }));
+  async function saveScanInterval(mins: number) {
+    setSavingInterval(true);
     try {
-      const res = await api<{ count: number }>(`/api/tag-rules/${ruleId}/tag-count`);
-      setTagCounts((prev) => ({ ...prev, [ruleId]: res.count }));
-    } catch {
-      // 静默失败
+      const settings = await api<import("@/types").GlobalConfig>("/api/settings");
+      await api("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ ...settings, tag_rule_scan_interval_mins: mins }),
+      });
+      setScanInterval(mins);
+      setMessage(`扫描间隔已设为 ${mins} 分钟`);
+    } catch (err) {
+      setMessage((err as Error).message);
     } finally {
-      setTagCountsLoading((prev) => ({ ...prev, [ruleId]: false }));
+      setSavingInterval(false);
     }
   }
 
@@ -262,8 +272,23 @@ export function TagRulesPage() {
                 标签规则
               </CardTitle>
               <CardDescription>
-                根据种子的 Tracker URL 自动匹配并添加标签，每分钟扫描一次。
+                根据种子的 Tracker 域名自动匹配并添加标签。
               </CardDescription>
+              <div className="mt-2 flex items-center gap-2 text-xs text-muted">
+                <Clock className="h-3.5 w-3.5" />
+                <span>扫描间隔</span>
+                <select
+                  value={scanInterval}
+                  onChange={(e) => saveScanInterval(Number(e.target.value))}
+                  disabled={savingInterval}
+                  className="h-7 rounded-lg border border-border bg-input px-2 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring/30"
+                >
+                  {[3, 5, 7, 10, 15, 20, 30, 60].map((m) => (
+                    <option key={m} value={m}>{m} 分钟</option>
+                  ))}
+                </select>
+                {savingInterval ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              </div>
             </div>
             <div className="flex items-center gap-2">
               <Button variant="outline" onClick={handleScan} disabled={scanning} className="gap-2">
@@ -322,13 +347,12 @@ export function TagRulesPage() {
                         </span>
                       </TableCell>
                       <TableCell>
-                        {tagCountsLoading[rule.id] ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin text-muted" />
-                        ) : (
-                          <span className="text-sm tabular-nums">
-                            {tagCounts[rule.id] ?? "-"}
+                        <span className="text-sm tabular-nums">{rule.tagged_torrent_count}</span>
+                        {rule.tagged_total_size > 0 ? (
+                          <span className="ml-1 text-xs text-muted">
+                            ({formatBytes(rule.tagged_total_size)})
                           </span>
-                        )}
+                        ) : null}
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-wrap gap-1">

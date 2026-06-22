@@ -109,7 +109,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let settings = conn
                 .query_row(
-                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda FROM global_settings WHERE id = 1",
+                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins FROM global_settings WHERE id = 1",
                     [],
                     |row| {
                         Ok(GlobalConfig {
@@ -125,6 +125,7 @@ impl Database {
                             throttle_interval_secs: row.get(7)?,
                             proxy: row.get(8)?,
                             use_proxy_for_lightpanda: row.get::<_, i32>(9).unwrap_or(1) != 0,
+                            tag_rule_scan_interval_mins: row.get::<_, i64>(10).unwrap_or(7) as u64,
                         })
                     },
                 )
@@ -141,7 +142,7 @@ impl Database {
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?, use_proxy_for_lightpanda = ? WHERE id = 1",
+                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?, use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ? WHERE id = 1",
                 params![
                     settings.download_rate_limit.requests,
                     settings.download_rate_limit.interval,
@@ -155,7 +156,8 @@ impl Database {
                         let value = value.trim();
                         (!value.is_empty()).then_some(value)
                     }),
-                    settings.use_proxy_for_lightpanda as i32
+                    settings.use_proxy_for_lightpanda as i32,
+                    settings.tag_rule_scan_interval_mins as i64
                 ],
             )
             .map_err(sql_error)?;
@@ -2133,7 +2135,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at
+                    "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, tagged_torrent_count, tagged_total_size, created_at, updated_at
                      FROM tag_rules ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -2156,7 +2158,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at
+                    "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, tagged_torrent_count, tagged_total_size, created_at, updated_at
                      FROM tag_rules WHERE enabled = 1 ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -2178,7 +2180,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at
+                "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, tagged_torrent_count, tagged_total_size, created_at, updated_at
                  FROM tag_rules WHERE id = ?",
                 params![id],
                 |row| row_to_tag_rule(row),
@@ -2262,6 +2264,22 @@ impl Database {
             conn.execute(
                 "UPDATE tag_rules SET enabled = ?, updated_at = ? WHERE id = ?",
                 params![enabled as i32, now, id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn update_tag_rule_stats(&self, id: i64, count: i64, total_size: i64) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE tag_rules SET tagged_torrent_count = ?, tagged_total_size = ?, updated_at = ? WHERE id = ?",
+                params![count, total_size, now, id],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -2635,6 +2653,12 @@ impl Database {
             )?;
             ensure_column(
                 &conn,
+                "global_settings",
+                "tag_rule_scan_interval_mins",
+                "ALTER TABLE global_settings ADD COLUMN tag_rule_scan_interval_mins INTEGER NOT NULL DEFAULT 7",
+            )?;
+            ensure_column(
+                &conn,
                 "sites",
                 "use_proxy",
                 "ALTER TABLE sites ADD COLUMN use_proxy INTEGER NOT NULL DEFAULT 1",
@@ -2648,15 +2672,30 @@ impl Database {
                     match_rules TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     downloader_ids TEXT,
+                    tagged_torrent_count INTEGER NOT NULL DEFAULT 0,
+                    tagged_total_size INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );",
             )
             .map_err(sql_error)?;
 
+            ensure_column(
+                &conn,
+                "tag_rules",
+                "tagged_torrent_count",
+                "ALTER TABLE tag_rules ADD COLUMN tagged_torrent_count INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "tag_rules",
+                "tagged_total_size",
+                "ALTER TABLE tag_rules ADD COLUMN tagged_total_size INTEGER NOT NULL DEFAULT 0",
+            )?;
+
             conn.execute(
-                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1],
+                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1, 7],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -2831,8 +2870,10 @@ fn row_to_tag_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::tag_rule:
         match_rules: row.get(3)?,
         enabled: row.get::<_, i32>(4)? != 0,
         downloader_ids: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        tagged_torrent_count: row.get(6)?,
+        tagged_total_size: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 

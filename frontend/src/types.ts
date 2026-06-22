@@ -12,6 +12,7 @@ export type GlobalConfig = {
   max_concurrent_rss_fetches: number;
   log_level: string | null;
   proxy: string | null;
+  tag_rule_scan_interval_mins?: number;
 };
 
 export type ProxyTestRequest = {
@@ -379,6 +380,8 @@ export type TagRuleRecord = {
   match_rules: string; // JSON string of TagMatchCriteria[]
   enabled: boolean;
   downloader_ids: string | null; // JSON string of number[] | null
+  tagged_torrent_count: number;
+  tagged_total_size: number;
   created_at: string;
   updated_at: string;
 };

@@ -20,10 +20,31 @@ impl TagRuleScheduler {
     }
 
     pub async fn start(&self) {
-        info!("tag rule scheduler started, scanning every 60 seconds");
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        // 首次使用默认值，后续每次循环从数据库读取最新配置
+        let mut interval_secs = self
+            .db
+            .get_settings()
+            .await
+            .map(|s| s.tag_rule_scan_interval_mins.saturating_mul(60).max(60))
+            .unwrap_or(420);
+        info!("tag rule scheduler started, scanning every {}s", interval_secs);
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
+            // 每次循环重新读取间隔配置
+            match self.db.get_settings().await {
+                Ok(s) => {
+                    let new_secs = s.tag_rule_scan_interval_mins.saturating_mul(60).max(60);
+                    if new_secs != interval_secs {
+                        info!("tag rule scan interval changed: {}s -> {}s", interval_secs, new_secs);
+                        interval_secs = new_secs;
+                        interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                    }
+                }
+                Err(e) => {
+                    warn!("tag scheduler: 读取设置失败，沿用上次间隔: {}", e);
+                }
+            }
             if let Err(e) = self.run_once().await {
                 error!("tag rule scheduler error: {}", e);
             }
@@ -224,6 +245,38 @@ impl TagRuleScheduler {
             "tag scheduler: === 扫描完成 === 种子:{} 已有标签跳过:{} 无tracker跳过:{} 命中:{} 标签成功:{}",
             total_torrents, total_already, total_no_tracker, total_matched, total_tagged
         );
+
+        // 统计每条规则的标签种子数和总体积，写入数据库
+        for (rule, _) in &parsed_rules {
+            let target_ids: Option<Vec<i64>> = rule
+                .downloader_ids
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok());
+
+            let mut count: i64 = 0;
+            let mut total_size: i64 = 0;
+            for downloader in &downloaders {
+                if let Some(ref ids) = target_ids {
+                    if !ids.is_empty() && !ids.contains(&downloader.id) {
+                        continue;
+                    }
+                }
+                if let Ok(client) = self.pool.get(downloader).await {
+                    if let Ok(torrents) = client.list_torrents(Some(&rule.tag_name)).await {
+                        count += torrents.len() as i64;
+                        total_size += torrents.iter().map(|t| t.size).sum::<i64>();
+                    }
+                }
+            }
+            if let Err(e) = self.db.update_tag_rule_stats(rule.id, count, total_size).await {
+                warn!("tag scheduler: 更新规则 '{}' 统计失败: {}", rule.name, e);
+            } else {
+                debug!(
+                    "tag scheduler: 规则 '{}' 统计已更新: 种子数={}, 总体积={}B",
+                    rule.name, count, total_size
+                );
+            }
+        }
 
         Ok(())
     }

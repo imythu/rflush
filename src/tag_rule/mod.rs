@@ -22,6 +22,10 @@ pub struct TagRuleRecord {
     pub enabled: bool,
     /// 生效的下载器 ID 列表 JSON 数组，null 表示所有
     pub downloader_ids: Option<String>,
+    /// 该标签当前关联的种子数
+    pub tagged_torrent_count: i64,
+    /// 该标签关联种子的总体积（字节）
+    pub tagged_total_size: i64,
     pub created_at: String,
     pub updated_at: String,
 }
