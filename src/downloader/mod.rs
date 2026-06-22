@@ -166,6 +166,19 @@ pub trait DownloaderClient: Send + Sync {
             })
         })
     }
+
+    /// 获取种子的 tracker URL 列表
+    fn get_torrent_trackers(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>>;
+
+    /// 为指定种子添加标签
+    fn add_torrent_tags(
+        &self,
+        hashes: Vec<String>,
+        tags: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 pub fn calculate_pending_download_bytes(torrents: &[TorrentInfo]) -> u64 {

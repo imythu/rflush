@@ -2125,6 +2125,151 @@ impl Database {
         .map_err(join_error)?
     }
 
+    // ========== Tag Rules ==========
+
+    pub async fn list_tag_rules(&self) -> Result<Vec<crate::tag_rule::TagRuleRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at
+                     FROM tag_rules ORDER BY id",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| row_to_tag_rule(row))
+                .map_err(sql_error)?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(sql_error)?);
+            }
+            Ok(list)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn list_enabled_tag_rules(&self) -> Result<Vec<crate::tag_rule::TagRuleRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at
+                     FROM tag_rules WHERE enabled = 1 ORDER BY id",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| row_to_tag_rule(row))
+                .map_err(sql_error)?;
+            let mut list = Vec::new();
+            for row in rows {
+                list.push(row.map_err(sql_error)?);
+            }
+            Ok(list)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn get_tag_rule(&self, id: i64) -> Result<Option<crate::tag_rule::TagRuleRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.query_row(
+                "SELECT id, name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at
+                 FROM tag_rules WHERE id = ?",
+                params![id],
+                |row| row_to_tag_rule(row),
+            )
+            .optional()
+            .map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn create_tag_rule(&self, req: &crate::tag_rule::TagRuleRequest) -> Result<i64, AppError> {
+        let path = self.path.clone();
+        let now = Utc::now().to_rfc3339();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let match_rules_json = serde_json::to_string(&req.match_rules)
+                .map_err(|e| sql_error(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+            let downloader_ids_json = req
+                .downloader_ids
+                .map(|ids| serde_json::to_string(&ids))
+                .transpose()
+                .map_err(|e| sql_error(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+            let enabled = req.enabled.unwrap_or(true) as i32;
+            conn.execute(
+                "INSERT INTO tag_rules (name, tag_name, match_rules, enabled, downloader_ids, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![req.name, req.tag_name, match_rules_json, enabled, downloader_ids_json, now, now],
+            )
+            .map_err(sql_error)?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn update_tag_rule(&self, id: i64, req: &crate::tag_rule::TagRuleRequest) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let now = Utc::now().to_rfc3339();
+        let req = req.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let match_rules_json = serde_json::to_string(&req.match_rules)
+                .map_err(|e| sql_error(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+            let downloader_ids_json = req
+                .downloader_ids
+                .map(|ids| serde_json::to_string(&ids))
+                .transpose()
+                .map_err(|e| sql_error(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+            let enabled = req.enabled.unwrap_or(true) as i32;
+            conn.execute(
+                "UPDATE tag_rules SET name = ?, tag_name = ?, match_rules = ?, enabled = ?, downloader_ids = ?, updated_at = ?
+                 WHERE id = ?",
+                params![req.name, req.tag_name, match_rules_json, enabled, downloader_ids_json, now, id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn delete_tag_rule(&self, id: i64) -> Result<(), AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute("DELETE FROM tag_rules WHERE id = ?", params![id])
+                .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn set_tag_rule_enabled(&self, id: i64, enabled: bool) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE tag_rules SET enabled = ?, updated_at = ? WHERE id = ?",
+                params![enabled as i32, now, id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     async fn init(&self) -> Result<(), AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
@@ -2495,6 +2640,20 @@ impl Database {
                 "ALTER TABLE sites ADD COLUMN use_proxy INTEGER NOT NULL DEFAULT 1",
             )?;
 
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tag_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    tag_name TEXT NOT NULL,
+                    match_rules TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    downloader_ids TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .map_err(sql_error)?;
+
             conn.execute(
                 "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1],
@@ -2661,6 +2820,19 @@ fn map_brush_torrent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTo
         avg_upload_speed: row.get(16)?,
         ratio: row.get(17)?,
         last_stats_at: row.get(18)?,
+    })
+}
+
+fn row_to_tag_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::tag_rule::TagRuleRecord> {
+    Ok(crate::tag_rule::TagRuleRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        tag_name: row.get(2)?,
+        match_rules: row.get(3)?,
+        enabled: row.get::<_, i32>(4)? != 0,
+        downloader_ids: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 

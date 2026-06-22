@@ -11,6 +11,7 @@ import {
   Menu,
   CalendarCheck,
   Settings,
+  Tag,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -44,6 +45,7 @@ type AppPage =
   | "downloaders"
   | "brush-tasks"
   | "sign-in"
+  | "tag-rules"
   | "stats"
   | "system-settings";
 
@@ -57,6 +59,7 @@ const SitesPage = lazy(() => import("@/pages/sites-page").then((module) => ({ de
 const DownloadersPage = lazy(() => import("@/pages/downloaders-page").then((module) => ({ default: module.DownloadersPage })));
 const BrushTasksPage = lazy(() => import("@/pages/brush-tasks-page").then((module) => ({ default: module.BrushTasksPage })));
 const SignInPage = lazy(() => import("@/pages/sign-in-page").then((module) => ({ default: module.SignInPage })));
+const TagRulesPage = lazy(() => import("@/pages/tag-rules-page").then((module) => ({ default: module.TagRulesPage })));
 const StatsPage = lazy(() => import("@/pages/stats-page").then((module) => ({ default: module.StatsPage })));
 const SystemSettingsPage = lazy(() =>
   import("@/pages/system-settings-page").then((module) => ({ default: module.SystemSettingsPage })),
@@ -98,6 +101,13 @@ const navItems: Array<{
     label: "自动签到",
     description: "NexusPHP 站点自动签到任务与执行记录",
     icon: CalendarCheck,
+    group: "brush",
+  },
+  {
+    key: "tag-rules",
+    label: "标签规则",
+    description: "根据 Tracker URL 自动匹配并管理种子标签",
+    icon: Tag,
     group: "brush",
   },
   {
@@ -156,6 +166,7 @@ function readPageFromHash(): AppPage {
     "downloaders",
     "brush-tasks",
     "sign-in",
+    "tag-rules",
     "stats",
     "system-settings",
   ];
@@ -214,7 +225,7 @@ export default function App() {
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsConnected, setLogsConnected] = useState(false);
-  const [logLevelFilter, setLogLevelFilter] = useState<LogLevel>("info");
+  const [logLevelFilter, setLogLevelFilter] = useState<LogLevel>("trace");
   const [logKeywordFilter, setLogKeywordFilter] = useState("");
   const logsViewportRef = useRef<HTMLDivElement | null>(null);
   const pendingLogsRef = useRef<string[]>([]);
@@ -229,17 +240,19 @@ export default function App() {
   );
 
   useEffect(() => {
-    setLogLevelFilter((prev) =>
-      LOG_LEVEL_PRIORITY[prev] >= LOG_LEVEL_PRIORITY[effectiveLogLevel] ? prev : effectiveLogLevel,
-    );
-  }, [effectiveLogLevel]);
+    if (logsOpen) {
+      setLogLevelFilter(effectiveLogLevel);
+    }
+  }, [logsOpen, effectiveLogLevel]);
 
   async function loadPageData(targetPage: AppPage) {
+    const settingsPromise = api<GlobalConfig>("/api/settings").then((s) => { setSettings(s); return s; });
     switch (targetPage) {
       case "dashboard": {
         const [rss, history] = await Promise.all([
           api<RssSubscription[]>("/api/rss"),
           api<DownloadRecord[]>("/api/history"),
+          settingsPromise,
         ]);
         setTasks(rss);
         setHistory(history);
@@ -249,24 +262,23 @@ export default function App() {
         const [rss, dl] = await Promise.all([
           api<RssSubscription[]>("/api/rss"),
           api<DownloaderRecord[]>("/api/downloaders"),
+          settingsPromise,
         ]);
         setTasks(rss);
         setDownloaders(dl);
         break;
       }
       case "history": {
-        const history = await api<DownloadRecord[]>("/api/history");
-        setHistory(history);
+        await Promise.all([
+          api<DownloadRecord[]>("/api/history").then((h) => setHistory(h)),
+          settingsPromise,
+        ]);
         break;
       }
-      case "settings":
-      case "system-settings": {
-        const nextSettings = await api<GlobalConfig>("/api/settings");
-        setSettings(nextSettings);
+      default: {
+        await settingsPromise;
         break;
       }
-      default:
-        break;
     }
   }
 
@@ -713,6 +725,7 @@ export default function App() {
               {page === "downloaders" ? <DownloadersPage /> : null}
               {page === "brush-tasks" ? <BrushTasksPage /> : null}
               {page === "sign-in" ? <SignInPage /> : null}
+              {page === "tag-rules" ? <TagRulesPage /> : null}
               {page === "stats" ? <StatsPage /> : null}
               {page === "system-settings" ? (
                 <SystemSettingsPage settings={settings} setSettings={setSettings} saving={saving} onSave={saveSettings} />

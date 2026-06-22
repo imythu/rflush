@@ -35,6 +35,7 @@ use crate::net::client_factory;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
 use crate::site_stats::SiteStatsRefresher;
+use crate::tag_rule::scheduler::TagRuleScheduler;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -47,6 +48,7 @@ pub struct AppState {
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     monitor: Arc<SystemMonitor>,
+    tag_rule_scheduler: Arc<TagRuleScheduler>,
 }
 
 struct JobRegistry {
@@ -147,6 +149,7 @@ impl AppState {
         collector: Arc<DownloaderSnapshotCollector>,
         pool: Arc<DownloaderClientPool>,
         monitor: Arc<SystemMonitor>,
+        tag_rule_scheduler: Arc<TagRuleScheduler>,
     ) -> Self {
         Self {
             db,
@@ -158,6 +161,7 @@ impl AppState {
             collector,
             pool,
             monitor,
+            tag_rule_scheduler,
         }
     }
 
@@ -303,6 +307,7 @@ pub async fn serve(
     pool: Arc<DownloaderClientPool>,
     rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
     monitor: Arc<SystemMonitor>,
+    tag_rule_scheduler: Arc<TagRuleScheduler>,
 ) -> Result<(), AppError> {
     let engine = DownloadEngine::new(rate_limiter);
     let state = AppState::new(
@@ -314,6 +319,7 @@ pub async fn serve(
         collector,
         pool,
         monitor,
+        tag_rule_scheduler,
     );
     let app = app_router(state);
     let listener = TcpListener::bind(addr)
@@ -427,6 +433,19 @@ fn app_router(state: AppState) -> Router {
         // 系统监控
         .route("/api/system/stats", get(get_system_stats))
         .route("/api/system/stats/history", get(get_system_stats_history))
+        // 标签规则
+        .route(
+            "/api/tag-rules",
+            get(list_tag_rules).post(create_tag_rule),
+        )
+        .route(
+            "/api/tag-rules/{id}",
+            get(get_tag_rule)
+                .put(update_tag_rule)
+                .delete(delete_tag_rule),
+        )
+        .route("/api/tag-rules/scan", post(scan_tag_rules))
+        .route("/api/tag-rules/{id}/tag-count", get(get_tag_rule_tag_count))
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state(state)
@@ -1659,6 +1678,133 @@ fn map_sign_in_trigger_error(message: String) -> ApiError {
         "签到任务正在运行中" => ApiError::conflict(message),
         _ => ApiError::internal(message),
     }
+}
+
+// ========== Tag Rules API ==========
+
+async fn list_tag_rules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::tag_rule::TagRuleRecord>>, ApiError> {
+    Ok(Json(state.db.list_tag_rules().await?))
+}
+
+async fn get_tag_rule(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::tag_rule::TagRuleRecord>, ApiError> {
+    state
+        .db
+        .get_tag_rule(id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("标签规则不存在"))
+}
+
+async fn create_tag_rule(
+    State(state): State<AppState>,
+    Json(body): Json<crate::tag_rule::TagRuleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_tag_rule(&body)?;
+    let id = state.db.create_tag_rule(&body).await?;
+    Ok(Json(serde_json::json!({ "id": id })))
+}
+
+async fn update_tag_rule(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<crate::tag_rule::TagRuleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_tag_rule(&body)?;
+    state.db.update_tag_rule(id, &body).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn delete_tag_rule(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state.db.delete_tag_rule(id).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn scan_tag_rules(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .tag_rule_scheduler
+        .run_once()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+async fn get_tag_rule_tag_count(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rule = state
+        .db
+        .get_tag_rule(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("标签规则不存在"))?;
+
+    let target_downloader_ids: Option<Vec<i64>> = rule
+        .downloader_ids
+        .as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    let downloaders = state.db.list_downloaders().await?;
+    let mut total_count: usize = 0;
+
+    for downloader in &downloaders {
+        if let Some(ref ids) = target_downloader_ids {
+            if !ids.is_empty() && !ids.contains(&downloader.id) {
+                continue;
+            }
+        }
+        let client = match state.pool.get(downloader).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        match client.list_torrents(Some(&rule.tag_name)).await {
+            Ok(torrents) => {
+                total_count += torrents.len();
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "count": total_count })))
+}
+
+fn validate_tag_rule(req: &crate::tag_rule::TagRuleRequest) -> Result<(), ApiError> {
+    if req.name.trim().is_empty() {
+        return Err(ApiError::bad_request("名称不能为空"));
+    }
+    if req.tag_name.trim().is_empty() {
+        return Err(ApiError::bad_request("标签名不能为空"));
+    }
+    if req.match_rules.is_empty() {
+        return Err(ApiError::bad_request("匹配规则不能为空"));
+    }
+    for (i, rule) in req.match_rules.iter().enumerate() {
+        match rule.match_type.as_str() {
+            "prefix" | "suffix" | "contains" | "exact" | "regex" => {}
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "第{}条规则的匹配类型无效: {}，支持: prefix, suffix, contains, exact, regex",
+                    i + 1, other
+                )));
+            }
+        }
+        if rule.pattern.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "第{}条规则的匹配模式不能为空",
+                i + 1
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

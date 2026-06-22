@@ -204,6 +204,35 @@ impl DownloaderClient for QBittorrentClient {
             Ok(free)
         })
     }
+
+    fn get_torrent_trackers(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+        let hash = hash.to_string();
+        Box::pin(async move {
+            let trackers = self
+                .qb
+                .get_torrent_trackers(&hash)
+                .await
+                .map_err(|e| format!("获取种子tracker失败: {}", e))?;
+            Ok(trackers.into_iter().map(|t| t.url).collect())
+        })
+    }
+
+    fn add_torrent_tags(
+        &self,
+        hashes: Vec<String>,
+        tags: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            self.qb
+                .add_torrent_tags(hashes, tags)
+                .await
+                .map_err(|e| format!("添加标签失败: {}", e))?;
+            Ok(())
+        })
+    }
 }
 
 impl From<qbit_rs::model::Torrent> for TorrentInfo {

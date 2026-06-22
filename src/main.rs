@@ -16,6 +16,7 @@ mod sign_in;
 mod site;
 mod site_stats;
 mod stats;
+mod tag_rule;
 mod web;
 
 use std::sync::Arc;
@@ -111,6 +112,12 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         monitor_ref.start().await;
     });
 
+    let tag_rule_scheduler = tag_rule::scheduler::TagRuleScheduler::new(db.clone(), pool.clone());
+    let tag_rule_scheduler_ref = tag_rule_scheduler.clone();
+    let tag_rule_scheduler_handle = tokio::spawn(async move {
+        tag_rule_scheduler_ref.start().await;
+    });
+
     let web_result = web::serve(
         base_dir,
         listen_addr,
@@ -122,6 +129,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         pool,
         limiter,
         monitor,
+        tag_rule_scheduler,
     )
     .await;
 
@@ -131,6 +139,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     sign_in_scheduler_handle.abort();
     site_stats_handle.abort();
     monitor_handle.abort();
+    tag_rule_scheduler_handle.abort();
 
     let _ = collector_handle.await;
     let _ = stats_handle.await;
@@ -138,6 +147,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let _ = sign_in_scheduler_handle.await;
     let _ = site_stats_handle.await;
     let _ = monitor_handle.await;
+    let _ = tag_rule_scheduler_handle.await;
 
     web_result
 }

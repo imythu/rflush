@@ -364,3 +364,29 @@ export type TaskOverview = {
   torrent_count: number;
   enabled: boolean;
 };
+
+// ========== 标签规则 ==========
+
+export type TagMatchCriteria = {
+  match_type: "prefix" | "suffix" | "contains" | "exact" | "regex";
+  pattern: string;
+};
+
+export type TagRuleRecord = {
+  id: number;
+  name: string;
+  tag_name: string;
+  match_rules: string; // JSON string of TagMatchCriteria[]
+  enabled: boolean;
+  downloader_ids: string | null; // JSON string of number[] | null
+  created_at: string;
+  updated_at: string;
+};
+
+export type TagRuleRequest = {
+  name: string;
+  tag_name: string;
+  match_rules: TagMatchCriteria[];
+  enabled?: boolean;
+  downloader_ids?: number[] | null;
+};

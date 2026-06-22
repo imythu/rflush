@@ -54,6 +54,20 @@ impl SignInScheduler {
             }
             drop(running);
 
+            // 冷却检查：上次执行距今不到 60 秒则跳过，防止同一 cron 窗口重复触发
+            if let Some(ref last_run) = task.last_run_at {
+                if let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_run) {
+                    let elapsed = (Utc::now() - last.with_timezone(&Utc)).num_seconds();
+                    if elapsed < 60 {
+                        debug!(
+                            "[签到][{}] 跳过：上次执行距今 {}s（冷却 60s）",
+                            task.name, elapsed
+                        );
+                        continue;
+                    }
+                }
+            }
+
             if should_trigger(&task) {
                 self.spawn_task(task).await;
             }
