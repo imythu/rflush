@@ -67,12 +67,11 @@ impl TagRuleScheduler {
         debug!("tag scheduler: === 开始扫描 ===");
         debug!("tag scheduler: 已加载 {} 条启用规则", parsed_rules.len());
         for (rule, compiled) in &parsed_rules {
-            let ids_desc = rule.downloader_ids.as_ref()
-                .map(|s| {
-                    let ids: Vec<i64> = serde_json::from_str(s).unwrap_or_default();
-                    ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
-                })
-                .unwrap_or_else(|| "所有".to_string());
+            let ids_desc = match rule.downloader_ids.as_ref().and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok()) {
+                None => "所有".to_string(),
+                Some(ids) if ids.is_empty() => "无".to_string(),
+                Some(ids) => ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+            };
             let criteria_desc: Vec<String> = compiled.iter().map(|c| match c {
                 CompiledCriteria::Prefix(p) => format!("前缀:{}", p),
                 CompiledCriteria::Suffix(s) => format!("后缀:{}", s),
@@ -104,7 +103,7 @@ impl TagRuleScheduler {
                 match &rule.downloader_ids {
                     Some(ids_str) => {
                         let ids: Vec<i64> = serde_json::from_str(ids_str).unwrap_or_default();
-                        ids.is_empty() || ids.contains(&downloader.id)
+                        ids.contains(&downloader.id)
                     }
                     None => true,
                 }
@@ -257,7 +256,7 @@ impl TagRuleScheduler {
             let mut total_size: i64 = 0;
             for downloader in &downloaders {
                 if let Some(ref ids) = target_ids {
-                    if !ids.is_empty() && !ids.contains(&downloader.id) {
+                    if !ids.contains(&downloader.id) {
                         continue;
                     }
                 }

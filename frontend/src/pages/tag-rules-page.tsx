@@ -143,6 +143,7 @@ export function TagRulesPage() {
     try {
       const payload: TagRuleRequest = {
         ...form,
+        name: form.tag_name,
         match_rules: form.match_rules.filter((r) => r.pattern.trim() !== ""),
       };
       if (payload.match_rules.length === 0) {
@@ -225,7 +226,7 @@ export function TagRulesPage() {
     setForm((prev) => {
       const current = prev.downloader_ids ?? [];
       const next = current.includes(id) ? current.filter((x) => x !== id) : [...current, id];
-      return { ...prev, downloader_ids: next.length === 0 ? null : next };
+      return { ...prev, downloader_ids: next };
     });
   }
 
@@ -312,7 +313,6 @@ export function TagRulesPage() {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>名称</TableHead>
                   <TableHead>标签名</TableHead>
                   <TableHead>种子数</TableHead>
                   <TableHead>匹配规则</TableHead>
@@ -340,7 +340,6 @@ export function TagRulesPage() {
                   }
                   return (
                     <TableRow key={rule.id}>
-                      <TableCell className="font-medium">{rule.name}</TableCell>
                       <TableCell>
                         <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-semibold text-primary">
                           {rule.tag_name}
@@ -428,23 +427,13 @@ export function TagRulesPage() {
           ) : null}
 
           {/* 基本信息 */}
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label>规则名称</Label>
-              <Input
-                value={form.name}
-                onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
-                placeholder="例如：馒头站种子"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>标签名</Label>
-              <Input
-                value={form.tag_name}
-                onChange={(e) => setForm((prev) => ({ ...prev, tag_name: e.target.value }))}
-                placeholder="例如：mteam"
-              />
-            </div>
+          <div className="space-y-2">
+            <Label>标签名</Label>
+            <Input
+              value={form.tag_name}
+              onChange={(e) => setForm((prev) => ({ ...prev, tag_name: e.target.value }))}
+              placeholder="例如：mteam"
+            />
           </div>
 
           {/* 启用状态 */}
