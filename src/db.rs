@@ -1475,6 +1475,32 @@ impl Database {
         .map_err(join_error)?
     }
 
+    /// 返回任务下所有未移除 (status != 'removed') 种子的 torrent_id 集合 (排除 NULL)。
+    pub async fn list_non_removed_brush_torrent_ids(
+        &self,
+        task_id: i64,
+    ) -> Result<std::collections::HashSet<String>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT torrent_id FROM brush_task_torrents WHERE task_id = ? AND status != 'removed' AND torrent_id IS NOT NULL",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map(params![task_id], |row| row.get::<_, String>(0))
+                .map_err(sql_error)?;
+            let mut set = std::collections::HashSet::new();
+            for row in rows {
+                set.insert(row.map_err(sql_error)?);
+            }
+            Ok(set)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn list_non_removed_brush_torrents_with_tasks(
         &self,
     ) -> Result<Vec<(BrushTorrentRecord, BrushTaskRecord)>, AppError> {

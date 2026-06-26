@@ -726,14 +726,11 @@ async fn execute_brush_task(
         snapshot.items.len()
     );
 
-    let existing_hashes: std::collections::HashSet<String> = managed_torrents
-        .iter()
-        .map(|t| {
-            t.torrent_id
-                .clone()
-                .unwrap_or_else(|| t.torrent_hash.clone())
-        })
-        .collect();
+    // 查询任务下所有未移除种子的 torrent_id，用于跳过已管理的种子
+    let mut existing_torrent_ids = db
+        .list_non_removed_brush_torrent_ids(task.id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // 7. 准备站点详情增强
     let mut site_adapter: Option<Box<dyn SiteAdapter>> = None;
@@ -792,9 +789,22 @@ async fn execute_brush_task(
             }
         }
 
-        // 跳过已存在的种子
-        if existing_hashes.contains(&item.guid) {
-            continue;
+        // 根据种子 id + 任务 id 查询数据库中是否存在未移除的记录，存在则跳过
+        let item_torrent_id = item
+            .link
+            .as_deref()
+            .map(extract_torrent_id)
+            .or_else(|| Some(extract_torrent_id(&item.guid)))
+            .map(str::to_string)
+            .filter(|value| !value.is_empty());
+        if let Some(ref tid) = item_torrent_id {
+            if existing_torrent_ids.contains(tid) {
+                debug!(
+                    "[刷流][{}] 跳过: 种子已存在且未移除 id={}",
+                    task.name, tid
+                );
+                continue;
+            }
         }
 
         // 第一轮过滤：用已有属性快速筛选，避免不必要的详情请求
@@ -1154,6 +1164,9 @@ async fn execute_brush_task(
                     effective_item.is_hr()
                 );
                 added += 1;
+                if let Some(ref tid) = torrent_id {
+                    existing_torrent_ids.insert(tid.clone());
+                }
                 if let Some(bytes) = effective_item.size_bytes {
                     current_size_gb += bytes as f64 / (1024.0 * 1024.0 * 1024.0);
                     if let Some(free) = qb_free_space.get_mut(&dl_id) {
