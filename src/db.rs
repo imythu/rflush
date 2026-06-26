@@ -1910,6 +1910,124 @@ impl Database {
         .map_err(join_error)?
     }
 
+    /// 返回指定时间范围内每天的增量上传/下载量（bytes）。
+    /// 通过比较同一天内第一个和最后一个快照的累计值来计算增量。
+    /// 多个任务的结果会按天聚合。返回 (date, uploaded_delta, downloaded_delta)。
+    pub async fn get_daily_transfer_totals(
+        &self,
+        task_id: Option<i64>,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<(String, i64, i64)>, AppError> {
+        let path = self.path.clone();
+        let (since, until) = (since.to_string(), until.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            // For each task, for each day, get the first and last snapshot's
+            // cumulative totals, then compute the delta. Sum across tasks per day.
+            let sql = if task_id.is_some() {
+                "SELECT strftime('%Y-%m-%d', recorded_at) AS day,
+                        task_id,
+                        MIN(recorded_at) AS first_at,
+                        MAX(recorded_at) AS last_at
+                 FROM task_stats_snapshots
+                 WHERE task_id = ?
+                   AND datetime(recorded_at) >= datetime(?)
+                   AND datetime(recorded_at) <= datetime(?)
+                 GROUP BY day, task_id"
+            } else {
+                "SELECT strftime('%Y-%m-%d', recorded_at) AS day,
+                        task_id,
+                        MIN(recorded_at) AS first_at,
+                        MAX(recorded_at) AS last_at
+                 FROM task_stats_snapshots
+                 WHERE datetime(recorded_at) >= datetime(?)
+                   AND datetime(recorded_at) <= datetime(?)
+                 GROUP BY day, task_id"
+            };
+
+            let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = if let Some(tid) = task_id {
+                vec![Box::new(tid), Box::new(since), Box::new(until)]
+            } else {
+                vec![Box::new(since), Box::new(until)]
+            };
+
+            let mut stmt = conn.prepare(sql).map_err(sql_error)?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt
+                .query_map(params_refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?, // day
+                        row.get::<_, i64>(1)?,    // task_id
+                        row.get::<_, String>(2)?, // first_at
+                        row.get::<_, String>(3)?, // last_at
+                    ))
+                })
+                .map_err(sql_error)?;
+
+            let mut day_map: std::collections::HashMap<String, (i64, i64)> =
+                std::collections::HashMap::new();
+
+            for row in rows {
+                let (day, _task_id, first_at, last_at) = row.map_err(sql_error)?;
+                if first_at == last_at {
+                    // Only one snapshot that day, no delta
+                    continue;
+                }
+                // Get first and last totals
+                let first_up: i64 = conn
+                    .query_row(
+                        "SELECT total_uploaded FROM task_stats_snapshots
+                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
+                        rusqlite::params![first_at],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let last_up: i64 = conn
+                    .query_row(
+                        "SELECT total_uploaded FROM task_stats_snapshots
+                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
+                        rusqlite::params![last_at],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let first_down: i64 = conn
+                    .query_row(
+                        "SELECT total_downloaded FROM task_stats_snapshots
+                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
+                        rusqlite::params![first_at],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let last_down: i64 = conn
+                    .query_row(
+                        "SELECT total_downloaded FROM task_stats_snapshots
+                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
+                        rusqlite::params![last_at],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                let delta_up = (last_up - first_up).max(0);
+                let delta_down = (last_down - first_down).max(0);
+
+                let entry = day_map.entry(day).or_insert((0, 0));
+                entry.0 += delta_up;
+                entry.1 += delta_down;
+            }
+
+            let mut result: Vec<(String, i64, i64)> = day_map
+                .into_iter()
+                .map(|(day, (up, down))| (day, up, down))
+                .collect();
+            result.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(result)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn save_torrent_traffic(
         &self,
         task_id: i64,

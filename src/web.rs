@@ -434,6 +434,7 @@ fn app_router(state: AppState) -> Router {
             "/api/stats/downloader-speed-trend",
             get(downloader_speed_trend),
         )
+        .route("/api/stats/daily-transfer", get(daily_transfer))
         // 系统监控
         .route("/api/system/stats", get(get_system_stats))
         .route("/api/system/stats/history", get(get_system_stats_history))
@@ -1590,6 +1591,36 @@ async fn downloader_speed_trend(
         .get_downloader_speed_snapshots(q.downloader_id, &since, &until, bucket_secs)
         .await?;
     Ok(Json(data))
+}
+
+#[derive(Debug, Serialize)]
+struct DailyTransferItem {
+    date: String,
+    uploaded: i64,
+    downloaded: i64,
+}
+
+async fn daily_transfer(
+    State(state): State<AppState>,
+    Query(q): Query<StatsQuery>,
+) -> Result<Json<Vec<DailyTransferItem>>, ApiError> {
+    let until = q.until.unwrap_or_else(|| Utc::now().to_rfc3339());
+    let since = q.since.unwrap_or_else(|| {
+        (Utc::now() - chrono::Duration::days(30)).to_rfc3339()
+    });
+    let data = state
+        .db
+        .get_daily_transfer_totals(q.task_id, &since, &until)
+        .await?;
+    Ok(Json(
+        data.into_iter()
+            .map(|(date, uploaded, downloaded)| DailyTransferItem {
+                date,
+                uploaded,
+                downloaded,
+            })
+            .collect(),
+    ))
 }
 
 async fn get_system_stats(

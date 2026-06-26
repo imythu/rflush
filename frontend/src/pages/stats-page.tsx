@@ -3,11 +3,14 @@ import {
   Activity,
   ArrowUpDown,
   BarChart3,
+  Calendar,
   HardDrive,
   RefreshCw,
   TrendingUp,
 } from "lucide-react";
 import {
+  Bar,
+  BarChart,
   CartesianGrid,
   Legend,
   Line,
@@ -25,9 +28,11 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import type {
+  DailyTransferItem,
   DownloaderRecord,
   DownloaderSpeedSnapshot,
   StatsOverview,
@@ -306,6 +311,143 @@ const COLORS = {
   grid: "#e5e7eb",
 } as const;
 
+/* ---------- date range helpers ---------- */
+
+function toDateInput(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function fromDateInput(value: string, endOfDay: boolean): number {
+  const d = new Date(value + "T00:00:00");
+  if (endOfDay) d.setHours(23, 59, 59, 999);
+  return d.getTime();
+}
+
+type DateRangeMode = "quick" | "custom";
+
+/* ---------- reusable time range controls ---------- */
+
+function TimeRangeControls({
+  mode,
+  setMode,
+  quickHours,
+  setQuickHours,
+  customStart,
+  customEnd,
+  setCustomStart,
+  setCustomEnd,
+  onApply,
+  refreshSecs,
+  setRefreshSecs,
+  lineFilter,
+  setLineFilter,
+  showLineFilter,
+}: {
+  mode: DateRangeMode;
+  setMode: (m: DateRangeMode) => void;
+  quickHours: number;
+  setQuickHours: (h: number) => void;
+  customStart: string;
+  customEnd: string;
+  setCustomStart: (s: string) => void;
+  setCustomEnd: (s: string) => void;
+  onApply: () => void;
+  refreshSecs: number;
+  setRefreshSecs: (s: number) => void;
+  lineFilter?: "both" | "upload" | "download";
+  setLineFilter?: (f: "both" | "upload" | "download") => void;
+  showLineFilter?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
+      <div className="flex items-center gap-1">
+        <button
+          className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+            mode === "quick" ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-surface-container/80"
+          }`}
+          onClick={() => setMode("quick")}
+        >
+          <Calendar className="h-3 w-3 inline mr-1" />
+          快捷
+        </button>
+        <button
+          className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+            mode === "custom" ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-surface-container/80"
+          }`}
+          onClick={() => setMode("custom")}
+        >
+          <Calendar className="h-3 w-3 inline mr-1" />
+          日期范围
+        </button>
+      </div>
+
+      {mode === "quick" ? (
+        <div className="flex gap-1">
+          {TIME_RANGES.map((r) => (
+            <button
+              key={r.label}
+              className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                quickHours === r.hours
+                  ? "bg-primary text-primary-foreground shadow-sm"
+                  : "hover:bg-surface-container/80 text-muted-foreground"
+              }`}
+              onClick={() => setQuickHours(r.hours)}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="flex items-center gap-1.5">
+          <input
+            type="date"
+            className="h-7 rounded-lg border border-border bg-input px-2 text-[10px]"
+            value={customStart}
+            onChange={(e) => setCustomStart(e.target.value)}
+          />
+          <span className="text-[10px] text-muted">至</span>
+          <input
+            type="date"
+            className="h-7 rounded-lg border border-border bg-input px-2 text-[10px]"
+            value={customEnd}
+            onChange={(e) => setCustomEnd(e.target.value)}
+          />
+          <Button size="sm" className="h-7 text-[10px] px-2" onClick={onApply}>
+            查询
+          </Button>
+        </div>
+      )}
+
+      <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block" />
+      {showLineFilter && lineFilter && setLineFilter && (
+        <div className="flex gap-1">
+          {(["both", "upload", "download"] as const).map((f) => (
+            <button
+              key={f}
+              className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                lineFilter === f
+                  ? "bg-surface-container-highest text-foreground shadow-sm ring-1 ring-border"
+                  : "hover:bg-surface-container/80 text-muted-foreground"
+              }`}
+              onClick={() => setLineFilter(f)}
+            >
+              {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
+            </button>
+          ))}
+        </div>
+      )}
+      <div className="flex items-center gap-2">
+        <Select
+          value={String(refreshSecs)}
+          onChange={(val) => setRefreshSecs(Number(val))}
+          options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
+        />
+      </div>
+    </div>
+  );
+}
+
 /* ---------- component ---------- */
 
 export function StatsPage() {
@@ -316,11 +458,21 @@ export function StatsPage() {
   const [transferRefreshSecs, setTransferRefreshSecs] = useState(0);
   const [transferSnapshots, setTransferSnapshots] = useState<TaskStatsSnapshot[]>([]);
   const [transferTimeWindow, setTransferTimeWindow] = useState<TimeWindow | null>(null);
+  const [transferRangeMode, setTransferRangeMode] = useState<DateRangeMode>("quick");
+  const [transferCustomStart, setTransferCustomStart] = useState(toDateInput(Date.now() - 24 * 60 * 60_000));
+  const [transferCustomEnd, setTransferCustomEnd] = useState(toDateInput(Date.now()));
+  const [transferCustomSince, setTransferCustomSince] = useState<string | null>(null);
+  const [transferCustomUntil, setTransferCustomUntil] = useState<string | null>(null);
   const [selectedTorrentTaskId, setSelectedTorrentTaskId] = useState<number | -1>(-1);
   const [torrentTrendHours, setTorrentTrendHours] = useState(24);
   const [torrentRefreshSecs, setTorrentRefreshSecs] = useState(0);
   const [torrentSnapshots, setTorrentSnapshots] = useState<TaskStatsSnapshot[]>([]);
   const [torrentTimeWindow, setTorrentTimeWindow] = useState<TimeWindow | null>(null);
+  const [torrentRangeMode, setTorrentRangeMode] = useState<DateRangeMode>("quick");
+  const [torrentCustomStart, setTorrentCustomStart] = useState(toDateInput(Date.now() - 24 * 60 * 60_000));
+  const [torrentCustomEnd, setTorrentCustomEnd] = useState(toDateInput(Date.now()));
+  const [torrentCustomSince, setTorrentCustomSince] = useState<string | null>(null);
+  const [torrentCustomUntil, setTorrentCustomUntil] = useState<string | null>(null);
   const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
   const [selectedDownloaderId, setSelectedDownloaderId] = useState<number | -1>(-1);
   const [downloaderLineFilter, setDownloaderLineFilter] = useState<"both" | "upload" | "download">("both");
@@ -328,10 +480,25 @@ export function StatsPage() {
   const [downloaderRefreshSecs, setDownloaderRefreshSecs] = useState(0);
   const [downloaderSnapshots, setDownloaderSnapshots] = useState<DownloaderSpeedSnapshot[]>([]);
   const [downloaderTimeWindow, setDownloaderTimeWindow] = useState<TimeWindow | null>(null);
-  const [downloaderTrendLoading, setDownloaderTrendLoading] = useState(false);
+  const [downloaderRangeMode, setDownloaderRangeMode] = useState<DateRangeMode>("quick");
+  const [downloaderCustomStart, setDownloaderCustomStart] = useState(toDateInput(Date.now() - 24 * 60 * 60_000));
+  const [downloaderCustomEnd, setDownloaderCustomEnd] = useState(toDateInput(Date.now()));
+  const [downloaderCustomSince, setDownloaderCustomSince] = useState<string | null>(null);
+  const [downloaderCustomUntil, setDownloaderCustomUntil] = useState<string | null>(null);
+  // Daily transfer chart
+  const [dailyTaskId, setDailyTaskId] = useState<number | -1>(-1);
+  const [dailyRangeMode, setDailyRangeMode] = useState<DateRangeMode>("quick");
+  const [dailyQuickDays, setDailyQuickDays] = useState(7);
+  const [dailyCustomStart, setDailyCustomStart] = useState(toDateInput(Date.now() - 7 * 24 * 60 * 60_000));
+  const [dailyCustomEnd, setDailyCustomEnd] = useState(toDateInput(Date.now()));
+  const [dailySince, setDailySince] = useState<string | null>(null);
+  const [dailyUntil, setDailyUntil] = useState<string | null>(null);
+  const [dailyData, setDailyData] = useState<DailyTransferItem[]>([]);
+  const [dailyLoading, setDailyLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [transferTrendLoading, setTransferTrendLoading] = useState(false);
   const [torrentTrendLoading, setTorrentTrendLoading] = useState(false);
+  const [downloaderTrendLoading, setDownloaderTrendLoading] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const transferRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const torrentRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -370,15 +537,31 @@ export function StatsPage() {
     setWindow: React.Dispatch<React.SetStateAction<TimeWindow | null>>,
     setData: React.Dispatch<React.SetStateAction<TaskStatsSnapshot[]>>,
     setLoadingState: React.Dispatch<React.SetStateAction<boolean>>,
+    customSince?: string | null,
+    customUntil?: string | null,
   ) => {
     setLoadingState(true);
     try {
-      const end = Date.now();
-      const visibleStart = end - h * 60 * 60_000;
-      const fetchStart = visibleStart - 2 * 60_000;
-      setWindow({ start: visibleStart, end });
-      const since = new Date(fetchStart).toISOString();
-      const until = new Date(end).toISOString();
+      let end: number;
+      let visibleStart: number;
+      let since: string;
+      let until: string;
+
+      if (customSince && customUntil) {
+        visibleStart = new Date(customSince).getTime();
+        end = new Date(customUntil).getTime();
+        const fetchStart = visibleStart - 2 * 60_000;
+        setWindow({ start: visibleStart, end });
+        since = new Date(fetchStart).toISOString();
+        until = new Date(end).toISOString();
+      } else {
+        end = Date.now();
+        visibleStart = end - h * 60 * 60_000;
+        const fetchStart = visibleStart - 2 * 60_000;
+        setWindow({ start: visibleStart, end });
+        since = new Date(fetchStart).toISOString();
+        until = new Date(end).toISOString();
+      }
 
       if (taskId === -1) {
         if (!overview || overview.tasks.length === 0) {
@@ -388,7 +571,7 @@ export function StatsPage() {
         const allData = await Promise.all(
           overview.tasks.map((t) =>
             api<TaskStatsSnapshot[]>(
-              `/api/stats/trend?task_id=${t.task_id}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
+              `/api/stats/trend?task_id=${t.task_id}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
             ),
           ),
         );
@@ -399,7 +582,7 @@ export function StatsPage() {
         setData(merged);
       } else {
         const data = await api<TaskStatsSnapshot[]>(
-          `/api/stats/trend?task_id=${taskId}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
+          `/api/stats/trend?task_id=${taskId}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
         );
         setData(
           mode === "transfer"
@@ -414,15 +597,39 @@ export function StatsPage() {
     }
   };
 
-  const fetchDownloaderTrend = async (downloaderId: number | -1, h: number) => {
+  const fetchDownloaderTrend = async (
+    downloaderId: number | -1,
+    h: number,
+    customSince?: string | null,
+    customUntil?: string | null,
+  ) => {
     setDownloaderTrendLoading(true);
     try {
-      const end = Date.now();
-      const visibleStart = end - h * 60 * 60_000;
-      const fetchStart = visibleStart - 2 * 60_000;
-      setDownloaderTimeWindow({ start: visibleStart, end });
-      const since = new Date(fetchStart).toISOString();
-      const until = new Date(end).toISOString();
+      let end: number;
+      let visibleStart: number;
+      let since: string;
+      let until: string;
+
+      if (customSince && customUntil) {
+        visibleStart = new Date(customSince).getTime();
+        end = new Date(customUntil).getTime();
+        const fetchStart = visibleStart - 2 * 60_000;
+        setDownloaderTimeWindow({ start: visibleStart, end });
+        since = new Date(fetchStart).toISOString();
+        until = new Date(end).toISOString();
+      } else {
+        end = Date.now();
+        visibleStart = end - h * 60 * 60_000;
+        const fetchStart = visibleStart - 2 * 60_000;
+        setDownloaderTimeWindow({ start: visibleStart, end });
+        since = new Date(fetchStart).toISOString();
+        until = new Date(end).toISOString();
+      }
+
+      // For custom date ranges, compute hours for bucket selection
+      const effectiveHours = customSince && customUntil
+        ? Math.max(1, Math.ceil((end - visibleStart) / (60 * 60_000)))
+        : h;
 
       if (downloaderId === -1) {
         if (downloaders.length === 0) {
@@ -432,14 +639,14 @@ export function StatsPage() {
         const allData = await Promise.all(
           downloaders.map((downloader) =>
             api<DownloaderSpeedSnapshot[]>(
-              `/api/stats/downloader-speed-trend?downloader_id=${downloader.id}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
+              `/api/stats/downloader-speed-trend?downloader_id=${downloader.id}&hours=${effectiveHours}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
             ),
           ),
         );
         // Backend already aggregates by time bucket for > 1h ranges,
         // so we just sum across downloaders per bucket.
         // For ≤ 1h (raw data), average within same minute per downloader first.
-        const needsMinuteDedup = downloaderTrendHours <= 1;
+        const needsMinuteDedup = effectiveHours <= 1;
         const perDownloaderBuckets = new Map<string, Map<string, { sum_up: number; sum_down: number; count: number }>>();
         for (const arr of allData) {
           for (const snapshot of arr) {
@@ -493,7 +700,7 @@ export function StatsPage() {
         setDownloaderSnapshots(merged);
       } else {
         const data = await api<DownloaderSpeedSnapshot[]>(
-          `/api/stats/downloader-speed-trend?downloader_id=${downloaderId}&hours=${h}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
+          `/api/stats/downloader-speed-trend?downloader_id=${downloaderId}&hours=${effectiveHours}&since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}`,
         );
         setDownloaderSnapshots(data);
       }
@@ -520,28 +727,67 @@ export function StatsPage() {
 
   useEffect(() => {
     if (overview) {
-      void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
+      const cs = transferRangeMode === "custom" ? transferCustomSince : null;
+      const cu = transferRangeMode === "custom" ? transferCustomUntil : null;
+      void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading, cs, cu);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTransferTaskId, transferTrendHours, overview]);
+  }, [selectedTransferTaskId, transferTrendHours, overview, transferRangeMode, transferCustomSince, transferCustomUntil]);
 
   useEffect(() => {
     if (overview) {
-      void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
+      const cs = torrentRangeMode === "custom" ? torrentCustomSince : null;
+      const cu = torrentRangeMode === "custom" ? torrentCustomUntil : null;
+      void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading, cs, cu);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTorrentTaskId, torrentTrendHours, overview]);
+  }, [selectedTorrentTaskId, torrentTrendHours, overview, torrentRangeMode, torrentCustomSince, torrentCustomUntil]);
 
   useEffect(() => {
     if (downloaders.length > 0 || selectedDownloaderId === -1) {
-      void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours);
+      const cs = downloaderRangeMode === "custom" ? downloaderCustomSince : null;
+      const cu = downloaderRangeMode === "custom" ? downloaderCustomUntil : null;
+      void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours, cs, cu);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedDownloaderId, downloaderTrendHours, downloaders]);
+  }, [selectedDownloaderId, downloaderTrendHours, downloaders, downloaderRangeMode, downloaderCustomSince, downloaderCustomUntil]);
+
+  // Daily transfer fetch
+  useEffect(() => {
+    const fetchDaily = async () => {
+      setDailyLoading(true);
+      try {
+        let since: string;
+        let until: string;
+        if (dailyRangeMode === "custom" && dailySince && dailyUntil) {
+          since = dailySince;
+          until = dailyUntil;
+        } else {
+          const end = new Date();
+          end.setHours(23, 59, 59, 999);
+          const start = new Date(end);
+          start.setDate(start.getDate() - dailyQuickDays + 1);
+          start.setHours(0, 0, 0, 0);
+          since = start.toISOString();
+          until = end.toISOString();
+        }
+        const params = new URLSearchParams({ since, until });
+        if (dailyTaskId !== -1) params.set("task_id", String(dailyTaskId));
+        const data = await api<DailyTransferItem[]>(`/api/stats/daily-transfer?${params}`);
+        setDailyData(data);
+      } catch {
+        setDailyData([]);
+      } finally {
+        setDailyLoading(false);
+      }
+    };
+    void fetchDaily();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dailyTaskId, dailyRangeMode, dailyQuickDays, dailySince, dailyUntil]);
 
   useEffect(() => {
     if (transferRefreshRef.current) clearInterval(transferRefreshRef.current);
-    if (transferRefreshSecs > 0) {
+    if (transferRefreshSecs > 0 && transferRangeMode === "quick") {
       transferRefreshRef.current = setInterval(() => {
         void fetchTaskTrend(selectedTransferTaskId, transferTrendHours, "transfer", setTransferTimeWindow, setTransferSnapshots, setTransferTrendLoading);
       }, transferRefreshSecs * 1000);
@@ -549,11 +795,11 @@ export function StatsPage() {
     return () => {
       if (transferRefreshRef.current) clearInterval(transferRefreshRef.current);
     };
-  }, [selectedTransferTaskId, transferTrendHours, transferRefreshSecs, overview]);
+  }, [selectedTransferTaskId, transferTrendHours, transferRefreshSecs, overview, transferRangeMode]);
 
   useEffect(() => {
     if (torrentRefreshRef.current) clearInterval(torrentRefreshRef.current);
-    if (torrentRefreshSecs > 0) {
+    if (torrentRefreshSecs > 0 && torrentRangeMode === "quick") {
       torrentRefreshRef.current = setInterval(() => {
         void fetchTaskTrend(selectedTorrentTaskId, torrentTrendHours, "torrent", setTorrentTimeWindow, setTorrentSnapshots, setTorrentTrendLoading);
       }, torrentRefreshSecs * 1000);
@@ -561,11 +807,11 @@ export function StatsPage() {
     return () => {
       if (torrentRefreshRef.current) clearInterval(torrentRefreshRef.current);
     };
-  }, [selectedTorrentTaskId, torrentTrendHours, torrentRefreshSecs, overview]);
+  }, [selectedTorrentTaskId, torrentTrendHours, torrentRefreshSecs, overview, torrentRangeMode]);
 
   useEffect(() => {
     if (downloaderRefreshRef.current) clearInterval(downloaderRefreshRef.current);
-    if (downloaderRefreshSecs > 0) {
+    if (downloaderRefreshSecs > 0 && downloaderRangeMode === "quick") {
       downloaderRefreshRef.current = setInterval(() => {
         void fetchDownloaderTrend(selectedDownloaderId, downloaderTrendHours);
       }, downloaderRefreshSecs * 1000);
@@ -573,7 +819,7 @@ export function StatsPage() {
     return () => {
       if (downloaderRefreshRef.current) clearInterval(downloaderRefreshRef.current);
     };
-  }, [selectedDownloaderId, downloaderTrendHours, downloaderRefreshSecs, downloaders]);
+  }, [selectedDownloaderId, downloaderTrendHours, downloaderRefreshSecs, downloaders, downloaderRangeMode]);
 
   /* ---------- chart data ---------- */
 
@@ -700,47 +946,25 @@ export function StatsPage() {
             </div>
           </CardHeader>
           <CardContent className="p-4 pt-2 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
-              <div className="flex gap-1">
-                {TIME_RANGES.map((r) => (
-                  <button
-                    key={`transfer-${r.label}`}
-                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
-                      transferTrendHours === r.hours
-                        ? "bg-primary text-primary-foreground shadow-sm"
-                        : "hover:bg-surface-container/80 text-muted-foreground"
-                    }`}
-                    onClick={() => setTransferTrendHours(r.hours)}
-                  >
-                    {r.label}
-                  </button>
-                ))}
-              </div>
-              <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
-              <div className="flex gap-1">
-                {(["both", "upload", "download"] as const).map((f) => (
-                  <button
-                    key={`transfer-filter-${f}`}
-                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
-                      transferLineFilter === f
-                        ? "bg-surface-container-highest text-foreground shadow-sm ring-1 ring-border"
-                        : "hover:bg-surface-container/80 text-muted-foreground"
-                    }`}
-                    onClick={() => setTransferLineFilter(f)}
-                  >
-                    {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
-                  </button>
-                ))}
-              </div>
-              <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
-              <div className="flex items-center gap-2">
-                <Select
-                  value={String(transferRefreshSecs)}
-                  onChange={(val) => setTransferRefreshSecs(Number(val))}
-                  options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
-                />
-              </div>
-            </div>
+            <TimeRangeControls
+              mode={transferRangeMode}
+              setMode={setTransferRangeMode}
+              quickHours={transferTrendHours}
+              setQuickHours={setTransferTrendHours}
+              customStart={transferCustomStart}
+              customEnd={transferCustomEnd}
+              setCustomStart={setTransferCustomStart}
+              setCustomEnd={setTransferCustomEnd}
+              onApply={() => {
+                setTransferCustomSince(new Date(fromDateInput(transferCustomStart, false)).toISOString());
+                setTransferCustomUntil(new Date(fromDateInput(transferCustomEnd, true)).toISOString());
+              }}
+              refreshSecs={transferRefreshSecs}
+              setRefreshSecs={setTransferRefreshSecs}
+              lineFilter={transferLineFilter}
+              setLineFilter={setTransferLineFilter}
+              showLineFilter
+            />
 
             <div className="h-[280px] w-full mt-2">
               {transferTrendLoading && transferData.length === 0 ? (
@@ -840,31 +1064,22 @@ export function StatsPage() {
             </div>
           </CardHeader>
           <CardContent className="p-4 pt-2 space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
-              <div className="flex gap-1">
-                {TIME_RANGES.map((r) => (
-                  <button
-                    key={`torrent-${r.label}`}
-                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
-                      torrentTrendHours === r.hours
-                        ? "bg-primary text-primary-foreground shadow-sm"
-                        : "hover:bg-surface-container/80 text-muted-foreground"
-                    }`}
-                    onClick={() => setTorrentTrendHours(r.hours)}
-                  >
-                    {r.label}
-                  </button>
-                ))}
-              </div>
-              <div className="h-4 w-[1px] bg-border/50 mx-1"></div>
-              <div className="flex items-center gap-2">
-                <Select
-                  value={String(torrentRefreshSecs)}
-                  onChange={(val) => setTorrentRefreshSecs(Number(val))}
-                  options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
-                />
-              </div>
-            </div>
+            <TimeRangeControls
+              mode={torrentRangeMode}
+              setMode={setTorrentRangeMode}
+              quickHours={torrentTrendHours}
+              setQuickHours={setTorrentTrendHours}
+              customStart={torrentCustomStart}
+              customEnd={torrentCustomEnd}
+              setCustomStart={setTorrentCustomStart}
+              setCustomEnd={setTorrentCustomEnd}
+              onApply={() => {
+                setTorrentCustomSince(new Date(fromDateInput(torrentCustomStart, false)).toISOString());
+                setTorrentCustomUntil(new Date(fromDateInput(torrentCustomEnd, true)).toISOString());
+              }}
+              refreshSecs={torrentRefreshSecs}
+              setRefreshSecs={setTorrentRefreshSecs}
+            />
 
             <div className="h-[280px] w-full mt-2">
               {torrentTrendLoading && torrentData.length === 0 ? (
@@ -951,47 +1166,25 @@ export function StatsPage() {
           </div>
         </CardHeader>
         <CardContent className="p-4 pt-2 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
-            <div className="flex gap-1">
-              {TIME_RANGES.map((r) => (
-                <button
-                  key={`downloader-${r.label}`}
-                  className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
-                    downloaderTrendHours === r.hours
-                      ? "bg-primary text-primary-foreground shadow-sm"
-                      : "hover:bg-surface-container/80 text-muted-foreground"
-                  }`}
-                  onClick={() => setDownloaderTrendHours(r.hours)}
-                >
-                  {r.label}
-                </button>
-              ))}
-            </div>
-            <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
-            <div className="flex gap-1">
-              {(["both", "upload", "download"] as const).map((f) => (
-                <button
-                  key={`downloader-filter-${f}`}
-                  className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
-                    downloaderLineFilter === f
-                      ? "bg-surface-container-highest text-foreground shadow-sm ring-1 ring-border"
-                      : "hover:bg-surface-container/80 text-muted-foreground"
-                  }`}
-                  onClick={() => setDownloaderLineFilter(f)}
-                >
-                  {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
-                </button>
-              ))}
-            </div>
-            <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block"></div>
-            <div className="flex items-center gap-2">
-              <Select
-                value={String(downloaderRefreshSecs)}
-                onChange={(val) => setDownloaderRefreshSecs(Number(val))}
-                options={REFRESH_OPTIONS.map((o) => ({ value: String(o.value), label: o.label }))}
-              />
-            </div>
-          </div>
+          <TimeRangeControls
+            mode={downloaderRangeMode}
+            setMode={setDownloaderRangeMode}
+            quickHours={downloaderTrendHours}
+            setQuickHours={setDownloaderTrendHours}
+            customStart={downloaderCustomStart}
+            customEnd={downloaderCustomEnd}
+            setCustomStart={setDownloaderCustomStart}
+            setCustomEnd={setDownloaderCustomEnd}
+            onApply={() => {
+              setDownloaderCustomSince(new Date(fromDateInput(downloaderCustomStart, false)).toISOString());
+              setDownloaderCustomUntil(new Date(fromDateInput(downloaderCustomEnd, true)).toISOString());
+            }}
+            refreshSecs={downloaderRefreshSecs}
+            setRefreshSecs={setDownloaderRefreshSecs}
+            lineFilter={downloaderLineFilter}
+            setLineFilter={setDownloaderLineFilter}
+            showLineFilter
+          />
 
           <div className="h-[320px] w-full">
             {downloaderTrendLoading && downloaderSpeedData.length === 0 ? (
@@ -1059,6 +1252,148 @@ export function StatsPage() {
                     hide={downloaderLineFilter === "upload"}
                   />
                 </LineChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ===== Daily Transfer Chart ===== */}
+      <Card className="rounded-[20px] border-border bg-surface-container/30 shadow-sm overflow-hidden">
+        <CardHeader className="pb-2">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="p-2 rounded-xl bg-emerald-500/10">
+                <BarChart3 className="h-4 w-4 text-emerald-500" />
+              </div>
+              <div>
+                <CardTitle className="text-sm font-semibold">每日上传 / 下载量</CardTitle>
+                <CardDescription className="text-[10px]">按天聚合的增量数据</CardDescription>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Select
+                value={String(dailyTaskId)}
+                onChange={(val) => setDailyTaskId(Number(val))}
+                options={[
+                  { value: "-1", label: "全部任务" },
+                  ...tasks.map((t) => ({ value: String(t.task_id), label: t.task_name })),
+                ]}
+              />
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="p-4 pt-2 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 bg-surface-container/50 p-1.5 rounded-xl border border-border/50">
+            <div className="flex items-center gap-1">
+              <button
+                className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                  dailyRangeMode === "quick" ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-surface-container/80"
+                }`}
+                onClick={() => setDailyRangeMode("quick")}
+              >
+                快捷
+              </button>
+              <button
+                className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                  dailyRangeMode === "custom" ? "bg-primary/10 text-primary" : "text-muted-foreground hover:bg-surface-container/80"
+                }`}
+                onClick={() => setDailyRangeMode("custom")}
+              >
+                日期范围
+              </button>
+            </div>
+            {dailyRangeMode === "quick" ? (
+              <div className="flex gap-1">
+                {[{ label: "7天", days: 7 }, { label: "14天", days: 14 }, { label: "30天", days: 30 }].map((r) => (
+                  <button
+                    key={r.label}
+                    className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                      dailyQuickDays === r.days
+                        ? "bg-primary text-primary-foreground shadow-sm"
+                        : "hover:bg-surface-container/80 text-muted-foreground"
+                    }`}
+                    onClick={() => setDailyQuickDays(r.days)}
+                  >
+                    {r.label}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="date"
+                  className="h-7 rounded-lg border border-border bg-input px-2 text-[10px]"
+                  value={dailyCustomStart}
+                  onChange={(e) => setDailyCustomStart(e.target.value)}
+                />
+                <span className="text-[10px] text-muted">至</span>
+                <input
+                  type="date"
+                  className="h-7 rounded-lg border border-border bg-input px-2 text-[10px]"
+                  value={dailyCustomEnd}
+                  onChange={(e) => setDailyCustomEnd(e.target.value)}
+                />
+                <Button size="sm" className="h-7 text-[10px] px-2" onClick={() => {
+                  setDailySince(new Date(fromDateInput(dailyCustomStart, false)).toISOString());
+                  setDailyUntil(new Date(fromDateInput(dailyCustomEnd, true)).toISOString());
+                }}>
+                  查询
+                </Button>
+              </div>
+            )}
+          </div>
+
+          <div className="h-[300px] w-full">
+            {dailyLoading && dailyData.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-muted text-[11px]">
+                <RefreshCw className="mb-2 h-4 w-4 animate-spin" />
+                加载中...
+              </div>
+            ) : dailyData.length === 0 ? (
+              <div className="flex items-center justify-center h-full rounded-2xl border border-dashed border-border bg-surface-container/20 text-[11px] text-muted">
+                无数据
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={dailyData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={COLORS.grid} vertical={false} />
+                  <XAxis
+                    dataKey="date"
+                    tick={{ fontSize: 9, fill: "#94a3b8" }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v: string) => {
+                      const parts = v.split("-");
+                      return `${parts[1]}/${parts[2]}`;
+                    }}
+                  />
+                  <YAxis
+                    tick={{ fontSize: 9, fill: "#94a3b8" }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v: number) => formatBytes(v)}
+                    width={50}
+                  />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: "rgba(255, 255, 255, 0.8)",
+                      backdropFilter: "blur(8px)",
+                      borderRadius: "12px",
+                      border: "1px solid rgba(0,0,0,0.05)",
+                      fontSize: "11px",
+                      boxShadow: "0 10px 15px -3px rgba(0, 0, 0, 0.1)",
+                    }}
+                    formatter={(value, name) => [
+                      formatBytes(Number(value)),
+                      name === "uploaded" ? "上传" : "下载",
+                    ]}
+                    labelFormatter={(label) => `日期: ${label}`}
+                  />
+                  <Legend formatter={(value) => (value === "uploaded" ? "上传" : "下载")} wrapperStyle={{ fontSize: 11 }} />
+                  <Bar dataKey="uploaded" fill={COLORS.upload} radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="downloaded" fill={COLORS.download} radius={[4, 4, 0, 0]} />
+                </BarChart>
               </ResponsiveContainer>
             )}
           </div>

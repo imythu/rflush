@@ -368,6 +368,12 @@ export type TaskOverview = {
   enabled: boolean;
 };
 
+export type DailyTransferItem = {
+  date: string;
+  uploaded: number;
+  downloaded: number;
+};
+
 // ========== 标签规则 ==========
 
 export type TagMatchCriteria = {
