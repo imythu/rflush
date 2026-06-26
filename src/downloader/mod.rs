@@ -36,6 +36,7 @@ pub struct DownloaderRecord {
     pub url: String,
     pub username: String,
     pub password: String,
+    pub weight: i32,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -143,6 +144,11 @@ pub trait DownloaderClient: Send + Sync {
         &self,
         path: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>>;
+
+    /// 获取下载器的默认保存路径
+    fn get_default_save_path(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>>;
 
     fn get_effective_free_space<'a>(
         &'a self,

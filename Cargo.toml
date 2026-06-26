@@ -29,3 +29,6 @@ tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 sysinfo = "0.34"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 urlencoding = "2"
+
+[dev-dependencies]
+tempfile = "3"

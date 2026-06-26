@@ -53,11 +53,41 @@ function formatHoursLabel(hours: number | null): string {
   return `= ${m}分钟`;
 }
 
+function joinPath(base: string, sub: string): string {
+  if (!sub) return base;
+  const b = base.replace(/\/+$/, "");
+  const s = sub.replace(/^\/+/, "");
+  return s ? `${b}/${s}` : b;
+}
+
+function extractSubPath(
+  saveDir: string | null,
+  downloaderIds: number[],
+  defaultPaths: Record<number, string>,
+): string {
+  if (!saveDir) return "";
+  let obj: Record<string, string>;
+  try {
+    obj = JSON.parse(saveDir);
+  } catch {
+    return "";
+  }
+  for (const dlId of downloaderIds) {
+    const full = obj[String(dlId)];
+    const base = defaultPaths[dlId] ?? "";
+    if (full && base && full.startsWith(base)) {
+      return full.slice(base.length).replace(/^\/+/, "");
+    }
+    if (full && !base) return full;
+  }
+  return "";
+}
+
 const emptyForm: BrushTaskRequest = {
   name: "",
   cron_expression: "",
   site_id: null,
-  downloader_id: 0,
+  downloader_ids: [],
   tag: "",
   rss_url: "",
   seed_volume_gb: null,
@@ -89,7 +119,7 @@ function taskToForm(task: BrushTaskRecord): BrushTaskRequest {
     name: task.name,
     cron_expression: task.cron_expression,
     site_id: task.site_id,
-    downloader_id: task.downloader_id,
+    downloader_ids: task.downloader_ids,
     tag: task.tag,
     rss_url: task.rss_url,
     seed_volume_gb: task.seed_volume_gb,
@@ -141,6 +171,8 @@ export function BrushTasksPage() {
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
+  const [defaultPaths, setDefaultPaths] = useState<Record<number, string>>({});
+  const [saveSubPath, setSaveSubPath] = useState("");
 
   function reload() {
     api<BrushTaskRecord[]>("/api/brush-tasks")
@@ -158,12 +190,23 @@ export function BrushTasksPage() {
       .catch((error: Error) => setMessage(error.message || "加载下载器列表失败"));
   }, []);
 
+  useEffect(() => {
+    for (const dlId of form.downloader_ids) {
+      if (defaultPaths[dlId] === undefined) {
+        api<{ path: string }>(`/api/downloaders/${dlId}/default-path`)
+          .then((res) => setDefaultPaths((prev) => ({ ...prev, [dlId]: res.path })))
+          .catch(() => setDefaultPaths((prev) => ({ ...prev, [dlId]: "" })));
+      }
+    }
+  }, [form.downloader_ids, defaultPaths]);
+
   function openAdd() {
     setForm({
       ...emptyForm,
       site_id: sites[0]?.id ?? null,
-      downloader_id: downloaders[0]?.id ?? 0,
+      downloader_ids: downloaders[0] ? [downloaders[0].id] : [],
     });
+    setSaveSubPath("");
     setEditingId(null);
     setSubmitError("");
     setFormOpen(true);
@@ -171,6 +214,7 @@ export function BrushTasksPage() {
 
   function openEdit(task: BrushTaskRecord) {
     setForm(taskToForm(task));
+    setSaveSubPath(extractSubPath(task.save_dir, task.downloader_ids, defaultPaths));
     setEditingId(task.id);
     setSubmitError("");
     setFormOpen(true);
@@ -385,6 +429,10 @@ export function BrushTasksPage() {
                         {sites.find((site) => site.id === task.site_id)?.name ?? (task.site_id ? `#${task.site_id}` : "未绑定")}
                       </div>
                       <div className="truncate">
+                        <span className="font-medium text-foreground">下载器: </span>
+                        {task.downloader_ids.map((id) => downloaders.find((d) => d.id === id)?.name ?? `#${id}`).join(", ") || "未绑定"}
+                      </div>
+                      <div className="truncate">
                         <span className="font-medium text-foreground">标签: </span>
                         {task.tag}
                       </div>
@@ -453,17 +501,37 @@ export function BrushTasksPage() {
                   }
                 />
               </div>
-              <div className="space-y-2">
-                <Label>下载器</Label>
-                <Select
-                  value={String(form.downloader_id)}
-                  onChange={(val) => setField("downloader_id", Number(val))}
-                  options={
-                    downloaders.length === 0
-                      ? [{ value: "0", label: "无可用下载器" }]
-                      : downloaders.map((d) => ({ value: String(d.id), label: `${d.name} (${d.downloader_type})` }))
-                  }
-                />
+              <div className="space-y-2 sm:col-span-2">
+                <Label>下载器（可多选，加权随机分配）</Label>
+                <div className="flex flex-wrap gap-2">
+                  {downloaders.length === 0 && (
+                    <span className="text-xs text-muted">无可用下载器</span>
+                  )}
+                  {downloaders.map((d) => {
+                    const selected = form.downloader_ids.includes(d.id);
+                    return (
+                      <button
+                        key={d.id}
+                        type="button"
+                        onClick={() =>
+                          setForm((prev) => {
+                            const ids = prev.downloader_ids.includes(d.id)
+                              ? prev.downloader_ids.filter((id) => id !== d.id)
+                              : [...prev.downloader_ids, d.id];
+                            return { ...prev, downloader_ids: ids };
+                          })
+                        }
+                        className={`rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
+                          selected
+                            ? "bg-primary text-primary-foreground shadow-glow"
+                            : "bg-surface-container text-muted hover:bg-accent"
+                        }`}
+                      >
+                        {d.name}（权重 {d.weight}）
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
               <div className="space-y-2">
                 <Label>标签</Label>
@@ -498,12 +566,46 @@ export function BrushTasksPage() {
                 />
               </div>
               <div className="space-y-2">
-                <Label>保存目录</Label>
+                <Label>最低剩余磁盘空间 (GB)</Label>
                 <Input
-                  placeholder="默认目录"
-                  value={form.save_dir ?? ""}
-                  onChange={(e) => setField("save_dir", e.target.value || null)}
+                  type="number"
+                  step="0.1"
+                  placeholder="不限"
+                  value={form.min_disk_space_gb ?? ""}
+                  onChange={(e) => setField("min_disk_space_gb", numOrNull(e.target.value))}
                 />
+                <p className="text-xs text-muted">低于此值的下载器不参与选种</p>
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <Label>保存子路径（留空使用各下载器默认目录）</Label>
+                <Input
+                  placeholder="如 brush/task1"
+                  value={saveSubPath}
+                  onChange={(e) => {
+                    const sub = e.target.value;
+                    setSaveSubPath(sub);
+                    const map: Record<string, string> = {};
+                    for (const dlId of form.downloader_ids) {
+                      const base = defaultPaths[dlId] ?? "";
+                      map[String(dlId)] = joinPath(base, sub.trim());
+                    }
+                    setField("save_dir", Object.keys(map).length > 0 ? JSON.stringify(map) : null);
+                  }}
+                />
+                {form.downloader_ids.length > 0 && (
+                  <div className="space-y-1">
+                    {form.downloader_ids.map((dlId) => {
+                      const dl = downloaders.find((d) => d.id === dlId);
+                      const base = defaultPaths[dlId] ?? "";
+                      const finalPath = joinPath(base, saveSubPath.trim());
+                      return (
+                        <p key={dlId} className="text-xs text-muted">
+                          {dl?.name ?? `#${dlId}`}: <code className="text-foreground/70">{finalPath || "（默认目录）"}</code>
+                        </p>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               <div className="space-y-2">
                 <Label>活动时间窗口</Label>
@@ -714,15 +816,6 @@ export function BrushTasksPage() {
                   onChange={(e) => setField("max_inactive_hours", numOrNull(e.target.value))}
                 />
                 <p className="text-xs text-muted">{formatHoursLabel(form.max_inactive_hours)}</p>
-              </div>
-              <div className="space-y-2">
-                <Label>最小磁盘空间 (GB)</Label>
-                <Input
-                  type="number"
-                  placeholder="不限"
-                  value={form.min_disk_space_gb ?? ""}
-                  onChange={(e) => setField("min_disk_space_gb", numOrNull(e.target.value))}
-                />
               </div>
             </div>
           </section>

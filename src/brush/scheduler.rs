@@ -68,7 +68,6 @@ enum FilterStage {
 /// 调度器状态
 pub struct BrushScheduler {
     db: Database,
-    collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     running_tasks: Arc<RwLock<HashMap<i64, RunningBrushTask>>>,
     http: Arc<AppHttpClient>,
@@ -83,134 +82,15 @@ struct RunningBrushTask {
 }
 
 impl BrushScheduler {
-    /// 启动删种协程：先尝试暂停种子，暂停成功则等待 60s 后删除；暂停返回 404 则种子已不存在，直接标记已移除；其他失败则放弃。
-    /// 外层调用方立即返回，不阻塞。
-    fn spawn_delete_torrent(
-        &self,
-        client: Arc<dyn DownloaderClient>,
-        downloader: DownloaderRecord,
-        task_id: i64,
-        task_name: String,
-        hash: String,
-        reason: String,
-    ) {
-        let db = self.db.clone();
-        let pool = self.pool.clone();
-        let pending = self.pending_deletions.clone();
-
-        tokio::spawn(async move {
-            // 标记为冷却中
-            pending
-                .write()
-                .await
-                .insert((task_id, hash.clone()));
-
-            let short_hash = &hash[..8.min(hash.len())];
-
-            // 尝试暂停种子
-            info!(
-                "[删种][{}] hash={} → 尝试暂停种子",
-                task_name, short_hash
-            );
-            match client.pause_torrent(&hash).await {
-                Ok(()) => {}
-                Err(e) if e.contains("404") => {
-                    // 种子已不在下载器中，跳过暂停和冷却，直接标记为已移除
-                    info!(
-                        "[删种][{}] hash={} 暂停返回404（种子已不存在），直接标记为已移除",
-                        task_name, short_hash
-                    );
-                    let _ = db
-                        .update_brush_torrent_status(task_id, &hash, "removed", Some(&reason))
-                        .await;
-                    pending.write().await.remove(&(task_id, hash));
-                    return;
-                }
-                Err(e) => {
-                    warn!(
-                        "[删种][{}] hash={} 暂停失败: {}，放弃本次删除",
-                        task_name, short_hash, e
-                    );
-                    pending.write().await.remove(&(task_id, hash));
-                    return;
-                }
-            }
-
-            // 暂停成功，等待 60s 冷却
-            info!(
-                "[删种][{}] hash={} 暂停成功，等待 60s 后删除",
-                task_name, short_hash
-            );
-            sleep(Duration::from_secs(60)).await;
-
-            // 获取客户端（可能已过期，重新获取）
-            let client = match pool.get(&downloader).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        "[删种][{}] 冷却结束但获取客户端失败: hash={} err={}",
-                        task_name, short_hash, e
-                    );
-                    pending.write().await.remove(&(task_id, hash));
-                    return;
-                }
-            };
-
-            // 执行删除
-            let final_reason = match client.delete_torrent(&hash, true).await {
-                Ok(()) => reason,
-                Err(delete_err) => {
-                    warn!(
-                        "[删种][{}] 删除失败: hash={} err={}",
-                        task_name, short_hash, delete_err
-                    );
-                    format!("{} (删除接口返回错误: {})", reason, delete_err)
-                }
-            };
-
-            // 验证种子已不在下载器中
-            match client.list_torrents(None).await {
-                Ok(all) => {
-                    if all.iter().any(|t| t.hash.eq_ignore_ascii_case(&hash)) {
-                        warn!(
-                            "[删种][{}] 删除后种子仍存在，保持 active 状态",
-                            task_name
-                        );
-                        pending.write().await.remove(&(task_id, hash));
-                        return;
-                    }
-                    info!(
-                        "[删种][{}] 确认种子已不在下载器中，标记为已移除",
-                        task_name
-                    );
-                }
-                Err(list_err) => {
-                    warn!(
-                        "[删种][{}] 无法确认种子是否仍存在: {}，保持 active 状态",
-                        task_name, list_err
-                    );
-                    pending.write().await.remove(&(task_id, hash));
-                    return;
-                }
-            }
-
-            let _ = db
-                .update_brush_torrent_status(task_id, &hash, "removed", Some(&final_reason))
-                .await;
-
-            pending.write().await.remove(&(task_id, hash));
-        });
-    }
-
     pub fn new(
         db: Database,
         collector: Arc<DownloaderSnapshotCollector>,
         pool: Arc<DownloaderClientPool>,
         http: Arc<AppHttpClient>,
     ) -> Self {
+        let _ = collector;
         Self {
             db,
-            collector,
             pool,
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
             http,
@@ -269,159 +149,176 @@ impl BrushScheduler {
         let downloader_map: HashMap<i64, DownloaderRecord> =
             downloaders.into_iter().map(|d| (d.id, d)).collect();
 
-        // 按 downloader_id -> task_id -> records 分组
+        // 按种子的 downloader_id -> task_id -> records 分组
         let mut downloader_groups: HashMap<i64, HashMap<i64, Vec<BrushTorrentRecord>>> =
             HashMap::new();
         for (record, task) in all_records {
+            let dl_id = record
+                .downloader_id
+                .or_else(|| task.downloader_ids.first().copied())
+                .unwrap_or(0);
             downloader_groups
-                .entry(task.downloader_id)
+                .entry(dl_id)
                 .or_default()
                 .entry(task.id)
                 .or_default()
                 .push(record);
         }
 
-        let mut total_removed: usize = 0;
-
-        for (downloader_id, task_groups) in downloader_groups {
-            let downloader = match downloader_map.get(&downloader_id) {
-                Some(d) => d,
-                None => {
+        // 每个下载器分组一个协程，并发处理
+        let group_futures = downloader_groups.into_iter().map(|(downloader_id, task_groups)| {
+            let db = self.db.clone();
+            let pool = self.pool.clone();
+            let task_cache = self.task_cache.clone();
+            let pending = self.pending_deletions.clone();
+            let downloader = downloader_map.get(&downloader_id).cloned();
+            async move {
+                let Some(downloader) = downloader else {
                     warn!(
                         "[cleaner] downloader_id={} 不存在，跳过关联任务",
                         downloader_id
                     );
-                    continue;
-                }
-            };
-
-            let client = match self.pool.get(downloader).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("[cleaner] 创建下载器客户端失败: {}", e);
-                    continue;
-                }
-            };
-
-            let mut downloader_hashes: Vec<String> = Vec::new();
-            for records in task_groups.values() {
-                for record in records {
-                    downloader_hashes.push(record.torrent_hash.clone());
-                }
-            }
-            downloader_hashes.sort();
-            downloader_hashes.dedup();
-
-            let dl_torrents = match client.list_torrents_by_hashes(&downloader_hashes).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        "[cleaner] 查询下载器 '{}' 指定种子信息失败: {}",
-                        downloader.name, e
-                    );
-                    continue;
-                }
-            };
-
-            info!(
-                "[cleaner] 下载器 '{}': 本次评估任务 {} 个、数据库种子 {} 条、下载器返回 {} 条",
-                downloader.name,
-                task_groups.len(),
-                downloader_hashes.len(),
-                dl_torrents.len()
-            );
-
-            for (task_id, records) in task_groups.into_iter() {
-                let Some(task) = self.task_cache.get_or_load(&self.db, task_id).await else {
-                    warn!("[cleaner] task_id={} 不存在或加载失败，跳过", task_id);
-                    continue;
+                    return 0usize;
                 };
 
-                if !has_delete_rules(&task) {
-                    info!("[cleaner][{}] 无删种规则，跳过", task.name);
-                    continue;
+                let client = match pool.get(&downloader).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("[cleaner] 创建下载器客户端失败: {}", e);
+                        return 0;
+                    }
+                };
+
+                let mut downloader_hashes: Vec<String> = Vec::new();
+                for records in task_groups.values() {
+                    for record in records {
+                        downloader_hashes.push(record.torrent_hash.clone());
+                    }
                 }
+                downloader_hashes.sort();
+                downloader_hashes.dedup();
 
-                let to_remove =
-                    cleaner::evaluate_delete_rules(&task, &records, &dl_torrents, &self.db).await;
+                let dl_torrents = match client.list_torrents_by_hashes(&downloader_hashes).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            "[cleaner] 查询下载器 '{}' 指定种子信息失败: {}",
+                            downloader.name, e
+                        );
+                        return 0;
+                    }
+                };
 
-                if to_remove.is_empty() {
-                    info!("[cleaner][{}] 评估完成，无需删种", task.name);
-                    continue;
-                }
+                info!(
+                    "[cleaner] 下载器 '{}': 本次评估任务 {} 个、数据库种子 {} 条、下载器返回 {} 条",
+                    downloader.name,
+                    task_groups.len(),
+                    downloader_hashes.len(),
+                    dl_torrents.len()
+                );
 
-                // 过滤掉已在冷却期中的种子，避免重复暂停
-                let pending = self.pending_deletions.read().await;
-                let to_remove: Vec<_> = to_remove
-                    .into_iter()
-                    .filter(|(hash, _)| !pending.contains(&(task.id, hash.clone())))
-                    .collect();
-                drop(pending);
+                let mut group_removed: usize = 0;
 
-                if to_remove.is_empty() {
-                    continue;
-                }
+                for (task_id, records) in task_groups.into_iter() {
+                    let Some(task) = task_cache.get_or_load(&db, task_id).await else {
+                        warn!("[cleaner] task_id={} 不存在或加载失败，跳过", task_id);
+                        continue;
+                    };
 
-                total_removed += to_remove.len();
-
-                info!("[删种][{}] 准备暂停并延迟删除 {} 个种子", task.name, to_remove.len());
-
-                for (hash, reason) in &to_remove {
-                    info!(
-                        "[删种][{}] hash={} 原因={} → 暂停种子，等待冷却后删除",
-                        task.name,
-                        &hash[..8.min(hash.len())],
-                        reason
-                    );
-                    // 保存当前流量快照
-                    if let Some(torrent) = dl_torrents
-                        .iter()
-                        .find(|t| t.hash.eq_ignore_ascii_case(hash))
-                    {
-                        let _ = self
-                            .db
-                            .save_torrent_traffic(
-                                task.id,
-                                &torrent.hash,
-                                torrent.uploaded,
-                                torrent.downloaded,
-                            )
-                            .await;
-                        let _ = self
-                            .db
-                            .update_brush_torrent_stats(
-                                task.id,
-                                &torrent.hash,
-                                torrent.uploaded,
-                                torrent.downloaded,
-                                torrent.time_active.max(0),
-                                average_upload_speed(torrent.uploaded, torrent.time_active),
-                                calculate_ratio(
-                                    torrent.uploaded,
-                                    torrent.downloaded,
-                                    torrent.ratio,
-                                ),
-                            )
-                            .await;
+                    if !has_delete_rules(&task) {
+                        info!("[cleaner][{}] 无删种规则，跳过", task.name);
+                        continue;
                     }
 
-                    self.spawn_delete_torrent(
-                        client.clone(),
-                        downloader.clone(),
-                        task.id,
-                        task.name.clone(),
-                        hash.clone(),
-                        reason.clone(),
-                    );
-                }
-            }
+                    let to_remove =
+                        cleaner::evaluate_delete_rules(&task, &records, &dl_torrents, &db).await;
 
-            info!(
-                "[cleaner] 下载器 '{}': 本轮删种 {} 个, 任务配置缓存大小: {}",
-                downloader.name,
-                total_removed,
-                self.task_cache.size().await
-            );
+                    if to_remove.is_empty() {
+                        info!("[cleaner][{}] 评估完成，无需删种", task.name);
+                        continue;
+                    }
+
+                    // 过滤掉已在冷却期中的种子，避免重复暂停
+                    let pending_read = pending.read().await;
+                    let to_remove: Vec<_> = to_remove
+                        .into_iter()
+                        .filter(|(hash, _)| !pending_read.contains(&(task.id, hash.clone())))
+                        .collect();
+                    drop(pending_read);
+
+                    if to_remove.is_empty() {
+                        continue;
+                    }
+
+                    group_removed += to_remove.len();
+
+                    info!("[删种][{}] 准备暂停并延迟删除 {} 个种子", task.name, to_remove.len());
+
+                    for (hash, reason) in &to_remove {
+                        info!(
+                            "[删种][{}] hash={} 原因={} → 暂停种子，等待冷却后删除",
+                            task.name,
+                            &hash[..8.min(hash.len())],
+                            reason
+                        );
+                        // 保存当前流量快照
+                        if let Some(torrent) = dl_torrents
+                            .iter()
+                            .find(|t| t.hash.eq_ignore_ascii_case(hash))
+                        {
+                            let _ = db
+                                .save_torrent_traffic(
+                                    task.id,
+                                    &torrent.hash,
+                                    torrent.uploaded,
+                                    torrent.downloaded,
+                                )
+                                .await;
+                            let _ = db
+                                .update_brush_torrent_stats(
+                                    task.id,
+                                    &torrent.hash,
+                                    torrent.uploaded,
+                                    torrent.downloaded,
+                                    torrent.time_active.max(0),
+                                    average_upload_speed(torrent.uploaded, torrent.time_active),
+                                    calculate_ratio(
+                                        torrent.uploaded,
+                                        torrent.downloaded,
+                                        torrent.ratio,
+                                    ),
+                                )
+                                .await;
+                        }
+
+                        spawn_delete_torrent_standalone(
+                            &db,
+                            &pool,
+                            &pending,
+                            client.clone(),
+                            downloader.clone(),
+                            task.id,
+                            task.name.clone(),
+                            hash.clone(),
+                            reason.clone(),
+                        );
+                    }
+                }
+
+                info!(
+                    "[cleaner] 下载器 '{}': 本轮删种 {} 个, 任务配置缓存大小: {}",
+                    downloader.name,
+                    group_removed,
+                    task_cache.size().await
+                );
+                group_removed
+            }
+        });
+
+        let results = futures::future::join_all(group_futures).await;
+        let total_removed: usize = results.into_iter().sum();
+        if total_removed > 0 {
+            info!("[cleaner] 本轮总删种 {} 个", total_removed);
         }
     }
 
@@ -458,7 +355,6 @@ impl BrushScheduler {
             // 检查是否应该触发
             if should_trigger(&task) {
                 let db = self.db.clone();
-                let collector = self.collector.clone();
                 let pool = self.pool.clone();
                 let running_tasks = self.running_tasks.clone();
                 let task_id = task.id;
@@ -470,7 +366,7 @@ impl BrushScheduler {
                 info!("[刷流][{}] cron 触发，开始调度执行", task_name);
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        execute_brush_task(&db, &collector, &pool, execution_config, &http).await
+                        execute_brush_task(&db, &pool, execution_config, &http).await
                     {
                         error!("[刷流][{}] 任务执行失败: {}", task_name, e);
                     }
@@ -497,7 +393,6 @@ impl BrushScheduler {
             .ok_or_else(|| "任务不存在".to_string())?;
 
         let db = self.db.clone();
-        let collector = self.collector.clone();
         let pool = self.pool.clone();
         let running_tasks = self.running_tasks.clone();
 
@@ -515,7 +410,7 @@ impl BrushScheduler {
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
             if let Err(e) =
-                execute_brush_task(&db, &collector, &pool, execution_config, &http).await
+                execute_brush_task(&db, &pool, execution_config, &http).await
             {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
@@ -615,7 +510,6 @@ fn snapshot_task(
 
 async fn execute_brush_task(
     db: &Database,
-    collector: &Arc<DownloaderSnapshotCollector>,
     pool: &Arc<DownloaderClientPool>,
     shared_task: Arc<RwLock<BrushTaskRecord>>,
     http: &AppHttpClient,
@@ -624,60 +518,120 @@ async fn execute_brush_task(
     let task = snapshot_task(&shared_task).await;
     info!("[刷流][{}] 开始执行任务 (id={})", task.name, task.id);
 
-    // 1. 获取下载器配置
-    let downloader_record = db
-        .get_downloader(task.downloader_id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "下载器不存在".to_string())?;
+    // 1. 加载所有绑定下载器，并执行 per-qb 空间门禁
+    let mut qb_clients: HashMap<i64, (DownloaderRecord, Arc<dyn DownloaderClient>)> = HashMap::new();
+    let mut qb_free_space: HashMap<i64, u64> = HashMap::new();
+    for dl_id in &task.downloader_ids {
+        let dl_record = match db.get_downloader(*dl_id).await.map_err(|e| e.to_string())? {
+            Some(r) => r,
+            None => {
+                warn!("[刷流][{}] 下载器 id={} 不存在，跳过", task.name, dl_id);
+                continue;
+            }
+        };
+        let dl_client = match pool.get(&dl_record).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "[刷流][{}] 创建下载器 '{}' 客户端失败: {}",
+                    task.name, dl_record.name, e
+                );
+                continue;
+            }
+        };
 
-    info!(
-        "[刷流][{}] 使用下载器: {} ({})",
-        task.name, downloader_record.name, downloader_record.url
-    );
+        // per-qb 空间门禁（使用任务级 min_disk_space_gb 配置）
+        let free = match dl_client.get_free_space(None).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "[刷流][{}] 下载器 '{}' 获取剩余空间失败: {}，跳过该下载器",
+                    task.name, dl_record.name, e
+                );
+                continue;
+            }
+        };
+        if let Some(min_gb) = task.min_disk_space_gb {
+            let min_bytes = gb_to_bytes(min_gb);
+            if free < min_bytes {
+                info!(
+                    "[刷流][{}] 下载器 '{}' 剩余空间 {:.2} GB < 最低 {:.2} GB，本轮排除",
+                    task.name, dl_record.name, bytes_to_gb(free), min_gb
+                );
+                continue;
+            }
+        }
+        info!(
+            "[刷流][{}] 下载器 '{}' 进入候选 (剩余 {:.2} GB, 权重 {})",
+            task.name, dl_record.name, bytes_to_gb(free), dl_record.weight
+        );
+        qb_clients.insert(*dl_id, (dl_record, dl_client));
+        qb_free_space.insert(*dl_id, free);
+    }
 
-    let client = pool.get(&downloader_record).await?;
+    if qb_clients.is_empty() {
+        info!(
+            "[刷流][{}] 所有绑定下载器剩余空间不足或不可用，结束本次任务",
+            task.name
+        );
+        return Ok(());
+    }
 
-    // 2. 获取当前管理的种子列表，并先同步下载器中已不存在的记录
+    // 2. 获取当前管理的种子列表，并先同步下载器中已不存在的记录（按 downloader_id 分组）
     let mut managed_torrents = db
         .list_active_brush_torrents(task.id)
         .await
         .map_err(|e| e.to_string())?;
 
     if !managed_torrents.is_empty() {
-        let managed_hashes: Vec<String> = managed_torrents
-            .iter()
-            .map(|torrent| torrent.torrent_hash.clone())
-            .collect();
-        let existing_torrents = client
-            .list_torrents_by_hashes(&managed_hashes)
-            .await
-            .map_err(|e| format!("检查下载器现有种子失败: {}", e))?;
-
         let mut missing_count = 0usize;
+        // 按 downloader_id 分组核对
+        let mut by_dl: HashMap<i64, Vec<&BrushTorrentRecord>> = HashMap::new();
         for record in &managed_torrents {
-            if existing_torrents
-                .iter()
-                .any(|torrent| torrent.hash.eq_ignore_ascii_case(&record.torrent_hash))
-            {
-                continue;
+            let dl_id = record.downloader_id.unwrap_or(0);
+            by_dl.entry(dl_id).or_default().push(record);
+        }
+        for (dl_id, records) in &by_dl {
+            let client = match qb_clients.get(dl_id).and_then(|(_, c)| Some(c.clone())) {
+                Some(c) => c,
+                None => continue,
+            };
+            let hashes: Vec<String> =
+                records.iter().map(|r| r.torrent_hash.clone()).collect();
+            let existing = match client.list_torrents_by_hashes(&hashes).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        "[刷流][{}] 检查下载器 id={} 现有种子失败: {}",
+                        task.name, dl_id, e
+                    );
+                    continue;
+                }
+            };
+            for record in records {
+                if existing
+                    .iter()
+                    .any(|t| t.hash.eq_ignore_ascii_case(&record.torrent_hash))
+                {
+                    continue;
+                }
+                missing_count += 1;
+                info!(
+                    "[刷流][{}] active 种子已不在下载器(id={})中，标记为 removed: hash={} name={}",
+                    task.name,
+                    dl_id,
+                    &record.torrent_hash[..8.min(record.torrent_hash.len())],
+                    record.torrent_name
+                );
+                let _ = db
+                    .update_brush_torrent_status(
+                        task.id,
+                        &record.torrent_hash,
+                        "removed",
+                        Some("刷流任务启动检查：下载器中不存在"),
+                    )
+                    .await;
             }
-
-            missing_count += 1;
-            info!(
-                "[刷流][{}] active 种子已不在下载器中，标记为 removed: hash={} name={}",
-                task.name,
-                &record.torrent_hash[..8.min(record.torrent_hash.len())],
-                record.torrent_name
-            );
-            let _ = db
-                .update_brush_torrent_status(
-                    task.id,
-                    &record.torrent_hash,
-                    "removed",
-                    Some("刷流任务启动检查：下载器中不存在"),
-                )
-                .await;
         }
 
         if missing_count > 0 {
@@ -688,23 +642,17 @@ async fn execute_brush_task(
         }
     }
 
-    let downloader_torrents = collector
-        .get_tagged_torrents(&downloader_record, &task.tag)
-        .await?;
-
     info!(
-        "[刷流][{}] 当前状态: 本系统管理 {} 个种子, 下载器中标签[{}]共 {} 个种子",
+        "[刷流][{}] 当前状态: 本系统管理 {} 个种子",
         task.name,
         managed_torrents.len(),
-        task.tag,
-        downloader_torrents.len()
     );
 
     // 3. 删种由 cleaner_loop 统一处理，刷流任务不再直接删种
     let task = snapshot_task(&shared_task).await;
     let deleted_count = 0;
 
-    // 4. 检查是否可以添加新种子
+    // 4. 检查是否可以添加新种子（任务级并发）
     let managed_torrents = db
         .list_active_brush_torrents(task.id)
         .await
@@ -727,9 +675,13 @@ async fn execute_brush_task(
         return Ok(());
     }
 
-    // 5. 检查保种体积
+    // 5. 检查保种体积（任务级，从数据库统计未移除种子大小和）
     let mut current_size_gb = {
-        let total: i64 = downloader_torrents.iter().map(|t| t.size).sum();
+        let total = db
+            .sum_non_removed_torrent_size(task.id)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
         total as f64 / (1024.0 * 1024.0 * 1024.0)
     };
     if let Some(max_gb) = task.seed_volume_gb {
@@ -743,36 +695,7 @@ async fn execute_brush_task(
         }
     }
 
-    let space_stats = client
-        .get_effective_free_space(task.save_dir.as_deref(), &downloader_torrents)
-        .await
-        .ok();
-    let mut effective_free_space_bytes =
-        space_stats.as_ref().map(|stats| stats.effective_free_space);
-
-    if let Some(min_disk_space_gb) = task.min_disk_space_gb {
-        let min_disk_space_bytes = gb_to_bytes(min_disk_space_gb);
-        if let Some(stats) = &space_stats {
-            info!(
-                "[刷流][{}] 磁盘空间: 当前空闲 {:.2} GB, 未完成剩余 {:.2} GB, 预测可用 {:.2} GB, 最低保留 {:.2} GB",
-                task.name,
-                bytes_to_gb(stats.free_space),
-                bytes_to_gb(stats.pending_download_bytes),
-                bytes_to_gb(effective_free_space_bytes.unwrap_or(0)),
-                min_disk_space_gb
-            );
-        } else {
-            warn!(
-                "[刷流][{}] 无法获取下载器剩余空间，跳过最小剩余空间检查",
-                task.name
-            );
-        }
-
-        if effective_free_space_bytes.is_some_and(|free_space| free_space < min_disk_space_bytes) {
-            info!("[刷流][{}] 预测剩余空间低于阈值，跳过选种", task.name);
-            return Ok(());
-        }
-    }
+    // 空间门禁已在步骤 1 完成，qb_free_space 缓存了各 qb 的剩余空间，供选 qb 时使用
 
     // 6. 获取种子列表（RSS 或 U2 shoutbox）
     let snapshot = if u2::is_u2_shoutbox_url(&task.rss_url) {
@@ -1040,28 +963,28 @@ async fn execute_brush_task(
             continue;
         }
 
-        if let Some(min_disk_space_gb) = task.min_disk_space_gb {
-            if let (Some(predicted_free_space), Some(item_size_bytes)) =
-                (effective_free_space_bytes, effective_item.size_bytes)
-            {
-                let min_disk_space_bytes = gb_to_bytes(min_disk_space_gb);
-                if predicted_free_space < min_disk_space_bytes.saturating_add(item_size_bytes) {
-                    info!(
-                        "[刷流][{}] 跳过种子: {}，预测剩余空间不足。当前预测可用 {:.2} GB，种子大小 {:.2} GB，最低保留 {:.2} GB",
-                        task.name,
-                        effective_item.title,
-                        bytes_to_gb(predicted_free_space),
-                        bytes_to_gb(item_size_bytes),
-                        min_disk_space_gb
-                    );
-                    continue;
-                }
-            }
+        // 选 qb：先按种子大小过滤，再按权重加权随机
+        let item_size = effective_item.size_bytes.unwrap_or(0);
+        let mut candidates: Vec<i64> = qb_clients
+            .keys()
+            .copied()
+            .filter(|dl_id| {
+                let free = qb_free_space.get(dl_id).copied().unwrap_or(0);
+                free >= item_size as u64
+            })
+            .collect();
+        if candidates.is_empty() {
+            info!(
+                "[刷流][{}] 跳过种子: {}，所有候选下载器剩余空间 < 种子大小 {:.2} GB",
+                task.name,
+                effective_item.title,
+                bytes_to_gb(item_size as u64)
+            );
+            continue;
         }
 
-        // 下载种子文件并添加到下载器
+        // 下载种子文件
         let torrent_bytes = if is_u2 {
-            // U2 站点需要带上 Cookie 下载种子
             match u2::download_torrent(&task, db, http, &effective_item.download_url).await {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -1101,7 +1024,7 @@ async fn execute_brush_task(
         };
         let data = torrent_bytes;
 
-        // 在发送到下载器之前验证种子文件有效性
+        // 验证种子文件有效性
         let info_hash = match extract_info_hash(&data) {
             Some(h) => h,
             None => {
@@ -1119,35 +1042,66 @@ async fn execute_brush_task(
             }
         };
 
-        let save_path = task.save_dir.clone().unwrap_or_default();
-        let options = AddTorrentOptions {
-            save_path: if save_path.is_empty() {
-                None
-            } else {
-                Some(save_path)
-            },
-            tags: Some(task.tag.clone()),
-            download_limit: task.download_speed_limit.map(|v| v * 1024),
-            upload_limit: task.upload_speed_limit.map(|v| v * 1024),
-            ratio_limit: task.target_ratio,
-            ..Default::default()
-        };
-
         let filename = format!("{}.torrent", effective_item.guid);
-        debug!(
-            "[刷流][{}] 准备添加到下载器: title={} filename={} download_url={} save_path={:?} tag={} dl_limit={:?} ul_limit={:?} torrent_bytes={}",
-            task.name,
-            effective_item.title,
-            filename,
-            effective_item.download_url,
-            options.save_path,
-            task.tag,
-            options.download_limit,
-            options.upload_limit,
-            data.len()
-        );
-        match client.add_torrent(data.clone(), &filename, &options).await {
-            Ok(()) => {
+
+        // 加权随机尝试候选下载器，任一失败则移除后重试
+        let mut added_to_qb: Option<i64> = None;
+        while !candidates.is_empty() {
+            let pick = weighted_random_pick(&candidates, |dl_id| {
+                qb_clients
+                    .get(dl_id)
+                    .map(|(r, _)| r.weight.max(1) as u64)
+                    .unwrap_or(1)
+            });
+            let (dl_record, dl_client) = match qb_clients.get(&pick) {
+                Some(pair) => pair.clone(),
+                None => {
+                    candidates.retain(|id| *id != pick);
+                    continue;
+                }
+            };
+            let save_path = task.get_save_path(pick);
+            let options = AddTorrentOptions {
+                save_path: save_path.clone(),
+                tags: Some(task.tag.clone()),
+                download_limit: task.download_speed_limit.map(|v| v * 1024),
+                upload_limit: task.upload_speed_limit.map(|v| v * 1024),
+                ratio_limit: task.target_ratio,
+                ..Default::default()
+            };
+            debug!(
+                "[刷流][{}] 准备添加到下载器 '{}': title={} filename={} download_url={} save_path={:?} tag={} dl_limit={:?} ul_limit={:?} torrent_bytes={}",
+                task.name,
+                dl_record.name,
+                effective_item.title,
+                filename,
+                effective_item.download_url,
+                options.save_path,
+                task.tag,
+                options.download_limit,
+                options.upload_limit,
+                data.len()
+            );
+            match dl_client
+                .add_torrent(data.clone(), &filename, &options)
+                .await
+            {
+                Ok(()) => {
+                    added_to_qb = Some(pick);
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "[刷流][{}] ✗ 添加到下载器 '{}' 失败: title={} save_path={:?} err={}",
+                        task.name, dl_record.name, effective_item.title, options.save_path, e
+                    );
+                    candidates.retain(|id| *id != pick);
+                }
+            }
+        }
+
+        match added_to_qb {
+            Some(dl_id) => {
                 let torrent_id = effective_item
                     .link
                     .as_deref()
@@ -1165,6 +1119,7 @@ async fn execute_brush_task(
                         effective_item.size_bytes.map(|size| size as i64),
                         effective_item.is_hr(),
                         effective_item.free_end_timestamp,
+                        dl_id,
                     )
                     .await
                 {
@@ -1179,9 +1134,14 @@ async fn execute_brush_task(
                         );
                     }
                 }
+                let dl_name = qb_clients
+                    .get(&dl_id)
+                    .map(|(r, _)| r.name.as_str())
+                    .unwrap_or("?");
                 info!(
-                    "[刷流][{}] ✓ 添加成功: {} id={} size={} seeders={} dl={:?} ul={:?} hr={}",
+                    "[刷流][{}] ✓ 添加成功 → {}: {} id={} size={} seeders={} dl={:?} ul={:?} hr={}",
                     task.name,
+                    dl_name,
                     effective_item.title,
                     extract_torrent_id(&effective_item.guid),
                     format_size(effective_item.size_bytes),
@@ -1196,25 +1156,17 @@ async fn execute_brush_task(
                 added += 1;
                 if let Some(bytes) = effective_item.size_bytes {
                     current_size_gb += bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-                    if let Some(free_space) = effective_free_space_bytes.as_mut() {
-                        *free_space = free_space.saturating_sub(bytes);
+                    if let Some(free) = qb_free_space.get_mut(&dl_id) {
+                        *free = free.saturating_sub(bytes as u64);
                     }
                 }
             }
-            Err(e) => {
-                warn!(
-                    "[刷流][{}] ✗ 添加到下载器失败: title={} filename={} download_url={} save_path={:?} tag={} err={}",
-                    task.name,
-                    effective_item.title,
-                    filename,
-                    effective_item.download_url,
-                    options.save_path,
-                    task.tag,
-                    e
-                );
+            None => {
                 failed += 1;
-                info!("[刷流][{}] 下载器返回错误，停止本次添加", task.name);
-                break;
+                info!(
+                    "[刷流][{}] 所有候选下载器均添加失败: {}",
+                    task.name, effective_item.title
+                );
             }
         }
     }
@@ -1369,7 +1321,7 @@ mod tests {
             name: "test".to_string(),
             cron_expression: "0 * * * * *".to_string(),
             site_id: None,
-            downloader_id: 1,
+            downloader_ids: vec![1],
             tag: "brush".to_string(),
             rss_url: "https://example.test/rss".to_string(),
             seed_volume_gb: None,
@@ -1539,6 +1491,150 @@ mod tests {
 
         assert_eq!(calculate_pending_download_bytes(&torrents), 600);
     }
+}
+
+/// 独立版删种协程，逻辑与 BrushScheduler::spawn_delete_torrent 相同。
+/// 供 cleaner_loop 的并发分组使用。
+fn spawn_delete_torrent_standalone(
+    db: &Database,
+    pool: &Arc<DownloaderClientPool>,
+    pending: &Arc<RwLock<HashSet<(i64, String)>>>,
+    client: Arc<dyn DownloaderClient>,
+    downloader: DownloaderRecord,
+    task_id: i64,
+    task_name: String,
+    hash: String,
+    reason: String,
+) {
+    let db = db.clone();
+    let pool = pool.clone();
+    let pending = pending.clone();
+
+    tokio::spawn(async move {
+        pending
+            .write()
+            .await
+            .insert((task_id, hash.clone()));
+
+        let short_hash = &hash[..8.min(hash.len())];
+
+        info!(
+            "[删种][{}] hash={} → 尝试暂停种子",
+            task_name, short_hash
+        );
+        match client.pause_torrent(&hash).await {
+            Ok(()) => {}
+            Err(e) if e.contains("404") => {
+                info!(
+                    "[删种][{}] hash={} 暂停返回404（种子已不存在），直接标记为已移除",
+                    task_name, short_hash
+                );
+                let _ = db
+                    .update_brush_torrent_status(task_id, &hash, "removed", Some(&reason))
+                    .await;
+                pending.write().await.remove(&(task_id, hash));
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    "[删种][{}] hash={} 暂停失败: {}，放弃本次删除",
+                    task_name, short_hash, e
+                );
+                pending.write().await.remove(&(task_id, hash));
+                return;
+            }
+        }
+
+        info!(
+            "[删种][{}] hash={} 暂停成功，等待 60s 后删除",
+            task_name, short_hash
+        );
+        sleep(Duration::from_secs(60)).await;
+
+        let client = match pool.get(&downloader).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "[删种][{}] 冷却结束但获取客户端失败: hash={} err={}",
+                    task_name, short_hash, e
+                );
+                pending.write().await.remove(&(task_id, hash));
+                return;
+            }
+        };
+
+        let final_reason = match client.delete_torrent(&hash, true).await {
+            Ok(()) => reason,
+            Err(delete_err) => {
+                warn!(
+                    "[删种][{}] 删除失败: hash={} err={}",
+                    task_name, short_hash, delete_err
+                );
+                format!("{} (删除接口返回错误: {})", reason, delete_err)
+            }
+        };
+
+        match client.list_torrents(None).await {
+            Ok(all) => {
+                if all.iter().any(|t| t.hash.eq_ignore_ascii_case(&hash)) {
+                    warn!(
+                        "[删种][{}] 删除后种子仍存在，保持 active 状态",
+                        task_name
+                    );
+                    pending.write().await.remove(&(task_id, hash));
+                    return;
+                }
+                info!(
+                    "[删种][{}] 确认种子已不在下载器中，标记为已移除",
+                    task_name
+                );
+            }
+            Err(list_err) => {
+                warn!(
+                    "[删种][{}] 无法确认种子是否仍存在: {}，保持 active 状态",
+                    task_name, list_err
+                );
+                pending.write().await.remove(&(task_id, hash));
+                return;
+            }
+        }
+
+        let _ = db
+            .update_brush_torrent_status(task_id, &hash, "removed", Some(&final_reason))
+            .await;
+
+        pending.write().await.remove(&(task_id, hash));
+    });
+}
+
+/// 加权随机选取。`items` 为候选列表，`weight_fn` 返回各项权重 (>0)。
+/// 基于当前时间纳秒做伪随机，不需要密码学强度。
+fn weighted_random_pick<T, F>(items: &[T], weight_fn: F) -> T
+where
+    T: Copy,
+    F: Fn(&T) -> u64,
+{
+    if items.is_empty() {
+        panic!("weighted_random_pick: empty candidates");
+    }
+    if items.len() == 1 {
+        return items[0];
+    }
+    let total: u64 = items.iter().map(|i| weight_fn(i).max(1)).sum();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seed = nanos ^ (nanos >> 32);
+    let mut threshold = if total == 0 { 0 } else { seed % total };
+    for item in items {
+        let w = weight_fn(item).max(1);
+        if threshold < w {
+            return *item;
+        }
+        threshold = threshold.saturating_sub(w);
+    }
+    items[items.len() - 1]
 }
 
 fn format_size(bytes: Option<u64>) -> String {

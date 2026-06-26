@@ -1054,7 +1054,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
-                .prepare("SELECT id, name, downloader_type, url, username, password, created_at, updated_at FROM downloaders ORDER BY id")
+                .prepare("SELECT id, name, downloader_type, url, username, password, weight, created_at, updated_at FROM downloaders ORDER BY id")
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1065,8 +1065,9 @@ impl Database {
                         url: row.get(3)?,
                         username: row.get(4)?,
                         password: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        weight: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
                     })
                 })
                 .map_err(sql_error)?;
@@ -1085,7 +1086,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, downloader_type, url, username, password, created_at, updated_at FROM downloaders WHERE id = ?",
+                "SELECT id, name, downloader_type, url, username, password, weight, created_at, updated_at FROM downloaders WHERE id = ?",
                 params![id],
                 |row| {
                     Ok(DownloaderRecord {
@@ -1095,8 +1096,9 @@ impl Database {
                         url: row.get(3)?,
                         username: row.get(4)?,
                         password: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        weight: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
                     })
                 },
             )
@@ -1114,6 +1116,7 @@ impl Database {
         url: &str,
         username: &str,
         password: &str,
+        weight: i32,
     ) -> Result<i64, AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -1127,8 +1130,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT INTO downloaders (name, downloader_type, url, username, password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![name, dtype, url, username, password, now, now],
+                "INSERT INTO downloaders (name, downloader_type, url, username, password, weight, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![name, dtype, url, username, password, weight, now, now],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -1145,6 +1148,7 @@ impl Database {
         url: &str,
         username: &str,
         password: &str,
+        weight: i32,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -1158,8 +1162,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE downloaders SET name = ?, downloader_type = ?, url = ?, username = ?, password = ?, updated_at = ? WHERE id = ?",
-                params![name, dtype, url, username, password, now, id],
+                "UPDATE downloaders SET name = ?, downloader_type = ?, url = ?, username = ?, password = ?, weight = ?, updated_at = ? WHERE id = ?",
+                params![name, dtype, url, username, password, weight, now, id],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -1188,7 +1192,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, cron_expression, site_id, downloader_id, tag, rss_url,
+                    "SELECT id, name, cron_expression, site_id, downloader_ids, tag, rss_url,
                      seed_volume_gb, save_dir, active_time_windows,
                      promotion, skip_hit_and_run, max_concurrent,
                      download_speed_limit, upload_speed_limit,
@@ -1218,7 +1222,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, cron_expression, site_id, downloader_id, tag, rss_url,
+                "SELECT id, name, cron_expression, site_id, downloader_ids, tag, rss_url,
                  seed_volume_gb, save_dir, active_time_windows,
                  promotion, skip_hit_and_run, max_concurrent,
                  download_speed_limit, upload_speed_limit,
@@ -1254,8 +1258,10 @@ impl Database {
             let max_concurrent = req.max_concurrent.unwrap_or(100);
             let delete_mode = req.delete_mode.unwrap_or_else(|| "or".to_string());
             let delete_on_free_expiry = req.delete_on_free_expiry.unwrap_or(false) as i32;
+            let downloader_ids_json =
+                serde_json::to_string(&req.downloader_ids).unwrap_or_else(|_| "[]".to_string());
             conn.execute(
-                "INSERT INTO brush_tasks (name, cron_expression, site_id, downloader_id, tag, rss_url,
+                "INSERT INTO brush_tasks (name, cron_expression, site_id, downloader_ids, tag, rss_url,
                  seed_volume_gb, save_dir, active_time_windows,
                  promotion, skip_hit_and_run, max_concurrent,
                  download_speed_limit, upload_speed_limit,
@@ -1264,9 +1270,9 @@ impl Database {
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                  enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
-                    req.name, req.cron_expression, req.site_id, req.downloader_id, req.tag, req.rss_url,
+                    req.name, req.cron_expression, req.site_id, downloader_ids_json, req.tag, req.rss_url,
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
@@ -1300,8 +1306,10 @@ impl Database {
             let max_concurrent = req.max_concurrent.unwrap_or(100);
             let delete_mode = req.delete_mode.unwrap_or_else(|| "or".to_string());
             let delete_on_free_expiry = req.delete_on_free_expiry.unwrap_or(false) as i32;
+            let downloader_ids_json =
+                serde_json::to_string(&req.downloader_ids).unwrap_or_else(|_| "[]".to_string());
             conn.execute(
-                "UPDATE brush_tasks SET name = ?, cron_expression = ?, site_id = ?, downloader_id = ?, tag = ?, rss_url = ?,
+                "UPDATE brush_tasks SET name = ?, cron_expression = ?, site_id = ?, downloader_ids = ?, tag = ?, rss_url = ?,
                  seed_volume_gb = ?, save_dir = ?, active_time_windows = ?,
                  promotion = ?, skip_hit_and_run = ?, max_concurrent = ?,
                  download_speed_limit = ?, upload_speed_limit = ?,
@@ -1311,7 +1319,7 @@ impl Database {
                  min_avg_upload_speed_kbs = ?, max_inactive_hours = ?, min_disk_space_gb = ?,
                  updated_at = ? WHERE id = ?",
                 params![
-                    req.name, req.cron_expression, req.site_id, req.downloader_id, req.tag, req.rss_url,
+                    req.name, req.cron_expression, req.site_id, downloader_ids_json, req.tag, req.rss_url,
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
@@ -1397,7 +1405,7 @@ impl Database {
 
             let sql = if like.is_some() {
                 "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, removed_at, remove_reason,
-                        uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
+                        uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at, downloader_id
                  FROM brush_task_torrents
                  WHERE task_id = ?
                    AND (torrent_name LIKE ? OR COALESCE(torrent_id, '') LIKE ?)
@@ -1405,7 +1413,7 @@ impl Database {
                  LIMIT ? OFFSET ?"
             } else {
                 "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, removed_at, remove_reason,
-                        uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
+                        uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at, downloader_id
                  FROM brush_task_torrents
                  WHERE task_id = ?
                  ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, added_at DESC, id DESC
@@ -1450,7 +1458,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, removed_at, remove_reason,
-                            uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at
+                            uploaded_bytes, downloaded_bytes, download_duration_secs, avg_upload_speed, ratio, last_stats_at, downloader_id
                      FROM brush_task_torrents WHERE task_id = ? AND status = 'active' ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -1478,8 +1486,8 @@ impl Database {
                     "SELECT bt.id, bt.task_id, bt.torrent_id, bt.torrent_link, bt.torrent_hash, bt.torrent_name,
                             bt.added_at, bt.size_bytes, bt.is_hr, bt.free_end_timestamp, bt.status, bt.removed_at,
                             bt.remove_reason, bt.uploaded_bytes, bt.downloaded_bytes, bt.download_duration_secs,
-                            bt.avg_upload_speed, bt.ratio, bt.last_stats_at,
-                            t.id, t.name, t.cron_expression, t.site_id, t.downloader_id, t.tag, t.rss_url,
+                            bt.avg_upload_speed, bt.ratio, bt.last_stats_at, bt.downloader_id,
+                            t.id, t.name, t.cron_expression, t.site_id, t.downloader_ids, t.tag, t.rss_url,
                             t.seed_volume_gb, t.save_dir, t.active_time_windows,
                             t.promotion, t.skip_hit_and_run, t.max_concurrent,
                             t.download_speed_limit, t.upload_speed_limit,
@@ -1496,7 +1504,7 @@ impl Database {
             let rows = stmt
                 .query_map([], |row| {
                     let torrent = map_brush_torrent_record(row)?;
-                    let task = row_to_brush_task_at(row, 19)?;
+                    let task = row_to_brush_task_at(row, 20)?;
                     Ok((torrent, task))
                 })
                 .map_err(sql_error)?;
@@ -1505,6 +1513,25 @@ impl Database {
                 list.push(row.map_err(sql_error)?);
             }
             Ok(list)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// 返回任务下所有未移除种子的体积总和 (bytes)。无种子时返回 None。
+    pub async fn sum_non_removed_torrent_size(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<i64>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.query_row(
+                "SELECT SUM(size_bytes) FROM brush_task_torrents WHERE task_id = ? AND status != 'removed'",
+                params![task_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(sql_error)
         })
         .await
         .map_err(join_error)?
@@ -1520,8 +1547,8 @@ impl Database {
         size_bytes: Option<i64>,
         is_hr: bool,
         free_end_timestamp: Option<i64>,
-    ) -> Result<i64, AppError> {
-        let path = self.path.clone();
+        downloader_id: i64,
+    ) -> Result<i64, AppError> {        let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
         let (torrent_id, torrent_link, hash, name) = (
             torrent_id.map(|value| value.to_string()),
@@ -1532,7 +1559,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                "INSERT INTO brush_task_torrents (task_id, torrent_id, torrent_link, torrent_hash, torrent_name, added_at, size_bytes, is_hr, free_end_timestamp, status, downloader_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
                  ON CONFLICT(task_id, torrent_hash) DO UPDATE SET
                     torrent_id = excluded.torrent_id,
                     torrent_link = excluded.torrent_link,
@@ -1543,8 +1570,9 @@ impl Database {
                     free_end_timestamp = excluded.free_end_timestamp,
                     status = 'active',
                     removed_at = NULL,
-                    remove_reason = NULL",
-                params![task_id, torrent_id, torrent_link, hash, name, now, size_bytes, is_hr as i32, free_end_timestamp],
+                    remove_reason = NULL,
+                    downloader_id = excluded.downloader_id",
+                params![task_id, torrent_id, torrent_link, hash, name, now, size_bytes, is_hr as i32, free_end_timestamp, downloader_id],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -2256,22 +2284,6 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn set_tag_rule_enabled(&self, id: i64, enabled: bool) -> Result<(), AppError> {
-        let path = self.path.clone();
-        let now = Utc::now().to_rfc3339();
-        tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "UPDATE tag_rules SET enabled = ?, updated_at = ? WHERE id = ?",
-                params![enabled as i32, now, id],
-            )
-            .map_err(sql_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(join_error)?
-    }
-
     pub async fn update_tag_rule_stats(&self, id: i64, count: i64, total_size: i64) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -2382,6 +2394,7 @@ impl Database {
                     url TEXT NOT NULL,
                     username TEXT NOT NULL DEFAULT '',
                     password TEXT NOT NULL DEFAULT '',
+                    weight INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -2391,7 +2404,7 @@ impl Database {
                     name TEXT NOT NULL UNIQUE,
                     cron_expression TEXT NOT NULL,
                     site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
-                    downloader_id INTEGER NOT NULL REFERENCES downloaders(id),
+                    downloader_ids TEXT NOT NULL DEFAULT '[]',
                     tag TEXT NOT NULL,
                     rss_url TEXT NOT NULL,
                     seed_volume_gb REAL,
@@ -2440,6 +2453,7 @@ impl Database {
                     avg_upload_speed REAL NOT NULL DEFAULT 0,
                     ratio REAL NOT NULL DEFAULT 0,
                     last_stats_at TEXT,
+                    downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
                     UNIQUE(task_id, torrent_hash)
                 );
 
@@ -2693,6 +2707,53 @@ impl Database {
                 "ALTER TABLE tag_rules ADD COLUMN tagged_total_size INTEGER NOT NULL DEFAULT 0",
             )?;
 
+            // ONE-TIME MIGRATION — remove next release: multi-qb task support
+            ensure_column(
+                &conn,
+                "brush_task_torrents",
+                "downloader_id",
+                "ALTER TABLE brush_task_torrents ADD COLUMN downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL",
+            )?;
+            ensure_column(
+                &conn,
+                "brush_tasks",
+                "downloader_ids",
+                "ALTER TABLE brush_tasks ADD COLUMN downloader_ids TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                &conn,
+                "downloaders",
+                "weight",
+                "ALTER TABLE downloaders ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
+            )?;
+            // Backfill + drop old columns. Only runs on databases that still
+            // have the legacy `downloader_id` column (created before this change).
+            if column_exists(&conn, "brush_tasks", "downloader_id") {
+                conn.execute(
+                    "UPDATE brush_task_torrents
+                     SET downloader_id = (SELECT downloader_id FROM brush_tasks WHERE id = brush_task_torrents.task_id)
+                     WHERE downloader_id IS NULL",
+                    [],
+                )
+                .map_err(sql_error)?;
+                conn.execute(
+                    "UPDATE brush_tasks SET downloader_ids = json_array(downloader_id)",
+                    [],
+                )
+                .map_err(sql_error)?;
+                // save_dir: legacy absolute path -> {"<downloader_id>": "<path>"}
+                conn.execute(
+                    "UPDATE brush_tasks
+                     SET save_dir = json_object(CAST(downloader_id AS TEXT), save_dir)
+                     WHERE save_dir IS NOT NULL AND save_dir NOT LIKE '{%'",
+                    [],
+                )
+                .map_err(sql_error)?;
+                conn.execute("ALTER TABLE brush_tasks DROP COLUMN downloader_id", [])
+                    .map_err(sql_error)?;
+                // min_disk_space_gb stays on brush_tasks (task-level config)
+            }
+
             conn.execute(
                 "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1, 7],
@@ -2710,12 +2771,15 @@ fn row_to_brush_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTaskRecor
 }
 
 fn row_to_brush_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<BrushTaskRecord> {
+    let downloader_ids_json: String = row.get(offset + 4)?;
+    let downloader_ids: Vec<i64> =
+        serde_json::from_str(&downloader_ids_json).unwrap_or_default();
     Ok(BrushTaskRecord {
         id: row.get(offset)?,
         name: row.get(offset + 1)?,
         cron_expression: row.get(offset + 2)?,
         site_id: row.get(offset + 3)?,
-        downloader_id: row.get(offset + 4)?,
+        downloader_ids,
         tag: row.get(offset + 5)?,
         rss_url: row.get(offset + 6)?,
         seed_volume_gb: row.get(offset + 7)?,
@@ -2859,6 +2923,7 @@ fn map_brush_torrent_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTo
         avg_upload_speed: row.get(16)?,
         ratio: row.get(17)?,
         last_stats_at: row.get(18)?,
+        downloader_id: row.get(19)?,
     })
 }
 
@@ -2907,17 +2972,26 @@ fn sql_error(error: rusqlite::Error) -> AppError {
     }
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Result<(), AppError> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .map_err(sql_error)?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(sql_error)?;
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let Ok(mut stmt) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+        return false;
+    };
     for row in rows {
-        if row.map_err(sql_error)? == column {
-            return Ok(());
+        if let Ok(c) = row {
+            if c == column {
+                return true;
+            }
         }
+    }
+    false
+}
+
+fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Result<(), AppError> {
+    if column_exists(conn, table, column) {
+        return Ok(());
     }
     conn.execute(sql, []).map_err(sql_error)?;
     Ok(())
@@ -2948,5 +3022,61 @@ fn final_status_name(status: FinalStatus) -> &'static str {
         FinalStatus::Success => "success",
         FinalStatus::SkippedExisting => "skipped_existing",
         FinalStatus::Failed => "failed",
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_migration_save_dir_json_conversion() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Simulate a legacy brush_tasks row with downloader_id=1 and save_dir='/path'
+        conn.execute_batch(
+            "CREATE TABLE brush_tasks (
+                id INTEGER PRIMARY KEY,
+                downloader_id INTEGER NOT NULL,
+                save_dir TEXT
+            );
+            INSERT INTO brush_tasks (downloader_id, save_dir) VALUES (1, '/downloads/brush');
+            INSERT INTO brush_tasks (downloader_id, save_dir) VALUES (2, '/other/path');
+            INSERT INTO brush_tasks (downloader_id, save_dir) VALUES (3, NULL);
+            ",
+        )
+        .unwrap();
+
+        // Run the same UPDATE as the migration
+        conn.execute(
+            "UPDATE brush_tasks
+             SET save_dir = json_object(CAST(downloader_id AS TEXT), save_dir)
+             WHERE save_dir IS NOT NULL AND save_dir NOT LIKE '{%'",
+            [],
+        )
+        .unwrap();
+
+        // Verify row 1
+        let row1: String = conn
+            .query_row("SELECT save_dir FROM brush_tasks WHERE downloader_id = 1", [], |row| row.get(0))
+            .unwrap();
+        let json1: serde_json::Value = serde_json::from_str(&row1).unwrap();
+        assert_eq!(json1["1"], "/downloads/brush");
+
+        // Verify row 2
+        let row2: String = conn
+            .query_row("SELECT save_dir FROM brush_tasks WHERE downloader_id = 2", [], |row| row.get(0))
+            .unwrap();
+        let json2: serde_json::Value = serde_json::from_str(&row2).unwrap();
+        assert_eq!(json2["2"], "/other/path");
+
+        // Verify row 3 (NULL save_dir stays NULL)
+        let row3: Option<String> = conn
+            .query_row("SELECT save_dir FROM brush_tasks WHERE downloader_id = 3", [], |row| row.get(0))
+            .unwrap();
+        assert!(row3.is_none());
     }
 }

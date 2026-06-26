@@ -404,6 +404,10 @@ fn app_router(state: AppState) -> Router {
             "/api/downloaders/{id}/space",
             get(get_downloader_space_stats),
         )
+        .route(
+            "/api/downloaders/{id}/default-path",
+            get(get_downloader_default_path),
+        )
         // 刷流任务
         .route(
             "/api/brush-tasks",
@@ -1144,6 +1148,7 @@ struct CreateDownloaderRequest {
     url: String,
     username: Option<String>,
     password: Option<String>,
+    weight: Option<i32>,
 }
 
 async fn list_downloaders(
@@ -1167,6 +1172,7 @@ async fn create_downloader(
             &body.url,
             body.username.as_deref().unwrap_or(""),
             body.password.as_deref().unwrap_or(""),
+            body.weight.unwrap_or(1),
         )
         .await?;
     Ok(Json(serde_json::json!({ "id": id })))
@@ -1186,6 +1192,7 @@ async fn update_downloader(
             &body.url,
             body.username.as_deref().unwrap_or(""),
             body.password.as_deref().unwrap_or(""),
+            body.weight.unwrap_or(1),
         )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1237,6 +1244,23 @@ async fn get_downloader_space_stats(
         .map_err(ApiError::internal)?;
 
     Ok(Json(stats))
+}
+
+async fn get_downloader_default_path(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let dl = state
+        .db
+        .get_downloader(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
+    let client = state.pool.get(&dl).await.map_err(ApiError::bad_request)?;
+    let path = client
+        .get_default_save_path()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(serde_json::json!({ "path": path })))
 }
 
 // ========== Brush Tasks API ==========
@@ -1384,14 +1408,32 @@ async fn list_brush_task_torrents(
         .list_brush_task_torrents(id, page, page_size, query.keyword.as_deref())
         .await?;
 
-    if let Some(downloader) = state.db.get_downloader(task.downloader_id).await? {
-        if let Ok(live_torrents) = state
-            .collector
-            .get_tagged_torrents(&downloader, &task.tag)
-            .await
-        {
-            for record in &mut torrents.records {
-                if let Some(live) = find_live_brush_torrent(record, &live_torrents) {
+    // 按 downloader_id 分组，分别从对应下载器拉取实时种子信息
+    let mut dl_live_cache: std::collections::HashMap<i64, Vec<crate::downloader::TorrentInfo>> =
+        std::collections::HashMap::new();
+    for record in &torrents.records {
+        let dl_id = match record.downloader_id {
+            Some(id) => id,
+            None => continue,
+        };
+        if dl_live_cache.contains_key(&dl_id) {
+            continue;
+        }
+        if let Ok(Some(downloader)) = state.db.get_downloader(dl_id).await {
+            if let Ok(live_torrents) = state
+                .collector
+                .get_tagged_torrents(&downloader, &task.tag)
+                .await
+            {
+                dl_live_cache.insert(dl_id, live_torrents);
+            }
+        }
+    }
+
+    for record in &mut torrents.records {
+        if let Some(dl_id) = record.downloader_id {
+            if let Some(live_torrents) = dl_live_cache.get(&dl_id) {
+                if let Some(live) = find_live_brush_torrent(record, live_torrents) {
                     apply_live_torrent(record, live);
                 }
             }

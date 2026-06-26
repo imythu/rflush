@@ -279,9 +279,6 @@ pub async fn evaluate_delete_rules(
             }
         }
 
-        // 规则 8: 磁盘最小剩余空间 (这个是全局的，但仍然按规则模式处理)
-        // 磁盘空间检查在外部处理，这里不重复
-
         // 根据模式判断是否需要删除
         if rule_results.is_empty() {
             info!(

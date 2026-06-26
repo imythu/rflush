@@ -205,6 +205,19 @@ impl DownloaderClient for QBittorrentClient {
         })
     }
 
+    fn get_default_save_path(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+        Box::pin(async move {
+            let path = self
+                .qb
+                .get_default_save_path()
+                .await
+                .map_err(|e| format!("获取默认保存路径失败: {}", e))?;
+            Ok(path.to_string_lossy().to_string())
+        })
+    }
+
     fn get_torrent_trackers(
         &self,
         hash: &str,

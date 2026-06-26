@@ -11,7 +11,7 @@ pub struct BrushTaskRecord {
     pub name: String,
     pub cron_expression: String,
     pub site_id: Option<i64>,
-    pub downloader_id: i64,
+    pub downloader_ids: Vec<i64>,
     pub tag: String,
     pub rss_url: String,
     // 可选项
@@ -45,13 +45,22 @@ pub struct BrushTaskRecord {
     pub updated_at: String,
 }
 
+impl BrushTaskRecord {
+    /// `save_dir` 存储为 JSON `{qb_id: "绝对路径"}`。返回指定 qb 的保存路径。
+    pub fn get_save_path(&self, downloader_id: i64) -> Option<String> {
+        let json = self.save_dir.as_deref()?;
+        let map: std::collections::HashMap<String, String> = serde_json::from_str(json).ok()?;
+        map.get(&downloader_id.to_string()).cloned()
+    }
+}
+
 /// 创建/更新刷流任务的请求体
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrushTaskRequest {
     pub name: String,
     pub cron_expression: String,
     pub site_id: Option<i64>,
-    pub downloader_id: i64,
+    pub downloader_ids: Vec<i64>,
     pub tag: String,
     pub rss_url: String,
     pub seed_volume_gb: Option<f64>,
@@ -100,6 +109,7 @@ pub struct BrushTorrentRecord {
     pub avg_upload_speed: f64,
     pub ratio: f64,
     pub last_stats_at: Option<String>,
+    pub downloader_id: Option<i64>,
 }
 
 /// 解析范围字符串 (如 "0-10", "1-100")

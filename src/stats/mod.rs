@@ -74,7 +74,7 @@ async fn process_snapshot(db: &Database, snapshot: &DownloaderSnapshot) -> Resul
     let mut torrent_stats = Vec::new();
     for task in tasks
         .into_iter()
-        .filter(|task| task.downloader_id == snapshot.downloader_id)
+        .filter(|task| task.downloader_ids.contains(&snapshot.downloader_id))
     {
         let torrents = snapshot
             .torrents

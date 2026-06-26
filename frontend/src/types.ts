@@ -148,6 +148,7 @@ export type DownloaderRecord = {
   url: string;
   username: string;
   password: string;
+  weight: number;
   created_at: string;
   updated_at: string;
 };
@@ -172,7 +173,7 @@ export type BrushTaskRecord = {
   name: string;
   cron_expression: string;
   site_id: number | null;
-  downloader_id: number;
+  downloader_ids: number[];
   tag: string;
   rss_url: string;
   seed_volume_gb: number | null;
@@ -206,7 +207,7 @@ export type BrushTaskRequest = {
   name: string;
   cron_expression: string;
   site_id?: number | null;
-  downloader_id: number;
+  downloader_ids: number[];
   tag: string;
   rss_url: string;
   seed_volume_gb?: number | null;
@@ -301,6 +302,7 @@ export type BrushTorrentRecord = {
   avg_upload_speed: number;
   ratio: number;
   last_stats_at: string | null;
+  downloader_id: number | null;
 };
 
 export type BrushTaskTorrentsResponse = {
