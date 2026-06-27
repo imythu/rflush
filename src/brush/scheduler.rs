@@ -9,8 +9,9 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
 use crate::brush::{
-    BrushTaskRecord, BrushTorrentRecord, average_upload_speed, calculate_ratio, in_any_range,
-    is_in_active_window, parse_ranges,
+    BrushTaskLastRunInfo, BrushTaskRecord, BrushTorrentRecord, LastRunAddedTorrent,
+    LastRunDownloaderCandidate, LastRunDownloaderSkipped, LastRunFailedTorrent, average_upload_speed,
+    calculate_ratio, in_any_range, is_in_active_window, parse_ranges,
 };
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
@@ -366,7 +367,7 @@ impl BrushScheduler {
                 info!("[刷流][{}] cron 触发，开始调度执行", task_name);
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        execute_brush_task(&db, &pool, execution_config, &http).await
+                        execute_brush_task(&db, &pool, execution_config, &http, "cron").await
                     {
                         error!("[刷流][{}] 任务执行失败: {}", task_name, e);
                     }
@@ -410,7 +411,7 @@ impl BrushScheduler {
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
             if let Err(e) =
-                execute_brush_task(&db, &pool, execution_config, &http).await
+                execute_brush_task(&db, &pool, execution_config, &http, "manual").await
             {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
@@ -513,8 +514,40 @@ async fn execute_brush_task(
     pool: &Arc<DownloaderClientPool>,
     shared_task: Arc<RwLock<BrushTaskRecord>>,
     http: &AppHttpClient,
+    trigger_type: &str,
 ) -> Result<(), String> {
     let task_start = std::time::Instant::now();
+    let task_id = shared_task.read().await.id;
+    let started_at = Utc::now().to_rfc3339();
+    let mut last_run_info = BrushTaskLastRunInfo::new(trigger_type, started_at);
+
+    let result = execute_brush_task_inner(db, pool, shared_task, http, &mut last_run_info).await;
+
+    last_run_info.finished_at = Utc::now().to_rfc3339();
+    last_run_info.duration_secs = task_start.elapsed().as_secs_f64();
+    if last_run_info.status.is_empty() {
+        last_run_info.status = match &result {
+            Ok(()) => "success".to_string(),
+            Err(e) => {
+                last_run_info.error = Some(e.clone());
+                "failed".to_string()
+            }
+        };
+    }
+    if let Ok(json) = serde_json::to_string(&last_run_info) {
+        let _ = db.update_brush_task_last_run_info(task_id, &json).await;
+    }
+    result
+}
+
+async fn execute_brush_task_inner(
+    db: &Database,
+    pool: &Arc<DownloaderClientPool>,
+    shared_task: Arc<RwLock<BrushTaskRecord>>,
+    http: &AppHttpClient,
+    last_run_info: &mut BrushTaskLastRunInfo,
+) -> Result<(), String> {
+    let inner_start = std::time::Instant::now();
     let task = snapshot_task(&shared_task).await;
     info!("[刷流][{}] 开始执行任务 (id={})", task.name, task.id);
 
@@ -526,6 +559,12 @@ async fn execute_brush_task(
             Some(r) => r,
             None => {
                 warn!("[刷流][{}] 下载器 id={} 不存在，跳过", task.name, dl_id);
+                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
+                    id: *dl_id,
+                    name: format!("#{}", dl_id),
+                    reason: "not_exist".to_string(),
+                    detail: None,
+                });
                 continue;
             }
         };
@@ -536,6 +575,12 @@ async fn execute_brush_task(
                     "[刷流][{}] 创建下载器 '{}' 客户端失败: {}",
                     task.name, dl_record.name, e
                 );
+                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
+                    id: *dl_id,
+                    name: dl_record.name.clone(),
+                    reason: "client_create_failed".to_string(),
+                    detail: Some(e.to_string()),
+                });
                 continue;
             }
         };
@@ -548,6 +593,12 @@ async fn execute_brush_task(
                     "[刷流][{}] 下载器 '{}' 获取剩余空间失败: {}，跳过该下载器",
                     task.name, dl_record.name, e
                 );
+                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
+                    id: *dl_id,
+                    name: dl_record.name.clone(),
+                    reason: "free_space_fetch_failed".to_string(),
+                    detail: Some(e.to_string()),
+                });
                 continue;
             }
         };
@@ -558,6 +609,16 @@ async fn execute_brush_task(
                     "[刷流][{}] 下载器 '{}' 剩余空间 {:.2} GB < 最低 {:.2} GB，本轮排除",
                     task.name, dl_record.name, bytes_to_gb(free), min_gb
                 );
+                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
+                    id: *dl_id,
+                    name: dl_record.name.clone(),
+                    reason: "space_insufficient".to_string(),
+                    detail: Some(format!(
+                        "free {:.2} GB < min {:.2} GB",
+                        bytes_to_gb(free),
+                        min_gb
+                    )),
+                });
                 continue;
             }
         }
@@ -565,6 +626,12 @@ async fn execute_brush_task(
             "[刷流][{}] 下载器 '{}' 进入候选 (剩余 {:.2} GB, 权重 {})",
             task.name, dl_record.name, bytes_to_gb(free), dl_record.weight
         );
+        last_run_info.downloaders.candidates.push(LastRunDownloaderCandidate {
+            id: *dl_id,
+            name: dl_record.name.clone(),
+            free_space_gb: bytes_to_gb(free),
+            weight: dl_record.weight,
+        });
         qb_clients.insert(*dl_id, (dl_record, dl_client));
         qb_free_space.insert(*dl_id, free);
     }
@@ -574,6 +641,8 @@ async fn execute_brush_task(
             "[刷流][{}] 所有绑定下载器剩余空间不足或不可用，结束本次任务",
             task.name
         );
+        last_run_info.status = "skipped".to_string();
+        last_run_info.early_exit_reason = Some("no_downloaders".to_string());
         return Ok(());
     }
 
@@ -582,6 +651,7 @@ async fn execute_brush_task(
         .list_active_brush_torrents(task.id)
         .await
         .map_err(|e| e.to_string())?;
+    last_run_info.sync.managed_before = managed_torrents.len();
 
     if !managed_torrents.is_empty() {
         let mut missing_count = 0usize;
@@ -640,6 +710,7 @@ async fn execute_brush_task(
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        last_run_info.sync.missing_marked_removed = missing_count;
     }
 
     info!(
@@ -663,6 +734,9 @@ async fn execute_brush_task(
         .count() as i32;
 
     let can_add = (task.max_concurrent - active_count.max(0)).max(0) as usize;
+    last_run_info.concurrency.active_count = active_count;
+    last_run_info.concurrency.max_concurrent = task.max_concurrent;
+    last_run_info.concurrency.can_add = can_add as i32;
     info!(
         "[刷流][{}] 并发检查: 活跃 {} 个, 最大 {}, 可添加 {} 个",
         task.name,
@@ -672,6 +746,8 @@ async fn execute_brush_task(
     );
     if can_add == 0 {
         info!("[刷流][{}] 已达并发上限，跳过选种", task.name);
+        last_run_info.status = "skipped".to_string();
+        last_run_info.early_exit_reason = Some("concurrency_limit".to_string());
         return Ok(());
     }
 
@@ -684,13 +760,17 @@ async fn execute_brush_task(
             .unwrap_or(0);
         total as f64 / (1024.0 * 1024.0 * 1024.0)
     };
+    last_run_info.seed_volume.current_gb = current_size_gb;
     if let Some(max_gb) = task.seed_volume_gb {
+        last_run_info.seed_volume.limit_gb = Some(max_gb);
         info!(
             "[刷流][{}] 保种体积: 当前 {:.2} GB / 上限 {:.2} GB",
             task.name, current_size_gb, max_gb
         );
         if current_size_gb >= max_gb {
             info!("[刷流][{}] 已达保种体积上限，跳过选种", task.name);
+            last_run_info.status = "skipped".to_string();
+            last_run_info.early_exit_reason = Some("seed_volume_limit".to_string());
             return Ok(());
         }
     }
@@ -699,6 +779,7 @@ async fn execute_brush_task(
 
     // 6. 获取种子列表（RSS 或 U2 shoutbox）
     let snapshot = if u2::is_u2_shoutbox_url(&task.rss_url) {
+        last_run_info.source.source_type = "u2_shoutbox".to_string();
         info!(
             "[刷流][{}] 检测到 U2 shoutbox URL，使用 shoutbox 解析器",
             task.name
@@ -706,6 +787,7 @@ async fn execute_brush_task(
         let shoutbox_html = u2::fetch_shoutbox_html(&task, db, http).await?;
         u2::parse_shoutbox_snapshot(&shoutbox_html, &task.name)?
     } else {
+        last_run_info.source.source_type = "rss".to_string();
         info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
         let rss_resp = http
             .get("brush-rss", &task.rss_url)
@@ -719,6 +801,7 @@ async fn execute_brush_task(
         let parsed = rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
         parsed.into_snapshot(task.name.clone(), 1)
     };
+    last_run_info.source.items_parsed = snapshot.items.len();
 
     info!(
         "[刷流][{}] 解析完成，共 {} 个条目",
@@ -750,6 +833,10 @@ async fn execute_brush_task(
     let mut failed = 0usize;
     let mut checked = 0usize;
     let mut skipped_attrs = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut skipped_pre_filter = 0usize;
+    let mut skipped_post_filter = 0usize;
+    let mut skipped_no_space = 0usize;
 
     for item in &sorted_items {
         let task = snapshot_task(&shared_task).await;
@@ -803,6 +890,7 @@ async fn execute_brush_task(
                     "[刷流][{}] 跳过: 种子已存在且未移除 id={}",
                     task.name, tid
                 );
+                skipped_existing += 1;
                 continue;
             }
         }
@@ -831,6 +919,7 @@ async fn execute_brush_task(
                 item.upload_volume_factor,
                 reason
             );
+            skipped_pre_filter += 1;
             continue;
         }
 
@@ -938,6 +1027,11 @@ async fn execute_brush_task(
                                     detail_url
                                 );
                                 skipped_attrs += 1;
+                                last_run_info.failed_torrents.push(LastRunFailedTorrent {
+                                    title: effective_item.title.clone(),
+                                    reason: "detail_fetch_failed".to_string(),
+                                    detail: Some(e.to_string()),
+                                });
                                 continue;
                             }
                         }
@@ -970,6 +1064,7 @@ async fn execute_brush_task(
                 effective_item.upload_volume_factor,
                 reason
             );
+            skipped_post_filter += 1;
             continue;
         }
 
@@ -990,6 +1085,7 @@ async fn execute_brush_task(
                 effective_item.title,
                 bytes_to_gb(item_size as u64)
             );
+            skipped_no_space += 1;
             continue;
         }
 
@@ -1003,6 +1099,11 @@ async fn execute_brush_task(
                         task.name, effective_item.title, e
                     );
                     failed += 1;
+                    last_run_info.failed_torrents.push(LastRunFailedTorrent {
+                        title: effective_item.title.clone(),
+                        reason: "download_failed".to_string(),
+                        detail: Some(e.to_string()),
+                    });
                     continue;
                 }
             }
@@ -1018,6 +1119,11 @@ async fn execute_brush_task(
                             "[刷流][{}] 下载种子失败: title={} download_url={} err={}",
                             task.name, effective_item.title, effective_item.download_url, error_msg
                         );
+                        last_run_info.failed_torrents.push(LastRunFailedTorrent {
+                            title: effective_item.title.clone(),
+                            reason: "download_failed".to_string(),
+                            detail: Some(error_msg),
+                        });
                         continue;
                     }
                     resp.body.to_vec()
@@ -1028,6 +1134,11 @@ async fn execute_brush_task(
                         task.name, effective_item.title, e
                     );
                     failed += 1;
+                    last_run_info.failed_torrents.push(LastRunFailedTorrent {
+                        title: effective_item.title.clone(),
+                        reason: "download_failed".to_string(),
+                        detail: Some(e.to_string()),
+                    });
                     continue;
                 }
             }
@@ -1048,6 +1159,11 @@ async fn execute_brush_task(
                     task.name, effective_item.title, effective_item.download_url, preview
                 );
                 failed += 1;
+                last_run_info.failed_torrents.push(LastRunFailedTorrent {
+                    title: effective_item.title.clone(),
+                    reason: "invalid_torrent".to_string(),
+                    detail: Some(format!("download_url={}", effective_item.download_url)),
+                });
                 continue;
             }
         };
@@ -1164,6 +1280,18 @@ async fn execute_brush_task(
                     effective_item.is_hr()
                 );
                 added += 1;
+                last_run_info.added_torrents.push(LastRunAddedTorrent {
+                    title: effective_item.title.clone(),
+                    hash: info_hash.clone(),
+                    size_bytes: effective_item.size_bytes.map(|size| size as i64),
+                    downloader_id: dl_id,
+                    downloader_name: dl_name.to_string(),
+                    is_hr: effective_item.is_hr(),
+                    is_free: effective_item
+                        .download_volume_factor
+                        .map(|f| f.abs() < f64::EPSILON)
+                        .unwrap_or(false),
+                });
                 if let Some(ref tid) = torrent_id {
                     existing_torrent_ids.insert(tid.clone());
                 }
@@ -1180,11 +1308,16 @@ async fn execute_brush_task(
                     "[刷流][{}] 所有候选下载器均添加失败: {}",
                     task.name, effective_item.title
                 );
+                last_run_info.failed_torrents.push(LastRunFailedTorrent {
+                    title: effective_item.title.clone(),
+                    reason: "all_downloaders_failed".to_string(),
+                    detail: None,
+                });
             }
         }
     }
 
-    let elapsed = task_start.elapsed();
+    let elapsed = inner_start.elapsed();
     info!(
         "[刷流][{}] 任务完成: 新增 {} 个, 删除 {} 个, 失败 {} 个, 跳过(详情失败) {} 个, 共检查 {} 个, 耗时 {:.1}s",
         task.name,
@@ -1195,6 +1328,15 @@ async fn execute_brush_task(
         checked,
         elapsed.as_secs_f64()
     );
+
+    last_run_info.selection.checked = checked;
+    last_run_info.selection.added = added;
+    last_run_info.selection.failed = failed;
+    last_run_info.selection.skipped_detail_failure = skipped_attrs;
+    last_run_info.selection.skipped_existing = skipped_existing;
+    last_run_info.selection.skipped_pre_filter = skipped_pre_filter;
+    last_run_info.selection.skipped_post_filter = skipped_post_filter;
+    last_run_info.selection.skipped_no_space = skipped_no_space;
 
     Ok(())
 }
@@ -1362,6 +1504,7 @@ mod tests {
             enabled: true,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+            last_run_info: None,
         }
     }
 

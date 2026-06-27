@@ -201,6 +201,45 @@ export type BrushTaskRecord = {
   enabled: boolean;
   created_at: string;
   updated_at: string;
+  last_run_info: string | null;
+};
+
+export type BrushTaskLastRunInfo = {
+  trigger_type: string;
+  started_at: string;
+  finished_at: string;
+  duration_secs: number;
+  status: string;
+  error?: string | null;
+  early_exit_reason?: string | null;
+  downloaders: {
+    candidates: { id: number; name: string; free_space_gb: number; weight: number }[];
+    skipped: { id: number; name: string; reason: string; detail?: string | null }[];
+  };
+  sync: { managed_before: number; missing_marked_removed: number };
+  concurrency: { active_count: number; max_concurrent: number; can_add: number };
+  seed_volume: { current_gb: number; limit_gb?: number | null };
+  source: { type: string; items_parsed: number };
+  selection: {
+    checked: number;
+    added: number;
+    failed: number;
+    skipped_detail_failure: number;
+    skipped_existing: number;
+    skipped_pre_filter: number;
+    skipped_post_filter: number;
+    skipped_no_space: number;
+  };
+  added_torrents: {
+    title: string;
+    hash: string;
+    size_bytes: number | null;
+    downloader_id: number;
+    downloader_name: string;
+    is_hr: boolean;
+    is_free: boolean;
+  }[];
+  failed_torrents: { title: string; reason: string; detail?: string | null }[];
 };
 
 export type BrushTaskRequest = {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronLeft, ChevronRight, Edit, Eye, Pause, Play, Plus, Search, Trash2, Zap } from "lucide-react";
+import { Activity, ChevronLeft, ChevronRight, Edit, Eye, Pause, Play, Plus, Search, Trash2, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -11,6 +11,7 @@ import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type {
+  BrushTaskLastRunInfo,
   BrushTaskRecord,
   BrushTaskRequest,
   BrushTaskTorrentsResponse,
@@ -81,6 +82,163 @@ function extractSubPath(
     if (full && !base) return full;
   }
   return "";
+}
+
+function parseLastRunInfo(info: string | null): BrushTaskLastRunInfo | null {
+  if (!info) return null;
+  try {
+    return JSON.parse(info) as BrushTaskLastRunInfo;
+  } catch {
+    return null;
+  }
+}
+
+const EARLY_EXIT_LABELS: Record<string, string> = {
+  no_downloaders: "无可用下载器",
+  concurrency_limit: "并发已满",
+  seed_volume_limit: "保种体积已满",
+};
+
+const SKIP_REASON_LABELS: Record<string, string> = {
+  not_exist: "不存在",
+  client_create_failed: "客户端创建失败",
+  free_space_fetch_failed: "空间查询失败",
+  space_insufficient: "空间不足",
+};
+
+const FAIL_REASON_LABELS: Record<string, string> = {
+  download_failed: "下载失败",
+  invalid_torrent: "无效种子",
+  all_downloaders_failed: "全部下载器添加失败",
+  detail_fetch_failed: "详情获取失败",
+};
+
+function LastRunPanel({ info }: { info: BrushTaskLastRunInfo }) {
+  const statusLabel =
+    info.status === "success" ? "成功" : info.status === "failed" ? "失败" : info.status === "skipped" ? "跳过" : info.status;
+  const statusColor =
+    info.status === "success"
+      ? "bg-emerald-100 text-emerald-700"
+      : info.status === "failed"
+        ? "bg-red-100 text-red-700"
+        : "bg-amber-100 text-amber-700";
+  const addedCap = info.added_torrents.slice(0, 200);
+  const failedCap = info.failed_torrents.slice(0, 200);
+  return (
+    <div className="space-y-3 text-sm">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <span className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium ${statusColor}`}>{statusLabel}</span>
+        <span className="text-muted">{info.trigger_type === "manual" ? "手动触发" : "定时触发"}</span>
+        <span className="text-muted">·</span>
+        <span className="text-muted">{formatDate(info.started_at)}</span>
+        <span className="text-muted">·</span>
+        <span className="text-muted">耗时 {info.duration_secs.toFixed(1)}s</span>
+        {info.early_exit_reason ? (
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+            {EARLY_EXIT_LABELS[info.early_exit_reason] ?? info.early_exit_reason}
+          </span>
+        ) : null}
+      </div>
+
+      {info.error ? (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{info.error}</div>
+      ) : null}
+
+      <div className="rounded-xl border border-border bg-surface-container/50 p-3">
+        <div className="mb-2 text-xs font-semibold text-foreground">概览</div>
+        <div className="grid gap-x-4 gap-y-1.5 text-xs text-muted sm:grid-cols-2 xl:grid-cols-4">
+          <div>
+            数据源: {info.source.type === "u2_shoutbox" ? "U2" : "RSS"} ({info.source.items_parsed} 条)
+          </div>
+          <div>
+            管理种子: {info.sync.managed_before}（标记移除 {info.sync.missing_marked_removed}）
+          </div>
+          <div>
+            并发: {info.concurrency.active_count}/{info.concurrency.max_concurrent}（可加 {info.concurrency.can_add}）
+          </div>
+          <div>
+            保种: {info.seed_volume.current_gb.toFixed(2)} GB
+            {info.seed_volume.limit_gb != null ? ` / ${info.seed_volume.limit_gb} GB` : ""}
+          </div>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted">
+          <span>检查 {info.selection.checked}</span>
+          <span className="text-emerald-600">新增 {info.selection.added}</span>
+          <span className="text-red-600">失败 {info.selection.failed}</span>
+          <span>已存在 {info.selection.skipped_existing}</span>
+          <span>预筛 {info.selection.skipped_pre_filter}</span>
+          <span>二筛 {info.selection.skipped_post_filter}</span>
+          <span>详情失败 {info.selection.skipped_detail_failure}</span>
+          <span>空间不足 {info.selection.skipped_no_space}</span>
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-border bg-surface-container/50 p-3">
+        <div className="mb-2 text-xs font-semibold text-foreground">下载器</div>
+        <div className="text-xs text-muted">
+          <span className="font-medium text-foreground">候选: </span>
+          {info.downloaders.candidates.map((d) => `${d.name} (${d.free_space_gb.toFixed(1)}GB)`).join(", ") || "无"}
+        </div>
+        {info.downloaders.skipped.length > 0 ? (
+          <div className="mt-1 text-xs text-muted">
+            <span className="font-medium text-foreground">排除: </span>
+            {info.downloaders.skipped
+              .map((d) => `${d.name}(${SKIP_REASON_LABELS[d.reason] ?? d.reason})`)
+              .join(", ")}
+          </div>
+        ) : null}
+      </div>
+
+      {addedCap.length > 0 ? (
+        <div className="rounded-xl border border-border bg-surface-container/50 p-3">
+          <div className="mb-2 text-xs font-semibold text-foreground">新增种子 ({info.added_torrents.length})</div>
+          <div className="space-y-1">
+            {addedCap.map((t, i) => (
+              <div key={i} className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                <span className="max-w-[360px] truncate text-foreground/80" title={t.title}>
+                  {t.title}
+                </span>
+                {t.size_bytes != null ? <span className="text-muted/70">{formatBytes(t.size_bytes)}</span> : null}
+                <span>→ {t.downloader_name}</span>
+                {t.is_free ? <span className="text-emerald-600">免费</span> : null}
+                {t.is_hr ? <span className="text-amber-600">H&amp;R</span> : null}
+              </div>
+            ))}
+            {info.added_torrents.length > addedCap.length ? (
+              <div className="text-xs text-muted">+{info.added_torrents.length - addedCap.length} 更多…</div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {failedCap.length > 0 ? (
+        <div className="rounded-xl border border-border bg-surface-container/50 p-3">
+          <div className="mb-2 text-xs font-semibold text-foreground">失败明细 ({info.failed_torrents.length})</div>
+          <div className="space-y-1">
+            {failedCap.map((t, i) => (
+              <div key={i} className="flex flex-wrap items-center gap-2 text-xs text-muted">
+                <span className="max-w-[340px] truncate text-foreground/80" title={t.title}>
+                  {t.title}
+                </span>
+                <span className="text-red-600">{FAIL_REASON_LABELS[t.reason] ?? t.reason}</span>
+                {t.detail ? <span className="truncate text-muted/70" title={t.detail}>{t.detail}</span> : null}
+              </div>
+            ))}
+            {info.failed_torrents.length > failedCap.length ? (
+              <div className="text-xs text-muted">+{info.failed_torrents.length - failedCap.length} 更多…</div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      <details className="text-xs text-muted/60">
+        <summary className="cursor-pointer select-none">原始 JSON</summary>
+        <pre className="mt-1 max-h-64 overflow-auto rounded-xl bg-surface-container/70 p-2 text-[10px]">
+          {JSON.stringify(info, null, 2)}
+        </pre>
+      </details>
+    </div>
+  );
 }
 
 const emptyForm: BrushTaskRequest = {
@@ -161,6 +319,7 @@ export function BrushTasksPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [torrentsOpen, setTorrentsOpen] = useState(false);
   const [torrentsTask, setTorrentsTask] = useState<BrushTaskRecord | null>(null);
+  const [lastRunTask, setLastRunTask] = useState<BrushTaskRecord | null>(null);
   const [torrents, setTorrents] = useState<BrushTorrentRecord[]>([]);
   const [torrentsPage, setTorrentsPage] = useState(1);
   const [torrentsPageSize] = useState(20);
@@ -411,6 +570,14 @@ export function BrushTasksPage() {
                         <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openTorrents(task)}>
                           <Eye className="mr-1.5 h-3.5 w-3.5" />
                           查看种子
+                        </Button>
+                        <Button
+                          variant="outline"
+                          className="h-7 text-[11px] px-2.5"
+                          onClick={() => setLastRunTask(task)}
+                        >
+                          <Activity className="mr-1.5 h-3.5 w-3.5" />
+                          最近执行
                         </Button>
                         <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteConfirmId(task.id)}>
                           <Trash2 className="mr-1.5 h-3.5 w-3.5" />
@@ -1019,6 +1186,29 @@ export function BrushTasksPage() {
               取消
             </Button>
           </div>
+        </div>
+      </Dialog>
+
+      {/* 最近执行信息对话框 */}
+      <Dialog
+        open={lastRunTask !== null}
+        onClose={() => setLastRunTask(null)}
+        title={lastRunTask ? `${lastRunTask.name} · 最近执行` : "最近执行"}
+        description="展示该刷流任务上一次执行采集的详细信息。"
+        escMode="double"
+        panelClassName="max-w-3xl"
+      >
+        <div className="p-4 sm:p-6">
+          {lastRunTask ? (
+            (() => {
+              const lastRun = parseLastRunInfo(lastRunTask.last_run_info);
+              return lastRun ? (
+                <LastRunPanel info={lastRun} />
+              ) : (
+                <div className="py-8 text-center text-sm text-muted">暂无执行记录。</div>
+              );
+            })()
+          ) : null}
         </div>
       </Dialog>
     </>

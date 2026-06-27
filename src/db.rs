@@ -1200,7 +1200,7 @@ impl Database {
                      delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                      target_ratio, max_upload_gb, download_timeout_hours,
                      min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
-                     enabled, created_at, updated_at, downloader_ranges
+                     enabled, created_at, updated_at, downloader_ranges, last_run_info
                      FROM brush_tasks ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -1230,7 +1230,7 @@ impl Database {
                  delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
-                 enabled, created_at, updated_at, downloader_ranges
+                 enabled, created_at, updated_at, downloader_ranges, last_run_info
                  FROM brush_tasks WHERE id = ?",
                 params![id],
                 |row| row_to_brush_task(row),
@@ -1357,6 +1357,27 @@ impl Database {
             conn.execute(
                 "UPDATE brush_tasks SET enabled = ?, updated_at = ? WHERE id = ?",
                 params![enabled as i32, now, id],
+            )
+            .map_err(sql_error)?;
+            Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// 更新刷流任务最后一次执行信息 (JSON)。不更新 updated_at，保留其"配置变更时间"语义。
+    pub async fn update_brush_task_last_run_info(
+        &self,
+        id: i64,
+        json: &str,
+    ) -> Result<(), AppError> {
+        let path = self.path.clone();
+        let json = json.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE brush_tasks SET last_run_info = ? WHERE id = ?",
+                params![json, id],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -1521,7 +1542,7 @@ impl Database {
                             t.delete_mode, t.delete_on_free_expiry, t.min_seed_time_hours, t.hr_min_seed_time_hours,
                             t.target_ratio, t.max_upload_gb, t.download_timeout_hours,
                             t.min_avg_upload_speed_kbs, t.max_inactive_hours, t.min_disk_space_gb,
-                            t.enabled, t.created_at, t.updated_at, t.downloader_ranges
+                            t.enabled, t.created_at, t.updated_at, t.downloader_ranges, t.last_run_info
                      FROM brush_task_torrents bt
                      INNER JOIN brush_tasks t ON bt.task_id = t.id
                      WHERE bt.status != 'removed'",
@@ -2763,6 +2784,12 @@ impl Database {
             )?;
             ensure_column(
                 &conn,
+                "brush_tasks",
+                "last_run_info",
+                "ALTER TABLE brush_tasks ADD COLUMN last_run_info TEXT",
+            )?;
+            ensure_column(
+                &conn,
                 "rss_subscriptions",
                 "enabled",
                 "ALTER TABLE rss_subscriptions ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
@@ -2951,6 +2978,7 @@ fn row_to_brush_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Res
         created_at: row.get(offset + 29)?,
         updated_at: row.get(offset + 30)?,
         downloader_ranges: row.get(offset + 31)?,
+        last_run_info: row.get(offset + 32)?,
     })
 }
 

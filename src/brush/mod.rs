@@ -43,6 +43,7 @@ pub struct BrushTaskRecord {
     pub enabled: bool,
     pub created_at: String,
     pub updated_at: String,
+    pub last_run_info: Option<String>,
 }
 
 impl BrushTaskRecord {
@@ -217,5 +218,132 @@ pub fn calculate_ratio(uploaded_bytes: i64, downloaded_bytes: i64, fallback: f64
         fallback.max(0.0)
     } else {
         0.0
+    }
+}
+
+/// 刷流任务最后一次执行的详细信息 (序列化为 JSON 存入 brush_tasks.last_run_info)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrushTaskLastRunInfo {
+    /// 触发方式: cron / manual
+    pub trigger_type: String,
+    /// 执行开始时间 (RFC3339)
+    pub started_at: String,
+    /// 执行结束时间 (RFC3339)
+    pub finished_at: String,
+    /// 总耗时 (秒)
+    pub duration_secs: f64,
+    /// 整体结果: success / failed / skipped
+    pub status: String,
+    /// 失败时的错误信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 提前结束原因: no_downloaders / concurrency_limit / seed_volume_limit
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early_exit_reason: Option<String>,
+    pub downloaders: LastRunDownloaders,
+    pub sync: LastRunSync,
+    pub concurrency: LastRunConcurrency,
+    pub seed_volume: LastRunSeedVolume,
+    pub source: LastRunSource,
+    pub selection: LastRunSelection,
+    pub added_torrents: Vec<LastRunAddedTorrent>,
+    pub failed_torrents: Vec<LastRunFailedTorrent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastRunDownloaders {
+    /// 进入候选的下载器
+    pub candidates: Vec<LastRunDownloaderCandidate>,
+    /// 被排除的下载器
+    pub skipped: Vec<LastRunDownloaderSkipped>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastRunDownloaderCandidate {
+    pub id: i64,
+    pub name: String,
+    pub free_space_gb: f64,
+    pub weight: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastRunDownloaderSkipped {
+    pub id: i64,
+    pub name: String,
+    /// not_exist / client_create_failed / free_space_fetch_failed / space_insufficient
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastRunSync {
+    /// 执行前系统管理的活跃种子数
+    pub managed_before: usize,
+    /// 下载器中已不存在、本轮标记为 removed 的数量
+    pub missing_marked_removed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastRunConcurrency {
+    pub active_count: i32,
+    pub max_concurrent: i32,
+    pub can_add: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastRunSeedVolume {
+    pub current_gb: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_gb: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastRunSource {
+    /// rss / u2_shoutbox
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub items_parsed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LastRunSelection {
+    pub checked: usize,
+    pub added: usize,
+    pub failed: usize,
+    pub skipped_detail_failure: usize,
+    pub skipped_existing: usize,
+    pub skipped_pre_filter: usize,
+    pub skipped_post_filter: usize,
+    pub skipped_no_space: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastRunAddedTorrent {
+    pub title: String,
+    pub hash: String,
+    pub size_bytes: Option<i64>,
+    pub downloader_id: i64,
+    pub downloader_name: String,
+    pub is_hr: bool,
+    pub is_free: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastRunFailedTorrent {
+    pub title: String,
+    /// download_failed / invalid_torrent / all_downloaders_failed / detail_fetch_failed
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl BrushTaskLastRunInfo {
+    pub fn new(trigger_type: &str, started_at: String) -> Self {
+        Self {
+            trigger_type: trigger_type.to_string(),
+            started_at,
+            ..Default::default()
+        }
     }
 }
