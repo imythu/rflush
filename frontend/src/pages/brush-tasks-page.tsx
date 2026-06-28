@@ -84,6 +84,31 @@ function extractSubPath(
   return "";
 }
 
+function parseDownloaderWeights(json: string | null): Record<number, number> {
+  if (!json) return {};
+  try {
+    const obj = JSON.parse(json) as Record<string, number>;
+    const result: Record<number, number> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      result[Number(key)] = value;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function buildDownloaderWeightsJson(
+  ids: number[],
+  weights: Record<number, number>,
+): string | null {
+  const map: Record<string, number> = {};
+  for (const id of ids) {
+    map[String(id)] = weights[id] ?? 1;
+  }
+  return Object.keys(map).length > 0 ? JSON.stringify(map) : null;
+}
+
 function parseLastRunInfo(info: string | null): BrushTaskLastRunInfo | null {
   if (!info) return null;
   try {
@@ -259,6 +284,7 @@ const emptyForm: BrushTaskRequest = {
   size_ranges: null,
   seeder_ranges: null,
   downloader_ranges: null,
+  downloader_weights: null,
   min_free_hours: null,
   delete_mode: "or",
   delete_on_free_expiry: false,
@@ -291,6 +317,7 @@ function taskToForm(task: BrushTaskRecord): BrushTaskRequest {
     size_ranges: task.size_ranges,
     seeder_ranges: task.seeder_ranges,
     downloader_ranges: task.downloader_ranges,
+    downloader_weights: task.downloader_weights,
     min_free_hours: task.min_free_hours,
     delete_mode: task.delete_mode,
     delete_on_free_expiry: task.delete_on_free_expiry,
@@ -332,6 +359,7 @@ export function BrushTasksPage() {
   const [message, setMessage] = useState("");
   const [defaultPaths, setDefaultPaths] = useState<Record<number, string>>({});
   const [saveSubPath, setSaveSubPath] = useState("");
+  const [downloaderWeights, setDownloaderWeights] = useState<Record<number, number>>({});
 
   function reload() {
     api<BrushTaskRecord[]>("/api/brush-tasks")
@@ -360,11 +388,16 @@ export function BrushTasksPage() {
   }, [form.downloader_ids, defaultPaths]);
 
   function openAdd() {
+    const initialIds = downloaders[0] ? [downloaders[0].id] : [];
     setForm({
       ...emptyForm,
       site_id: sites[0]?.id ?? null,
-      downloader_ids: downloaders[0] ? [downloaders[0].id] : [],
+      downloader_ids: initialIds,
+      downloader_weights: buildDownloaderWeightsJson(initialIds, {}),
     });
+    const weights: Record<number, number> = {};
+    for (const id of initialIds) weights[id] = 1;
+    setDownloaderWeights(weights);
     setSaveSubPath("");
     setEditingId(null);
     setSubmitError("");
@@ -374,6 +407,7 @@ export function BrushTasksPage() {
   function openEdit(task: BrushTaskRecord) {
     setForm(taskToForm(task));
     setSaveSubPath(extractSubPath(task.save_dir, task.downloader_ids, defaultPaths));
+    setDownloaderWeights(parseDownloaderWeights(task.downloader_weights));
     setEditingId(task.id);
     setSubmitError("");
     setFormOpen(true);
@@ -383,6 +417,34 @@ export function BrushTasksPage() {
     setFormOpen(false);
     setEditingId(null);
     setSubmitError("");
+  }
+
+  function toggleDownloader(id: number) {
+    const isCurrentlySelected = form.downloader_ids.includes(id);
+    const newIds = isCurrentlySelected
+      ? form.downloader_ids.filter((d) => d !== id)
+      : [...form.downloader_ids, id];
+    const newWeights = { ...downloaderWeights };
+    if (isCurrentlySelected) {
+      delete newWeights[id];
+    } else {
+      newWeights[id] = 1;
+    }
+    setDownloaderWeights(newWeights);
+    setForm((prev) => ({
+      ...prev,
+      downloader_ids: newIds,
+      downloader_weights: buildDownloaderWeightsJson(newIds, newWeights),
+    }));
+  }
+
+  function updateDownloaderWeight(id: number, weight: number) {
+    const newWeights = { ...downloaderWeights, [id]: weight };
+    setDownloaderWeights(newWeights);
+    setForm((prev) => ({
+      ...prev,
+      downloader_weights: buildDownloaderWeightsJson(prev.downloader_ids, newWeights),
+    }));
   }
 
   async function handleSubmit() {
@@ -680,25 +742,38 @@ export function BrushTasksPage() {
                       <button
                         key={d.id}
                         type="button"
-                        onClick={() =>
-                          setForm((prev) => {
-                            const ids = prev.downloader_ids.includes(d.id)
-                              ? prev.downloader_ids.filter((id) => id !== d.id)
-                              : [...prev.downloader_ids, d.id];
-                            return { ...prev, downloader_ids: ids };
-                          })
-                        }
+                        onClick={() => toggleDownloader(d.id)}
                         className={`rounded-full px-3 py-1.5 text-xs font-medium transition-colors ${
                           selected
                             ? "bg-primary text-primary-foreground shadow-glow"
                             : "bg-surface-container text-muted hover:bg-accent"
                         }`}
                       >
-                        {d.name}（权重 {d.weight}）
+                        {d.name}
                       </button>
                     );
                   })}
                 </div>
+                {form.downloader_ids.length > 0 && (
+                  <div className="mt-2 space-y-1.5">
+                    <p className="text-xs text-muted">优先级（数值越大越优先被选中）</p>
+                    {form.downloader_ids.map((dlId) => {
+                      const dl = downloaders.find((d) => d.id === dlId);
+                      return (
+                        <div key={dlId} className="flex items-center gap-2">
+                          <span className="text-xs text-muted w-28 truncate">{dl?.name ?? `#${dlId}`}</span>
+                          <Input
+                            type="number"
+                            min="1"
+                            className="h-8 w-24 text-xs"
+                            value={downloaderWeights[dlId] ?? 1}
+                            onChange={(e) => updateDownloaderWeight(dlId, Number(e.target.value) || 1)}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
               <div className="space-y-2">
                 <Label>标签</Label>

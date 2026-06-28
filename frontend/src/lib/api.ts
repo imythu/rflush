@@ -14,6 +14,7 @@ export const defaultSettings: GlobalConfig = {
   max_concurrent_rss_fetches: 8,
   log_level: "info",
   proxy: null,
+  ocr_api_key: null,
 };
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {

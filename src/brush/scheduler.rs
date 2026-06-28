@@ -622,15 +622,16 @@ async fn execute_brush_task_inner(
                 continue;
             }
         }
+        let dl_weight = task.get_downloader_weight(*dl_id).unwrap_or(1);
         info!(
             "[刷流][{}] 下载器 '{}' 进入候选 (剩余 {:.2} GB, 权重 {})",
-            task.name, dl_record.name, bytes_to_gb(free), dl_record.weight
+            task.name, dl_record.name, bytes_to_gb(free), dl_weight
         );
         last_run_info.downloaders.candidates.push(LastRunDownloaderCandidate {
             id: *dl_id,
             name: dl_record.name.clone(),
             free_space_gb: bytes_to_gb(free),
-            weight: dl_record.weight,
+            weight: dl_weight,
         });
         qb_clients.insert(*dl_id, (dl_record, dl_client));
         qb_free_space.insert(*dl_id, free);
@@ -1174,10 +1175,9 @@ async fn execute_brush_task_inner(
         let mut added_to_qb: Option<i64> = None;
         while !candidates.is_empty() {
             let pick = weighted_random_pick(&candidates, |dl_id| {
-                qb_clients
-                    .get(dl_id)
-                    .map(|(r, _)| r.weight.max(1) as u64)
+                task.get_downloader_weight(*dl_id)
                     .unwrap_or(1)
+                    .max(1) as u64
             });
             let (dl_record, dl_client) = match qb_clients.get(&pick) {
                 Some(pair) => pair.clone(),
@@ -1490,6 +1490,7 @@ mod tests {
             size_ranges: None,
             seeder_ranges: None,
             downloader_ranges: None,
+            downloader_weights: None,
             min_free_hours: None,
             delete_mode: "or".to_string(),
             delete_on_free_expiry: false,

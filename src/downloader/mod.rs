@@ -36,7 +36,6 @@ pub struct DownloaderRecord {
     pub url: String,
     pub username: String,
     pub password: String,
-    pub weight: i32,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cron::Schedule;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, sleep};
@@ -53,20 +53,6 @@ impl SignInScheduler {
                 continue;
             }
             drop(running);
-
-            // 冷却检查：上次执行距今不到 60 秒则跳过，防止同一 cron 窗口重复触发
-            if let Some(ref last_run) = task.last_run_at {
-                if let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_run) {
-                    let elapsed = (Utc::now() - last.with_timezone(&Utc)).num_seconds();
-                    if elapsed < 60 {
-                        debug!(
-                            "[签到][{}] 跳过：上次执行距今 {}s（冷却 60s）",
-                            task.name, elapsed
-                        );
-                        continue;
-                    }
-                }
-            }
 
             if should_trigger(&task) {
                 self.spawn_task(task).await;
@@ -131,7 +117,14 @@ async fn run_and_record(
         .ok_or_else(|| "站点不存在".to_string())?;
     let settings = db.get_settings().await.map_err(|e| e.to_string())?;
     let site_name = site.name.clone();
-    let result = execute_task(base_dir, task.clone(), site, settings.use_proxy_for_lightpanda).await;
+    let result = execute_task(
+        base_dir,
+        task.clone(),
+        site,
+        settings.use_proxy_for_lightpanda,
+        settings.ocr_api_key,
+    )
+    .await;
     match result {
         Ok(result) => {
             info!(
@@ -176,6 +169,10 @@ async fn run_and_record(
 }
 
 fn should_trigger(task: &SignInTaskRecord) -> bool {
+    should_trigger_at(task, Utc::now())
+}
+
+fn should_trigger_at(task: &SignInTaskRecord, now: DateTime<Utc>) -> bool {
     let cron_expr = {
         let fields: Vec<&str> = task.cron_expression.split_whitespace().collect();
         if fields.len() == 5 {
@@ -192,17 +189,96 @@ fn should_trigger(task: &SignInTaskRecord) -> bool {
         }
     };
 
-    let now = Utc::now();
-    if let Some(next) = schedule.upcoming(Utc).next() {
-        let diff = (next - now).num_seconds().abs();
+    let last_run_at = task
+        .last_run_at
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+
+    let window_start = now - chrono::Duration::seconds(45);
+    let Some(due_at) = schedule.after(&window_start).next() else {
+        return false;
+    };
+    if due_at > now {
         debug!(
-            "[签到][{}] next={} diff={}s",
+            "[签到][{}] 未到执行时间: due_at={} now={}",
             task.name,
-            next.to_rfc3339(),
-            diff
+            due_at.to_rfc3339(),
+            now.to_rfc3339()
         );
-        diff <= 30
-    } else {
-        false
+        return false;
+    }
+    if let Some(last_run_at) = last_run_at {
+        if last_run_at < due_at {
+            debug!(
+                "[签到][{}] cron 到点: due_at={} now={}",
+                task.name,
+                due_at.to_rfc3339(),
+                now.to_rfc3339()
+            );
+            return true;
+        }
+        debug!(
+            "[签到][{}] 跳过已执行的计划点: due_at={} last_run_at={}",
+            task.name,
+            due_at.to_rfc3339(),
+            last_run_at.to_rfc3339()
+        );
+        return false;
+    }
+
+    debug!(
+        "[签到][{}] cron 到点: due_at={} now={}",
+        task.name,
+        due_at.to_rfc3339(),
+        now.to_rfc3339()
+    );
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn task(last_run_at: Option<String>) -> SignInTaskRecord {
+        SignInTaskRecord {
+            id: 1,
+            name: "test".to_string(),
+            site_id: 1,
+            cron_expression: "0 0 0/8 * * *".to_string(),
+            lightpanda_endpoint: None,
+            lightpanda_token: "token".to_string(),
+            lightpanda_region: "euwest".to_string(),
+            browser: "lightpanda".to_string(),
+            proxy: "fast_dc".to_string(),
+            country: None,
+            sign_in_method: crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string(),
+            enabled: true,
+            last_status: None,
+            last_message: None,
+            last_run_at,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn sign_in_cron_does_not_trigger_before_due_time() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 27, 7, 59, 30).unwrap();
+
+        assert!(!should_trigger_at(&task(None), now));
+    }
+
+    #[test]
+    fn sign_in_cron_triggers_once_for_due_window() {
+        let now = Utc.with_ymd_and_hms(2026, 6, 27, 8, 0, 5).unwrap();
+        let mut task = task(None);
+
+        assert!(should_trigger_at(&task, now));
+
+        task.last_run_at = Some(Utc.with_ymd_and_hms(2026, 6, 27, 8, 0, 20).unwrap().to_rfc3339());
+
+        assert!(!should_trigger_at(&task, now + chrono::Duration::seconds(25)));
     }
 }

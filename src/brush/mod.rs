@@ -27,6 +27,7 @@ pub struct BrushTaskRecord {
     pub size_ranges: Option<String>,
     pub seeder_ranges: Option<String>,
     pub downloader_ranges: Option<String>,
+    pub downloader_weights: Option<String>,
     pub min_free_hours: Option<f64>,
     // 删种规则
     pub delete_mode: String,
@@ -53,6 +54,13 @@ impl BrushTaskRecord {
         let map: std::collections::HashMap<String, String> = serde_json::from_str(json).ok()?;
         map.get(&downloader_id.to_string()).cloned()
     }
+
+    /// `downloader_weights` 存储为 JSON `{qb_id: weight}`。返回指定 qb 的权重。
+    pub fn get_downloader_weight(&self, downloader_id: i64) -> Option<i32> {
+        let json = self.downloader_weights.as_deref()?;
+        let map: std::collections::HashMap<String, i32> = serde_json::from_str(json).ok()?;
+        map.get(&downloader_id.to_string()).copied()
+    }
 }
 
 /// 创建/更新刷流任务的请求体
@@ -75,6 +83,7 @@ pub struct BrushTaskRequest {
     pub size_ranges: Option<String>,   // JSON array string
     pub seeder_ranges: Option<String>, // JSON array string
     pub downloader_ranges: Option<String>, // JSON array string
+    pub downloader_weights: Option<String>, // JSON {qb_id: weight}
     pub min_free_hours: Option<f64>,
     pub delete_mode: Option<String>,
     pub delete_on_free_expiry: Option<bool>,

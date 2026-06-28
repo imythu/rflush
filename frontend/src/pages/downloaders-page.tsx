@@ -32,7 +32,6 @@ type FormData = {
   url: string;
   username: string;
   password: string;
-  weight: number;
 };
 
 const emptyForm: FormData = {
@@ -41,7 +40,6 @@ const emptyForm: FormData = {
   url: "",
   username: "",
   password: "",
-  weight: 1,
 };
 
 export function DownloadersPage() {
@@ -113,7 +111,6 @@ export function DownloadersPage() {
       url: d.url,
       username: d.username,
       password: d.password,
-      weight: d.weight,
     });
     setSubmitError("");
     setDialogOpen(true);
@@ -425,18 +422,6 @@ export function DownloadersPage() {
                 placeholder="可选"
               />
             </div>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="dl-weight">权重（加权随机选下载器）</Label>
-            <Input
-              id="dl-weight"
-              type="number"
-              min="1"
-              value={form.weight}
-              onChange={(e) => setForm((prev) => ({ ...prev, weight: Number(e.target.value) || 1 }))}
-              placeholder="1"
-            />
           </div>
 
           <div className="flex justify-end gap-2 border-t border-border pt-4">

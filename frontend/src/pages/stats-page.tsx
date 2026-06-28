@@ -495,6 +495,7 @@ export function StatsPage() {
   const [dailyUntil, setDailyUntil] = useState<string | null>(null);
   const [dailyData, setDailyData] = useState<DailyTransferItem[]>([]);
   const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyLineFilter, setDailyLineFilter] = useState<"both" | "upload" | "download">("both");
   const [loading, setLoading] = useState(true);
   const [transferTrendLoading, setTransferTrendLoading] = useState(false);
   const [torrentTrendLoading, setTorrentTrendLoading] = useState(false);
@@ -1342,6 +1343,22 @@ export function StatsPage() {
                 </Button>
               </div>
             )}
+            <div className="h-4 w-[1px] bg-border/50 mx-1 hidden sm:block" />
+            <div className="flex gap-1">
+              {(["both", "upload", "download"] as const).map((f) => (
+                <button
+                  key={f}
+                  className={`h-7 px-2.5 rounded-lg text-[10px] font-medium transition-colors ${
+                    dailyLineFilter === f
+                      ? "bg-surface-container-highest text-foreground shadow-sm ring-1 ring-border"
+                      : "hover:bg-surface-container/80 text-muted-foreground"
+                  }`}
+                  onClick={() => setDailyLineFilter(f)}
+                >
+                  {f === "both" ? "全部" : f === "upload" ? "上传" : "下载"}
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="h-[300px] w-full">
@@ -1391,8 +1408,8 @@ export function StatsPage() {
                     labelFormatter={(label) => `日期: ${label}`}
                   />
                   <Legend formatter={(value) => (value === "uploaded" ? "上传" : "下载")} wrapperStyle={{ fontSize: 11 }} />
-                  <Bar dataKey="uploaded" fill={COLORS.upload} radius={[4, 4, 0, 0]} />
-                  <Bar dataKey="downloaded" fill={COLORS.download} radius={[4, 4, 0, 0]} />
+                  <Bar dataKey="uploaded" fill={COLORS.upload} radius={[4, 4, 0, 0]} maxBarSize={36} hide={dailyLineFilter === "download"} />
+                  <Bar dataKey="downloaded" fill={COLORS.download} radius={[4, 4, 0, 0]} maxBarSize={36} hide={dailyLineFilter === "upload"} />
                 </BarChart>
               </ResponsiveContainer>
             )}

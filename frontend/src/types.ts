@@ -148,7 +148,6 @@ export type DownloaderRecord = {
   url: string;
   username: string;
   password: string;
-  weight: number;
   created_at: string;
   updated_at: string;
 };
@@ -187,6 +186,7 @@ export type BrushTaskRecord = {
   size_ranges: string | null;
   seeder_ranges: string | null;
   downloader_ranges: string | null;
+  downloader_weights: string | null;
   min_free_hours: number | null;
   delete_mode: string;
   delete_on_free_expiry: boolean;
@@ -259,6 +259,8 @@ export type BrushTaskRequest = {
   upload_speed_limit?: number | null;
   size_ranges?: string | null;
   seeder_ranges?: string | null;
+  downloader_ranges?: string | null;
+  downloader_weights?: string | null;
   min_free_hours?: number | null;
   delete_mode?: string | null;
   delete_on_free_expiry?: boolean | null;
@@ -283,6 +285,7 @@ export type SignInTaskRecord = {
   browser: string;
   proxy: string;
   country: string | null;
+  sign_in_method: string;
   enabled: boolean;
   last_status: string | null;
   last_message: string | null;
@@ -301,6 +304,7 @@ export type SignInTaskRequest = {
   browser?: "lightpanda" | "chrome" | string | null;
   proxy?: "fast_dc" | "datacenter" | string | null;
   country?: string | null;
+  sign_in_method?: string | null;
 };
 
 export type SignInRecord = {

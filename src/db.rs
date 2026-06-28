@@ -109,7 +109,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let settings = conn
                 .query_row(
-                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins FROM global_settings WHERE id = 1",
+                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins, ocr_api_key FROM global_settings WHERE id = 1",
                     [],
                     |row| {
                         Ok(GlobalConfig {
@@ -126,6 +126,7 @@ impl Database {
                             proxy: row.get(8)?,
                             use_proxy_for_lightpanda: row.get::<_, i32>(9).unwrap_or(1) != 0,
                             tag_rule_scan_interval_mins: row.get::<_, i64>(10).unwrap_or(7) as u64,
+                            ocr_api_key: row.get(11)?,
                         })
                     },
                 )
@@ -142,7 +143,7 @@ impl Database {
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?, use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ? WHERE id = 1",
+                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?, use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ?, ocr_api_key = ? WHERE id = 1",
                 params![
                     settings.download_rate_limit.requests,
                     settings.download_rate_limit.interval,
@@ -157,7 +158,11 @@ impl Database {
                         (!value.is_empty()).then_some(value)
                     }),
                     settings.use_proxy_for_lightpanda as i32,
-                    settings.tag_rule_scan_interval_mins as i64
+                    settings.tag_rule_scan_interval_mins as i64,
+                    settings.ocr_api_key.as_deref().and_then(|value| {
+                        let value = value.trim();
+                        (!value.is_empty()).then_some(value)
+                    })
                 ],
             )
             .map_err(sql_error)?;
@@ -813,7 +818,7 @@ impl Database {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
-                     lightpanda_region, browser, proxy, country, enabled, last_status, last_message,
+                     lightpanda_region, browser, proxy, country, sign_in_method, enabled, last_status, last_message,
                      last_run_at, created_at, updated_at
                      FROM sign_in_tasks ORDER BY id",
                 )
@@ -837,7 +842,7 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.query_row(
                 "SELECT id, name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
-                 lightpanda_region, browser, proxy, country, enabled, last_status, last_message,
+                 lightpanda_region, browser, proxy, country, sign_in_method, enabled, last_status, last_message,
                  last_run_at, created_at, updated_at
                  FROM sign_in_tasks WHERE id = ?",
                 params![id],
@@ -859,8 +864,8 @@ impl Database {
             conn.execute(
                 "INSERT INTO sign_in_tasks
                  (name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
-                  lightpanda_region, browser, proxy, country, enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                  lightpanda_region, browser, proxy, country, sign_in_method, enabled, created_at, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
                     req.name,
                     req.site_id,
@@ -872,6 +877,9 @@ impl Database {
                     req.browser.unwrap_or_else(|| "lightpanda".to_string()),
                     req.proxy.unwrap_or_else(|| "fast_dc".to_string()),
                     req.country,
+                    req.sign_in_method
+                        .as_deref()
+                        .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
                     now,
                     now,
                 ],
@@ -896,7 +904,7 @@ impl Database {
             conn.execute(
                 "UPDATE sign_in_tasks SET
                  name = ?, site_id = ?, cron_expression = ?, lightpanda_endpoint = ?, lightpanda_token = ?,
-                 lightpanda_region = ?, browser = ?, proxy = ?, country = ?, updated_at = ?
+                 lightpanda_region = ?, browser = ?, proxy = ?, country = ?, sign_in_method = ?, updated_at = ?
                  WHERE id = ?",
                 params![
                     req.name,
@@ -908,6 +916,9 @@ impl Database {
                     req.browser.unwrap_or_else(|| "lightpanda".to_string()),
                     req.proxy.unwrap_or_else(|| "fast_dc".to_string()),
                     req.country,
+                    req.sign_in_method
+                        .as_deref()
+                        .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
                     now,
                     id,
                 ],
@@ -1054,7 +1065,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
-                .prepare("SELECT id, name, downloader_type, url, username, password, weight, created_at, updated_at FROM downloaders ORDER BY id")
+                .prepare("SELECT id, name, downloader_type, url, username, password, created_at, updated_at FROM downloaders ORDER BY id")
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1065,9 +1076,8 @@ impl Database {
                         url: row.get(3)?,
                         username: row.get(4)?,
                         password: row.get(5)?,
-                        weight: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 })
                 .map_err(sql_error)?;
@@ -1086,7 +1096,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, downloader_type, url, username, password, weight, created_at, updated_at FROM downloaders WHERE id = ?",
+                "SELECT id, name, downloader_type, url, username, password, created_at, updated_at FROM downloaders WHERE id = ?",
                 params![id],
                 |row| {
                     Ok(DownloaderRecord {
@@ -1096,9 +1106,8 @@ impl Database {
                         url: row.get(3)?,
                         username: row.get(4)?,
                         password: row.get(5)?,
-                        weight: row.get(6)?,
-                        created_at: row.get(7)?,
-                        updated_at: row.get(8)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 },
             )
@@ -1116,7 +1125,6 @@ impl Database {
         url: &str,
         username: &str,
         password: &str,
-        weight: i32,
     ) -> Result<i64, AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -1130,8 +1138,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT INTO downloaders (name, downloader_type, url, username, password, weight, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                params![name, dtype, url, username, password, weight, now, now],
+                "INSERT INTO downloaders (name, downloader_type, url, username, password, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![name, dtype, url, username, password, now, now],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -1148,7 +1156,6 @@ impl Database {
         url: &str,
         username: &str,
         password: &str,
-        weight: i32,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
@@ -1162,8 +1169,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE downloaders SET name = ?, downloader_type = ?, url = ?, username = ?, password = ?, weight = ?, updated_at = ? WHERE id = ?",
-                params![name, dtype, url, username, password, weight, now, id],
+                "UPDATE downloaders SET name = ?, downloader_type = ?, url = ?, username = ?, password = ?, updated_at = ? WHERE id = ?",
+                params![name, dtype, url, username, password, now, id],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -1200,7 +1207,7 @@ impl Database {
                      delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                      target_ratio, max_upload_gb, download_timeout_hours,
                      min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
-                     enabled, created_at, updated_at, downloader_ranges, last_run_info
+                     enabled, created_at, updated_at, downloader_ranges, last_run_info, downloader_weights
                      FROM brush_tasks ORDER BY id",
                 )
                 .map_err(sql_error)?;
@@ -1230,7 +1237,7 @@ impl Database {
                  delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
-                 enabled, created_at, updated_at, downloader_ranges, last_run_info
+                 enabled, created_at, updated_at, downloader_ranges, last_run_info, downloader_weights
                  FROM brush_tasks WHERE id = ?",
                 params![id],
                 |row| row_to_brush_task(row),
@@ -1265,18 +1272,18 @@ impl Database {
                  seed_volume_gb, save_dir, active_time_windows,
                  promotion, skip_hit_and_run, max_concurrent,
                  download_speed_limit, upload_speed_limit,
-                 size_ranges, seeder_ranges, downloader_ranges, min_free_hours,
+                 size_ranges, seeder_ranges, downloader_ranges, downloader_weights, min_free_hours,
                  delete_mode, delete_on_free_expiry, min_seed_time_hours, hr_min_seed_time_hours,
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                  enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
                     req.name, req.cron_expression, req.site_id, downloader_ids_json, req.tag, req.rss_url,
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
-                    req.size_ranges, req.seeder_ranges, req.downloader_ranges, min_free_hours,
+                    req.size_ranges, req.seeder_ranges, req.downloader_ranges, req.downloader_weights, min_free_hours,
                     delete_mode, delete_on_free_expiry, req.min_seed_time_hours, req.hr_min_seed_time_hours,
                     req.target_ratio, req.max_upload_gb, req.download_timeout_hours,
                     req.min_avg_upload_speed_kbs, req.max_inactive_hours, req.min_disk_space_gb,
@@ -1313,7 +1320,7 @@ impl Database {
                  seed_volume_gb = ?, save_dir = ?, active_time_windows = ?,
                  promotion = ?, skip_hit_and_run = ?, max_concurrent = ?,
                  download_speed_limit = ?, upload_speed_limit = ?,
-                 size_ranges = ?, seeder_ranges = ?, downloader_ranges = ?, min_free_hours = ?,
+                 size_ranges = ?, seeder_ranges = ?, downloader_ranges = ?, downloader_weights = ?, min_free_hours = ?,
                  delete_mode = ?, delete_on_free_expiry = ?, min_seed_time_hours = ?, hr_min_seed_time_hours = ?,
                  target_ratio = ?, max_upload_gb = ?, download_timeout_hours = ?,
                  min_avg_upload_speed_kbs = ?, max_inactive_hours = ?, min_disk_space_gb = ?,
@@ -1323,7 +1330,7 @@ impl Database {
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
                     promotion, skip_hr, max_concurrent,
                     req.download_speed_limit, req.upload_speed_limit,
-                    req.size_ranges, req.seeder_ranges, req.downloader_ranges, min_free_hours,
+                    req.size_ranges, req.seeder_ranges, req.downloader_ranges, req.downloader_weights, min_free_hours,
                     delete_mode, delete_on_free_expiry, req.min_seed_time_hours, req.hr_min_seed_time_hours,
                     req.target_ratio, req.max_upload_gb, req.download_timeout_hours,
                     req.min_avg_upload_speed_kbs, req.max_inactive_hours, req.min_disk_space_gb,
@@ -1542,7 +1549,7 @@ impl Database {
                             t.delete_mode, t.delete_on_free_expiry, t.min_seed_time_hours, t.hr_min_seed_time_hours,
                             t.target_ratio, t.max_upload_gb, t.download_timeout_hours,
                             t.min_avg_upload_speed_kbs, t.max_inactive_hours, t.min_disk_space_gb,
-                            t.enabled, t.created_at, t.updated_at, t.downloader_ranges, t.last_run_info
+                            t.enabled, t.created_at, t.updated_at, t.downloader_ranges, t.last_run_info, t.downloader_weights
                      FROM brush_task_torrents bt
                      INNER JOIN brush_tasks t ON bt.task_id = t.id
                      WHERE bt.status != 'removed'",
@@ -1966,113 +1973,50 @@ impl Database {
         since: &str,
         until: &str,
     ) -> Result<Vec<(String, i64, i64)>, AppError> {
-        let path = self.path.clone();
-        let (since, until) = (since.to_string(), until.to_string());
-        tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            // For each task, for each day, get the first and last snapshot's
-            // cumulative totals, then compute the delta. Sum across tasks per day.
-            let sql = if task_id.is_some() {
-                "SELECT strftime('%Y-%m-%d', recorded_at) AS day,
-                        task_id,
-                        MIN(recorded_at) AS first_at,
-                        MAX(recorded_at) AS last_at
-                 FROM task_stats_snapshots
-                 WHERE task_id = ?
-                   AND datetime(recorded_at) >= datetime(?)
-                   AND datetime(recorded_at) <= datetime(?)
-                 GROUP BY day, task_id"
-            } else {
-                "SELECT strftime('%Y-%m-%d', recorded_at) AS day,
-                        task_id,
-                        MIN(recorded_at) AS first_at,
-                        MAX(recorded_at) AS last_at
-                 FROM task_stats_snapshots
-                 WHERE datetime(recorded_at) >= datetime(?)
-                   AND datetime(recorded_at) <= datetime(?)
-                 GROUP BY day, task_id"
+        // 复用已验证可用的快照查询，在 Rust 侧按天聚合。
+        // 避免在遍历游标时对同一连接执行嵌套查询。
+        let snapshots = self.get_task_stats_snapshots(task_id, since, until).await?;
+
+        // 按 (task_id, day) 分组，记录当天首个和末个快照的累计值。
+        // 快照已按 recorded_at 排序，首次遇到即为当天最早一条。
+        let mut task_day_first: std::collections::HashMap<(i64, String), (i64, i64)> =
+            std::collections::HashMap::new();
+        let mut task_day_last: std::collections::HashMap<(i64, String), (i64, i64)> =
+            std::collections::HashMap::new();
+
+        for snap in &snapshots {
+            let day = match snap.recorded_at.get(..10) {
+                Some(d) => d.to_string(),
+                None => continue,
             };
+            let key = (snap.task_id, day);
+            task_day_first
+                .entry(key.clone())
+                .or_insert((snap.total_uploaded, snap.total_downloaded));
+            task_day_last.insert(key, (snap.total_uploaded, snap.total_downloaded));
+        }
 
-            let params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = if let Some(tid) = task_id {
-                vec![Box::new(tid), Box::new(since), Box::new(until)]
-            } else {
-                vec![Box::new(since), Box::new(until)]
-            };
-
-            let mut stmt = conn.prepare(sql).map_err(sql_error)?;
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params_vec.iter().map(|p| p.as_ref()).collect();
-            let rows = stmt
-                .query_map(params_refs.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?, // day
-                        row.get::<_, i64>(1)?,    // task_id
-                        row.get::<_, String>(2)?, // first_at
-                        row.get::<_, String>(3)?, // last_at
-                    ))
-                })
-                .map_err(sql_error)?;
-
-            let mut day_map: std::collections::HashMap<String, (i64, i64)> =
-                std::collections::HashMap::new();
-
-            for row in rows {
-                let (day, _task_id, first_at, last_at) = row.map_err(sql_error)?;
-                if first_at == last_at {
-                    // Only one snapshot that day, no delta
+        let mut day_map: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
+        for (key, first) in &task_day_first {
+            if let Some(last) = task_day_last.get(key) {
+                if first == last {
                     continue;
                 }
-                // Get first and last totals
-                let first_up: i64 = conn
-                    .query_row(
-                        "SELECT total_uploaded FROM task_stats_snapshots
-                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
-                        rusqlite::params![first_at],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                let last_up: i64 = conn
-                    .query_row(
-                        "SELECT total_uploaded FROM task_stats_snapshots
-                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
-                        rusqlite::params![last_at],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                let first_down: i64 = conn
-                    .query_row(
-                        "SELECT total_downloaded FROM task_stats_snapshots
-                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
-                        rusqlite::params![first_at],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                let last_down: i64 = conn
-                    .query_row(
-                        "SELECT total_downloaded FROM task_stats_snapshots
-                         WHERE datetime(recorded_at) = datetime(?) LIMIT 1",
-                        rusqlite::params![last_at],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-
-                let delta_up = (last_up - first_up).max(0);
-                let delta_down = (last_down - first_down).max(0);
-
-                let entry = day_map.entry(day).or_insert((0, 0));
+                let delta_up = (last.0 - first.0).max(0);
+                let delta_down = (last.1 - first.1).max(0);
+                let entry = day_map.entry(key.1.clone()).or_insert((0, 0));
                 entry.0 += delta_up;
                 entry.1 += delta_down;
             }
+        }
 
-            let mut result: Vec<(String, i64, i64)> = day_map
-                .into_iter()
-                .map(|(day, (up, down))| (day, up, down))
-                .collect();
-            result.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(result)
-        })
-        .await
-        .map_err(join_error)?
+        let mut result: Vec<(String, i64, i64)> = day_map
+            .into_iter()
+            .map(|(day, (up, down))| (day, up, down))
+            .collect();
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
     }
 
     pub async fn save_torrent_traffic(
@@ -2484,7 +2428,8 @@ impl Database {
                     max_concurrent_downloads INTEGER NOT NULL,
                     max_concurrent_rss_fetches INTEGER NOT NULL,
                     throttle_interval_secs INTEGER NOT NULL,
-                    proxy TEXT
+                    proxy TEXT,
+                    ocr_api_key TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS rss_subscriptions (
@@ -2559,7 +2504,6 @@ impl Database {
                     url TEXT NOT NULL,
                     username TEXT NOT NULL DEFAULT '',
                     password TEXT NOT NULL DEFAULT '',
-                    weight INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -2659,6 +2603,7 @@ impl Database {
                     browser TEXT NOT NULL DEFAULT 'lightpanda',
                     proxy TEXT NOT NULL DEFAULT 'fast_dc',
                     country TEXT,
+                    sign_in_method TEXT NOT NULL DEFAULT 'open_page',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_status TEXT,
                     last_message TEXT,
@@ -2820,9 +2765,15 @@ impl Database {
             )?;
             ensure_column(
                 &conn,
-                "download_records",
-                "file_deleted",
-                "ALTER TABLE download_records ADD COLUMN file_deleted INTEGER NOT NULL DEFAULT 0",
+                "downloaders",
+                "weight",
+                "ALTER TABLE downloaders ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
+            )?;
+            ensure_column(
+                &conn,
+                "sign_in_tasks",
+                "sign_in_method",
+                "ALTER TABLE sign_in_tasks ADD COLUMN sign_in_method TEXT NOT NULL DEFAULT 'open_page'",
             )?;
             ensure_column(
                 &conn,
@@ -2841,6 +2792,12 @@ impl Database {
                 "global_settings",
                 "tag_rule_scan_interval_mins",
                 "ALTER TABLE global_settings ADD COLUMN tag_rule_scan_interval_mins INTEGER NOT NULL DEFAULT 7",
+            )?;
+            ensure_column(
+                &conn,
+                "global_settings",
+                "ocr_api_key",
+                "ALTER TABLE global_settings ADD COLUMN ocr_api_key TEXT",
             )?;
             ensure_column(
                 &conn,
@@ -2891,12 +2848,29 @@ impl Database {
                 "downloader_ids",
                 "ALTER TABLE brush_tasks ADD COLUMN downloader_ids TEXT NOT NULL DEFAULT '[]'",
             )?;
+            // 将权重从下载器迁移到刷流任务（按 qb 维度配置）
             ensure_column(
                 &conn,
-                "downloaders",
-                "weight",
-                "ALTER TABLE downloaders ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
+                "brush_tasks",
+                "downloader_weights",
+                "ALTER TABLE brush_tasks ADD COLUMN downloader_weights TEXT",
             )?;
+            // Backfill: 从 downloaders.weight 回填到 brush_tasks.downloader_weights
+            if column_exists(&conn, "downloaders", "weight") {
+                conn.execute(
+                    "UPDATE brush_tasks
+                     SET downloader_weights = (
+                         SELECT json_group_object(CAST(d.id AS TEXT), d.weight)
+                         FROM downloaders d
+                         WHERE d.id IN (SELECT value FROM json_each(brush_tasks.downloader_ids))
+                     )
+                     WHERE downloader_weights IS NULL
+                       AND downloader_ids IS NOT NULL
+                       AND downloader_ids != '[]'",
+                    [],
+                )
+                .map_err(sql_error)?;
+            }
             // Backfill + drop old columns. Only runs on databases that still
             // have the legacy `downloader_id` column (created before this change).
             if column_exists(&conn, "brush_tasks", "downloader_id") {
@@ -2926,8 +2900,8 @@ impl Database {
             }
 
             conn.execute(
-                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1, 7],
+                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins, ocr_api_key) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1, 7, Option::<String>::None],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -2979,6 +2953,7 @@ fn row_to_brush_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Res
         updated_at: row.get(offset + 30)?,
         downloader_ranges: row.get(offset + 31)?,
         last_run_info: row.get(offset + 32)?,
+        downloader_weights: row.get(offset + 33)?,
     })
 }
 
@@ -3035,12 +3010,13 @@ fn map_sign_in_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInTaskRecor
         browser: row.get(7)?,
         proxy: row.get(8)?,
         country: row.get(9)?,
-        enabled: row.get::<_, i32>(10)? != 0,
-        last_status: row.get(11)?,
-        last_message: row.get(12)?,
-        last_run_at: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        sign_in_method: row.get(10)?,
+        enabled: row.get::<_, i32>(11)? != 0,
+        last_status: row.get(12)?,
+        last_message: row.get(13)?,
+        last_run_at: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 

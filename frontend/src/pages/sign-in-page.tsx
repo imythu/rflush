@@ -24,6 +24,7 @@ const emptyForm: SignInTaskRequest = {
   browser: null,
   proxy: null,
   country: null,
+  sign_in_method: "open_page",
 };
 
 function taskToForm(task: SignInTaskRecord): SignInTaskRequest {
@@ -37,6 +38,7 @@ function taskToForm(task: SignInTaskRecord): SignInTaskRequest {
     browser: null,
     proxy: null,
     country: null,
+    sign_in_method: task.sign_in_method,
   };
 }
 
@@ -51,6 +53,12 @@ function displayStatus(status: string | null | undefined) {
   if (status === "already") return "已签到";
   if (status === "failed") return "失败";
   return status;
+}
+
+function signInMethodLabel(method: string | null | undefined) {
+  if (method === "cloudflare") return "CF 签到";
+  if (method === "ocr_captcha") return "OCR 验证码签到";
+  return "打开页面签到";
 }
 
 function intervalToCron(hours: SignInIntervalHours) {
@@ -139,6 +147,7 @@ export function SignInPage() {
       browser: null,
       proxy: null,
       country: null,
+      sign_in_method: source.sign_in_method,
     }));
     setIntervalHours(cronToInterval(source.cron_expression));
   }
@@ -173,6 +182,7 @@ export function SignInPage() {
       browser: "lightpanda",
       proxy: "fast_dc",
       country: null,
+      sign_in_method: form.sign_in_method ?? "open_page",
     };
 
     setSubmitting(true);
@@ -351,6 +361,10 @@ export function SignInPage() {
                       每 {cronToInterval(task.cron_expression)} 小时
                     </div>
                     <div className="truncate">
+                      <span className="font-medium text-foreground">方式: </span>
+                      {signInMethodLabel(task.sign_in_method)}
+                    </div>
+                    <div className="truncate">
                       <span className="font-medium text-foreground">最近时间: </span>
                       {formatDate(task.last_run_at)}
                     </div>
@@ -479,6 +493,21 @@ export function SignInPage() {
                 onChange={(event) => setField("lightpanda_token", event.target.value)}
                 placeholder="Lightpanda token"
               />
+            </div>
+            <div className="space-y-2">
+              <Label>签到方式</Label>
+              <Select
+                value={form.sign_in_method ?? "open_page"}
+                onChange={(val) => setField("sign_in_method", val)}
+                options={[
+                  { value: "open_page", label: "打开页面签到" },
+                  { value: "cloudflare", label: "CF 签到" },
+                  { value: "ocr_captcha", label: "OCR 验证码签到" },
+                ]}
+              />
+              <p className="text-xs text-muted-foreground">
+                打开页面签到：访问签到页停留即完成；CF 签到：等待 Cloudflare 挑战通过后点击签到；OCR 验证码签到：点击签到并自动识别图片验证码。
+              </p>
             </div>
             <div className="space-y-2 sm:col-span-2">
               <Label>Lightpanda endpoint</Label>

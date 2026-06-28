@@ -992,11 +992,6 @@ async fn start_sign_in_task(
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.db.set_sign_in_task_enabled(id, true).await?;
-    state
-        .sign_in_scheduler
-        .trigger_task(id)
-        .await
-        .map_err(map_sign_in_trigger_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -1119,6 +1114,9 @@ async fn validate_sign_in_task(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    body.sign_in_method = Some(crate::sign_in::normalize_sign_in_method(
+        body.sign_in_method.as_deref().unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
+    ));
 
     if body.name.is_empty() {
         return Err(ApiError::bad_request("名称不能为空"));
@@ -1149,7 +1147,6 @@ struct CreateDownloaderRequest {
     url: String,
     username: Option<String>,
     password: Option<String>,
-    weight: Option<i32>,
 }
 
 async fn list_downloaders(
@@ -1173,7 +1170,6 @@ async fn create_downloader(
             &body.url,
             body.username.as_deref().unwrap_or(""),
             body.password.as_deref().unwrap_or(""),
-            body.weight.unwrap_or(1),
         )
         .await?;
     Ok(Json(serde_json::json!({ "id": id })))
@@ -1193,7 +1189,6 @@ async fn update_downloader(
             &body.url,
             body.username.as_deref().unwrap_or(""),
             body.password.as_deref().unwrap_or(""),
-            body.weight.unwrap_or(1),
         )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
