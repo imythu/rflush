@@ -1277,7 +1277,7 @@ impl Database {
                  target_ratio, max_upload_gb, download_timeout_hours,
                  min_avg_upload_speed_kbs, max_inactive_hours, min_disk_space_gb,
                  enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
                     req.name, req.cron_expression, req.site_id, downloader_ids_json, req.tag, req.rss_url,
                     req.seed_volume_gb, req.save_dir, req.active_time_windows,
@@ -3177,6 +3177,50 @@ fn final_status_name(status: FinalStatus) -> &'static str {
 mod migration_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn creates_brush_task() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let request = BrushTaskRequest {
+            name: "test-task".to_string(),
+            cron_expression: "0 */9 * * * *".to_string(),
+            site_id: None,
+            downloader_ids: vec![3, 1],
+            tag: "test".to_string(),
+            rss_url: "https://example.com/rss".to_string(),
+            seed_volume_gb: None,
+            save_dir: None,
+            active_time_windows: None,
+            promotion: Some("free".to_string()),
+            skip_hit_and_run: Some(false),
+            max_concurrent: Some(9),
+            download_speed_limit: None,
+            upload_speed_limit: Some(117_000),
+            size_ranges: None,
+            seeder_ranges: Some("[\"1-37\"]".to_string()),
+            downloader_ranges: None,
+            downloader_weights: None,
+            min_free_hours: None,
+            delete_mode: Some("or".to_string()),
+            delete_on_free_expiry: Some(false),
+            min_seed_time_hours: None,
+            hr_min_seed_time_hours: None,
+            target_ratio: Some(3.0),
+            max_upload_gb: None,
+            download_timeout_hours: Some(2.0),
+            min_avg_upload_speed_kbs: Some(2048.0),
+            max_inactive_hours: Some(0.1),
+            min_disk_space_gb: Some(1.0),
+        };
+
+        let id = db.create_brush_task(&request).await.unwrap();
+        let task = db.get_brush_task(id).await.unwrap().unwrap();
+
+        assert_eq!(task.name, request.name);
+        assert_eq!(task.downloader_ids, request.downloader_ids);
+        assert_eq!(task.min_disk_space_gb, request.min_disk_space_gb);
+    }
 
     #[test]
     fn test_migration_save_dir_json_conversion() {
