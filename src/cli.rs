@@ -10,14 +10,14 @@ use crate::error::AppError;
     name = "rflush",
     version,
     about = "PT 刷流与 RSS 下载控制台",
-    long_about = "启动 rflush Web 服务。\n\n默认行为:\n- 监听地址: 0.0.0.0:3000\n- 数据库: ./data/rflush.db\n- RSS 下载输出: 当前目录\n\n指定 --data-dir 后:\n- 数据库与下载输出都写入该目录\n\n示例:\n- rflush\n- rflush -H 127.0.0.1 -p 8080\n- rflush -d ./runtime-data\n- RFLUSH_DATA_DIR=/data rflush"
+    long_about = "启动 rflush Web 服务。\n\n默认行为:\n- 监听地址: 127.0.0.1:3000\n- 数据库: ./data/rflush.db\n- RSS 下载输出: 当前目录\n\n指定 --data-dir 后:\n- 数据库与下载输出都写入该目录\n\n示例:\n- rflush\n- rflush -H 127.0.0.1 -p 8080\n- rflush -d ./runtime-data\n- RFLUSH_DATA_DIR=/data rflush"
 )]
 pub struct Cli {
     #[arg(
         short = 'H',
         long,
         env = "RFLUSH_HOST",
-        default_value = "0.0.0.0",
+        default_value = "127.0.0.1",
         help = "Web 服务监听地址 (env: RFLUSH_HOST)"
     )]
     pub host: String,

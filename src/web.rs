@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -16,9 +14,9 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, info_span};
+use tracing::{info, info_span, warn};
 
 use crate::brush::BrushTaskRequest;
 use crate::brush::scheduler::BrushScheduler;
@@ -30,10 +28,23 @@ use crate::downloader::DownloaderSpaceStats;
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
+use crate::indexer::IndexerError;
+use crate::media::domain::{MediaTarget, ReleaseInfo, ReleaseParser};
+use crate::media::models::{
+    MediaDownloadRecord, MediaSettings, QualityProfileRecord, QualityProfileRequest,
+    SubscriptionRecord, UpdateSubscription,
+};
+use crate::media::scheduler::MediaScheduler;
+use crate::media::service::{
+    CreateSubscriptionRequest, MediaService, MediaServiceError, QueueDownloadRequest,
+    ResourceSearchRequest, ResourceSearchResponse, SubscriptionRunResult, SubscriptionRunSnapshot,
+};
+use crate::media::tmdb::{TmdbDetails, TmdbError, TmdbMedia, TmdbMediaType, TmdbSeason};
 use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
+use crate::site::{SiteAuth, SiteStatsRecord, SiteType, SiteWithStats};
 use crate::site_stats::SiteStatsRefresher;
 use crate::tag_rule::scheduler::TagRuleScheduler;
 
@@ -47,6 +58,8 @@ pub struct AppState {
     site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
+    media: Arc<MediaService>,
+    media_scheduler: Arc<MediaScheduler>,
     monitor: Arc<SystemMonitor>,
     tag_rule_scheduler: Arc<TagRuleScheduler>,
 }
@@ -148,6 +161,8 @@ impl AppState {
         site_stats_refresher: Arc<SiteStatsRefresher>,
         collector: Arc<DownloaderSnapshotCollector>,
         pool: Arc<DownloaderClientPool>,
+        media: Arc<MediaService>,
+        media_scheduler: Arc<MediaScheduler>,
         monitor: Arc<SystemMonitor>,
         tag_rule_scheduler: Arc<TagRuleScheduler>,
     ) -> Self {
@@ -160,6 +175,8 @@ impl AppState {
             site_stats_refresher,
             collector,
             pool,
+            media,
+            media_scheduler,
             monitor,
             tag_rule_scheduler,
         }
@@ -297,18 +314,22 @@ impl JobRegistry {
 }
 
 pub async fn serve(
-    _base_dir: PathBuf,
-    addr: SocketAddr,
+    listener: TcpListener,
     db: Database,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
     site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
+    media: Arc<MediaService>,
+    media_scheduler: Arc<MediaScheduler>,
     rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
     monitor: Arc<SystemMonitor>,
     tag_rule_scheduler: Arc<TagRuleScheduler>,
 ) -> Result<(), AppError> {
+    let addr = listener.local_addr().map_err(|error| AppError::Server {
+        message: format!("failed to read bound web server address: {error}"),
+    })?;
     let engine = DownloadEngine::new(rate_limiter);
     let state = AppState::new(
         db,
@@ -318,15 +339,17 @@ pub async fn serve(
         site_stats_refresher,
         collector,
         pool,
+        media,
+        media_scheduler,
         monitor,
         tag_rule_scheduler,
     );
     let app = app_router(state);
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| AppError::Server {
-            message: format!("failed to bind {}: {}", addr, e),
-        })?;
+    if !addr.ip().is_loopback() {
+        warn!(
+            "web server is listening on a non-loopback address; place rflush behind an authenticated reverse proxy and restrict network access"
+        );
+    }
     info!("web server listening on http://{}", addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -343,6 +366,8 @@ pub async fn serve(
 }
 
 fn app_router(state: AppState) -> Router {
+    let media = Arc::clone(&state.media);
+    let media_scheduler = Arc::clone(&state.media_scheduler);
     Router::new()
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/rss", get(list_rss).post(create_rss))
@@ -439,10 +464,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/system/stats", get(get_system_stats))
         .route("/api/system/stats/history", get(get_system_stats_history))
         // 标签规则
-        .route(
-            "/api/tag-rules",
-            get(list_tag_rules).post(create_tag_rule),
-        )
+        .route("/api/tag-rules", get(list_tag_rules).post(create_tag_rule))
         .route(
             "/api/tag-rules/{id}",
             get(get_tag_rule)
@@ -453,6 +475,7 @@ fn app_router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state(state)
+        .nest("/api/media", media_router(media, media_scheduler))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                 info_span!(
@@ -462,12 +485,1090 @@ fn app_router(state: AppState) -> Router {
                 )
             }),
         )
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
+        .layer(cors_layer())
+}
+
+const VITE_DEV_ORIGINS: [&str; 3] = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://[::1]:5173",
+];
+
+fn cors_layer() -> CorsLayer {
+    let origins = VITE_DEV_ORIGINS.map(HeaderValue::from_static);
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::ACCEPT, header::CONTENT_TYPE])
+}
+
+#[derive(Clone)]
+struct MediaApiState {
+    service: Arc<MediaService>,
+    scheduler: Arc<MediaScheduler>,
+}
+
+fn media_router(service: Arc<MediaService>, scheduler: Arc<MediaScheduler>) -> Router {
+    Router::new()
+        .route(
+            "/settings",
+            get(get_media_settings).put(update_media_settings),
         )
+        .route("/tmdb/search", get(search_tmdb_media))
+        .route("/tmdb/details", get(get_tmdb_details_query))
+        .route("/tmdb/season", get(get_tmdb_season_query))
+        .route("/tmdb/{media_type}/{id}", get(get_tmdb_details_path))
+        .route("/tmdb/tv/{id}/season/{season}", get(get_tmdb_season_path))
+        .route(
+            "/quality-profiles",
+            get(list_quality_profiles).post(create_quality_profile),
+        )
+        .route(
+            "/quality-profiles/{id}",
+            get(get_quality_profile)
+                .put(update_quality_profile)
+                .delete(delete_quality_profile),
+        )
+        .route(
+            "/subscriptions",
+            get(list_media_subscriptions).post(create_media_subscription),
+        )
+        .route(
+            "/subscriptions/{id}",
+            get(get_media_subscription)
+                .put(update_media_subscription)
+                .delete(delete_media_subscription),
+        )
+        .route("/subscriptions/{id}/run", post(run_media_subscription))
+        .route(
+            "/subscriptions/{id}/last-run",
+            get(get_media_subscription_last_run),
+        )
+        .route("/subscriptions/{id}/pause", post(pause_media_subscription))
+        .route(
+            "/subscriptions/{id}/resume",
+            post(resume_media_subscription),
+        )
+        .route(
+            "/subscriptions/{id}/downloads",
+            get(list_subscription_downloads),
+        )
+        .route("/resources/search", post(search_media_resources))
+        .route(
+            "/downloads",
+            get(list_media_downloads).post(queue_media_download),
+        )
+        .route("/downloads/{id}", get(get_media_download))
+        .with_state(MediaApiState { service, scheduler })
+}
+
+#[derive(Debug, Serialize)]
+struct MediaSettingsResponse {
+    // Never return the configured token. `tmdb_token_configured` is sufficient for the UI.
+    tmdb_token: Option<String>,
+    tmdb_token_configured: bool,
+    tmdb_language: String,
+    scan_interval_mins: u64,
+    max_search_queries: usize,
+    search_concurrency: usize,
+    updated_at: String,
+}
+
+impl MediaSettingsResponse {
+    fn from_settings(settings: MediaSettings) -> Self {
+        let tmdb_token_configured = settings
+            .tmdb_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        Self {
+            tmdb_token: None,
+            tmdb_token_configured,
+            tmdb_language: settings.tmdb_language,
+            scan_interval_mins: settings.scan_interval_mins,
+            max_search_queries: settings.max_search_queries,
+            search_concurrency: settings.search_concurrency,
+            updated_at: settings.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMediaSettingsRequest {
+    tmdb_token: Option<String>,
+    #[serde(default)]
+    clear_tmdb_token: bool,
+    tmdb_language: String,
+    scan_interval_mins: u64,
+    max_search_queries: usize,
+    search_concurrency: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbSearchQuery {
+    query: String,
+    media_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbDetailsQuery {
+    tmdb_id: i64,
+    media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbSeasonQuery {
+    tmdb_id: i64,
+    season: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MediaDownloadsQuery {
+    subscription_id: Option<i64>,
+    status: Option<String>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SubscriptionDownloadsQuery {
+    status: Option<String>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+async fn get_media_settings(
+    State(state): State<MediaApiState>,
+) -> Result<Json<MediaSettingsResponse>, ApiError> {
+    let settings = state
+        .service
+        .database()
+        .get_media_settings()
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(MediaSettingsResponse::from_settings(settings)))
+}
+
+async fn update_media_settings(
+    State(state): State<MediaApiState>,
+    Json(payload): Json<UpdateMediaSettingsRequest>,
+) -> Result<Json<MediaSettingsResponse>, ApiError> {
+    validate_media_settings(&payload)?;
+    let current = state
+        .service
+        .database()
+        .get_media_settings()
+        .await
+        .map_err(media_app_error)?;
+    let supplied_token = payload
+        .tmdb_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string);
+    let tmdb_token = if payload.clear_tmdb_token {
+        None
+    } else {
+        supplied_token.or(current.tmdb_token)
+    };
+    let updated = state
+        .service
+        .database()
+        .update_media_settings(&MediaSettings {
+            tmdb_token,
+            tmdb_language: payload.tmdb_language.trim().to_string(),
+            scan_interval_mins: payload.scan_interval_mins,
+            max_search_queries: payload.max_search_queries,
+            search_concurrency: payload.search_concurrency,
+            updated_at: current.updated_at,
+        })
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(MediaSettingsResponse::from_settings(updated)))
+}
+
+async fn search_tmdb_media(
+    State(state): State<MediaApiState>,
+    Query(query): Query<TmdbSearchQuery>,
+) -> Result<Json<Vec<TmdbMedia>>, ApiError> {
+    let text = query.query.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("query is required"));
+    }
+    if text.len() > 200 {
+        return Err(ApiError::bad_request("query must not exceed 200 bytes"));
+    }
+    let media_type = normalize_tmdb_search_type(query.media_type.as_deref())?;
+    Ok(Json(
+        state
+            .service
+            .tmdb_search(text, media_type)
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+async fn get_tmdb_details_query(
+    State(state): State<MediaApiState>,
+    Query(query): Query<TmdbDetailsQuery>,
+) -> Result<Json<TmdbDetails>, ApiError> {
+    tmdb_details(&state, query.tmdb_id, &query.media_type).await
+}
+
+async fn get_tmdb_details_path(
+    State(state): State<MediaApiState>,
+    Path((media_type, id)): Path<(String, i64)>,
+) -> Result<Json<TmdbDetails>, ApiError> {
+    tmdb_details(&state, id, &media_type).await
+}
+
+async fn tmdb_details(
+    state: &MediaApiState,
+    tmdb_id: i64,
+    media_type: &str,
+) -> Result<Json<TmdbDetails>, ApiError> {
+    validate_positive_id(tmdb_id, "tmdb_id")?;
+    let media_type = parse_tmdb_media_type(media_type)?;
+    Ok(Json(
+        state
+            .service
+            .tmdb_details(tmdb_id, media_type)
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+async fn get_tmdb_season_query(
+    State(state): State<MediaApiState>,
+    Query(query): Query<TmdbSeasonQuery>,
+) -> Result<Json<TmdbSeason>, ApiError> {
+    tmdb_season(&state, query.tmdb_id, query.season).await
+}
+
+async fn get_tmdb_season_path(
+    State(state): State<MediaApiState>,
+    Path((id, season)): Path<(i64, u32)>,
+) -> Result<Json<TmdbSeason>, ApiError> {
+    tmdb_season(&state, id, season).await
+}
+
+async fn tmdb_season(
+    state: &MediaApiState,
+    tmdb_id: i64,
+    season: u32,
+) -> Result<Json<TmdbSeason>, ApiError> {
+    validate_positive_id(tmdb_id, "tmdb_id")?;
+    if season > 1_000 {
+        return Err(ApiError::bad_request("season must not exceed 1000"));
+    }
+    Ok(Json(
+        state
+            .service
+            .tmdb_season(tmdb_id, season)
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+async fn list_quality_profiles(
+    State(state): State<MediaApiState>,
+) -> Result<Json<Vec<QualityProfileRecord>>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .database()
+            .list_quality_profiles()
+            .await
+            .map_err(media_app_error)?,
+    ))
+}
+
+async fn get_quality_profile(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<QualityProfileRecord>, ApiError> {
+    validate_positive_id(id, "quality profile id")?;
+    let profile = state
+        .service
+        .database()
+        .get_quality_profile(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("quality profile not found"))?;
+    Ok(Json(profile))
+}
+
+async fn create_quality_profile(
+    State(state): State<MediaApiState>,
+    Json(mut payload): Json<QualityProfileRequest>,
+) -> Result<(StatusCode, Json<QualityProfileRecord>), ApiError> {
+    normalize_and_validate_quality_profile(&mut payload)?;
+    let profile = state
+        .service
+        .database()
+        .create_quality_profile(&payload)
+        .await
+        .map_err(media_app_error)?;
+    Ok((StatusCode::CREATED, Json(profile)))
+}
+
+async fn update_quality_profile(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    Json(mut payload): Json<QualityProfileRequest>,
+) -> Result<Json<QualityProfileRecord>, ApiError> {
+    validate_positive_id(id, "quality profile id")?;
+    normalize_and_validate_quality_profile(&mut payload)?;
+    let profile = state
+        .service
+        .database()
+        .update_quality_profile(id, &payload)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("quality profile not found"))?;
+    Ok(Json(profile))
+}
+
+async fn delete_quality_profile(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    validate_positive_id(id, "quality profile id")?;
+    if state
+        .service
+        .database()
+        .delete_quality_profile(id)
+        .await
+        .map_err(media_app_error)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found("quality profile not found"))
+    }
+}
+
+async fn list_media_subscriptions(
+    State(state): State<MediaApiState>,
+) -> Result<Json<Vec<SubscriptionRecord>>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .database()
+            .list_subscriptions()
+            .await
+            .map_err(media_app_error)?,
+    ))
+}
+
+async fn get_media_subscription(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SubscriptionRecord>, ApiError> {
+    Ok(Json(load_media_subscription(&state, id).await?))
+}
+
+async fn create_media_subscription(
+    State(state): State<MediaApiState>,
+    Json(mut payload): Json<CreateSubscriptionRequest>,
+) -> Result<(StatusCode, Json<SubscriptionRecord>), ApiError> {
+    normalize_and_validate_new_subscription(&mut payload)?;
+    let subscription = state
+        .service
+        .create_subscription(&payload)
+        .await
+        .map_err(ApiError::from)?;
+    if subscription.enabled {
+        state.scheduler.wake();
+    }
+    Ok((StatusCode::CREATED, Json(subscription)))
+}
+
+async fn update_media_subscription(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    Json(mut payload): Json<UpdateSubscription>,
+) -> Result<Json<SubscriptionRecord>, ApiError> {
+    let current = load_media_subscription(&state, id).await?;
+    if subscription_is_leased(&current) {
+        return Err(ApiError::conflict(
+            "subscription is currently being scanned",
+        ));
+    }
+    normalize_and_validate_subscription_update(&current, &mut payload)?;
+    ensure_media_references(
+        &state,
+        payload.quality_profile_id,
+        payload.downloader_id,
+        &payload.site_ids,
+    )
+    .await?;
+    let updated = state
+        .service
+        .database()
+        .update_subscription(id, current.version, &payload)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::conflict("subscription changed or is currently being scanned"))?;
+    if updated.enabled {
+        state.scheduler.wake();
+    }
+    Ok(Json(updated))
+}
+
+async fn delete_media_subscription(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    let current = load_media_subscription(&state, id).await?;
+    if subscription_is_leased(&current) {
+        return Err(ApiError::conflict(
+            "subscription is currently being scanned",
+        ));
+    }
+    if state
+        .service
+        .database()
+        .delete_subscription(id, current.version)
+        .await
+        .map_err(media_app_error)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::conflict(
+            "subscription changed or is currently being scanned",
+        ))
+    }
+}
+
+async fn run_media_subscription(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SubscriptionRunResult>, ApiError> {
+    let subscription = load_media_subscription(&state, id).await?;
+    reject_completed_subscription(&subscription, "run")?;
+    let result = state
+        .service
+        .run_subscription(id)
+        .await
+        .map_err(ApiError::from)?;
+    info!(
+        subscription_id = result.subscription_id,
+        target_key = %result.target_key,
+        queries = result.query_count,
+        candidates = result.candidate_count,
+        accepted = result.accepted_count,
+        queued = result.download.is_some(),
+        site_errors = result.site_errors.len(),
+        "manual media subscription scan completed"
+    );
+    state.scheduler.wake();
+    Ok(Json(result))
+}
+
+async fn get_media_subscription_last_run(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SubscriptionRunSnapshot>, ApiError> {
+    load_media_subscription(&state, id).await?;
+    state
+        .service
+        .get_subscription_last_run(id)
+        .await
+        .map_err(ApiError::from)?
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("subscription has no recorded run details"))
+}
+
+async fn pause_media_subscription(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SubscriptionRecord>, ApiError> {
+    set_media_subscription_enabled(&state, id, false).await
+}
+
+async fn resume_media_subscription(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SubscriptionRecord>, ApiError> {
+    set_media_subscription_enabled(&state, id, true).await
+}
+
+async fn set_media_subscription_enabled(
+    state: &MediaApiState,
+    id: i64,
+    enabled: bool,
+) -> Result<Json<SubscriptionRecord>, ApiError> {
+    let current = load_media_subscription(state, id).await?;
+    if enabled {
+        reject_completed_subscription(&current, "resume")?;
+    }
+    if subscription_is_leased(&current) {
+        return Err(ApiError::conflict(
+            "subscription is currently being scanned",
+        ));
+    }
+    if !state
+        .service
+        .database()
+        .set_subscription_enabled(id, current.version, enabled)
+        .await
+        .map_err(media_app_error)?
+    {
+        return Err(ApiError::conflict(
+            "subscription changed or is currently being scanned",
+        ));
+    }
+    let subscription = load_media_subscription(state, id).await?;
+    if enabled {
+        state.scheduler.wake();
+    }
+    Ok(Json(subscription))
+}
+
+async fn search_media_resources(
+    State(state): State<MediaApiState>,
+    Json(payload): Json<ResourceSearchRequest>,
+) -> Result<Json<ResourceSearchResponse>, ApiError> {
+    validate_resource_search(&payload)?;
+    Ok(Json(
+        state
+            .service
+            .search_resources(&payload)
+            .await
+            .map_err(ApiError::from)?,
+    ))
+}
+
+async fn queue_media_download(
+    State(state): State<MediaApiState>,
+    Json(mut payload): Json<QueueDownloadRequest>,
+) -> Result<(StatusCode, Json<MediaDownloadResponse>), ApiError> {
+    normalize_and_validate_download(&state, &mut payload).await?;
+    let download = state
+        .service
+        .queue_download(&payload)
+        .await
+        .map_err(ApiError::from)?;
+    state.scheduler.wake();
+    Ok((
+        StatusCode::CREATED,
+        Json(MediaDownloadResponse::from(download)),
+    ))
+}
+
+async fn list_media_downloads(
+    State(state): State<MediaApiState>,
+    Query(query): Query<MediaDownloadsQuery>,
+) -> Result<Json<Vec<MediaDownloadResponse>>, ApiError> {
+    let (status, limit, offset) =
+        validate_download_query(query.status.as_deref(), query.page, query.page_size)?;
+    if let Some(subscription_id) = query.subscription_id {
+        load_media_subscription(&state, subscription_id).await?;
+    }
+    let downloads = state
+        .service
+        .database()
+        .list_media_downloads(query.subscription_id, status.as_deref(), limit, offset)
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(
+        downloads
+            .into_iter()
+            .map(MediaDownloadResponse::from)
+            .collect(),
+    ))
+}
+
+async fn list_subscription_downloads(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    Query(query): Query<SubscriptionDownloadsQuery>,
+) -> Result<Json<Vec<MediaDownloadResponse>>, ApiError> {
+    load_media_subscription(&state, id).await?;
+    let (status, limit, offset) =
+        validate_download_query(query.status.as_deref(), query.page, query.page_size)?;
+    let downloads = state
+        .service
+        .database()
+        .list_media_downloads(Some(id), status.as_deref(), limit, offset)
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(
+        downloads
+            .into_iter()
+            .map(MediaDownloadResponse::from)
+            .collect(),
+    ))
+}
+
+async fn get_media_download(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<MediaDownloadResponse>, ApiError> {
+    validate_positive_id(id, "download id")?;
+    let download = state
+        .service
+        .database()
+        .get_media_download(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("media download not found"))?;
+    Ok(Json(MediaDownloadResponse::from(download)))
+}
+
+#[derive(Debug, Serialize)]
+struct MediaDownloadResponse {
+    #[serde(flatten)]
+    download: MediaDownloadRecord,
+    parsed_release: Option<ReleaseInfo>,
+}
+
+impl From<MediaDownloadRecord> for MediaDownloadResponse {
+    fn from(download: MediaDownloadRecord) -> Self {
+        let parsed_release = ReleaseParser::default().parse(&download.title).ok();
+        Self {
+            download,
+            parsed_release,
+        }
+    }
+}
+
+async fn load_media_subscription(
+    state: &MediaApiState,
+    id: i64,
+) -> Result<SubscriptionRecord, ApiError> {
+    validate_positive_id(id, "subscription id")?;
+    state
+        .service
+        .database()
+        .get_subscription(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("subscription not found"))
+}
+
+fn validate_media_settings(payload: &UpdateMediaSettingsRequest) -> Result<(), ApiError> {
+    let language = payload.tmdb_language.trim();
+    if language.is_empty() || language.len() > 32 {
+        return Err(ApiError::bad_request(
+            "tmdb_language must contain between 1 and 32 bytes",
+        ));
+    }
+    if payload.scan_interval_mins == 0 || payload.scan_interval_mins > 10_080 {
+        return Err(ApiError::bad_request(
+            "scan_interval_mins must be between 1 and 10080",
+        ));
+    }
+    if !(1..=32).contains(&payload.max_search_queries) {
+        return Err(ApiError::bad_request(
+            "max_search_queries must be between 1 and 32",
+        ));
+    }
+    if !(1..=16).contains(&payload.search_concurrency) {
+        return Err(ApiError::bad_request(
+            "search_concurrency must be between 1 and 16",
+        ));
+    }
+    if payload
+        .tmdb_token
+        .as_deref()
+        .is_some_and(|token| token.trim().len() > 4_096)
+    {
+        return Err(ApiError::bad_request(
+            "tmdb_token must not exceed 4096 bytes",
+        ));
+    }
+    if payload.clear_tmdb_token
+        && payload
+            .tmdb_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "tmdb_token and clear_tmdb_token cannot both be set",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_tmdb_search_type(media_type: Option<&str>) -> Result<Option<&str>, ApiError> {
+    match media_type
+        .unwrap_or("multi")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "multi" | "" => Ok(None),
+        "tv" => Ok(Some("tv")),
+        "movie" => Ok(Some("movie")),
+        _ => Err(ApiError::bad_request(
+            "media_type must be multi, tv, or movie",
+        )),
+    }
+}
+
+fn parse_tmdb_media_type(value: &str) -> Result<TmdbMediaType, ApiError> {
+    TmdbMediaType::parse(value).map_err(|_| ApiError::bad_request("media_type must be tv or movie"))
+}
+
+fn validate_positive_id(id: i64, field: &str) -> Result<(), ApiError> {
+    if id <= 0 {
+        Err(ApiError::bad_request(format!("{field} must be positive")))
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_and_validate_quality_profile(
+    payload: &mut QualityProfileRequest,
+) -> Result<(), ApiError> {
+    payload.name = payload.name.trim().to_string();
+    if payload.name.is_empty() || payload.name.len() > 100 {
+        return Err(ApiError::bad_request(
+            "quality profile name must contain between 1 and 100 bytes",
+        ));
+    }
+    if !(0..=100).contains(&payload.minimum_score) {
+        return Err(ApiError::bad_request(
+            "minimum_score must be between 0 and 100",
+        ));
+    }
+    if payload.min_seeders > 1_000_000 {
+        return Err(ApiError::bad_request("min_seeders must not exceed 1000000"));
+    }
+    for (field, values) in [
+        ("resolution_order", &mut payload.resolution_order),
+        ("allowed_resolutions", &mut payload.allowed_resolutions),
+        ("blocked_resolutions", &mut payload.blocked_resolutions),
+        ("source_order", &mut payload.source_order),
+        ("allowed_sources", &mut payload.allowed_sources),
+        ("codec_order", &mut payload.codec_order),
+        ("blocked_codecs", &mut payload.blocked_codecs),
+    ] {
+        normalize_string_list(field, values)?;
+    }
+    Ok(())
+}
+
+fn normalize_string_list(field: &str, values: &mut Vec<String>) -> Result<(), ApiError> {
+    if values.len() > 64 {
+        return Err(ApiError::bad_request(format!(
+            "{field} must not contain more than 64 values"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for value in values.iter_mut() {
+        *value = value.trim().to_string();
+        if value.is_empty() || value.len() > 64 {
+            return Err(ApiError::bad_request(format!(
+                "{field} values must contain between 1 and 64 bytes"
+            )));
+        }
+        if !seen.insert(value.to_ascii_lowercase()) {
+            return Err(ApiError::bad_request(format!(
+                "{field} must not contain duplicate values"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_and_validate_new_subscription(
+    payload: &mut CreateSubscriptionRequest,
+) -> Result<(), ApiError> {
+    validate_positive_id(payload.tmdb_id, "tmdb_id")?;
+    validate_positive_id(payload.quality_profile_id, "quality_profile_id")?;
+    validate_positive_id(payload.downloader_id, "downloader_id")?;
+    payload.media_type = payload.media_type.trim().to_ascii_lowercase();
+    if !matches!(payload.media_type.as_str(), "tv" | "movie") {
+        return Err(ApiError::bad_request("media_type must be tv or movie"));
+    }
+    validate_site_ids(&payload.site_ids)?;
+    normalize_save_path(&mut payload.save_path)?;
+    if payload.start_episode == Some(0) || payload.absolute_episode == Some(0) {
+        return Err(ApiError::bad_request(
+            "episode numbers must be greater than zero",
+        ));
+    }
+    if payload.media_type == "tv" && payload.season.is_none() {
+        return Err(ApiError::bad_request(
+            "season is required for a TV subscription",
+        ));
+    }
+    if payload.media_type == "movie"
+        && (payload.season.is_some()
+            || payload.start_episode.is_some()
+            || payload.absolute_episode.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "movie subscriptions cannot contain episode fields",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_and_validate_subscription_update(
+    current: &SubscriptionRecord,
+    payload: &mut UpdateSubscription,
+) -> Result<(), ApiError> {
+    validate_positive_id(payload.quality_profile_id, "quality_profile_id")?;
+    validate_positive_id(payload.downloader_id, "downloader_id")?;
+    validate_site_ids(&payload.site_ids)?;
+    normalize_save_path(&mut payload.save_path)?;
+    if payload.next_episode == Some(0) || payload.absolute_episode == Some(0) {
+        return Err(ApiError::bad_request(
+            "episode numbers must be greater than zero",
+        ));
+    }
+    if current.media_type == "movie" {
+        if payload.season.is_some()
+            || payload.next_episode.is_some()
+            || payload.absolute_episode.is_some()
+        {
+            return Err(ApiError::bad_request(
+                "movie subscriptions cannot contain episode fields",
+            ));
+        }
+    } else {
+        if payload.season.is_none() {
+            return Err(ApiError::bad_request(
+                "season is required for a TV subscription",
+            ));
+        }
+        if payload.next_episode.is_none() && payload.absolute_episode.is_some() {
+            payload.next_episode = current.next_episode.or(current.start_episode);
+        }
+        if payload.next_episode.is_none() {
+            return Err(ApiError::bad_request(
+                "next_episode is required for a TV subscription",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_site_ids(site_ids: &[i64]) -> Result<(), ApiError> {
+    if site_ids.is_empty() {
+        return Err(ApiError::bad_request("at least one site is required"));
+    }
+    if site_ids.len() > 100 {
+        return Err(ApiError::bad_request(
+            "no more than 100 sites may be selected",
+        ));
+    }
+    let mut unique = std::collections::HashSet::new();
+    for site_id in site_ids {
+        validate_positive_id(*site_id, "site_id")?;
+        if !unique.insert(*site_id) {
+            return Err(ApiError::bad_request(
+                "site_ids must not contain duplicates",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_save_path(save_path: &mut Option<String>) -> Result<(), ApiError> {
+    let normalized = save_path
+        .take()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty());
+    if normalized.as_deref().is_some_and(|path| path.len() > 1_024) {
+        return Err(ApiError::bad_request(
+            "save_path must not exceed 1024 bytes",
+        ));
+    }
+    *save_path = normalized;
+    Ok(())
+}
+
+async fn ensure_media_references(
+    state: &MediaApiState,
+    quality_profile_id: i64,
+    downloader_id: i64,
+    site_ids: &[i64],
+) -> Result<(), ApiError> {
+    let db = state.service.database();
+    if db
+        .get_quality_profile(quality_profile_id)
+        .await
+        .map_err(media_app_error)?
+        .is_none()
+    {
+        return Err(ApiError::not_found("quality profile not found"));
+    }
+    if db
+        .get_downloader(downloader_id)
+        .await
+        .map_err(media_app_error)?
+        .is_none()
+    {
+        return Err(ApiError::not_found("downloader not found"));
+    }
+    let configured: std::collections::HashSet<_> = db
+        .list_sites()
+        .await
+        .map_err(media_app_error)?
+        .into_iter()
+        .map(|site| site.id)
+        .collect();
+    if site_ids.iter().any(|site_id| !configured.contains(site_id)) {
+        return Err(ApiError::not_found(
+            "one or more selected PT sites do not exist",
+        ));
+    }
+    Ok(())
+}
+
+fn subscription_is_leased(subscription: &SubscriptionRecord) -> bool {
+    subscription.lease_owner.is_some()
+        && subscription
+            .lease_until
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|until| until > Utc::now())
+}
+
+fn validate_resource_search(payload: &ResourceSearchRequest) -> Result<(), ApiError> {
+    if payload
+        .query
+        .as_deref()
+        .is_none_or(|query| query.trim().is_empty())
+        && payload.target.is_none()
+    {
+        return Err(ApiError::bad_request("query or target is required"));
+    }
+    if payload
+        .query
+        .as_deref()
+        .is_some_and(|query| query.trim().len() > 512)
+    {
+        return Err(ApiError::bad_request("query must not exceed 512 bytes"));
+    }
+    if payload
+        .page_size
+        .is_some_and(|size| !(1..=100).contains(&size))
+    {
+        return Err(ApiError::bad_request("page_size must be between 1 and 100"));
+    }
+    if let Some(profile_id) = payload.quality_profile_id {
+        validate_positive_id(profile_id, "quality_profile_id")?;
+    }
+    if !payload.site_ids.is_empty() {
+        validate_site_ids(&payload.site_ids)?;
+    }
+    if let Some(target) = &payload.target {
+        validate_media_target(target)?;
+    }
+    Ok(())
+}
+
+fn validate_media_target(target: &MediaTarget) -> Result<(), ApiError> {
+    validate_positive_id(target.tmdb_id(), "target.tmdb_id")?;
+    if target.titles().is_empty() || target.titles().len() > 32 {
+        return Err(ApiError::bad_request(
+            "target.titles must contain between 1 and 32 values",
+        ));
+    }
+    if target
+        .titles()
+        .iter()
+        .any(|title| title.trim().is_empty() || title.len() > 512)
+    {
+        return Err(ApiError::bad_request(
+            "target titles must contain between 1 and 512 bytes",
+        ));
+    }
+    match target {
+        MediaTarget::Episode { episode: 0, .. }
+        | MediaTarget::Anime {
+            absolute_episode: 0,
+            ..
+        } => Err(ApiError::bad_request(
+            "target episode numbers must be greater than zero",
+        )),
+        _ => Ok(()),
+    }
+}
+
+async fn normalize_and_validate_download(
+    _state: &MediaApiState,
+    payload: &mut QueueDownloadRequest,
+) -> Result<(), ApiError> {
+    validate_positive_id(payload.quality_profile_id, "quality_profile_id")?;
+    validate_positive_id(payload.downloader_id, "downloader_id")?;
+    payload.candidate_id = payload.candidate_id.trim().to_string();
+    let token = payload
+        .candidate_id
+        .strip_prefix("cand_")
+        .ok_or_else(|| ApiError::bad_request("candidate_id is invalid"))?;
+    if token.len() != 48 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("candidate_id is invalid"));
+    }
+
+    if let Some(reason) = payload.override_reason.take() {
+        let reason = reason.trim().to_string();
+        if reason.len() > 1_000 {
+            return Err(ApiError::bad_request(
+                "override_reason must not exceed 1000 bytes",
+            ));
+        }
+        payload.override_reason = (!reason.is_empty()).then_some(reason);
+    }
+
+    Ok(())
+}
+
+fn reject_completed_subscription(
+    subscription: &SubscriptionRecord,
+    action: &str,
+) -> Result<(), ApiError> {
+    if subscription.last_status.as_deref() == Some("completed") {
+        Err(ApiError::conflict(format!(
+            "completed subscription cannot {action}; edit it with a new cursor first"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_download_query(
+    status: Option<&str>,
+    page: Option<usize>,
+    page_size: Option<usize>,
+) -> Result<(Option<String>, usize, usize), ApiError> {
+    let page = page.unwrap_or(1);
+    let page_size = page_size.unwrap_or(100);
+    if page == 0 {
+        return Err(ApiError::bad_request("page must be greater than zero"));
+    }
+    if !(1..=200).contains(&page_size) {
+        return Err(ApiError::bad_request("page_size must be between 1 and 200"));
+    }
+    let offset = page
+        .checked_sub(1)
+        .and_then(|value| value.checked_mul(page_size))
+        .ok_or_else(|| ApiError::bad_request("pagination values are too large"))?;
+    i64::try_from(offset).map_err(|_| ApiError::bad_request("pagination values are too large"))?;
+    let status = status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    if status.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "queued"
+                | "fetching"
+                | "submitting"
+                | "reconciling"
+                | "retry_wait"
+                | "submitted"
+                | "failed"
+                | "cancelled"
+        )
+    }) {
+        return Err(ApiError::bad_request("invalid download status"));
+    }
+    Ok((status, page_size, offset))
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<GlobalConfig>, ApiError> {
@@ -741,7 +1842,12 @@ async fn spawn_job(state: AppState, scope: String, task_id: Option<i64>, config:
         state.jobs.mark_running(job_id).await;
         match state
             .engine
-            .run_with_shutdown(config, shutdown.clone(), Some(state.pool.clone()), Some(state.db.clone()))
+            .run_with_shutdown(
+                config,
+                shutdown.clone(),
+                Some(state.pool.clone()),
+                Some(state.db.clone()),
+            )
             .await
         {
             Ok(history) => match state
@@ -830,14 +1936,247 @@ struct CreateSiteRequest {
     use_proxy: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateSiteRequest {
+    name: String,
+    site_type: String,
+    base_url: String,
+    auth_config: Option<serde_json::Value>,
+    #[serde(default)]
+    clear_auth_config: bool,
+    #[serde(default = "default_true")]
+    use_proxy: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SiteAuthInput {
+    auth_type: String,
+    cookie: Option<String>,
+    passkey: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SiteResponse {
+    id: i64,
+    name: String,
+    site_type: String,
+    base_url: String,
+    auth_type: Option<&'static str>,
+    auth_configured: bool,
+    use_proxy: bool,
+    created_at: String,
+    updated_at: String,
+    stats: Option<SiteStatsRecord>,
+}
+
 fn default_true() -> bool {
     true
 }
 
-async fn list_sites(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<crate::site::SiteWithStats>>, ApiError> {
-    Ok(Json(state.db.list_sites_with_stats().await?))
+impl From<SiteWithStats> for SiteResponse {
+    fn from(site: SiteWithStats) -> Self {
+        let auth = serde_json::from_str::<SiteAuth>(&site.auth_config).ok();
+        Self {
+            id: site.id,
+            name: site.name,
+            site_type: site.site_type,
+            base_url: site.base_url,
+            auth_type: auth.as_ref().map(site_auth_type),
+            auth_configured: auth.as_ref().is_some_and(site_auth_is_configured),
+            use_proxy: site.use_proxy,
+            created_at: site.created_at,
+            updated_at: site.updated_at,
+            stats: site.stats,
+        }
+    }
+}
+
+fn site_auth_type(auth: &SiteAuth) -> &'static str {
+    match auth {
+        SiteAuth::Cookie { .. } => "cookie",
+        SiteAuth::Passkey { .. } => "passkey",
+        SiteAuth::CookiePasskey { .. } => "cookie_passkey",
+        SiteAuth::ApiKey { .. } => "api_key",
+    }
+}
+
+fn site_auth_is_configured(auth: &SiteAuth) -> bool {
+    match auth {
+        SiteAuth::Cookie { cookie } => !cookie.trim().is_empty(),
+        SiteAuth::Passkey { passkey } => !passkey.trim().is_empty(),
+        SiteAuth::CookiePasskey { cookie, passkey } => {
+            !cookie.trim().is_empty() && !passkey.trim().is_empty()
+        }
+        SiteAuth::ApiKey { api_key } => !api_key.trim().is_empty(),
+    }
+}
+
+fn site_auth_has_secret(auth: &SiteAuth) -> bool {
+    match auth {
+        SiteAuth::Cookie { cookie } => !cookie.is_empty(),
+        SiteAuth::Passkey { passkey } => !passkey.is_empty(),
+        SiteAuth::CookiePasskey { cookie, passkey } => !cookie.is_empty() || !passkey.is_empty(),
+        SiteAuth::ApiKey { api_key } => !api_key.is_empty(),
+    }
+}
+
+fn parse_site_auth_input(value: serde_json::Value) -> Result<SiteAuth, ApiError> {
+    let input: SiteAuthInput =
+        serde_json::from_value(value).map_err(|_| ApiError::bad_request("认证配置格式无效"))?;
+    match input.auth_type.as_str() {
+        "cookie" => Ok(SiteAuth::Cookie {
+            cookie: input.cookie.unwrap_or_default(),
+        }),
+        "passkey" => Ok(SiteAuth::Passkey {
+            passkey: input.passkey.unwrap_or_default(),
+        }),
+        "cookie_passkey" => Ok(SiteAuth::CookiePasskey {
+            cookie: input.cookie.unwrap_or_default(),
+            passkey: input.passkey.unwrap_or_default(),
+        }),
+        "api_key" => Ok(SiteAuth::ApiKey {
+            api_key: input.api_key.unwrap_or_default(),
+        }),
+        _ => Err(ApiError::bad_request("不支持的认证类型")),
+    }
+}
+
+fn parse_site_type(value: &str) -> Result<SiteType, ApiError> {
+    SiteType::from_str(value.trim()).ok_or_else(|| ApiError::bad_request("不支持的站点类型"))
+}
+
+fn validate_site_auth_type(site_type: SiteType, auth: &SiteAuth) -> Result<(), ApiError> {
+    if site_type == SiteType::MTeam && !matches!(auth, SiteAuth::ApiKey { .. }) {
+        return Err(ApiError::bad_request("M-Team 站点必须使用 API Key 认证"));
+    }
+    Ok(())
+}
+
+fn require_configured_site_auth(auth: &SiteAuth) -> Result<(), ApiError> {
+    if site_auth_is_configured(auth) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("认证凭据不能为空"))
+    }
+}
+
+fn empty_site_auth(auth: &SiteAuth) -> SiteAuth {
+    match auth {
+        SiteAuth::Cookie { .. } => SiteAuth::Cookie {
+            cookie: String::new(),
+        },
+        SiteAuth::Passkey { .. } => SiteAuth::Passkey {
+            passkey: String::new(),
+        },
+        SiteAuth::CookiePasskey { .. } => SiteAuth::CookiePasskey {
+            cookie: String::new(),
+            passkey: String::new(),
+        },
+        SiteAuth::ApiKey { .. } => SiteAuth::ApiKey {
+            api_key: String::new(),
+        },
+    }
+}
+
+fn merge_site_auth(existing: SiteAuth, incoming: SiteAuth) -> Result<SiteAuth, ApiError> {
+    match (existing, incoming) {
+        (SiteAuth::Cookie { cookie }, SiteAuth::Cookie { cookie: next }) => Ok(SiteAuth::Cookie {
+            cookie: if next.is_empty() { cookie } else { next },
+        }),
+        (SiteAuth::Passkey { passkey }, SiteAuth::Passkey { passkey: next }) => {
+            Ok(SiteAuth::Passkey {
+                passkey: if next.is_empty() { passkey } else { next },
+            })
+        }
+        (
+            SiteAuth::CookiePasskey { cookie, passkey },
+            SiteAuth::CookiePasskey {
+                cookie: next_cookie,
+                passkey: next_passkey,
+            },
+        ) => Ok(SiteAuth::CookiePasskey {
+            cookie: if next_cookie.is_empty() {
+                cookie
+            } else {
+                next_cookie
+            },
+            passkey: if next_passkey.is_empty() {
+                passkey
+            } else {
+                next_passkey
+            },
+        }),
+        (SiteAuth::ApiKey { api_key }, SiteAuth::ApiKey { api_key: next }) => {
+            Ok(SiteAuth::ApiKey {
+                api_key: if next.is_empty() { api_key } else { next },
+            })
+        }
+        _ => Err(ApiError::bad_request("切换认证类型时必须提交完整的新凭据")),
+    }
+}
+
+fn resolve_site_auth_update(
+    existing: &crate::site::SiteRecord,
+    site_type: &str,
+    incoming: Option<serde_json::Value>,
+    clear_auth_config: bool,
+) -> Result<SiteAuth, ApiError> {
+    let old_site_type = SiteType::from_str(existing.site_type.trim())
+        .ok_or_else(|| ApiError::internal("现有站点类型无效"))?;
+    let new_site_type = parse_site_type(site_type)?;
+    let existing_auth: SiteAuth = serde_json::from_str(&existing.auth_config)
+        .map_err(|_| ApiError::internal("现有认证配置无效"))?;
+    let incoming = incoming.map(parse_site_auth_input).transpose()?;
+
+    if let Some(auth) = incoming.as_ref() {
+        validate_site_auth_type(new_site_type, auth)?;
+    }
+
+    let site_type_changed = old_site_type != new_site_type;
+    let auth_type_changed = incoming
+        .as_ref()
+        .is_some_and(|auth| site_auth_type(auth) != site_auth_type(&existing_auth));
+
+    if site_type_changed || auth_type_changed {
+        if clear_auth_config {
+            return Err(ApiError::bad_request(
+                "切换站点或认证类型时不能同时清除凭据",
+            ));
+        }
+        let auth = incoming
+            .ok_or_else(|| ApiError::bad_request("切换站点或认证类型时必须提交完整的新凭据"))?;
+        require_configured_site_auth(&auth)?;
+        return Ok(auth);
+    }
+
+    validate_site_auth_type(new_site_type, &existing_auth)?;
+    if clear_auth_config {
+        if incoming.as_ref().is_some_and(site_auth_has_secret) {
+            return Err(ApiError::bad_request(
+                "认证凭据和 clear_auth_config 不能同时提交",
+            ));
+        }
+        return Ok(empty_site_auth(&existing_auth));
+    }
+
+    match incoming {
+        Some(auth) => merge_site_auth(existing_auth, auth),
+        None => Ok(existing_auth),
+    }
+}
+
+async fn list_sites(State(state): State<AppState>) -> Result<Json<Vec<SiteResponse>>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .list_sites_with_stats()
+            .await?
+            .into_iter()
+            .map(SiteResponse::from)
+            .collect(),
+    ))
 }
 
 async fn create_site(
@@ -847,11 +2186,21 @@ async fn create_site(
     if body.name.is_empty() || body.site_type.is_empty() || body.base_url.is_empty() {
         return Err(ApiError::bad_request("名称、站点类型和基础URL不能为空"));
     }
-    let auth_str = serde_json::to_string(&body.auth_config)
+    let site_type = parse_site_type(&body.site_type)?;
+    let auth = parse_site_auth_input(body.auth_config)?;
+    validate_site_auth_type(site_type, &auth)?;
+    require_configured_site_auth(&auth)?;
+    let auth_str = serde_json::to_string(&auth)
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
     let id = state
         .db
-        .create_site(&body.name, &body.site_type, &body.base_url, &auth_str, body.use_proxy)
+        .create_site(
+            &body.name,
+            &body.site_type,
+            &body.base_url,
+            &auth_str,
+            body.use_proxy,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "id": id })))
 }
@@ -859,13 +2208,34 @@ async fn create_site(
 async fn update_site(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<CreateSiteRequest>,
+    Json(body): Json<UpdateSiteRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_str = serde_json::to_string(&body.auth_config)
+    if body.name.is_empty() || body.site_type.is_empty() || body.base_url.is_empty() {
+        return Err(ApiError::bad_request("名称、站点类型和基础URL不能为空"));
+    }
+    let existing = state
+        .db
+        .get_site(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("站点不存在"))?;
+    let auth = resolve_site_auth_update(
+        &existing,
+        &body.site_type,
+        body.auth_config,
+        body.clear_auth_config,
+    )?;
+    let auth_str = serde_json::to_string(&auth)
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
     state
         .db
-        .update_site(id, &body.name, &body.site_type, &body.base_url, &auth_str, body.use_proxy)
+        .update_site(
+            id,
+            &body.name,
+            &body.site_type,
+            &body.base_url,
+            &auth_str,
+            body.use_proxy,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -920,8 +2290,16 @@ async fn get_site_stats(
 
 async fn get_sites_stats_overview(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::site::SiteWithStats>>, ApiError> {
-    Ok(Json(state.site_stats_refresher.refresh_all().await?))
+) -> Result<Json<Vec<SiteResponse>>, ApiError> {
+    Ok(Json(
+        state
+            .site_stats_refresher
+            .refresh_all()
+            .await?
+            .into_iter()
+            .map(SiteResponse::from)
+            .collect(),
+    ))
 }
 
 // ========== Proxy Test API ==========
@@ -1026,10 +2404,7 @@ async fn probe_sign_in_task_1_1_1_1(
         .await?
         .ok_or_else(|| ApiError::not_found("签到任务不存在"))?;
     let settings = state.db.get_settings().await?;
-    let result = crate::sign_in::probe_lightpanda_1_1_1_1(
-        task,
-        settings.use_proxy_for_lightpanda,
-    )
+    let result = crate::sign_in::probe_lightpanda_1_1_1_1(task, settings.use_proxy_for_lightpanda)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(result))
@@ -1050,12 +2425,10 @@ async fn probe_sign_in_form_1_1_1_1(
         return Err(ApiError::bad_request("Lightpanda endpoint 不能为空"));
     }
     let settings = state.db.get_settings().await?;
-    let result = crate::sign_in::probe_lightpanda_request_1_1_1_1(
-        body,
-        settings.use_proxy_for_lightpanda,
-    )
-        .await
-        .map_err(ApiError::internal)?;
+    let result =
+        crate::sign_in::probe_lightpanda_request_1_1_1_1(body, settings.use_proxy_for_lightpanda)
+            .await
+            .map_err(ApiError::internal)?;
     Ok(Json(result))
 }
 
@@ -1115,7 +2488,9 @@ async fn validate_sign_in_task(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     body.sign_in_method = Some(crate::sign_in::normalize_sign_in_method(
-        body.sign_in_method.as_deref().unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
+        body.sign_in_method
+            .as_deref()
+            .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
     ));
 
     if body.name.is_empty() {
@@ -1149,10 +2524,78 @@ struct CreateDownloaderRequest {
     password: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateDownloaderRequest {
+    name: String,
+    downloader_type: String,
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+    #[serde(default)]
+    clear_password: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DownloaderResponse {
+    id: i64,
+    name: String,
+    downloader_type: String,
+    url: String,
+    username: String,
+    password_configured: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<crate::downloader::DownloaderRecord> for DownloaderResponse {
+    fn from(downloader: crate::downloader::DownloaderRecord) -> Self {
+        Self {
+            id: downloader.id,
+            name: downloader.name,
+            downloader_type: downloader.downloader_type,
+            url: downloader.url,
+            username: downloader.username,
+            password_configured: !downloader.password.is_empty(),
+            created_at: downloader.created_at,
+            updated_at: downloader.updated_at,
+        }
+    }
+}
+
+fn resolve_downloader_password(
+    existing: &str,
+    incoming: Option<String>,
+    clear_password: bool,
+) -> Result<String, ApiError> {
+    if clear_password {
+        if incoming
+            .as_ref()
+            .is_some_and(|password| !password.is_empty())
+        {
+            return Err(ApiError::bad_request(
+                "password and clear_password cannot both be set",
+            ));
+        }
+        return Ok(String::new());
+    }
+
+    Ok(incoming
+        .filter(|password| !password.is_empty())
+        .unwrap_or_else(|| existing.to_string()))
+}
+
 async fn list_downloaders(
     State(state): State<AppState>,
-) -> Result<Json<Vec<crate::downloader::DownloaderRecord>>, ApiError> {
-    Ok(Json(state.db.list_downloaders().await?))
+) -> Result<Json<Vec<DownloaderResponse>>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .list_downloaders()
+            .await?
+            .into_iter()
+            .map(DownloaderResponse::from)
+            .collect(),
+    ))
 }
 
 async fn create_downloader(
@@ -1178,8 +2621,18 @@ async fn create_downloader(
 async fn update_downloader(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<CreateDownloaderRequest>,
+    Json(body): Json<UpdateDownloaderRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    if body.name.is_empty() || body.url.is_empty() {
+        return Err(ApiError::bad_request("名称和URL不能为空"));
+    }
+    let existing = state
+        .db
+        .get_downloader(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
+    let password =
+        resolve_downloader_password(&existing.password, body.password, body.clear_password)?;
     state
         .db
         .update_downloader(
@@ -1188,7 +2641,7 @@ async fn update_downloader(
             &body.downloader_type,
             &body.url,
             body.username.as_deref().unwrap_or(""),
-            body.password.as_deref().unwrap_or(""),
+            &password,
         )
         .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -1600,9 +3053,9 @@ async fn daily_transfer(
     Query(q): Query<StatsQuery>,
 ) -> Result<Json<Vec<DailyTransferItem>>, ApiError> {
     let until = q.until.unwrap_or_else(|| Utc::now().to_rfc3339());
-    let since = q.since.unwrap_or_else(|| {
-        (Utc::now() - chrono::Duration::days(30)).to_rfc3339()
-    });
+    let since = q
+        .since
+        .unwrap_or_else(|| (Utc::now() - chrono::Duration::days(30)).to_rfc3339());
     let data = state
         .db
         .get_daily_transfer_totals(q.task_id, &since, &until)
@@ -1821,7 +3274,8 @@ fn validate_tag_rule(req: &crate::tag_rule::TagRuleRequest) -> Result<(), ApiErr
             other => {
                 return Err(ApiError::bad_request(format!(
                     "第{}条规则的匹配类型无效: {}，支持: prefix, suffix, contains, exact, regex",
-                    i + 1, other
+                    i + 1,
+                    other
                 )));
             }
         }
@@ -1869,6 +3323,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn bad_gateway(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<AppError> for ApiError {
@@ -1886,6 +3347,89 @@ impl From<AppError> for ApiError {
     }
 }
 
+impl From<MediaServiceError> for ApiError {
+    fn from(value: MediaServiceError) -> Self {
+        match value {
+            MediaServiceError::App(error) => media_app_error(error),
+            MediaServiceError::Tmdb(error) => match error {
+                TmdbError::MissingToken => Self::bad_request("TMDB token is not configured"),
+                TmdbError::InvalidMediaType(_) => {
+                    Self::bad_request("media_type must be multi, tv, or movie")
+                }
+                TmdbError::Http { status, .. } if status.as_u16() == 404 => {
+                    Self::not_found("TMDB media not found")
+                }
+                TmdbError::Http { status, .. } if status.as_u16() == 400 => {
+                    Self::bad_request("TMDB rejected the request")
+                }
+                TmdbError::Http { status, .. } if matches!(status.as_u16(), 401 | 403) => {
+                    Self::bad_gateway("TMDB authentication failed")
+                }
+                TmdbError::Http { status, .. } => {
+                    Self::bad_gateway(format!("TMDB request failed with HTTP {}", status.as_u16()))
+                }
+                TmdbError::Transport(_) | TmdbError::Parse(_) => {
+                    Self::bad_gateway("TMDB request failed")
+                }
+            },
+            MediaServiceError::Progression(error) => Self::bad_request(error.to_string()),
+            MediaServiceError::Indexer(error) => match error {
+                IndexerError::Configuration(_) => {
+                    Self::bad_gateway("PT indexer configuration is invalid")
+                }
+                IndexerError::AuthenticationExpired(_) => {
+                    Self::bad_gateway("PT site authentication failed")
+                }
+                IndexerError::RateLimited(_) => Self::bad_gateway("PT site rate limit reached"),
+                IndexerError::Http(_)
+                | IndexerError::Api(_)
+                | IndexerError::Parse(_)
+                | IndexerError::UnsafeUrl(_)
+                | IndexerError::InvalidTorrent(_) => Self::bad_gateway("PT site request failed"),
+            },
+            MediaServiceError::Torrent(_) => {
+                Self::bad_gateway("PT site returned an invalid torrent")
+            }
+            MediaServiceError::NotFound(message) => Self::not_found(message),
+            MediaServiceError::Conflict(message) => Self::conflict(message),
+            MediaServiceError::Invalid(message) => {
+                if message.starts_with("failed to create HTTP client") {
+                    Self::bad_request("HTTP client configuration is invalid")
+                } else {
+                    Self::bad_request(message)
+                }
+            }
+            MediaServiceError::Serialization(_) => Self::internal("failed to serialize media data"),
+            MediaServiceError::Downloader(_) => Self::bad_gateway("downloader request failed"),
+        }
+    }
+}
+
+fn media_app_error(error: AppError) -> ApiError {
+    match error {
+        AppError::InvalidConfig { message } => ApiError::bad_request(message),
+        AppError::Database { message } if message.contains("UNIQUE constraint failed") => {
+            ApiError::conflict("resource already exists")
+        }
+        AppError::Database { message } if message.contains("FOREIGN KEY constraint failed") => {
+            ApiError::conflict("resource is still in use or references missing data")
+        }
+        AppError::Database { message }
+            if message.contains("CHECK constraint failed")
+                || message.contains("NOT NULL constraint failed") =>
+        {
+            ApiError::bad_request("request violates a data constraint")
+        }
+        AppError::Database { message }
+            if message.contains("database is locked") || message.contains("database is busy") =>
+        {
+            ApiError::conflict("database is busy; retry the request")
+        }
+        AppError::Database { .. } => ApiError::internal("media database operation failed"),
+        _ => ApiError::internal("media operation failed"),
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
@@ -1893,5 +3437,354 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({ "error": self.message })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod media_api_tests {
+    use super::*;
+
+    fn subscription_with_status(status: Option<&str>) -> SubscriptionRecord {
+        SubscriptionRecord {
+            id: 1,
+            tmdb_id: 42,
+            media_type: "tv".to_string(),
+            title: "Example Show".to_string(),
+            original_title: None,
+            aliases: Vec::new(),
+            year: Some(2026),
+            poster_path: None,
+            season: Some(1),
+            next_episode: Some(3),
+            start_episode: Some(3),
+            absolute_episode: None,
+            quality_profile_id: 1,
+            downloader_id: 1,
+            site_ids: vec![1],
+            save_path: None,
+            enabled: true,
+            next_run_at: String::new(),
+            lease_owner: None,
+            lease_until: None,
+            version: 0,
+            last_status: status.map(str::to_string),
+            last_error: None,
+            last_run_at: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    async fn test_media_state() -> (tempfile::TempDir, MediaApiState) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(temp.path()).await.unwrap();
+        let downloaders = DownloaderClientPool::new(db.clone());
+        let service = MediaService::new(db, downloaders);
+        let scheduler = MediaScheduler::new(service.clone());
+        (temp, MediaApiState { service, scheduler })
+    }
+
+    #[tokio::test]
+    async fn settings_handler_never_returns_or_accidentally_clears_token() {
+        let (_temp, state) = test_media_state().await;
+        let current = state.service.database().get_media_settings().await.unwrap();
+        state
+            .service
+            .database()
+            .update_media_settings(&MediaSettings {
+                tmdb_token: Some("super-secret-token".to_string()),
+                ..current
+            })
+            .await
+            .unwrap();
+
+        let Json(response) = get_media_settings(State(state.clone())).await.unwrap();
+        assert!(response.tmdb_token.is_none());
+        assert!(response.tmdb_token_configured);
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains("super-secret-token")
+        );
+
+        let Json(saved) = update_media_settings(
+            State(state.clone()),
+            Json(UpdateMediaSettingsRequest {
+                tmdb_token: None,
+                clear_tmdb_token: false,
+                tmdb_language: "zh-CN".to_string(),
+                scan_interval_mins: 45,
+                max_search_queries: 6,
+                search_concurrency: 3,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(saved.tmdb_token.is_none());
+        assert!(saved.tmdb_token_configured);
+        assert_eq!(
+            state
+                .service
+                .database()
+                .get_media_settings()
+                .await
+                .unwrap()
+                .tmdb_token
+                .as_deref(),
+            Some("super-secret-token")
+        );
+    }
+
+    #[test]
+    fn media_service_errors_map_to_stable_http_classes_without_secrets() {
+        let not_found = ApiError::from(MediaServiceError::NotFound("download 9".to_string()));
+        assert_eq!(not_found.status, StatusCode::NOT_FOUND);
+
+        let conflict = ApiError::from(MediaServiceError::Conflict("leased".to_string()));
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+
+        let upstream = ApiError::from(MediaServiceError::Indexer(
+            IndexerError::AuthenticationExpired("cookie=secret".to_string()),
+        ));
+        assert_eq!(upstream.status, StatusCode::BAD_GATEWAY);
+        assert!(!upstream.message.contains("secret"));
+
+        let client = ApiError::from(MediaServiceError::Invalid(
+            "failed to create HTTP client: proxy http://user:secret@example.test".to_string(),
+        ));
+        assert_eq!(client.status, StatusCode::BAD_REQUEST);
+        assert!(!client.message.contains("secret"));
+
+        let database = media_app_error(AppError::Database {
+            message: "unexpected database detail at /private/path".to_string(),
+        });
+        assert_eq!(database.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!database.message.contains("private"));
+    }
+
+    #[test]
+    fn download_filters_validate_status_and_pagination_bounds() {
+        assert_eq!(
+            validate_download_query(Some(" CANCELLED "), Some(2), Some(50)).unwrap(),
+            (Some("cancelled".to_string()), 50, 50)
+        );
+        assert!(validate_download_query(Some("unknown"), None, None).is_err());
+        assert!(validate_download_query(None, Some(0), Some(10)).is_err());
+        assert!(validate_download_query(None, Some(1), Some(201)).is_err());
+        assert!(validate_download_query(None, Some(usize::MAX), Some(200)).is_err());
+    }
+
+    #[test]
+    fn completed_subscriptions_reject_run_and_resume() {
+        let completed = subscription_with_status(Some("completed"));
+        let run = reject_completed_subscription(&completed, "run").unwrap_err();
+        let resume = reject_completed_subscription(&completed, "resume").unwrap_err();
+        assert_eq!(run.status, StatusCode::CONFLICT);
+        assert_eq!(resume.status, StatusCode::CONFLICT);
+        assert!(run.message.contains("new cursor"));
+
+        assert!(
+            reject_completed_subscription(&subscription_with_status(Some("waiting")), "run")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn download_queue_accepts_only_well_formed_candidate_ids() {
+        let (_temp, state) = test_media_state().await;
+        let mut valid = QueueDownloadRequest {
+            candidate_id: format!("cand_{}", "a".repeat(48)),
+            quality_profile_id: 1,
+            downloader_id: 1,
+            subscription_id: None,
+            override_reason: Some(" operator checked ".to_string()),
+        };
+        normalize_and_validate_download(&state, &mut valid)
+            .await
+            .unwrap();
+        assert_eq!(valid.override_reason.as_deref(), Some("operator checked"));
+
+        valid.candidate_id = "cand_predictable".to_string();
+        assert!(
+            normalize_and_validate_download(&state, &mut valid)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn media_router_builds_with_all_route_groups() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_temp, state) = runtime.block_on(test_media_state());
+        let _router = media_router(state.service, state.scheduler);
+    }
+}
+
+#[cfg(test)]
+mod security_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn site_and_downloader_responses_never_serialize_credentials() {
+        let site = SiteResponse::from(SiteWithStats {
+            id: 1,
+            name: "example".to_string(),
+            site_type: "nexusphp".to_string(),
+            base_url: "https://tracker.example".to_string(),
+            auth_config: r#"{"auth_type":"cookie","cookie":"dummy-site-secret"}"#.to_string(),
+            use_proxy: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            stats: None,
+        });
+        let site_json = serde_json::to_value(site).unwrap();
+        assert_eq!(site_json["auth_type"], "cookie");
+        assert_eq!(site_json["auth_configured"], true);
+        assert!(site_json.get("auth_config").is_none());
+        assert!(!site_json.to_string().contains("dummy-site-secret"));
+
+        let downloader = DownloaderResponse::from(crate::downloader::DownloaderRecord {
+            id: 2,
+            name: "qBittorrent".to_string(),
+            downloader_type: "qbittorrent".to_string(),
+            url: "http://127.0.0.1:8080".to_string(),
+            username: "operator".to_string(),
+            password: "dummy-downloader-secret".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        let downloader_json = serde_json::to_value(downloader).unwrap();
+        assert_eq!(downloader_json["password_configured"], true);
+        assert!(downloader_json.get("password").is_none());
+        assert!(
+            !downloader_json
+                .to_string()
+                .contains("dummy-downloader-secret")
+        );
+    }
+
+    #[test]
+    fn site_update_preserves_blank_credentials_and_requires_explicit_clear() {
+        let existing = crate::site::SiteRecord {
+            id: 1,
+            name: "example".to_string(),
+            site_type: "nexusphp".to_string(),
+            base_url: "https://tracker.example".to_string(),
+            auth_config: r#"{"auth_type":"cookie","cookie":"dummy-site-secret"}"#.to_string(),
+            use_proxy: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let preserved = resolve_site_auth_update(
+            &existing,
+            "nexusphp",
+            Some(serde_json::json!({ "auth_type": "cookie", "cookie": "" })),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            preserved,
+            SiteAuth::Cookie { ref cookie } if cookie == "dummy-site-secret"
+        ));
+
+        let cleared = resolve_site_auth_update(
+            &existing,
+            "nexusphp",
+            Some(serde_json::json!({ "auth_type": "cookie", "cookie": "" })),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(cleared, SiteAuth::Cookie { ref cookie } if cookie.is_empty()));
+
+        assert!(
+            resolve_site_auth_update(
+                &existing,
+                "nexusphp",
+                Some(serde_json::json!({ "auth_type": "api_key", "api_key": "" })),
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_site_auth_update(
+                &existing,
+                "mteam",
+                Some(serde_json::json!({
+                    "auth_type": "api_key",
+                    "api_key": "dummy-new-secret"
+                })),
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn downloader_update_keeps_password_until_clear_is_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(temp.path()).await.unwrap();
+        let id = db
+            .create_downloader(
+                "qBittorrent",
+                "qbittorrent",
+                "http://127.0.0.1:8080",
+                "operator",
+                "dummy-downloader-secret",
+            )
+            .await
+            .unwrap();
+        let existing = db.get_downloader(id).await.unwrap().unwrap();
+
+        let preserved =
+            resolve_downloader_password(&existing.password, Some(String::new()), false).unwrap();
+        db.update_downloader(
+            id,
+            &existing.name,
+            &existing.downloader_type,
+            &existing.url,
+            &existing.username,
+            &preserved,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_downloader(id).await.unwrap().unwrap().password,
+            "dummy-downloader-secret"
+        );
+
+        let cleared = resolve_downloader_password(&preserved, None, true).unwrap();
+        db.update_downloader(
+            id,
+            &existing.name,
+            &existing.downloader_type,
+            &existing.url,
+            &existing.username,
+            &cleared,
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.get_downloader(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .password
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cors_is_limited_to_local_vite_origins() {
+        assert_eq!(
+            VITE_DEV_ORIGINS,
+            [
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+                "http://[::1]:5173",
+            ]
+        );
+        assert!(!VITE_DEV_ORIGINS.contains(&"https://third-party.example"));
+        let _layer = cors_layer();
     }
 }

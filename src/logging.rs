@@ -14,8 +14,10 @@ const DEPENDENCY_LOG_DIRECTIVES: &[&str] = &[
     "hyper=info",
     "hyper_util=info",
     "h2=info",
+    "html5ever=info",
     "reqwest=info",
     "rustls=info",
+    "selectors=info",
     "tungstenite=info",
 ];
 const LOG_CHANNEL_CAPACITY: usize = 1024;
@@ -48,23 +50,33 @@ pub fn build_log_filter(log_level: Option<&str>) -> Result<EnvFilter, AppError> 
                 message: format!("global.log_level is invalid: {}", error),
             })
         }
-        None => Ok(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))),
+        None => {
+            let level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+            Ok(EnvFilter::try_new(normalize_log_filter(&level))
+                .unwrap_or_else(|_| EnvFilter::new(normalize_log_filter("info"))))
+        }
     }
 }
 
 fn normalize_log_filter(level: &str) -> String {
-    if level.contains('=') || level.contains(',') {
-        level.to_string()
-    } else {
-        let mut directives = Vec::with_capacity(1 + DEPENDENCY_LOG_DIRECTIVES.len());
-        directives.push(level.to_string());
-        directives.extend(
-            DEPENDENCY_LOG_DIRECTIVES
-                .iter()
-                .map(|directive| directive.to_string()),
-        );
-        directives.join(",")
+    let mut directives = Vec::with_capacity(1 + DEPENDENCY_LOG_DIRECTIVES.len());
+    directives.push(level.to_string());
+    for directive in DEPENDENCY_LOG_DIRECTIVES {
+        let target = directive
+            .split_once('=')
+            .map(|(target, _)| target)
+            .unwrap_or(directive);
+        let explicitly_configured = level.split(',').any(|configured| {
+            configured
+                .trim()
+                .split_once('=')
+                .is_some_and(|(configured_target, _)| configured_target.trim() == target)
+        });
+        if !explicitly_configured {
+            directives.push((*directive).to_string());
+        }
     }
+    directives.join(",")
 }
 
 pub fn init_logging(filter: EnvFilter) {
@@ -222,4 +234,29 @@ fn redact_query_value(input: &str, key: &str) -> String {
 
     output.push_str(rest);
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dependency_debug_noise_is_capped_for_simple_and_custom_filters() {
+        let simple = normalize_log_filter("debug");
+        assert!(simple.contains("selectors=info"));
+        assert!(simple.contains("html5ever=info"));
+
+        let custom = normalize_log_filter("debug,rflush=trace");
+        assert!(custom.contains("rflush=trace"));
+        assert!(custom.contains("selectors=info"));
+        assert!(custom.contains("html5ever=info"));
+    }
+
+    #[test]
+    fn explicit_dependency_filter_is_preserved() {
+        let filter = normalize_log_filter("debug,html5ever=trace");
+        assert!(filter.contains("html5ever=trace"));
+        assert!(!filter.contains("html5ever=info"));
+        assert!(filter.contains("selectors=info"));
+    }
 }

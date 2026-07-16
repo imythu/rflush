@@ -6,7 +6,7 @@ use chrono::Utc;
 use cron::Schedule;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::brush::{
     BrushTaskLastRunInfo, BrushTaskRecord, BrushTorrentRecord, LastRunAddedTorrent,
@@ -136,7 +136,7 @@ impl BrushScheduler {
         };
 
         if all_records.is_empty() {
-            info!("[cleaner] 无活跃种子记录，跳过本轮");
+            trace!("[cleaner] 无活跃种子记录，跳过本轮");
             return;
         }
 

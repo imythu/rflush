@@ -12,6 +12,7 @@ import {
   CalendarCheck,
   Settings,
   Tag,
+  Tv,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -37,6 +38,7 @@ const LOG_LEVELS: LogLevel[] = ["trace", "debug", "info", "warn", "error"];
 
 type AppPage =
   | "system-overview"
+  | "media"
   | "dashboard"
   | "tasks"
   | "settings"
@@ -67,6 +69,7 @@ const SystemSettingsPage = lazy(() =>
 const SystemOverviewPage = lazy(() =>
   import("@/pages/system-overview-page").then((module) => ({ default: module.SystemOverviewPage })),
 );
+const MediaPage = lazy(() => import("@/pages/media-page").then((module) => ({ default: module.MediaPage })));
 
 const navItems: Array<{
   key: AppPage;
@@ -75,6 +78,13 @@ const navItems: Array<{
   icon: typeof LayoutDashboard;
   group: NavGroup;
 }> = [
+  {
+    key: "media",
+    label: "自动追剧",
+    description: "TMDB 订阅、PT 聚合搜索与自动下载",
+    icon: Tv,
+    group: "brush",
+  },
   {
     key: "sites",
     label: "站点管理",
@@ -158,6 +168,7 @@ function readPageFromHash(): AppPage {
   const raw = window.location.hash.replace(/^#\/?/, "");
   const valid: AppPage[] = [
     "system-overview",
+    "media",
     "dashboard",
     "tasks",
     "settings",
@@ -545,7 +556,7 @@ export default function App() {
 
       <NavSection
         index="01."
-        title="PT 刷流"
+        title="PT 自动化"
         open={groupOpen.brush}
         onToggle={() => toggleGroup("brush")}
         items={navItems.filter((item) => item.group === "brush")}
@@ -606,6 +617,7 @@ export default function App() {
       {/* Mobile Floating Dock */}
       <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 w-[92%] max-w-[440px] lg:hidden">
         <div className="rounded-[26px] border border-white/20 bg-card/80 p-2 shadow-2xl backdrop-blur-2xl flex items-center justify-between">
+          <DockItem icon={Tv} active={page === "media"} onClick={() => navigate("media")} label="追剧" />
           <DockItem icon={BarChart3} active={page === "stats"} onClick={() => navigate("stats")} label="统计" />
           <DockItem icon={Download} active={page === "brush-tasks"} onClick={() => navigate("brush-tasks")} label="刷流" />
           <DockItem icon={Database} active={page === "sites"} onClick={() => navigate("sites")} label="站点" />
@@ -683,6 +695,7 @@ export default function App() {
           <Suspense fallback={<div className="mt-4 rounded-2xl border border-border bg-card px-4 py-6 text-sm text-muted shadow-card">页面加载中...</div>}>
             <div className="mt-4">
               {page === "system-overview" ? <SystemOverviewPage /> : null}
+              {page === "media" ? <MediaPage /> : null}
 
               {page === "dashboard" ? (
                 <DashboardPage

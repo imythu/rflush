@@ -51,6 +51,8 @@ export function DownloadersPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<FormData>(emptyForm);
+  const [existingPasswordConfigured, setExistingPasswordConfigured] = useState(false);
+  const [clearPassword, setClearPassword] = useState(false);
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState("");
 
@@ -99,6 +101,8 @@ export function DownloadersPage() {
   function openAdd() {
     setEditingId(null);
     setForm(emptyForm);
+    setExistingPasswordConfigured(false);
+    setClearPassword(false);
     setSubmitError("");
     setDialogOpen(true);
   }
@@ -110,8 +114,10 @@ export function DownloadersPage() {
       downloader_type: d.downloader_type,
       url: d.url,
       username: d.username,
-      password: d.password,
+      password: "",
     });
+    setExistingPasswordConfigured(d.password_configured);
+    setClearPassword(false);
     setSubmitError("");
     setDialogOpen(true);
   }
@@ -120,6 +126,8 @@ export function DownloadersPage() {
     setDialogOpen(false);
     setEditingId(null);
     setForm(emptyForm);
+    setExistingPasswordConfigured(false);
+    setClearPassword(false);
     setSubmitError("");
   }
 
@@ -127,7 +135,9 @@ export function DownloadersPage() {
     setSaving(true);
     setSubmitError("");
     try {
-      const body = JSON.stringify(form);
+      const body = JSON.stringify(
+        editingId !== null ? { ...form, clear_password: clearPassword } : form,
+      );
       if (editingId !== null) {
         await api(`/api/downloaders/${editingId}`, { method: "PUT", body });
       } else {
@@ -418,11 +428,37 @@ export function DownloadersPage() {
                 id="dl-pass"
                 type="password"
                 value={form.password}
-                onChange={(e) => setForm((prev) => ({ ...prev, password: e.target.value }))}
-                placeholder="可选"
+                onChange={(e) => {
+                  setForm((prev) => ({ ...prev, password: e.target.value }));
+                  if (e.target.value) setClearPassword(false);
+                }}
+                placeholder={
+                  editingId !== null && existingPasswordConfigured
+                    ? "留空以保留已保存密码"
+                    : "可选"
+                }
+                disabled={clearPassword}
               />
             </div>
           </div>
+
+          {editingId !== null && existingPasswordConfigured ? (
+            <Label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="size-4 accent-primary"
+                checked={clearPassword}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setClearPassword(checked);
+                  if (checked) {
+                    setForm((prev) => ({ ...prev, password: "" }));
+                  }
+                }}
+              />
+              清除已保存密码
+            </Label>
+          ) : null}
 
           <div className="flex justify-end gap-2 border-t border-border pt-4">
             <Button variant="outline" onClick={closeDialog}>

@@ -1,3 +1,4 @@
+use std::sync::Once;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
@@ -6,6 +7,7 @@ use serde::Serialize;
 use tracing::warn;
 
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+static MISSING_PROXY_WARNING: Once = Once::new();
 
 /// 代理测试结果
 #[derive(Debug, Clone, Serialize)]
@@ -29,10 +31,7 @@ fn base_builder() -> reqwest::ClientBuilder {
 /// 构建一个 reqwest::Client，可选带代理。
 pub fn build_client(proxy: Option<&str>) -> Result<Client, reqwest::Error> {
     let mut builder = base_builder();
-    if let Some(proxy_url) = proxy
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(proxy_url) = proxy.map(str::trim).filter(|v| !v.is_empty()) {
         builder = builder.proxy(Proxy::all(proxy_url)?);
     }
     builder.build()
@@ -41,7 +40,7 @@ pub fn build_client(proxy: Option<&str>) -> Result<Client, reqwest::Error> {
 /// 根据 (全局代理地址, use_proxy 开关) 决定返回带代理还是直连的 Client。
 ///
 /// - `use_proxy=true` 且 `proxy` 有值 → 返回带代理 Client
-/// - `use_proxy=true` 且 `proxy` 为空 → warn 日志 + 返回直连 Client（静默降级）
+/// - `use_proxy=true` 且 `proxy` 为空 → 每个进程 warn 一次 + 返回直连 Client（静默降级）
 /// - `use_proxy=false` → 返回直连 Client
 pub fn resolve_client(proxy: Option<&str>, use_proxy: bool) -> Result<Client, reqwest::Error> {
     let effective_proxy = proxy.map(str::trim).filter(|v| !v.is_empty());
@@ -49,7 +48,9 @@ pub fn resolve_client(proxy: Option<&str>, use_proxy: bool) -> Result<Client, re
         if let Some(url) = effective_proxy {
             return build_client(Some(url));
         }
-        warn!("站点标记了使用代理，但全局代理地址未配置，将直连访问");
+        MISSING_PROXY_WARNING.call_once(|| {
+            warn!("站点标记了使用代理，但全局代理地址未配置，将直连访问");
+        });
     }
     build_client(None)
 }

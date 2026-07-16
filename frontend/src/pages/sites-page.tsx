@@ -57,6 +57,7 @@ interface SiteForm {
   name: string;
   site_type: "nexusphp" | "mteam";
   base_url: string;
+  use_proxy: boolean;
   auth_type: AuthType;
   cookie: string;
   passkey: string;
@@ -303,6 +304,7 @@ const emptySiteForm: SiteForm = {
   name: "",
   site_type: "nexusphp",
   base_url: "",
+  use_proxy: true,
   auth_type: "cookie",
   cookie: "",
   passkey: "",
@@ -324,27 +326,10 @@ function buildAuthConfig(form: SiteForm): object {
         cookie: form.cookie,
         passkey: form.passkey,
       };
+    case "api_key":
+      return { auth_type: "api_key", api_key: form.api_key };
     default:
       return { auth_type: form.auth_type };
-  }
-}
-
-function parseAuthConfig(
-  siteType: string,
-  raw: string,
-): Partial<SiteForm> {
-  try {
-    const obj = JSON.parse(raw);
-    const authType: AuthType = obj.auth_type ?? "cookie";
-    return {
-      auth_type: authType,
-      cookie: obj.cookie ?? "",
-      passkey: obj.passkey ?? "",
-      api_key: obj.api_key ?? "",
-      site_type: siteType as SiteForm["site_type"],
-    };
-  } catch {
-    return {};
   }
 }
 
@@ -361,6 +346,12 @@ export function SitesPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<SiteForm>(emptySiteForm);
+  const [existingAuth, setExistingAuth] = useState<{
+    siteType: SiteForm["site_type"];
+    authType: AuthType;
+    configured: boolean;
+  } | null>(null);
+  const [clearAuthConfig, setClearAuthConfig] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   // delete confirmation
@@ -418,19 +409,25 @@ export function SitesPage() {
   function openAdd() {
     setEditingId(null);
     setForm(emptySiteForm);
+    setExistingAuth(null);
+    setClearAuthConfig(false);
     setFormOpen(true);
   }
 
   function openEdit(site: SiteRecord) {
     setEditingId(site.id);
-    const parsed = parseAuthConfig(site.site_type, site.auth_config);
+    const siteType = (site.site_type as SiteForm["site_type"]) || "nexusphp";
+    const authType = site.auth_type ?? (siteType === "mteam" ? "api_key" : "cookie");
     setForm({
       ...emptySiteForm,
       name: site.name,
-      site_type: (site.site_type as SiteForm["site_type"]) || "nexusphp",
+      site_type: siteType,
       base_url: site.base_url,
-      ...parsed,
+      use_proxy: site.use_proxy,
+      auth_type: authType,
     });
+    setExistingAuth({ siteType, authType, configured: site.auth_configured });
+    setClearAuthConfig(false);
     setFormOpen(true);
   }
 
@@ -440,7 +437,9 @@ export function SitesPage() {
       name: form.name,
       site_type: form.site_type,
       base_url: form.base_url,
+      use_proxy: form.use_proxy,
       auth_config: buildAuthConfig(form),
+      clear_auth_config: editingId != null && clearAuthConfig,
     };
     const req =
       editingId != null
@@ -570,6 +569,15 @@ export function SitesPage() {
 
   /* ---- auth fields ---- */
 
+  const canPreserveAuth = Boolean(
+    existingAuth?.configured &&
+      existingAuth.siteType === form.site_type &&
+      existingAuth.authType === form.auth_type,
+  );
+  const credentialPlaceholder = canPreserveAuth
+    ? "留空以保留已保存的凭据"
+    : "输入新的认证凭据";
+
   function renderAuthFields() {
     if (form.site_type === "mteam") {
       return (
@@ -577,8 +585,12 @@ export function SitesPage() {
           <Label>API Key</Label>
           <Input
             value={form.api_key}
-            onChange={(e) => patch({ api_key: e.target.value })}
-            placeholder="输入 API Key"
+            onChange={(e) => {
+              patch({ api_key: e.target.value });
+              if (e.target.value) setClearAuthConfig(false);
+            }}
+            placeholder={credentialPlaceholder}
+            disabled={clearAuthConfig}
           />
         </div>
       );
@@ -591,13 +603,32 @@ export function SitesPage() {
           <select
             className="h-10 w-full rounded-full border border-border bg-card px-4 text-sm"
             value={form.auth_type}
-            onChange={(e) => patch({ auth_type: e.target.value as AuthType })}
+            onChange={(e) => {
+              patch({ auth_type: e.target.value as AuthType });
+              setClearAuthConfig(false);
+            }}
           >
             <option value="cookie">Cookie</option>
             <option value="passkey">Passkey</option>
             <option value="cookie_passkey">Cookie + Passkey</option>
+            <option value="api_key">API Key</option>
           </select>
         </div>
+
+        {form.auth_type === "api_key" && (
+          <div className="space-y-2">
+            <Label>API Key</Label>
+            <Input
+              value={form.api_key}
+              onChange={(e) => {
+                patch({ api_key: e.target.value });
+                if (e.target.value) setClearAuthConfig(false);
+              }}
+              placeholder={credentialPlaceholder}
+              disabled={clearAuthConfig}
+            />
+          </div>
+        )}
 
         {(form.auth_type === "cookie" ||
           form.auth_type === "cookie_passkey") && (
@@ -605,8 +636,12 @@ export function SitesPage() {
             <Label>Cookie</Label>
             <Input
               value={form.cookie}
-              onChange={(e) => patch({ cookie: e.target.value })}
-              placeholder="输入 Cookie"
+              onChange={(e) => {
+                patch({ cookie: e.target.value });
+                if (e.target.value) setClearAuthConfig(false);
+              }}
+              placeholder={credentialPlaceholder}
+              disabled={clearAuthConfig}
             />
           </div>
         )}
@@ -617,8 +652,12 @@ export function SitesPage() {
             <Label>Passkey</Label>
             <Input
               value={form.passkey}
-              onChange={(e) => patch({ passkey: e.target.value })}
-              placeholder="输入 Passkey"
+              onChange={(e) => {
+                patch({ passkey: e.target.value });
+                if (e.target.value) setClearAuthConfig(false);
+              }}
+              placeholder={credentialPlaceholder}
+              disabled={clearAuthConfig}
             />
           </div>
         )}
@@ -832,6 +871,7 @@ export function SitesPage() {
               value={form.site_type}
               onChange={(val) => {
                 const v = val as SiteForm["site_type"];
+                setClearAuthConfig(false);
                 patch({
                   site_type: v,
                   auth_type: v === "mteam" ? "api_key" : "cookie",
@@ -854,6 +894,24 @@ export function SitesPage() {
           </div>
 
           {renderAuthFields()}
+
+          {canPreserveAuth ? (
+            <Label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="size-4 accent-primary"
+                checked={clearAuthConfig}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setClearAuthConfig(checked);
+                  if (checked) {
+                    patch({ cookie: "", passkey: "", api_key: "" });
+                  }
+                }}
+              />
+              清除已保存的认证凭据
+            </Label>
+          ) : null}
 
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="secondary" onClick={() => setFormOpen(false)}>

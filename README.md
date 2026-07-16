@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square)](https://github.com/imythu/rflush/releases/latest)
 [![Docker Image](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square&label=ghcr.io)](https://github.com/imythu/rflush/pkgs/container/rflush)
 
-云母是一套面向 PT 使用场景的 Web 管理工具，包含 RSS 种子下载、PT 刷流任务管理、站点账号数据缓存与账号数据总览导出。
+云母是一套面向 PT 使用场景的 Web 管理工具，包含自动追剧与电影订阅、PT 聚合资源搜索、RSS 种子下载、PT 刷流任务管理、站点账号数据缓存与账号数据总览导出。
 
 当前仓库、二进制、Docker 镜像与数据库文件名仍沿用 `rflush`，对外展示的产品名为“云母”。
 
@@ -18,6 +18,9 @@
 - PT 站点上传 / 下载量缓存与账号数据总览
 - 站点账号数据支持导出 PNG、复制到剪贴板，便于求邀或资历展示
 - 下载器配置与连接测试
+- TMDB 影视搜索、电影 / 剧集订阅与自动扫描
+- 多 PT 站点聚合搜索、发布名解析、匹配评分与手动下载
+- 质量配置、候选拒绝原因与媒体下载队列查看
 - 刷流任务的新增 / 编辑 / 删除 / 启动 / 停止 / 立即执行一次
 - 刷流种子列表、删种状态、缓存状态查看
 
@@ -37,6 +40,10 @@
 - 免费种 / H&R 判定支持 RSS 扩展属性和站点详情增强两层来源
 - PT 站点账号数据会写入 SQLite，程序启动后异步刷新一次，之后每小时自动刷新
 - 站点总览按站点并发拉取数据，单个站点失败不会影响其它站点，失败项会保留错误状态
+- 自动追剧支持电影、标准季集和动画绝对集目标，自动生成分层搜索词
+- 资源决策按“解析 -> 身份硬门槛 -> 质量规则 -> 评分 -> 稳定排序”执行，错剧、错季、错集不能靠高分抵消
+- PT 聚合搜索支持 NexusPHP API / Cookie HTML 与 M-Team，单站失败不会丢弃其它站点的结果
+- 自动与手动下载共用持久化 outbox，使用 infohash 幂等和状态对账处理重试
 
 ## Get Started
 
@@ -58,7 +65,7 @@
 
 支持的启动参数：
 
-- `-H, --host`：监听地址，默认 `0.0.0.0`（支持环境变量 `RFLUSH_HOST`）
+- `-H, --host`：监听地址，默认 `127.0.0.1`（支持环境变量 `RFLUSH_HOST`）
 - `-p, --port`：监听端口，默认 `3000`（支持环境变量 `RFLUSH_PORT`）
 - `-d, --data-dir <DIR>`：数据目录（数据库和下载输出都写入该目录，支持环境变量 `RFLUSH_DATA_DIR`）
 
@@ -74,7 +81,7 @@
 
 默认行为（不传 `--data-dir`）：
 
-- 监听 `http://0.0.0.0:3000`
+- 监听 `http://127.0.0.1:3000`
 - 数据库 `./data/rflush.db`
 - RSS 下载输出目录仍在当前工作目录
 
@@ -84,8 +91,9 @@
 2. RSS 任务
 3. PT 站点
 4. 下载器
-5. 刷流任务
-6. 站点账号数据总览与导出
+5. 自动追剧的 TMDB、质量配置与订阅
+6. 刷流任务
+7. 站点账号数据总览与导出
 
 ### 方式二：使用 Docker
 
@@ -104,7 +112,7 @@ ghcr.io/imythu/rflush
 
 ```bash
 docker run --name rflush \
-  -p 3000:3000 \
+  -p 127.0.0.1:3000:3000 \
   -v $(pwd)/data:/data \
   ghcr.io/imythu/rflush:latest
 ```
@@ -122,7 +130,7 @@ docker run --name rflush \
 ```bash
 docker run --name rflush \
   -e RFLUSH_PORT=8080 \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -v $(pwd)/data:/data \
   ghcr.io/imythu/rflush:latest
 ```
@@ -131,10 +139,12 @@ docker run --name rflush \
 
 ```bash
 docker run --name rflush \
-  -p 3000:3000 \
+  -p 127.0.0.1:3000:3000 \
   -v $(pwd)/data:/data \
   ghcr.io/imythu/rflush:<version>
 ```
+
+上述示例只把端口发布到宿主机回环地址。rflush 当前不内置用户认证；如果使用 `-H 0.0.0.0`、其它非回环监听地址，或把容器端口暴露给局域网 / 公网，必须限制网络访问并置于带身份认证的反向代理后。程序检测到非回环监听时会输出安全警告。CORS 限制不能替代身份认证。
 
 ### 开发模式
 
@@ -147,6 +157,39 @@ cd frontend
 npm install
 npm run dev
 ```
+
+## 自动追剧与资源搜索
+
+### 前置配置
+
+自动追剧复用现有的 PT 站点和下载器配置，不需要维护第二套账号：
+
+1. 在“站点管理”添加至少一个可搜索的 `NexusPHP` 或 `M-Team` 站点，并完成连接测试。
+2. 在“下载器”添加并测试 qBittorrent。
+3. 打开“自动追剧 -> 质量与设置”，填写 TMDB v3 API Key 或 v4 Read Access Token。默认语言为 `zh-CN`。
+4. 使用内置“高清优先”质量配置，或按分辨率、来源、编码、最低匹配分和最低做种数新建配置。
+5. 从 TMDB 搜索结果创建电影或剧集订阅，选择 PT 站点、质量配置、下载器和保存路径。
+
+`扫描间隔` 决定每轮订阅扫描后的下次运行时间；`单次查询上限` 限制标题、别名和季集组合产生的搜索词数量；`搜索并发` 限制站点请求并发数。程序启动后会自动恢复过期的订阅和下载 lease，并启动订阅扫描及下载 worker。
+
+TMDB token 与站点、下载器凭据保存在本地 SQLite 中，请保护数据目录和数据库备份。`GET /api/media/settings` 不会回传 token，只返回 `tmdb_token_configured`；站点和下载器列表同样只返回认证类型 / `configured` 标记，不返回 Cookie、Passkey、API Key 或密码。更新配置时省略密钥或传空字符串会保留原值，只有显式提交 `clear_tmdb_token=true`、`clear_auth_config=true` 或 `clear_password=true` 才会清除对应凭据。聚合搜索响应会清洗站点结果，不返回 Cookie、API Key、密码、授权头或长期签名下载 URL。
+
+### 搜索、匹配与下载
+
+“资源搜索”既可以直接输入关键词，也可以选择订阅的当前目标。选择目标时，后端复用自动扫描的完整流程：生成查询、并发搜索、解析发布名、检查媒体身份和季集、应用质量规则、评分并稳定排序。去重、评分和排序完成后，单次聚合搜索全局最多返回前 512 个候选。响应中的 `errors` 会逐站记录认证过期、限流、解析等错误；部分站点失败时，其它站点的候选仍会正常返回。
+
+每个搜索候选会获得一个短期有效的 opaque `candidate_id`。手动入队只提交该 ID，后端从有界缓存恢复权威站点结果并重新检查标题、站点、质量配置和订阅当前目标，不接受客户端拼装的种子 ID、下载地址或匹配结论。关联订阅时，目标必须已经由 TMDB 物化为 `pending` 且已到播出时间；校验、outbox 入队和 `pending -> queued` 在同一 SQLite 事务完成。
+
+候选的 `accepted` 只会在所有硬门槛和最低分都通过时为 `true`。手动下载被拒绝的候选必须填写覆盖原因，覆盖原因会随下载决策快照进入审计记录。
+
+自动与手动下载都先写入 `media_downloads` outbox，再由后台 worker 取种、校验 torrent、计算 infohash 并提交 qBittorrent。自动扫描同样以 subscription owner/version/lease 做 CAS，并在同一事务写入 outbox 与 `pending -> queued`，过期扫描不能为已修改的游标创建旧任务。该链路是 **at-least-once（至少一次）投递 + infohash 幂等 + 状态对账**，不是 SQLite 与 qBittorrent 之间的 exactly-once 事务。进程在外部提交窗口中断时，记录可能进入 `reconciling` 或重试状态；worker 会按 infohash 查询下载器后再确认成功或重试。确认最终失败时，关联的 `queued` 目标会恢复为 `pending` 并重新进入选种周期；外部提交结果未知时则保守停留在对账流程。
+
+### 当前限制
+
+- 媒体类型限 TMDB `tv` 和 `movie`；不订阅人物搜索结果。
+- PT 搜索适配器当前限 NexusPHP API / Cookie HTML 与 M-Team；下载器当前限 qBittorrent。
+- scene/XEM 编号映射、每日剧日期模式、整季升级、更多下载器和通知渠道尚未实现。
+- 搜索质量依赖站点返回字段和发布名；无法可靠解析的候选会展示解析错误，不会被自动下载。
 
 ## PT 刷流说明
 
@@ -183,7 +226,7 @@ npm run dev
 
 默认监听：
 
-- 后端 / 页面：`http://0.0.0.0:3000`
+- 后端 / 页面：`http://127.0.0.1:3000`
 
 首次启动会自动创建：
 
@@ -198,8 +241,9 @@ npm run dev
 4. 在任务页执行单个或批量启动 / 暂停 / 删除
 5. 在“下载历史”或任务弹窗中查看结果
 6. 在“站点管理”和“下载器”中完成 PT 配置
-7. 在“刷流任务”中创建任务，可按计划执行或点击“立即执行一次”
-8. 在“站点管理”的“总览”中查看账号数据，并按需复制或下载图片
+7. 在“自动追剧”中配置 TMDB 与质量规则，再创建订阅或手动搜索资源
+8. 在“刷流任务”中创建任务，可按计划执行或点击“立即执行一次”
+9. 在“站点管理”的“总览”中查看账号数据，并按需复制或下载图片
 
 ## 前后端开发模式
 
@@ -294,6 +338,11 @@ SQLite 数据库位于：
 - `brush_task_torrents`：刷流任务下的种子记录
 - `task_stats_snapshots`：刷流任务统计快照
 - `torrent_traffic`：种子级流量快照
+- `media_settings`：TMDB、自动扫描间隔和搜索并发设置
+- `quality_profiles`：分辨率、来源、编码、最低分和做种数规则
+- `subscriptions` / `subscription_sites`：影视订阅及其搜索站点
+- `subscription_targets`：TMDB 已确认集、播出日期、元数据前沿及季终状态；未来集不会提前搜索
+- `media_downloads`：自动与手动下载共用的持久化 outbox、lease、重试和对账状态
 
 ## 后端接口
 
@@ -338,5 +387,28 @@ SQLite 数据库位于：
 - `POST /api/brush-tasks/:id/stop`
 - `POST /api/brush-tasks/:id/run`
 - `GET /api/brush-tasks/:id/torrents`
+- `GET /api/media/settings`
+- `PUT /api/media/settings`
+- `GET /api/media/tmdb/search?query=...&media_type=multi|tv|movie`
+- `GET /api/media/tmdb/details?tmdb_id=...&media_type=tv|movie`
+- `GET /api/media/tmdb/season?tmdb_id=...&season=...`
+- `GET /api/media/quality-profiles`
+- `POST /api/media/quality-profiles`
+- `GET /api/media/quality-profiles/:id`
+- `PUT /api/media/quality-profiles/:id`
+- `DELETE /api/media/quality-profiles/:id`
+- `GET /api/media/subscriptions`
+- `POST /api/media/subscriptions`
+- `GET /api/media/subscriptions/:id`
+- `PUT /api/media/subscriptions/:id`
+- `DELETE /api/media/subscriptions/:id`
+- `POST /api/media/subscriptions/:id/run`
+- `POST /api/media/subscriptions/:id/pause`
+- `POST /api/media/subscriptions/:id/resume`
+- `GET /api/media/subscriptions/:id/downloads`
+- `POST /api/media/resources/search`
+- `GET /api/media/downloads`
+- `POST /api/media/downloads`
+- `GET /api/media/downloads/:id`
 - `GET /api/stats/overview`
 - `GET /api/stats/trend`

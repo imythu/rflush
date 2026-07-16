@@ -160,7 +160,7 @@ paths:
   /api/sites:
     get:
       responses:
-        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteWithStats'}}}}}
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteResponse'}}}}}
         default: {$ref: '#/components/responses/Error'}
     post:
       requestBody:
@@ -175,7 +175,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/IdPath'}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/CreateSiteRequest'}}}
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateSiteRequest'}}}
       responses:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
         default: {$ref: '#/components/responses/Error'}
@@ -202,13 +202,13 @@ paths:
   /api/sites/stats-overview:
     get:
       responses:
-        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteWithStats'}}}}}
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteResponse'}}}}}
         default: {$ref: '#/components/responses/Error'}
 
   /api/downloaders:
     get:
       responses:
-        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloaderRecord'}}}}}
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloaderResponse'}}}}}
         default: {$ref: '#/components/responses/Error'}
     post:
       requestBody:
@@ -223,7 +223,7 @@ paths:
       parameters: [{$ref: '#/components/parameters/IdPath'}]
       requestBody:
         required: true
-        content: {application/json: {schema: {$ref: '#/components/schemas/CreateDownloaderRequest'}}}
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateDownloaderRequest'}}}
       responses:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
         default: {$ref: '#/components/responses/Error'}
@@ -355,6 +355,265 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloaderSpeedSnapshot'}}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/media/settings:
+    get:
+      summary: Get media automation settings
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSettingsResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    put:
+      summary: Update media automation settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateMediaSettingsRequest'}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSettingsResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/tmdb/search:
+    get:
+      summary: Search TMDB
+      parameters:
+        - {name: query, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 200}}
+        - {name: media_type, in: query, required: false, schema: {type: string, enum: [multi, tv, movie], default: multi}}
+      responses:
+        '200':
+          description: Matching TV and movie records
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/TmdbMedia'}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/tmdb/details:
+    get:
+      summary: Get TMDB title details
+      parameters:
+        - {name: tmdb_id, in: query, required: true, schema: {type: integer, format: int64, minimum: 1}}
+        - {name: media_type, in: query, required: true, schema: {type: string, enum: [tv, movie]}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/TmdbDetails'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/tmdb/season:
+    get:
+      summary: Get a TMDB TV season
+      parameters:
+        - {name: tmdb_id, in: query, required: true, schema: {type: integer, format: int64, minimum: 1}}
+        - {name: season, in: query, required: true, schema: {type: integer, format: int32, minimum: 0, maximum: 1000}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/TmdbSeason'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/quality-profiles:
+    get:
+      summary: List quality profiles
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/QualityProfile'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      summary: Create a quality profile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QualityProfileRequest'}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/QualityProfile'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/quality-profiles/{id}:
+    get:
+      summary: Get a quality profile
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/QualityProfile'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    put:
+      summary: Update a quality profile
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QualityProfileRequest'}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/QualityProfile'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      summary: Delete a quality profile
+      description: A profile referenced by a subscription cannot be deleted.
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '204': {description: Deleted}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions:
+    get:
+      summary: List media subscriptions
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/MediaSubscription'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      summary: Create a media subscription
+      description: >-
+        The server reloads TMDB details, aliases, and the selected TV season instead of trusting
+        client-supplied metadata. Confirmed episodes and air dates are materialized atomically;
+        unannounced episodes are not sent to PT indexers.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateMediaSubscriptionRequest'}
+      responses:
+        '201': {description: Created, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSubscription'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions/{id}:
+    get:
+      summary: Get a media subscription
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSubscription'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    put:
+      summary: Update a media subscription
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/UpdateMediaSubscriptionRequest'}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSubscription'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      summary: Delete a media subscription
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '204': {description: Deleted}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions/{id}/run:
+    post:
+      summary: Run a subscription scan immediately
+      description: Returns 409 if the subscription is completed or its lease is already held by another scan.
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Scan completed, content: {application/json: {schema: {$ref: '#/components/schemas/SubscriptionRunResult'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions/{id}/last-run:
+    get:
+      summary: Get the latest subscription scan diagnostics
+      description: Returns the persisted queries, candidate parsing and match decisions from the latest run.
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/SubscriptionRunSnapshot'}}}}
+        '404': {description: Subscription not found or no run details have been recorded}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions/{id}/pause:
+    post:
+      summary: Pause a media subscription
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Paused, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSubscription'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions/{id}/resume:
+    post:
+      summary: Resume a media subscription
+      description: A completed subscription must first be edited to select a new cursor; otherwise this returns 409.
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Resumed, content: {application/json: {schema: {$ref: '#/components/schemas/MediaSubscription'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/subscriptions/{id}/downloads:
+    get:
+      summary: List downloads for a subscription
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {$ref: '#/components/parameters/MediaDownloadStatus'}
+        - {$ref: '#/components/parameters/Page'}
+        - {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 200, default: 100}}
+      responses:
+        '200':
+          description: Most recent records first
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/MediaDownload'}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/resources/search:
+    post:
+      summary: Search PT sites and evaluate releases
+      description: >-
+        Sites are searched concurrently. A failed site is reported in errors while successful
+        sites still contribute candidates. Search results never contain Cookie, API key,
+        password, authorization headers, or a long-lived signed download URL. Each result has a
+        short-lived opaque candidate_id that binds later queue requests to the server-owned result.
+        After global deduplication and ranking, at most the best 512 candidates are returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResourceSearchRequest'}
+      responses:
+        '200': {description: Aggregated results, content: {application/json: {schema: {$ref: '#/components/schemas/ResourceSearchResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/downloads:
+    get:
+      summary: List media download outbox records
+      parameters:
+        - {name: subscription_id, in: query, required: false, schema: {type: integer, format: int64}}
+        - {$ref: '#/components/parameters/MediaDownloadStatus'}
+        - {$ref: '#/components/parameters/Page'}
+        - {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 200, default: 100}}
+      responses:
+        '200':
+          description: Most recent records first
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/MediaDownload'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      summary: Queue a selected PT resource
+      description: >-
+        The shared outbox provides at-least-once delivery. A stable dedupe key and the torrent
+        infohash make retries idempotent per downloader; this is not an exactly-once transaction
+        across SQLite and the downloader. The candidate_id must come from a recent resource search;
+        client-supplied torrent locators, titles, and match decisions are not accepted. For a linked
+        subscription, readiness and the match decision are revalidated atomically before enqueue.
+        override_reason is required when the authoritative decision is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/QueueMediaDownloadRequest'}
+      responses:
+        '201': {description: Queued, content: {application/json: {schema: {$ref: '#/components/schemas/MediaDownload'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/downloads/{id}:
+    get:
+      summary: Get a media download outbox record
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/MediaDownload'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
 components:
   parameters:
     IdPath:
@@ -377,6 +636,13 @@ components:
       in: query
       required: false
       schema: {type: integer, minimum: 1}
+    MediaDownloadStatus:
+      name: status
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [queued, fetching, submitting, reconciling, retry_wait, submitted, failed, cancelled]
 
   responses:
     Error:
@@ -505,16 +771,35 @@ components:
         total_records: {type: integer, format: int64}
         records: {type: array, items: {$ref: '#/components/schemas/DownloadHistoryRecord'}}
 
-    SiteRecord:
+    SiteResponse:
       type: object
+      description: Site credentials are write-only and are never returned by the API.
+      required:
+        - id
+        - name
+        - site_type
+        - base_url
+        - auth_type
+        - auth_configured
+        - use_proxy
+        - created_at
+        - updated_at
+        - stats
       properties:
         id: {type: integer, format: int64}
         name: {type: string}
         site_type: {type: string}
         base_url: {type: string}
-        auth_config: {type: string}
-        created_at: {type: string}
-        updated_at: {type: string}
+        auth_type:
+          type: string
+          enum: [cookie, passkey, cookie_passkey, api_key]
+          nullable: true
+          readOnly: true
+        auth_configured: {type: boolean, readOnly: true}
+        use_proxy: {type: boolean}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        stats: {allOf: [{$ref: '#/components/schemas/SiteStatsRecord'}], nullable: true}
 
     SiteStatsRecord:
       type: object
@@ -532,13 +817,6 @@ components:
         last_checked_at: {type: string}
         last_error: {type: string, nullable: true}
 
-    SiteWithStats:
-      allOf:
-        - {$ref: '#/components/schemas/SiteRecord'}
-        - type: object
-          properties:
-            stats: {allOf: [{$ref: '#/components/schemas/SiteStatsRecord'}], nullable: true}
-
     CreateSiteRequest:
       type: object
       required: [name, site_type, base_url, auth_config]
@@ -546,7 +824,39 @@ components:
         name: {type: string}
         site_type: {type: string}
         base_url: {type: string}
-        auth_config: {type: object, additionalProperties: true}
+        auth_config: {$ref: '#/components/schemas/SiteAuthConfig'}
+        use_proxy: {type: boolean, default: true}
+
+    UpdateSiteRequest:
+      type: object
+      required: [name, site_type, base_url]
+      properties:
+        name: {type: string}
+        site_type: {type: string}
+        base_url: {type: string}
+        auth_config:
+          allOf: [{$ref: '#/components/schemas/SiteAuthConfig'}]
+          nullable: true
+          description: >-
+            Omission preserves the existing credentials. Empty secret values preserve the
+            corresponding stored value when the site and authentication types are unchanged.
+        clear_auth_config:
+          type: boolean
+          default: false
+          description: >-
+            Explicitly clear the stored credentials. Cannot be combined with non-empty incoming
+            credentials or with a site/authentication type change.
+        use_proxy: {type: boolean, default: true}
+
+    SiteAuthConfig:
+      type: object
+      required: [auth_type]
+      additionalProperties: false
+      properties:
+        auth_type: {type: string, enum: [cookie, passkey, cookie_passkey, api_key]}
+        cookie: {type: string, nullable: true, writeOnly: true}
+        passkey: {type: string, nullable: true, writeOnly: true}
+        api_key: {type: string, nullable: true, writeOnly: true}
 
     UserStats:
       type: object
@@ -567,17 +877,19 @@ components:
         message: {type: string}
         user_stats: {allOf: [{$ref: '#/components/schemas/UserStats'}], nullable: true}
 
-    DownloaderRecord:
+    DownloaderResponse:
       type: object
+      description: The downloader password is write-only and is never returned by the API.
+      required: [id, name, downloader_type, url, username, password_configured, created_at, updated_at]
       properties:
         id: {type: integer, format: int64}
         name: {type: string}
         downloader_type: {type: string}
         url: {type: string}
         username: {type: string}
-        password: {type: string}
-        created_at: {type: string}
-        updated_at: {type: string}
+        password_configured: {type: boolean, readOnly: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
 
     CreateDownloaderRequest:
       type: object
@@ -587,7 +899,25 @@ components:
         downloader_type: {type: string}
         url: {type: string}
         username: {type: string, nullable: true}
-        password: {type: string, nullable: true}
+        password: {type: string, nullable: true, writeOnly: true}
+
+    UpdateDownloaderRequest:
+      type: object
+      required: [name, downloader_type, url]
+      properties:
+        name: {type: string}
+        downloader_type: {type: string}
+        url: {type: string}
+        username: {type: string, nullable: true}
+        password:
+          type: string
+          nullable: true
+          writeOnly: true
+          description: Null, an empty string, or omission preserves the existing password.
+        clear_password:
+          type: boolean
+          default: false
+          description: Clear the stored password. Cannot be combined with a non-empty password.
 
     DownloaderTestResult:
       type: object
@@ -661,6 +991,528 @@ components:
               total_downloaded: {type: integer, format: int64}
               torrent_count: {type: integer, format: int64}
               enabled: {type: boolean}
+
+    MediaSettingsResponse:
+      type: object
+      description: The configured TMDB token is never returned by the API.
+      required: [tmdb_token, tmdb_token_configured, tmdb_language, scan_interval_mins, max_search_queries, search_concurrency, updated_at]
+      properties:
+        tmdb_token:
+          type: string
+          nullable: true
+          readOnly: true
+          description: Always null so the stored token cannot be read back.
+        tmdb_token_configured: {type: boolean, readOnly: true}
+        tmdb_language: {type: string, default: zh-CN}
+        scan_interval_mins: {type: integer, format: int64, minimum: 1, maximum: 10080, default: 30}
+        max_search_queries: {type: integer, minimum: 1, maximum: 32, default: 8}
+        search_concurrency: {type: integer, minimum: 1, maximum: 16, default: 4}
+        updated_at: {type: string, format: date-time, readOnly: true}
+
+    UpdateMediaSettingsRequest:
+      type: object
+      required: [tmdb_language, scan_interval_mins, max_search_queries, search_concurrency]
+      properties:
+        tmdb_token:
+          type: string
+          maxLength: 4096
+          nullable: true
+          description: >-
+            TMDB v3 API key or v4 Read Access Token. Null, an empty string, or omission preserves
+            the existing token unless clear_tmdb_token is true.
+        clear_tmdb_token:
+          type: boolean
+          default: false
+          description: Clear the stored token. Cannot be combined with a non-empty tmdb_token.
+        tmdb_language: {type: string, minLength: 1, maxLength: 32, default: zh-CN}
+        scan_interval_mins: {type: integer, format: int64, minimum: 1, maximum: 10080, default: 30}
+        max_search_queries: {type: integer, minimum: 1, maximum: 32, default: 8}
+        search_concurrency: {type: integer, minimum: 1, maximum: 16, default: 4}
+
+    TmdbMedia:
+      type: object
+      required: [tmdb_id, media_type, title, original_title, year, overview, poster_path]
+      properties:
+        tmdb_id: {type: integer, format: int64}
+        media_type: {type: string, enum: [tv, movie]}
+        title: {type: string}
+        original_title: {type: string, nullable: true}
+        year: {type: integer, format: int32, nullable: true}
+        overview: {type: string}
+        poster_path:
+          type: string
+          nullable: true
+          description: TMDB image path, not a complete URL.
+
+    TmdbDetails:
+      allOf:
+        - {$ref: '#/components/schemas/TmdbMedia'}
+        - type: object
+          required: [aliases, number_of_seasons, status]
+          properties:
+            aliases: {type: array, items: {type: string}}
+            number_of_seasons: {type: integer, format: int32, nullable: true}
+            status: {type: string, nullable: true}
+
+    TmdbEpisode:
+      type: object
+      required: [id, season_number, episode_number, name, overview, air_date, runtime]
+      properties:
+        id: {type: integer, format: int64}
+        season_number: {type: integer, format: int32, minimum: 0}
+        episode_number: {type: integer, format: int32, minimum: 0}
+        name: {type: string}
+        overview: {type: string}
+        air_date: {type: string, format: date, nullable: true}
+        runtime: {type: integer, format: int32, nullable: true}
+
+    TmdbSeason:
+      type: object
+      required: [id, tmdb_id, season_number, name, overview, poster_path, air_date, episodes]
+      properties:
+        id: {type: integer, format: int64}
+        tmdb_id: {type: integer, format: int64}
+        season_number: {type: integer, format: int32, minimum: 0}
+        name: {type: string}
+        overview: {type: string}
+        poster_path: {type: string, nullable: true}
+        air_date: {type: string, format: date, nullable: true}
+        episodes: {type: array, items: {$ref: '#/components/schemas/TmdbEpisode'}}
+
+    QualityProfileRequest:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1}
+        resolution_order: {type: array, items: {type: string}, default: []}
+        allowed_resolutions: {type: array, items: {type: string}, default: []}
+        blocked_resolutions: {type: array, items: {type: string}, default: []}
+        source_order: {type: array, items: {type: string}, default: []}
+        allowed_sources: {type: array, items: {type: string}, default: []}
+        codec_order: {type: array, items: {type: string}, default: []}
+        blocked_codecs: {type: array, items: {type: string}, default: []}
+        allow_unknown_quality: {type: boolean, default: false}
+        minimum_score: {type: integer, format: int32, minimum: 0, maximum: 100, default: 80}
+        min_seeders: {type: integer, format: int32, minimum: 0, maximum: 1000000, default: 1}
+
+    QualityProfile:
+      allOf:
+        - {$ref: '#/components/schemas/QualityProfileRequest'}
+        - type: object
+          required:
+            - id
+            - resolution_order
+            - allowed_resolutions
+            - blocked_resolutions
+            - source_order
+            - allowed_sources
+            - codec_order
+            - blocked_codecs
+            - allow_unknown_quality
+            - minimum_score
+            - min_seeders
+            - created_at
+            - updated_at
+          properties:
+            id: {type: integer, format: int64}
+            created_at: {type: string, format: date-time}
+            updated_at: {type: string, format: date-time}
+
+    CreateMediaSubscriptionRequest:
+      type: object
+      required: [tmdb_id, media_type, quality_profile_id, downloader_id, site_ids]
+      properties:
+        tmdb_id: {type: integer, format: int64}
+        media_type: {type: string, enum: [tv, movie]}
+        season:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+          description: Required for TV subscriptions; null for movies.
+        start_episode: {type: integer, format: int32, minimum: 1, nullable: true}
+        absolute_episode:
+          type: integer
+          format: int32
+          minimum: 1
+          nullable: true
+          description: Optional anime absolute-number anchor corresponding to start_episode.
+        quality_profile_id: {type: integer, format: int64}
+        downloader_id: {type: integer, format: int64}
+        site_ids: {type: array, minItems: 1, maxItems: 100, uniqueItems: true, items: {type: integer, format: int64, minimum: 1}}
+        save_path: {type: string, maxLength: 1024, nullable: true}
+        enabled: {type: boolean, default: true}
+
+    UpdateMediaSubscriptionRequest:
+      type: object
+      required: [quality_profile_id, downloader_id, site_ids, enabled]
+      properties:
+        season: {type: integer, format: int32, minimum: 0, nullable: true}
+        next_episode:
+          type: integer
+          format: int32
+          minimum: 1
+          nullable: true
+          description: A newly selected TV episode remains metadata-pending until TMDB confirms it.
+        absolute_episode: {type: integer, format: int32, minimum: 1, nullable: true}
+        quality_profile_id: {type: integer, format: int64}
+        downloader_id: {type: integer, format: int64}
+        site_ids: {type: array, minItems: 1, maxItems: 100, uniqueItems: true, items: {type: integer, format: int64, minimum: 1}}
+        save_path: {type: string, maxLength: 1024, nullable: true}
+        enabled: {type: boolean}
+
+    MediaSubscription:
+      type: object
+      required:
+        - id
+        - tmdb_id
+        - media_type
+        - title
+        - original_title
+        - aliases
+        - year
+        - poster_path
+        - season
+        - next_episode
+        - start_episode
+        - absolute_episode
+        - quality_profile_id
+        - downloader_id
+        - site_ids
+        - save_path
+        - enabled
+        - next_run_at
+        - lease_owner
+        - lease_until
+        - version
+        - last_status
+        - last_error
+        - last_run_at
+        - created_at
+        - updated_at
+      properties:
+        id: {type: integer, format: int64}
+        tmdb_id: {type: integer, format: int64}
+        media_type: {type: string, enum: [tv, movie]}
+        title: {type: string}
+        original_title: {type: string, nullable: true}
+        aliases: {type: array, items: {type: string}}
+        year: {type: integer, format: int32, nullable: true}
+        poster_path: {type: string, nullable: true}
+        season: {type: integer, format: int32, nullable: true}
+        next_episode: {type: integer, format: int32, nullable: true}
+        start_episode: {type: integer, format: int32, nullable: true}
+        absolute_episode: {type: integer, format: int32, nullable: true}
+        quality_profile_id: {type: integer, format: int64}
+        downloader_id: {type: integer, format: int64}
+        site_ids: {type: array, items: {type: integer, format: int64}}
+        save_path: {type: string, nullable: true}
+        enabled: {type: boolean}
+        next_run_at: {type: string, format: date-time}
+        lease_owner: {type: string, nullable: true}
+        lease_until: {type: string, format: date-time, nullable: true}
+        version: {type: integer, format: int64}
+        last_status:
+          type: string
+          nullable: true
+          description: Includes waiting_air_date, awaiting_metadata, queued, submitted, error, and completed.
+        last_error: {type: string, nullable: true}
+        last_run_at: {type: string, format: date-time, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+
+    SeasonEpisode:
+      type: object
+      required: [season, episode]
+      properties:
+        season: {type: integer, format: int32, minimum: 0}
+        episode: {type: integer, format: int32, minimum: 1}
+
+    MediaTarget:
+      oneOf:
+        - type: object
+          required: [target_type, tmdb_id, titles]
+          properties:
+            target_type: {type: string, enum: [movie]}
+            tmdb_id: {type: integer, format: int64}
+            titles: {type: array, minItems: 1, maxItems: 32, items: {type: string, minLength: 1, maxLength: 512}}
+            year: {type: integer, format: int32, nullable: true}
+        - type: object
+          required: [target_type, tmdb_id, titles, season, episode]
+          properties:
+            target_type: {type: string, enum: [episode]}
+            tmdb_id: {type: integer, format: int64}
+            titles: {type: array, minItems: 1, maxItems: 32, items: {type: string, minLength: 1, maxLength: 512}}
+            year: {type: integer, format: int32, nullable: true}
+            season: {type: integer, format: int32, minimum: 0}
+            episode: {type: integer, format: int32, minimum: 1}
+            allow_season_pack: {type: boolean, default: false}
+        - type: object
+          required: [target_type, tmdb_id, titles, absolute_episode]
+          properties:
+            target_type: {type: string, enum: [anime]}
+            tmdb_id: {type: integer, format: int64}
+            titles: {type: array, minItems: 1, maxItems: 32, items: {type: string, minLength: 1, maxLength: 512}}
+            year: {type: integer, format: int32, nullable: true}
+            absolute_episode: {type: integer, format: int32, minimum: 1}
+            season_episode: {type: object, allOf: [{$ref: '#/components/schemas/SeasonEpisode'}], nullable: true}
+        - type: object
+          required: [target_type, tmdb_id, titles, season]
+          properties:
+            target_type: {type: string, enum: [season]}
+            tmdb_id: {type: integer, format: int64}
+            titles: {type: array, minItems: 1, maxItems: 32, items: {type: string, minLength: 1, maxLength: 512}}
+            year: {type: integer, format: int32, nullable: true}
+            season: {type: integer, format: int32, minimum: 0}
+      discriminator:
+        propertyName: target_type
+
+    ResourceSearchRequest:
+      type: object
+      description: Supply a non-empty query, a typed target, or both. A target enables identity and quality evaluation.
+      anyOf:
+        - required: [query]
+        - required: [target]
+      properties:
+        query: {type: string, minLength: 1, maxLength: 512}
+        site_ids:
+          type: array
+          uniqueItems: true
+          maxItems: 100
+          items: {type: integer, format: int64, minimum: 1}
+          default: []
+          description: Empty or omitted searches all configured supported PT sites.
+        target: {type: object, allOf: [{$ref: '#/components/schemas/MediaTarget'}], nullable: true}
+        quality_profile_id: {type: integer, format: int64, nullable: true, default: 1}
+        page_size: {type: integer, format: int32, minimum: 1, maximum: 100, nullable: true, default: 30}
+
+    SearchResult:
+      type: object
+      description: >-
+        Credential-free normalized PT result. detail_url is sanitized and same-origin;
+        download_locator is an opaque public locator such as the torrent ID, never a credential.
+      required: [site_id, source_site, torrent_id, title, detail_url, download_locator, magnet, size, seeders, leechers, publish_time]
+      properties:
+        site_id: {type: integer, format: int64}
+        source_site: {type: string}
+        torrent_id: {type: string}
+        title: {type: string}
+        detail_url: {type: string, format: uri, nullable: true}
+        download_locator: {type: string, nullable: true}
+        magnet: {type: string, nullable: true}
+        size: {type: integer, format: int64, minimum: 0}
+        seeders: {type: integer, format: int32, minimum: 0}
+        leechers: {type: integer, format: int32, minimum: 0}
+        publish_time: {type: string, format: date-time, nullable: true}
+
+    ReleaseInfo:
+      type: object
+      required: [raw_title, title, alternate_titles, year, season, episodes, absolute_episodes, full_season, resolution, codec, source, revision, release_group, matched_rule]
+      properties:
+        raw_title: {type: string}
+        title: {type: string}
+        alternate_titles: {type: array, items: {type: string}}
+        year: {type: integer, format: int32, nullable: true}
+        season: {type: integer, format: int32, nullable: true}
+        episodes: {type: array, items: {type: integer, format: int32}}
+        absolute_episodes: {type: array, items: {type: integer, format: int32}}
+        full_season: {type: boolean}
+        resolution: {type: string, nullable: true}
+        codec: {type: string, nullable: true}
+        source: {type: string, nullable: true}
+        revision: {type: string, nullable: true}
+        release_group: {type: string, nullable: true}
+        matched_rule: {type: string}
+
+    ScoreBreakdown:
+      type: object
+      required: [title, year, season, episode, quality]
+      properties:
+        title: {type: integer, format: int32, minimum: 0}
+        year: {type: integer, format: int32, minimum: 0}
+        season: {type: integer, format: int32, minimum: 0}
+        episode: {type: integer, format: int32, minimum: 0}
+        quality: {type: integer, format: int32, minimum: 0}
+
+    MatchRejection:
+      type: object
+      required: [code, message, permanent]
+      properties:
+        code:
+          type: string
+          enum: [wrong_media, wrong_title, wrong_year, wrong_season, wrong_episode, ambiguous_numbering, season_pack_not_allowed, quality_not_allowed, unknown_quality, minimum_seeders, below_minimum_score]
+        message: {type: string}
+        permanent: {type: boolean}
+
+    MatchDecision:
+      type: object
+      description: Identity, season, episode, and quality rejections are hard gates and cannot be offset by score.
+      required: [accepted, score, breakdown, quality_rank, rejections, explanations]
+      properties:
+        accepted: {type: boolean}
+        score: {type: integer, format: int32, minimum: 0}
+        breakdown: {$ref: '#/components/schemas/ScoreBreakdown'}
+        quality_rank: {type: integer, format: int64, minimum: 0}
+        rejections: {type: array, items: {$ref: '#/components/schemas/MatchRejection'}}
+        explanations: {type: array, items: {type: string}}
+
+    SortKey:
+      type: object
+      required: [accepted, score, quality_rank, seeders, publish_time, site_priority, stable_release_key]
+      properties:
+        accepted: {type: boolean}
+        score: {type: integer, format: int32, minimum: 0}
+        quality_rank: {type: integer, format: int64, minimum: 0}
+        seeders: {type: integer, format: int32, minimum: 0}
+        publish_time: {type: string, format: date-time, nullable: true}
+        site_priority: {type: integer, format: int32, minimum: 0}
+        stable_release_key: {type: string}
+
+    ResourceCandidate:
+      type: object
+      required: [candidate_id, result, release, parse_error, decision, sort_key]
+      properties:
+        candidate_id:
+          type: string
+          minLength: 1
+          description: Short-lived opaque server-owned identifier required when queueing this exact result.
+        result: {$ref: '#/components/schemas/SearchResult'}
+        release: {type: object, allOf: [{$ref: '#/components/schemas/ReleaseInfo'}], nullable: true}
+        parse_error: {type: string, nullable: true}
+        decision: {type: object, allOf: [{$ref: '#/components/schemas/MatchDecision'}], nullable: true}
+        sort_key: {type: object, allOf: [{$ref: '#/components/schemas/SortKey'}], nullable: true}
+
+    SiteSearchError:
+      type: object
+      required: [site_id, source_site, query, code, message]
+      properties:
+        site_id: {type: integer, format: int64}
+        source_site: {type: string}
+        query: {type: string}
+        code: {type: string, enum: [configuration_error, authentication_expired, http_error, api_error, rate_limited, parse_error, unsafe_url, invalid_torrent]}
+        message: {type: string}
+
+    ResourceSearchResponse:
+      type: object
+      description: successful_sites may be lower than total_sites; inspect errors for partial failures.
+      required: [queries, candidates, errors, total_sites, successful_sites]
+      properties:
+        queries: {type: array, items: {type: string}}
+        candidates: {type: array, maxItems: 512, items: {$ref: '#/components/schemas/ResourceCandidate'}}
+        errors: {type: array, items: {$ref: '#/components/schemas/SiteSearchError'}}
+        total_sites: {type: integer, minimum: 0}
+        successful_sites: {type: integer, minimum: 0}
+
+    QueueMediaDownloadRequest:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, quality_profile_id, downloader_id]
+      properties:
+        candidate_id:
+          type: string
+          minLength: 1
+          description: Opaque identifier returned by a recent resource search.
+        quality_profile_id: {type: integer, format: int64}
+        downloader_id: {type: integer, format: int64}
+        subscription_id: {type: integer, format: int64, nullable: true}
+        override_reason:
+          type: string
+          maxLength: 1000
+          nullable: true
+          description: Required when the server's authoritative match decision is rejected.
+
+    MediaDownload:
+      type: object
+      description: Durable outbox record. JSON snapshot fields are serialized strings retained for audit and replay.
+      required:
+        - id
+        - subscription_id
+        - target_key
+        - dedupe_key
+        - site_id
+        - downloader_id
+        - source_site
+        - downloader_name
+        - torrent_id
+        - title
+        - size
+        - release_json
+        - decision_json
+        - profile_snapshot_json
+        - infohash
+        - status
+        - attempts
+        - next_attempt_at
+        - lease_owner
+        - lease_until
+        - version
+        - last_error
+        - created_at
+        - updated_at
+        - submitted_at
+      properties:
+        id: {type: integer, format: int64}
+        subscription_id: {type: integer, format: int64, nullable: true}
+        target_key: {type: string, minLength: 1}
+        dedupe_key: {type: string, minLength: 1}
+        site_id: {type: integer, format: int64, nullable: true}
+        downloader_id: {type: integer, format: int64, nullable: true}
+        source_site: {type: string}
+        downloader_name: {type: string}
+        torrent_id: {type: string}
+        title: {type: string}
+        size: {type: integer, format: int64, minimum: 0}
+        release_json: {type: string}
+        decision_json: {type: string}
+        profile_snapshot_json: {type: string}
+        infohash:
+          type: string
+          pattern: '^[0-9A-Fa-f]{40}$'
+          nullable: true
+          description: >-
+            Case-insensitively unique together with downloader_id. The same torrent may be
+            submitted independently to different downloaders.
+        status: {type: string, enum: [queued, fetching, submitting, reconciling, retry_wait, submitted, failed, cancelled]}
+        attempts: {type: integer, format: int32, minimum: 0}
+        next_attempt_at: {type: string, format: date-time, nullable: true}
+        lease_owner: {type: string, nullable: true}
+        lease_until: {type: string, format: date-time, nullable: true}
+        version: {type: integer, format: int64}
+        last_error: {type: string, nullable: true}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        submitted_at: {type: string, format: date-time, nullable: true}
+
+    SubscriptionRunResult:
+      type: object
+      required: [subscription_id, target_key, query_count, candidate_count, accepted_count, download, site_errors]
+      properties:
+        subscription_id: {type: integer, format: int64}
+        target_key: {type: string, minLength: 1}
+        query_count: {type: integer, minimum: 0}
+        candidate_count: {type: integer, minimum: 0}
+        accepted_count: {type: integer, minimum: 0}
+        download: {type: object, allOf: [{$ref: '#/components/schemas/MediaDownload'}], nullable: true}
+        site_errors: {type: array, items: {$ref: '#/components/schemas/SiteSearchError'}}
+
+    SubscriptionRunSnapshot:
+      type: object
+      required: [started_at, finished_at, target_key, queries, candidates, site_errors, total_sites, successful_sites, best_candidate_id, error]
+      properties:
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        target_key: {type: string, minLength: 1}
+        queries: {type: array, items: {type: string}}
+        candidates:
+          type: array
+          maxItems: 512
+          description: Diagnostic copies of evaluated candidates; candidate_id values are not valid for later queue requests.
+          items: {$ref: '#/components/schemas/ResourceCandidate'}
+        site_errors: {type: array, items: {$ref: '#/components/schemas/SiteSearchError'}}
+        total_sites: {type: integer, minimum: 0}
+        successful_sites: {type: integer, minimum: 0}
+        best_candidate_id: {type: string, nullable: true}
+        error: {type: string, nullable: true}
 
     IdResponse:
       type: object

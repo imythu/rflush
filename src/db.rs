@@ -13,6 +13,8 @@ use crate::sign_in::{SignInRecord, SignInResult, SignInTaskRecord, SignInTaskReq
 use crate::site::{SiteRecord, SiteStatsRecord, SiteWithStats, UserStats};
 use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
+mod media;
+
 #[derive(Clone)]
 pub struct Database {
     path: PathBuf,
@@ -1602,7 +1604,8 @@ impl Database {
         is_hr: bool,
         free_end_timestamp: Option<i64>,
         downloader_id: i64,
-    ) -> Result<i64, AppError> {        let path = self.path.clone();
+    ) -> Result<i64, AppError> {
+        let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
         let (torrent_id, torrent_link, hash, name) = (
             torrent_id.map(|value| value.to_string()),
@@ -2289,7 +2292,9 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn list_enabled_tag_rules(&self) -> Result<Vec<crate::tag_rule::TagRuleRecord>, AppError> {
+    pub async fn list_enabled_tag_rules(
+        &self,
+    ) -> Result<Vec<crate::tag_rule::TagRuleRecord>, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
@@ -2312,7 +2317,10 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn get_tag_rule(&self, id: i64) -> Result<Option<crate::tag_rule::TagRuleRecord>, AppError> {
+    pub async fn get_tag_rule(
+        &self,
+        id: i64,
+    ) -> Result<Option<crate::tag_rule::TagRuleRecord>, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
@@ -2329,7 +2337,10 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn create_tag_rule(&self, req: &crate::tag_rule::TagRuleRequest) -> Result<i64, AppError> {
+    pub async fn create_tag_rule(
+        &self,
+        req: &crate::tag_rule::TagRuleRequest,
+    ) -> Result<i64, AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
         let req = req.clone();
@@ -2355,7 +2366,11 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn update_tag_rule(&self, id: i64, req: &crate::tag_rule::TagRuleRequest) -> Result<(), AppError> {
+    pub async fn update_tag_rule(
+        &self,
+        id: i64,
+        req: &crate::tag_rule::TagRuleRequest,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
         let req = req.clone();
@@ -2393,7 +2408,12 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn update_tag_rule_stats(&self, id: i64, count: i64, total_size: i64) -> Result<(), AppError> {
+    pub async fn update_tag_rule_stats(
+        &self,
+        id: i64,
+        count: i64,
+        total_size: i64,
+    ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
@@ -2822,6 +2842,158 @@ impl Database {
             )
             .map_err(sql_error)?;
 
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS media_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    tmdb_token TEXT,
+                    tmdb_language TEXT NOT NULL DEFAULT 'zh-CN',
+                    scan_interval_mins INTEGER NOT NULL DEFAULT 30,
+                    max_search_queries INTEGER NOT NULL DEFAULT 8,
+                    search_concurrency INTEGER NOT NULL DEFAULT 4,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS quality_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    resolution_order TEXT NOT NULL,
+                    allowed_resolutions TEXT NOT NULL,
+                    blocked_resolutions TEXT NOT NULL,
+                    source_order TEXT NOT NULL,
+                    allowed_sources TEXT NOT NULL,
+                    codec_order TEXT NOT NULL,
+                    blocked_codecs TEXT NOT NULL,
+                    allow_unknown_quality INTEGER NOT NULL DEFAULT 0,
+                    minimum_score INTEGER NOT NULL DEFAULT 80,
+                    min_seeders INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tmdb_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL CHECK (media_type IN ('tv', 'movie')),
+                    title TEXT NOT NULL,
+                    original_title TEXT,
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    year INTEGER,
+                    poster_path TEXT,
+                    season INTEGER,
+                    next_episode INTEGER,
+                    start_episode INTEGER,
+                    absolute_episode INTEGER,
+                    quality_profile_id INTEGER NOT NULL REFERENCES quality_profiles(id) ON DELETE RESTRICT,
+                    downloader_id INTEGER NOT NULL REFERENCES downloaders(id) ON DELETE RESTRICT,
+                    save_path TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    next_run_at TEXT NOT NULL,
+                    lease_owner TEXT,
+                    lease_until TEXT,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    last_status TEXT,
+                    last_error TEXT,
+                    last_run_at TEXT,
+                    last_run_info TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS subscription_sites (
+                    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+                    site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE RESTRICT,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (subscription_id, site_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS subscription_targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
+                    target_key TEXT NOT NULL,
+                    season INTEGER,
+                    episode INTEGER,
+                    absolute_episode INTEGER,
+                    air_date TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(subscription_id, target_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS media_downloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
+                    target_key TEXT NOT NULL,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+                    downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+                    source_site TEXT NOT NULL,
+                    downloader_name TEXT NOT NULL,
+                    torrent_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    release_json TEXT NOT NULL,
+                    decision_json TEXT NOT NULL,
+                    profile_snapshot_json TEXT NOT NULL,
+                    infohash TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    lease_owner TEXT,
+                    lease_until TEXT,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    submitted_at TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_media_season
+                    ON subscriptions(media_type, tmdb_id, COALESCE(season, -1));
+                CREATE INDEX IF NOT EXISTS idx_subscriptions_due
+                    ON subscriptions(enabled, next_run_at, lease_until);
+                CREATE INDEX IF NOT EXISTS idx_subscription_targets_status
+                    ON subscription_targets(subscription_id, status);
+                CREATE INDEX IF NOT EXISTS idx_media_downloads_due
+                    ON media_downloads(status, next_attempt_at, lease_until);
+                CREATE INDEX IF NOT EXISTS idx_media_downloads_subscription
+                    ON media_downloads(subscription_id, created_at);
+                ",
+            )
+            .map_err(sql_error)?;
+
+            migrate_media_download_infohash_uniqueness(&conn)?;
+
+            ensure_column(
+                &conn,
+                "subscriptions",
+                "last_run_info",
+                "ALTER TABLE subscriptions ADD COLUMN last_run_info TEXT",
+            )?;
+
+            let media_now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT OR IGNORE INTO media_settings
+                 (id, tmdb_token, tmdb_language, scan_interval_mins, max_search_queries, search_concurrency, updated_at)
+                 VALUES (1, NULL, 'zh-CN', 30, 8, 4, ?)",
+                [&media_now],
+            )
+            .map_err(sql_error)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO quality_profiles
+                 (id, name, resolution_order, allowed_resolutions, blocked_resolutions,
+                  source_order, allowed_sources, codec_order, blocked_codecs,
+                  allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
+                 VALUES (1, '高清优先', '[\"1080p\",\"2160p\",\"720p\"]',
+                         '[\"2160p\",\"1080p\",\"720p\"]', '[\"480p\",\"360p\"]',
+                         '[\"web-dl\",\"bluray\",\"webrip\",\"hdtv\"]',
+                         '[\"web-dl\",\"bluray\",\"webrip\",\"hdtv\"]',
+                         '[\"h265\",\"hevc\",\"av1\",\"h264\"]', '[]',
+                         0, 80, 1, ?, ?)",
+                params![media_now, media_now],
+            )
+            .map_err(sql_error)?;
+
             ensure_column(
                 &conn,
                 "tag_rules",
@@ -2915,10 +3087,12 @@ fn row_to_brush_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrushTaskRecor
     row_to_brush_task_at(row, 0)
 }
 
-fn row_to_brush_task_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<BrushTaskRecord> {
+fn row_to_brush_task_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<BrushTaskRecord> {
     let downloader_ids_json: String = row.get(offset + 4)?;
-    let downloader_ids: Vec<i64> =
-        serde_json::from_str(&downloader_ids_json).unwrap_or_default();
+    let downloader_ids: Vec<i64> = serde_json::from_str(&downloader_ids_json).unwrap_or_default();
     Ok(BrushTaskRecord {
         id: row.get(offset)?,
         name: row.get(offset + 1)?,
@@ -3145,6 +3319,85 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Res
     Ok(())
 }
 
+fn migrate_media_download_infohash_uniqueness(conn: &Connection) -> Result<(), AppError> {
+    let table_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_downloads'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let normalized = table_sql
+        .to_ascii_lowercase()
+        .replace(['\n', '\r', '\t'], " ");
+    let has_legacy_constraint = normalized.contains("infohash text unique")
+        || normalized.contains("unique(infohash)")
+        || normalized.contains("unique (infohash)");
+
+    if has_legacy_constraint {
+        let tx = conn.unchecked_transaction().map_err(sql_error)?;
+        tx.execute_batch(
+            "ALTER TABLE media_downloads RENAME TO media_downloads_legacy_infohash;
+
+             CREATE TABLE media_downloads (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
+                 target_key TEXT NOT NULL,
+                 dedupe_key TEXT NOT NULL UNIQUE,
+                 site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+                 downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+                 source_site TEXT NOT NULL,
+                 downloader_name TEXT NOT NULL,
+                 torrent_id TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 size INTEGER NOT NULL DEFAULT 0,
+                 release_json TEXT NOT NULL,
+                 decision_json TEXT NOT NULL,
+                 profile_snapshot_json TEXT NOT NULL,
+                 infohash TEXT,
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 next_attempt_at TEXT,
+                 lease_owner TEXT,
+                 lease_until TEXT,
+                 version INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 submitted_at TEXT
+             );
+
+             INSERT INTO media_downloads
+                 (id, subscription_id, target_key, dedupe_key, site_id, downloader_id,
+                  source_site, downloader_name, torrent_id, title, size, release_json,
+                  decision_json, profile_snapshot_json, infohash, status, attempts,
+                  next_attempt_at, lease_owner, lease_until, version, last_error,
+                  created_at, updated_at, submitted_at)
+             SELECT id, subscription_id, target_key, dedupe_key, site_id, downloader_id,
+                    source_site, downloader_name, torrent_id, title, size, release_json,
+                    decision_json, profile_snapshot_json, infohash, status, attempts,
+                    next_attempt_at, lease_owner, lease_until, version, last_error,
+                    created_at, updated_at, submitted_at
+             FROM media_downloads_legacy_infohash;
+
+             DROP TABLE media_downloads_legacy_infohash;",
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)?;
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_media_downloads_due
+             ON media_downloads(status, next_attempt_at, lease_until);
+         CREATE INDEX IF NOT EXISTS idx_media_downloads_subscription
+             ON media_downloads(subscription_id, created_at);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_media_downloads_downloader_infohash
+             ON media_downloads(downloader_id, lower(infohash))
+             WHERE downloader_id IS NOT NULL AND infohash IS NOT NULL;",
+    )
+    .map_err(sql_error)
+}
+
 fn time_unit_name(unit: TimeUnit) -> &'static str {
     match unit {
         TimeUnit::Second => "second",
@@ -3222,6 +3475,154 @@ mod migration_tests {
         assert_eq!(task.min_disk_space_gb, request.min_disk_space_gb);
     }
 
+    #[tokio::test]
+    async fn migrates_legacy_global_infohash_constraint_without_losing_rows() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let downloader_a = db
+            .create_downloader(
+                "migration-downloader-a",
+                "qbittorrent",
+                "http://127.0.0.1:8080",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        let downloader_b = db
+            .create_downloader(
+                "migration-downloader-b",
+                "qbittorrent",
+                "http://127.0.0.1:8081",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        let db_path = dir.path().join("rflush.db");
+        let conn = open_connection(&db_path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_media_downloads_downloader_infohash;
+             ALTER TABLE media_downloads RENAME TO media_downloads_current;
+             CREATE TABLE media_downloads (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 subscription_id INTEGER REFERENCES subscriptions(id) ON DELETE SET NULL,
+                 target_key TEXT NOT NULL,
+                 dedupe_key TEXT NOT NULL UNIQUE,
+                 site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+                 downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+                 source_site TEXT NOT NULL,
+                 downloader_name TEXT NOT NULL,
+                 torrent_id TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 size INTEGER NOT NULL DEFAULT 0,
+                 release_json TEXT NOT NULL,
+                 decision_json TEXT NOT NULL,
+                 profile_snapshot_json TEXT NOT NULL,
+                 infohash TEXT UNIQUE,
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 next_attempt_at TEXT,
+                 lease_owner TEXT,
+                 lease_until TEXT,
+                 version INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 submitted_at TEXT
+             );
+             DROP TABLE media_downloads_current;",
+        )
+        .unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        conn.execute(
+            "INSERT INTO media_downloads
+             (id, target_key, dedupe_key, downloader_id, source_site, downloader_name,
+              torrent_id, title, size, release_json, decision_json,
+              profile_snapshot_json, infohash, status, attempts, next_attempt_at,
+              lease_owner, lease_until, version, last_error, created_at, updated_at,
+              submitted_at)
+             VALUES (77, 'movie:42', 'legacy-row', ?, 'legacy-site', 'legacy-qb',
+                     'torrent-42', 'Legacy Movie 2026 1080p WEB-DL', 4242, '{\"legacy\":true}',
+                     '{\"accepted\":true}', '{\"profile\":1}', ?, 'submitted', 3,
+                     NULL, NULL, NULL, 4, 'preserved audit',
+                     '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z',
+                     '2026-01-02T00:00:00Z')",
+            params![downloader_a, hash],
+        )
+        .unwrap();
+        drop(conn);
+
+        Database::open(dir.path()).await.unwrap();
+        let conn = open_connection(&db_path).unwrap();
+        let preserved: (i64, String, i64, String, i64, i64, String) = conn
+            .query_row(
+                "SELECT id, target_key, size, release_json, attempts, version, last_error
+                 FROM media_downloads WHERE dedupe_key = 'legacy-row'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                77,
+                "movie:42".to_string(),
+                4242,
+                "{\"legacy\":true}".to_string(),
+                3,
+                4,
+                "preserved audit".to_string(),
+            )
+        );
+
+        conn.execute(
+            "INSERT INTO media_downloads
+             (target_key, dedupe_key, downloader_id, source_site, downloader_name,
+              torrent_id, title, release_json, decision_json, profile_snapshot_json,
+              infohash, created_at, updated_at)
+             VALUES ('movie:43', 'other-downloader', ?, 'legacy-site', 'other-qb',
+                     'torrent-43', 'Other Movie', '{}', '{}', '{}', ?,
+                     '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z')",
+            params![downloader_b, hash.to_ascii_uppercase()],
+        )
+        .unwrap();
+        let duplicate = conn.execute(
+            "INSERT INTO media_downloads
+             (target_key, dedupe_key, downloader_id, source_site, downloader_name,
+              torrent_id, title, release_json, decision_json, profile_snapshot_json,
+              infohash, created_at, updated_at)
+             VALUES ('movie:44', 'same-downloader', ?, 'legacy-site', 'legacy-qb',
+                     'torrent-44', 'Duplicate Movie', '{}', '{}', '{}', ?,
+                     '2026-01-04T00:00:00Z', '2026-01-04T00:00:00Z')",
+            params![downloader_a, hash.to_ascii_uppercase()],
+        );
+        assert!(duplicate.is_err());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM media_downloads", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            2
+        );
+        assert!(
+            conn.query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn test_migration_save_dir_json_conversion() {
         let dir = tempdir().unwrap();
@@ -3253,21 +3654,33 @@ mod migration_tests {
 
         // Verify row 1
         let row1: String = conn
-            .query_row("SELECT save_dir FROM brush_tasks WHERE downloader_id = 1", [], |row| row.get(0))
+            .query_row(
+                "SELECT save_dir FROM brush_tasks WHERE downloader_id = 1",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let json1: serde_json::Value = serde_json::from_str(&row1).unwrap();
         assert_eq!(json1["1"], "/downloads/brush");
 
         // Verify row 2
         let row2: String = conn
-            .query_row("SELECT save_dir FROM brush_tasks WHERE downloader_id = 2", [], |row| row.get(0))
+            .query_row(
+                "SELECT save_dir FROM brush_tasks WHERE downloader_id = 2",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         let json2: serde_json::Value = serde_json::from_str(&row2).unwrap();
         assert_eq!(json2["2"], "/other/path");
 
         // Verify row 3 (NULL save_dir stays NULL)
         let row3: Option<String> = conn
-            .query_row("SELECT save_dir FROM brush_tasks WHERE downloader_id = 3", [], |row| row.get(0))
+            .query_row(
+                "SELECT save_dir FROM brush_tasks WHERE downloader_id = 3",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(row3.is_none());
     }

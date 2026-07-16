@@ -103,7 +103,9 @@ export type SiteRecord = {
   name: string;
   site_type: string;
   base_url: string;
-  auth_config: string;
+  auth_type: "cookie" | "passkey" | "cookie_passkey" | "api_key" | null;
+  auth_configured: boolean;
+  use_proxy: boolean;
   created_at: string;
   updated_at: string;
   stats: SiteStatsRecord | null;
@@ -147,7 +149,7 @@ export type DownloaderRecord = {
   downloader_type: string;
   url: string;
   username: string;
-  password: string;
+  password_configured: boolean;
   created_at: string;
   updated_at: string;
 };

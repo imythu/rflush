@@ -8,7 +8,9 @@ mod downloader;
 mod engine;
 mod error;
 mod history;
+mod indexer;
 mod logging;
+mod media;
 mod monitor;
 mod net;
 mod rss;
@@ -44,6 +46,11 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     })?;
     let (base_dir, db_dir) = cli.resolve_paths(&cwd);
     let listen_addr = cli.resolve_listen_addr()?;
+    let listener = tokio::net::TcpListener::bind(listen_addr)
+        .await
+        .map_err(|error| AppError::Server {
+            message: format!("failed to bind {listen_addr}: {error}"),
+        })?;
     let db = db::Database::open(&db_dir).await?;
     let settings = db.get_settings().await?;
     let log_filter = logging::build_log_filter(settings.log_level.as_deref())?;
@@ -56,83 +63,95 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     );
 
     let pool = downloader::DownloaderClientPool::new(db.clone());
+    let media_service = media::service::MediaService::new(db.clone(), pool.clone());
+    let media_scheduler = media::scheduler::MediaScheduler::new(media_service.clone());
 
-    let collector = std::sync::Arc::new(collector::DownloaderSnapshotCollector::new(db.clone(), pool.clone()));
-    let collector_ref = collector.clone();
-    let collector_handle = tokio::spawn(async move {
-        collector_ref.start().await;
-    });
-
+    let collector = std::sync::Arc::new(collector::DownloaderSnapshotCollector::new(
+        db.clone(),
+        pool.clone(),
+    ));
     let stats_db = db.clone();
     let stats_rx = collector.subscribe();
-    let stats_handle = tokio::spawn(async move {
-        stats::start_stats_consumer(stats_db, stats_rx).await;
-    });
 
     // 构建共享 HTTP 客户端（代理 + 限流），供刷流调度器使用
     let proxy = settings.proxy.as_deref();
     let limiter = Arc::new(SharedRateLimiter::new());
     let policy = RateLimitPolicy::new(5, Duration::from_secs(1), Duration::from_secs(60));
     let http = Arc::new(
-        AppHttpClient::new(limiter.clone(), policy, proxy).map_err(|e| AppError::InvalidConfig {
-            message: format!("failed to build HTTP client: {}", e),
+        AppHttpClient::new(limiter.clone(), policy, proxy).map_err(|e| {
+            AppError::InvalidConfig {
+                message: format!("failed to build HTTP client: {}", e),
+            }
         })?,
     );
 
-    // 启动刷流调度器
     let scheduler = std::sync::Arc::new(brush::scheduler::BrushScheduler::new(
         db.clone(),
         collector.clone(),
         pool.clone(),
         http,
     ));
-    let scheduler_ref = scheduler.clone();
-    let scheduler_handle = tokio::spawn(async move {
-        scheduler_ref.start().await;
-    });
 
     let sign_in_scheduler = std::sync::Arc::new(sign_in::scheduler::SignInScheduler::new(
         db.clone(),
         base_dir.clone(),
     ));
+
+    let site_stats_refresher = std::sync::Arc::new(site_stats::SiteStatsRefresher::new(db.clone()));
+
+    let monitor = std::sync::Arc::new(monitor::SystemMonitor::new(db.clone()));
+
+    let tag_rule_scheduler = tag_rule::scheduler::TagRuleScheduler::new(db.clone(), pool.clone());
+
+    let media_scheduler_ref = media_scheduler.clone();
+    let mut media_scheduler_handle = tokio::spawn(async move {
+        media_scheduler_ref.start().await;
+    });
+    let collector_ref = collector.clone();
+    let collector_handle = tokio::spawn(async move {
+        collector_ref.start().await;
+    });
+    let stats_handle = tokio::spawn(async move {
+        stats::start_stats_consumer(stats_db, stats_rx).await;
+    });
+    let scheduler_ref = scheduler.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        scheduler_ref.start().await;
+    });
     let sign_in_scheduler_ref = sign_in_scheduler.clone();
     let sign_in_scheduler_handle = tokio::spawn(async move {
         sign_in_scheduler_ref.start().await;
     });
-
-    let site_stats_refresher = std::sync::Arc::new(site_stats::SiteStatsRefresher::new(db.clone()));
     let site_stats_refresher_ref = site_stats_refresher.clone();
     let site_stats_handle = tokio::spawn(async move {
         site_stats_refresher_ref.start().await;
     });
-
-    let monitor = std::sync::Arc::new(monitor::SystemMonitor::new(db.clone()));
     let monitor_ref = monitor.clone();
     let monitor_handle = tokio::spawn(async move {
         monitor_ref.start().await;
     });
-
-    let tag_rule_scheduler = tag_rule::scheduler::TagRuleScheduler::new(db.clone(), pool.clone());
     let tag_rule_scheduler_ref = tag_rule_scheduler.clone();
     let tag_rule_scheduler_handle = tokio::spawn(async move {
         tag_rule_scheduler_ref.start().await;
     });
 
     let web_result = web::serve(
-        base_dir,
-        listen_addr,
+        listener,
         db,
         scheduler,
         sign_in_scheduler,
         site_stats_refresher,
         collector,
         pool,
+        media_service,
+        media_scheduler.clone(),
         limiter,
         monitor,
         tag_rule_scheduler,
     )
     .await;
 
+    media_scheduler.stop();
     collector_handle.abort();
     stats_handle.abort();
     scheduler_handle.abort();
@@ -140,6 +159,25 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     site_stats_handle.abort();
     monitor_handle.abort();
     tag_rule_scheduler_handle.abort();
+
+    if tokio::time::timeout(Duration::from_secs(10), &mut media_scheduler_handle)
+        .await
+        .is_err()
+    {
+        media_scheduler_handle.abort();
+        let _ = media_scheduler_handle.await;
+    }
+    match media_scheduler.release_owned_leases().await {
+        Ok((0, 0)) => {}
+        Ok((subscriptions, downloads)) => info!(
+            recovered_subscriptions = subscriptions,
+            recovered_downloads = downloads,
+            "released interrupted media leases during shutdown"
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to release media leases during shutdown")
+        }
+    }
 
     let _ = collector_handle.await;
     let _ = stats_handle.await;
