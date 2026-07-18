@@ -614,6 +614,18 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/MediaDownload'}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/media/downloads/{id}/redeliver:
+    post:
+      summary: Verify or redeliver a submitted media download
+      description: >-
+        Confirms that the stored infohash exists in the configured downloader. If it is missing,
+        the stored torrent locator is fetched again, its infohash is verified, and the torrent is
+        resubmitted without changing subscription progression.
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Verified in downloader, content: {application/json: {schema: {$ref: '#/components/schemas/MediaDownload'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
 components:
   parameters:
     IdPath:

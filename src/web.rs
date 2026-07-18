@@ -579,7 +579,8 @@ fn media_router(
             "/downloads",
             get(list_media_downloads).post(queue_media_download),
         )
-        .route("/downloads/{id}", get(get_media_download));
+        .route("/downloads/{id}", get(get_media_download))
+        .route("/downloads/{id}/redeliver", post(redeliver_media_download));
     let router = if self_use {
         router
             .route(
@@ -1553,6 +1554,19 @@ async fn get_media_download(
         .await
         .map_err(media_app_error)?
         .ok_or_else(|| ApiError::not_found("media download not found"))?;
+    Ok(Json(MediaDownloadResponse::from(download)))
+}
+
+async fn redeliver_media_download(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<MediaDownloadResponse>, ApiError> {
+    validate_positive_id(id, "download id")?;
+    let download = state
+        .service
+        .redeliver_download(id)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(MediaDownloadResponse::from(download)))
 }
 

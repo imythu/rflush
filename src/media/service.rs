@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{Instrument, warn};
 
 use crate::db::Database;
-use crate::downloader::{AddTorrentOptions, DownloaderClientPool};
+use crate::downloader::{AddTorrentOptions, DownloaderClient, DownloaderClientPool};
 use crate::error::AppError;
 use crate::indexer::{
     IndexerAggregator, IndexerError, IndexerPool, SearchRequest, SearchResult, SiteSearchError,
@@ -33,6 +33,8 @@ use super::torrent::{TorrentMetadataError, torrent_infohash};
 
 const SUBSCRIPTION_LEASE_SECONDS: i64 = 10 * 60;
 const DOWNLOAD_LEASE_SECONDS: i64 = 5 * 60;
+const DOWNLOAD_CONFIRM_ATTEMPTS: usize = 5;
+const DOWNLOAD_CONFIRM_INTERVAL: StdDuration = StdDuration::from_millis(300);
 const CANDIDATE_CACHE_TTL: StdDuration = StdDuration::from_secs(10 * 60);
 const CANDIDATE_CACHE_CAPACITY: usize = 2_048;
 const RESOURCE_SEARCH_RESULT_LIMIT: usize = 512;
@@ -215,6 +217,11 @@ enum PreparedSubscriptionTarget {
     Completed {
         target_key: String,
     },
+}
+
+enum TorrentSubmissionError {
+    ConfirmedAbsent(String),
+    Unknown(String),
 }
 
 impl MediaService {
@@ -1388,6 +1395,116 @@ impl MediaService {
         Ok(queued)
     }
 
+    pub async fn redeliver_download(
+        &self,
+        download_id: i64,
+    ) -> Result<MediaDownloadRecord, MediaServiceError> {
+        let download = self
+            .db
+            .get_media_download(download_id)
+            .await?
+            .ok_or_else(|| MediaServiceError::NotFound(format!("download {download_id}")))?;
+        if download.status != "submitted" {
+            return Err(MediaServiceError::Conflict(
+                "only submitted downloads can be verified or redelivered".to_string(),
+            ));
+        }
+        let infohash = download.infohash.clone().ok_or_else(|| {
+            MediaServiceError::Conflict("submitted download has no infohash".to_string())
+        })?;
+        if !is_valid_infohash(&infohash) {
+            return Err(MediaServiceError::Conflict(
+                "submitted download has an invalid infohash".to_string(),
+            ));
+        }
+        let downloader_id = download.downloader_id.ok_or_else(|| {
+            MediaServiceError::NotFound("download client was deleted".to_string())
+        })?;
+        let downloader = self
+            .db
+            .get_downloader(downloader_id)
+            .await?
+            .ok_or_else(|| MediaServiceError::NotFound(format!("downloader {downloader_id}")))?;
+        let client = self
+            .downloaders
+            .get(&downloader)
+            .await
+            .map_err(MediaServiceError::Downloader)?;
+        if torrent_is_present(client.as_ref(), &infohash)
+            .await
+            .map_err(MediaServiceError::Downloader)?
+        {
+            return Ok(download);
+        }
+
+        let (result, torrent) = self.fetch_torrent_for_download(&download).await?;
+        let fetched_infohash = torrent_infohash(&torrent)?;
+        if !fetched_infohash.eq_ignore_ascii_case(&infohash) {
+            return Err(MediaServiceError::Conflict(
+                "the stored torrent locator now returns different torrent content".to_string(),
+            ));
+        }
+        let options = self.add_torrent_options(&download).await?;
+        let filename = media_download_filename(&result);
+        match add_torrent_and_confirm(client.as_ref(), torrent, &filename, &options, &infohash)
+            .await
+        {
+            Ok(()) => Ok(download),
+            Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
+                Err(MediaServiceError::Downloader(message))
+            }
+            Err(TorrentSubmissionError::Unknown(message)) => Err(MediaServiceError::Downloader(
+                format!("submission result is unknown: {message}"),
+            )),
+        }
+    }
+
+    async fn fetch_torrent_for_download(
+        &self,
+        download: &MediaDownloadRecord,
+    ) -> Result<(SearchResult, Vec<u8>), MediaServiceError> {
+        let result: SearchResult = serde_json::from_str(&download.release_json)
+            .map_err(|error| MediaServiceError::Serialization(error.to_string()))?;
+        let site_id = download
+            .site_id
+            .ok_or_else(|| MediaServiceError::NotFound("download site was deleted".to_string()))?;
+        let site = self
+            .db
+            .get_site(site_id)
+            .await?
+            .ok_or_else(|| MediaServiceError::NotFound(format!("site {site_id}")))?;
+        let proxy = self.db.get_settings().await?.proxy;
+        let adapter = self.indexers.get_or_create(&site, proxy.as_deref()).await?;
+        let torrent = adapter.fetch_torrent(&result).await?;
+        Ok((result, torrent))
+    }
+
+    async fn add_torrent_options(
+        &self,
+        download: &MediaDownloadRecord,
+    ) -> Result<AddTorrentOptions, MediaServiceError> {
+        let subscription = match download.subscription_id {
+            Some(subscription_id) => self.db.get_subscription(subscription_id).await?,
+            None => None,
+        };
+        Ok(AddTorrentOptions {
+            save_path: subscription
+                .as_ref()
+                .and_then(|subscription| subscription.save_path.clone()),
+            tags: Some("云母".to_string()),
+            category: Some(
+                media_download_category(
+                    &download.target_key,
+                    subscription
+                        .as_ref()
+                        .is_some_and(|subscription| subscription.tmdb_is_animation),
+                )
+                .to_string(),
+            ),
+            ..Default::default()
+        })
+    }
+
     pub async fn process_download(
         &self,
         download: MediaDownloadRecord,
@@ -1417,37 +1534,53 @@ impl MediaService {
                 download.id, download.status
             )));
         }
-        let result: SearchResult = serde_json::from_str(&download.release_json)
-            .map_err(|error| MediaServiceError::Serialization(error.to_string()))?;
-        let site_id = download
-            .site_id
-            .ok_or_else(|| MediaServiceError::NotFound("download site was deleted".to_string()))?;
+        let (result, torrent) = self.fetch_torrent_for_download(&download).await?;
         let downloader_id = download.downloader_id.ok_or_else(|| {
             MediaServiceError::NotFound("download client was deleted".to_string())
         })?;
-        let site = self
-            .db
-            .get_site(site_id)
-            .await?
-            .ok_or_else(|| MediaServiceError::NotFound(format!("site {site_id}")))?;
         let downloader = self
             .db
             .get_downloader(downloader_id)
             .await?
             .ok_or_else(|| MediaServiceError::NotFound(format!("downloader {downloader_id}")))?;
-        let proxy = self.db.get_settings().await?.proxy;
-        let adapter = self.indexers.get_or_create(&site, proxy.as_deref()).await?;
-        let torrent = match adapter.fetch_torrent(&result).await {
-            Ok(torrent) => torrent,
-            Err(error) => return Err(error.into()),
-        };
         let infohash = torrent_infohash(&torrent)?;
+        let client = self
+            .downloaders
+            .get(&downloader)
+            .await
+            .map_err(MediaServiceError::Downloader)?;
         if let Some(existing) = self
             .db
             .get_media_download_by_infohash(downloader_id, &infohash)
             .await?
         {
             if existing.id != download.id && existing.status == "submitted" {
+                if !torrent_is_present(client.as_ref(), &infohash)
+                    .await
+                    .map_err(MediaServiceError::Downloader)?
+                {
+                    let options = self.add_torrent_options(&download).await?;
+                    let filename = media_download_filename(&result);
+                    match add_torrent_and_confirm(
+                        client.as_ref(),
+                        torrent,
+                        &filename,
+                        &options,
+                        &infohash,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
+                            return Err(MediaServiceError::Downloader(message));
+                        }
+                        Err(TorrentSubmissionError::Unknown(message)) => {
+                            return Err(MediaServiceError::Downloader(format!(
+                                "submission result is unknown: {message}"
+                            )));
+                        }
+                    }
+                }
                 if !self
                     .db
                     .mark_media_download_duplicate_submitted(
@@ -1485,47 +1618,12 @@ impl MediaService {
             .get_media_download(download.id)
             .await?
             .ok_or_else(|| MediaServiceError::NotFound(format!("download {}", download.id)))?;
-        let client = self
-            .downloaders
-            .get(&downloader)
+        let options = self.add_torrent_options(&submitting).await?;
+        let filename = media_download_filename(&result);
+        match add_torrent_and_confirm(client.as_ref(), torrent, &filename, &options, &infohash)
             .await
-            .map_err(MediaServiceError::Downloader)?;
-        let subscription = match submitting.subscription_id {
-            Some(subscription_id) => self.db.get_subscription(subscription_id).await?,
-            None => None,
-        };
-        let save_path = subscription
-            .as_ref()
-            .and_then(|subscription| subscription.save_path.clone());
-        let options = AddTorrentOptions {
-            save_path,
-            tags: Some("云母".to_string()),
-            category: Some(
-                media_download_category(
-                    &submitting.target_key,
-                    subscription
-                        .as_ref()
-                        .is_some_and(|subscription| subscription.tmdb_is_animation),
-                )
-                .to_string(),
-            ),
-            ..Default::default()
-        };
-        let filename = format!(
-            "rflush-media-{}-{}.torrent",
-            result.site_id, result.torrent_id
-        );
-        let submission = client.add_torrent(torrent, &filename, &options).await;
-        let submission_error = submission.as_ref().err().cloned();
-        let submitted: Result<bool, String> = match submission {
-            Ok(()) => Ok(true),
-            Err(_) => client
-                .list_torrents_by_hashes(std::slice::from_ref(&infohash))
-                .await
-                .map(|torrents| !torrents.is_empty()),
-        };
-        match submitted {
-            Ok(true) => {
+        {
+            Ok(()) => {
                 if !self
                     .db
                     .mark_media_download_submitted(
@@ -1537,21 +1635,18 @@ impl MediaService {
                     .await?
                 {
                     return Err(MediaServiceError::Conflict(
-                        "qBittorrent accepted the torrent but the outbox state changed".to_string(),
+                        "qBittorrent contains the torrent but the outbox state changed".to_string(),
                     ));
                 }
                 Ok(())
             }
-            Ok(false) => {
-                let message = submission_error.unwrap_or_else(|| {
-                    "qBittorrent did not contain the submitted torrent".to_string()
-                });
+            Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
                 self.db
                     .release_media_download_after_error(submitting.id, owner, &message, true)
                     .await?;
                 Err(MediaServiceError::Downloader(message))
             }
-            Err(error) => {
+            Err(TorrentSubmissionError::Unknown(message)) => {
                 let next = (Utc::now()
                     + Duration::seconds(MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS))
                 .to_rfc3339();
@@ -1564,7 +1659,7 @@ impl MediaService {
                         "submitting",
                         "reconciling",
                         Some(&infohash),
-                        Some(&error),
+                        Some(&message),
                         Some(&next),
                     )
                     .await?
@@ -1574,7 +1669,7 @@ impl MediaService {
                     ));
                 }
                 Err(MediaServiceError::Downloader(format!(
-                    "submission result is unknown: {error}"
+                    "submission result is unknown: {message}"
                 )))
             }
         }
@@ -1601,11 +1696,8 @@ impl MediaService {
             .get(&downloader)
             .await
             .map_err(MediaServiceError::Downloader)?;
-        match client
-            .list_torrents_by_hashes(std::slice::from_ref(&infohash))
-            .await
-        {
-            Ok(torrents) if !torrents.is_empty() => {
+        match torrent_is_present(client.as_ref(), &infohash).await {
+            Ok(true) => {
                 if !self
                     .db
                     .mark_media_download_submitted(download.id, download.version, owner, &infohash)
@@ -1617,7 +1709,7 @@ impl MediaService {
                 }
                 Ok(())
             }
-            Ok(_) => {
+            Ok(false) => {
                 self.db
                     .release_media_download_after_error(
                         download.id,
@@ -1734,6 +1826,69 @@ impl MediaService {
         let proxy = self.db.get_settings().await?.proxy;
         let client = client_factory::build_client(proxy.as_deref())?;
         TmdbClient::new(client, token, media.tmdb_language).map_err(Into::into)
+    }
+}
+
+fn media_download_filename(result: &SearchResult) -> String {
+    format!(
+        "rflush-media-{}-{}.torrent",
+        result.site_id, result.torrent_id
+    )
+}
+
+fn is_valid_infohash(infohash: &str) -> bool {
+    infohash.len() == 40 && infohash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn torrent_is_present(client: &dyn DownloaderClient, infohash: &str) -> Result<bool, String> {
+    let hashes = [infohash.to_string()];
+    client
+        .list_torrents_by_hashes(&hashes)
+        .await
+        .map(|torrents| {
+            torrents
+                .iter()
+                .any(|torrent| torrent.hash.eq_ignore_ascii_case(infohash))
+        })
+}
+
+async fn confirm_torrent_present(
+    client: &dyn DownloaderClient,
+    infohash: &str,
+) -> Result<bool, String> {
+    let mut last_result = Ok(false);
+    for attempt in 0..DOWNLOAD_CONFIRM_ATTEMPTS {
+        match torrent_is_present(client, infohash).await {
+            Ok(true) => return Ok(true),
+            result => last_result = result,
+        }
+        if attempt + 1 < DOWNLOAD_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(DOWNLOAD_CONFIRM_INTERVAL).await;
+        }
+    }
+    last_result
+}
+
+async fn add_torrent_and_confirm(
+    client: &dyn DownloaderClient,
+    torrent: Vec<u8>,
+    filename: &str,
+    options: &AddTorrentOptions,
+    infohash: &str,
+) -> Result<(), TorrentSubmissionError> {
+    let submission_error = client.add_torrent(torrent, filename, options).await.err();
+    match confirm_torrent_present(client, infohash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(TorrentSubmissionError::ConfirmedAbsent(
+            submission_error
+                .unwrap_or_else(|| "qBittorrent did not contain the submitted torrent".to_string()),
+        )),
+        Err(confirmation_error) => {
+            let message = submission_error.map_or(confirmation_error.clone(), |submission_error| {
+                format!("{submission_error}; qBittorrent verification failed: {confirmation_error}")
+            });
+            Err(TorrentSubmissionError::Unknown(message))
+        }
     }
 }
 
@@ -1985,7 +2140,15 @@ impl From<reqwest::Error> for MediaServiceError {
 
 #[cfg(test)]
 mod tests {
-    use crate::downloader::DownloaderClientPool;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::downloader::{
+        DownloaderClient, DownloaderClientPool, DownloaderTestResult, TorrentInfo,
+    };
     use crate::indexer::{IndexerAdapter, IndexerCapabilities, IndexerFuture};
     use tempfile::tempdir;
 
@@ -1995,6 +2158,152 @@ mod tests {
         site_id: i64,
         site_name: String,
         results: Vec<SearchResult>,
+    }
+
+    struct TorrentIndexer {
+        site_id: i64,
+        site_name: String,
+        torrent: Vec<u8>,
+        fetch_count: Arc<AtomicUsize>,
+    }
+
+    impl IndexerAdapter for TorrentIndexer {
+        fn site_id(&self) -> i64 {
+            self.site_id
+        }
+
+        fn site_name(&self) -> &str {
+            &self.site_name
+        }
+
+        fn capabilities(&self) -> IndexerCapabilities {
+            IndexerCapabilities {
+                search: false,
+                fetch_torrent: true,
+                api_search: false,
+                html_search: false,
+            }
+        }
+
+        fn search<'a>(
+            &'a self,
+            _request: &'a SearchRequest,
+        ) -> IndexerFuture<'a, Vec<SearchResult>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fetch_torrent<'a>(&'a self, _result: &'a SearchResult) -> IndexerFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                self.fetch_count.fetch_add(1, Ordering::SeqCst);
+                Ok(self.torrent.clone())
+            })
+        }
+    }
+
+    struct ScriptedDownloader {
+        lookups: StdMutex<VecDeque<Result<Vec<TorrentInfo>, String>>>,
+        fallback_lookup: Result<Vec<TorrentInfo>, String>,
+        add_result: Result<(), String>,
+        add_calls: AtomicUsize,
+    }
+
+    impl ScriptedDownloader {
+        fn new(
+            lookups: Vec<Result<Vec<TorrentInfo>, String>>,
+            fallback_lookup: Result<Vec<TorrentInfo>, String>,
+            add_result: Result<(), String>,
+        ) -> Self {
+            Self {
+                lookups: StdMutex::new(lookups.into()),
+                fallback_lookup,
+                add_result,
+                add_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DownloaderClient for ScriptedDownloader {
+        fn test_connection(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<DownloaderTestResult, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("unused test operation".to_string()) })
+        }
+
+        fn add_torrent(
+            &self,
+            _torrent_data: Vec<u8>,
+            _filename: &str,
+            _options: &AddTorrentOptions,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            self.add_calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.add_result.clone();
+            Box::pin(async move { result })
+        }
+
+        fn list_torrents(
+            &self,
+            _tag: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + '_>> {
+            let result = self.fallback_lookup.clone();
+            Box::pin(async move { result })
+        }
+
+        fn list_torrents_by_hashes<'a>(
+            &'a self,
+            _hashes: &'a [String],
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + 'a>> {
+            let result = self
+                .lookups
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.fallback_lookup.clone());
+            Box::pin(async move { result })
+        }
+
+        fn pause_torrent(
+            &self,
+            _hash: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Err("unused test operation".to_string()) })
+        }
+
+        fn delete_torrent(
+            &self,
+            _hash: &str,
+            _delete_files: bool,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Err("unused test operation".to_string()) })
+        }
+
+        fn get_free_space(
+            &self,
+            _path: Option<&str>,
+        ) -> Pin<Box<dyn Future<Output = Result<u64, String>> + Send + '_>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn get_default_save_path(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + '_>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn get_torrent_trackers(
+            &self,
+            _hash: &str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn add_torrent_tags(
+            &self,
+            _hashes: Vec<String>,
+            _tags: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     impl IndexerAdapter for StaticIndexer {
@@ -2121,6 +2430,282 @@ mod tests {
                 }),
             )
             .await;
+    }
+
+    fn test_torrent(name: &str) -> Vec<u8> {
+        format!("d4:infod4:name{}:{}ee", name.len(), name).into_bytes()
+    }
+
+    fn test_torrent_info(infohash: &str) -> TorrentInfo {
+        TorrentInfo {
+            hash: infohash.to_string(),
+            name: "test torrent".to_string(),
+            size: 1,
+            uploaded: 0,
+            downloaded: 0,
+            upload_speed: 0,
+            download_speed: 0,
+            ratio: 0.0,
+            state: "downloading".to_string(),
+            added_on: 0,
+            completion_on: 0,
+            num_seeds: 0,
+            num_leechs: 0,
+            save_path: String::new(),
+            root_path: String::new(),
+            content_path: String::new(),
+            tags: String::new(),
+            category: String::new(),
+            time_active: 0,
+            last_activity: 0,
+        }
+    }
+
+    fn test_download_result(site_id: i64, torrent_id: &str) -> SearchResult {
+        SearchResult {
+            site_id,
+            source_site: "test site".to_string(),
+            torrent_id: torrent_id.to_string(),
+            title: "Example.Show.S01E01.1080p.WEB-DL.H264".to_string(),
+            detail_url: None,
+            download_locator: Some(torrent_id.to_string()),
+            magnet: None,
+            size: 1_024,
+            seeders: 10,
+            leechers: 0,
+            publish_time: None,
+        }
+    }
+
+    async fn enqueue_test_download(
+        db: &Database,
+        site_id: i64,
+        downloader_id: i64,
+        torrent_id: &str,
+    ) -> MediaDownloadRecord {
+        let site = db.get_site(site_id).await.unwrap().unwrap();
+        let downloader = db.get_downloader(downloader_id).await.unwrap().unwrap();
+        let result = test_download_result(site_id, torrent_id);
+        db.enqueue_media_download(&NewMediaDownload {
+            subscription_id: None,
+            target_key: format!("manual:{site_id}:{torrent_id}"),
+            dedupe_key: format!("test:{site_id}:{downloader_id}:{torrent_id}"),
+            site_id: Some(site_id),
+            downloader_id: Some(downloader_id),
+            source_site: site.name,
+            downloader_name: downloader.name,
+            torrent_id: torrent_id.to_string(),
+            title: result.title.clone(),
+            size: result.size,
+            release_json: to_json(&result).unwrap(),
+            decision_json: "{}".to_string(),
+            profile_snapshot_json: "{}".to_string(),
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn install_download_dependencies(
+        service: &MediaService,
+        db: &Database,
+        site_id: i64,
+        downloader_id: i64,
+        torrent: Vec<u8>,
+        client: Arc<ScriptedDownloader>,
+    ) -> Arc<AtomicUsize> {
+        let site = db.get_site(site_id).await.unwrap().unwrap();
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        service
+            .indexers
+            .insert_for_test(
+                &site,
+                None,
+                Arc::new(TorrentIndexer {
+                    site_id,
+                    site_name: site.name.clone(),
+                    torrent,
+                    fetch_count: Arc::clone(&fetch_count),
+                }),
+            )
+            .await;
+        let downloader = db.get_downloader(downloader_id).await.unwrap().unwrap();
+        let injected: Arc<dyn DownloaderClient> = client;
+        service
+            .downloaders
+            .insert_for_test(&downloader, None, injected)
+            .await;
+        fetch_count
+    }
+
+    async fn mark_test_download_submitted(
+        db: &Database,
+        queued: &MediaDownloadRecord,
+        owner: &str,
+        infohash: &str,
+    ) -> MediaDownloadRecord {
+        let fetching = db
+            .claim_due_media_downloads(owner, 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(fetching.id, queued.id);
+        assert!(
+            db.mark_media_download_submitting(fetching.id, fetching.version, owner, infohash, 60,)
+                .await
+                .unwrap()
+        );
+        let submitting = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert!(
+            db.mark_media_download_submitted(submitting.id, submitting.version, owner, infohash,)
+                .await
+                .unwrap()
+        );
+        db.get_media_download(queued.id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_add_without_visible_infohash_is_not_marked_submitted() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("missing-after-add");
+        let client = Arc::new(ScriptedDownloader::new(Vec::new(), Ok(Vec::new()), Ok(())));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "missing").await;
+        let owner = "missing-hash-worker";
+        let fetching = db
+            .claim_due_media_downloads(owner, 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let error = service.process_download(fetching, owner).await.unwrap_err();
+
+        assert!(matches!(error, MediaServiceError::Downloader(_)));
+        let stored = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "retry_wait");
+        assert!(stored.submitted_at.is_none());
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn delayed_infohash_visibility_is_confirmed_before_marking_submitted() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("delayed-after-add");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        let present = vec![test_torrent_info(&infohash)];
+        let client = Arc::new(ScriptedDownloader::new(
+            vec![Ok(Vec::new()), Ok(present.clone())],
+            Ok(present),
+            Ok(()),
+        ));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "delayed").await;
+        let owner = "delayed-hash-worker";
+        let fetching = db
+            .claim_due_media_downloads(owner, 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        service.process_download(fetching, owner).await.unwrap();
+
+        let stored = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "submitted");
+        assert_eq!(stored.infohash.as_deref(), Some(infohash.as_str()));
+        assert!(stored.submitted_at.is_some());
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn redelivery_is_idempotent_when_infohash_already_exists() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("already-present");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "already-present").await;
+        let submitted =
+            mark_test_download_submitted(&db, &queued, "submit-existing", &infohash).await;
+        let client = Arc::new(ScriptedDownloader::new(
+            Vec::new(),
+            Ok(vec![test_torrent_info(&infohash)]),
+            Ok(()),
+        ));
+        let fetch_count = install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+
+        let verified = service.redeliver_download(submitted.id).await.unwrap();
+
+        assert_eq!(verified.version, submitted.version);
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn redelivery_restores_missing_torrent_without_mutating_outbox_state() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("redelivered");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "redelivered").await;
+        let submitted =
+            mark_test_download_submitted(&db, &queued, "submit-missing", &infohash).await;
+        let present = vec![test_torrent_info(&infohash)];
+        let client = Arc::new(ScriptedDownloader::new(
+            vec![Ok(Vec::new()), Ok(present.clone())],
+            Ok(present),
+            Ok(()),
+        ));
+        let fetch_count = install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+
+        service.redeliver_download(submitted.id).await.unwrap();
+
+        let stored = db.get_media_download(submitted.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "submitted");
+        assert_eq!(stored.version, submitted.version);
+        assert_eq!(stored.submitted_at, submitted.submitted_at);
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn redelivery_rejects_downloads_that_are_not_submitted() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "still-queued").await;
+
+        let error = service.redeliver_download(queued.id).await.unwrap_err();
+
+        assert!(matches!(error, MediaServiceError::Conflict(_)));
     }
 
     #[test]

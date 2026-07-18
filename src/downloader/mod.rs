@@ -288,4 +288,21 @@ impl DownloaderClientPool {
         );
         Ok(client)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn insert_for_test(
+        &self,
+        record: &DownloaderRecord,
+        proxy: Option<&str>,
+        client: Arc<dyn DownloaderClient>,
+    ) {
+        self.cache.lock().await.insert(
+            record.id,
+            CachedClient {
+                record: record.clone(),
+                proxy: proxy.map(str::to_string),
+                client,
+            },
+        );
+    }
 }

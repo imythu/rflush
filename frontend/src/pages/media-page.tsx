@@ -704,7 +704,8 @@ function subscriptionStatus(subscription: Subscription): { label: string; tone: 
   if (!subscription.enabled) return { label: "已暂停", tone: "neutral" };
   if (subscription.last_error) return { label: "需处理", tone: "negative" };
   if (status === "running" || status === "searching") return { label: "扫描中", tone: "positive" };
-  if (status === "queued" || status === "submitted") return { label: "已入队", tone: "positive" };
+  if (status === "queued") return { label: "已入队", tone: "positive" };
+  if (status === "submitted") return { label: "已提交下载器", tone: "positive" };
   if (status === "waiting_air_date") return { label: "待播出", tone: "neutral" };
   if (status === "awaiting_metadata") return { label: "等待 TMDB 更新", tone: "neutral" };
   return { label: "等待扫描", tone: "neutral" };
@@ -1452,6 +1453,23 @@ export function MediaPage() {
     }
   }
 
+  async function redeliverDownload(download: MediaDownload) {
+    const key = `redeliver:${download.id}`;
+    setBusyKey(key);
+    setNotice(null);
+    try {
+      await api<MediaDownload>(`/api/media/downloads/${download.id}/redeliver`, {
+        method: "POST",
+      });
+      await reloadDownloads();
+      setNotice({ tone: "success", text: "核验完成：种子已确认存在于下载器" });
+    } catch (error) {
+      setNotice({ tone: "error", text: describeUnknown(error) });
+    } finally {
+      setBusyKey("");
+    }
+  }
+
   async function openRunDetails(subscription: Subscription) {
     setRunDetailsSubscription(subscription);
     setRunDetails(null);
@@ -1891,6 +1909,7 @@ export function MediaPage() {
           onViewRun={(subscription) => void openRunDetails(subscription)}
           onEdit={openSubscriptionEditor}
           onDelete={setDeleteSubscription}
+          onRedeliver={(download) => void redeliverDownload(download)}
         />
       ) : mode === "tmdb" ? (
         <TmdbPanel
@@ -2837,6 +2856,7 @@ function SubscriptionsPanel({
   onViewRun,
   onEdit,
   onDelete,
+  onRedeliver,
 }: {
   subscriptions: Subscription[];
   downloads: MediaDownload[];
@@ -2852,6 +2872,7 @@ function SubscriptionsPanel({
   onViewRun: (subscription: Subscription) => void;
   onEdit: (subscription: Subscription) => void;
   onDelete: (subscription: Subscription) => void;
+  onRedeliver: (download: MediaDownload) => void;
 }) {
   const activeCount = subscriptions.filter((item) => item.enabled && !subscriptionIsCompleted(item)).length;
   const pausedCount = subscriptions.filter((item) => !item.enabled && !subscriptionIsCompleted(item)).length;
@@ -3113,9 +3134,24 @@ function SubscriptionsPanel({
                         </div>
                       ) : null}
                     </div>
-                    <div className="flex items-center justify-between gap-3 lg:justify-end">
+                    <div className="flex flex-wrap items-center justify-end gap-2">
                       <span className="text-xs text-muted">{download.downloader_name}</span>
                       <StatusPill label={downloadStatus(download.status)} tone={downloadTone(download.status)} />
+                      {download.status === "submitted" ? (
+                        <Button
+                          variant="outline"
+                          className="h-8 px-3"
+                          disabled={busyKey === `redeliver:${download.id}`}
+                          onClick={() => onRedeliver(download)}
+                        >
+                          {busyKey === `redeliver:${download.id}` ? (
+                            <LoaderCircle className="animate-spin" data-icon="inline-start" />
+                          ) : (
+                            <RefreshCw data-icon="inline-start" />
+                          )}
+                          {busyKey === `redeliver:${download.id}` ? "核验中" : "核验/补交"}
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
                 );
