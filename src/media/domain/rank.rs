@@ -46,8 +46,8 @@ impl Ord for SortKey {
     fn cmp(&self, other: &Self) -> Ordering {
         self.accepted
             .cmp(&other.accepted)
-            .then_with(|| self.score.cmp(&other.score))
             .then_with(|| self.quality_rank.cmp(&other.quality_rank))
+            .then_with(|| self.score.cmp(&other.score))
             .then_with(|| self.seeders.cmp(&other.seeders))
             .then_with(|| self.publish_time.cmp(&other.publish_time))
             // Lower site priority and lexical stable key are preferred, so these
@@ -128,12 +128,14 @@ mod tests {
 
         values.sort_by(SortKey::compare_best_first);
 
-        assert_eq!(values[0].score, 95);
-        assert_eq!(values[1].stable_release_key, "a");
-        assert_eq!(values[2].site_priority, 1);
-        assert_eq!(values[3].publish_time.unwrap().timestamp(), 2);
-        assert_eq!(values[4].seeders, 5);
-        assert_eq!(values[5].quality_rank, 200);
+        assert_eq!(values[0].quality_rank, 200);
+        assert_eq!(values[0].stable_release_key, "a");
+        assert_eq!(values[1].site_priority, 1);
+        assert_eq!(values[2].publish_time.unwrap().timestamp(), 2);
+        assert_eq!(values[3].seeders, 5);
+        assert_eq!(values[4].quality_rank, 200);
+        assert_eq!(values[5].quality_rank, 100);
+        assert_eq!(values[6].score, 95);
         assert!(values.last().is_some_and(|value| !value.accepted));
     }
 

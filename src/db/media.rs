@@ -513,7 +513,9 @@ impl Database {
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open_connection(&path)?;
-            let tx = conn.transaction().map_err(sql_error)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
             let now = Utc::now().to_rfc3339();
             let Some(current) = load_subscription(&tx, id)? else {
                 tx.rollback().map_err(sql_error)?;
@@ -569,8 +571,7 @@ impl Database {
                 if existing_target_status.as_deref() == Some("submitted")
                     || (key != current_key
                         && (existing_target_status.as_deref() == Some("queued")
-                            || current_target_status.as_deref() == Some("queued")
-                            || current_target_status.as_deref() == Some("submitted")))
+                            || current_target_status.as_deref() == Some("queued")))
                 {
                     return Err(invalid(
                         "cannot move a subscription cursor to a submitted or active target",
@@ -4470,6 +4471,45 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn submitted_current_target_does_not_block_moving_to_another_episode() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = db
+            .create_subscription(&test_tv_subscription_request(
+                205,
+                1,
+                10,
+                site_id,
+                downloader_id,
+            ))
+            .await
+            .unwrap();
+        let current_key = target_key("tv", 205, Some(1), Some(10), None);
+        set_test_target_status(&db, created.id, &current_key, "submitted");
+
+        let moved = db
+            .update_subscription(
+                created.id,
+                created.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(9),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(moved.next_episode, Some(9));
+        assert_eq!(moved.start_episode, Some(9));
     }
 
     #[tokio::test]
