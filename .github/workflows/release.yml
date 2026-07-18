@@ -78,7 +78,7 @@ jobs:
             VERSION="${BASE_VERSION}-snapshot.${UTC_STAMP}.${GITHUB_RUN_NUMBER}"
             RELEASE_KIND="snapshot"
             PRERELEASE="true"
-            CHANNEL_TAG="edge"
+            CHANNEL_TAG="latest-beta"
             RELEASE_NAME="rflush ${VERSION} (snapshot)"
           fi
 
@@ -375,7 +375,7 @@ jobs:
             echo "## 版本策略"
             echo "- 自动推送到 \`master\`：生成 snapshot 预发布，版本格式为 \`<base>-snapshot.<UTC时间>.<run_number>\`"
             echo "- 手动触发并填写 \`version\`：生成手动发布版本，适合正式版或指定版本补发"
-            echo "- Docker 渠道标签：snapshot 使用 \`edge\`，正式版使用 \`latest\`，手动预发布使用 \`rc\`"
+            echo "- Docker 渠道标签：snapshot 使用 \`latest-beta\`，正式版使用 \`latest\`，手动预发布使用 \`rc\`"
             echo
             echo "$CHANGE_TITLE"
             if [[ -n "$PREVIOUS_TAG" ]]; then
