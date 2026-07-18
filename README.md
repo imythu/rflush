@@ -310,6 +310,15 @@ cargo build --release
 
 发布构建会将 `frontend/dist` 嵌入 Rust 可执行文件。
 
+## 感谢与参考
+
+本项目的自动追剧与资源搜索设计参考了以下开源项目：
+
+- [Sonarr](https://github.com/Sonarr/Sonarr)：参考了剧集订阅、季集目标推进、质量配置、发布名称解析、候选筛选以及自动下载的整体产品思路。
+- [pt_mate](https://github.com/JustLookAtNow/pt_mate)：参考了 PT 多站资源聚合搜索、NexusPHP 与 M-Team 站点适配、搜索结果归一化和资源获取流程。
+
+云母没有直接照搬这些项目的实现，而是结合当前 Rust 后端、SQLite 状态管理、React 前端和已有 PT 站点配置体系重新设计并独立实现。感谢相关项目及其贡献者提供的思路和开源成果。
+
 ## 合并种子文件
 
 将当前目录一级子目录中的 `.torrent` 文件合并到 `merge/`：
