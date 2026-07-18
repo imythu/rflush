@@ -1,6 +1,16 @@
 name: Release
 
 on:
+  push:
+    branches:
+      - master
+    paths:
+      - "src/**"
+      - "frontend/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "docker/**"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       version:
