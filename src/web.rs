@@ -22,7 +22,10 @@ use crate::brush::BrushTaskRequest;
 use crate::brush::scheduler::BrushScheduler;
 use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
-use crate::db::{Database, DownloadHistoryRecord, DownloadRunRecord, PaginatedRunRecords};
+use crate::db::{
+    Database, DownloadHistoryRecord, DownloadRunRecord, MediaRelocationJob, OpenListConfig,
+    OpenListPathMapping, OpenListTargetDirectory, PaginatedRunRecords,
+};
 use crate::downloader::DownloaderClientPool;
 use crate::downloader::DownloaderSpaceStats;
 use crate::engine::DownloadEngine;
@@ -42,6 +45,7 @@ use crate::media::service::{
 use crate::media::tmdb::{TmdbDetails, TmdbError, TmdbMedia, TmdbMediaType, TmdbSeason};
 use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
+use crate::relocation::RelocationScheduler;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
 use crate::site::{SiteAuth, SiteStatsRecord, SiteType, SiteWithStats};
@@ -62,6 +66,7 @@ pub struct AppState {
     media_scheduler: Arc<MediaScheduler>,
     monitor: Arc<SystemMonitor>,
     tag_rule_scheduler: Arc<TagRuleScheduler>,
+    self_use: bool,
 }
 
 struct JobRegistry {
@@ -165,6 +170,7 @@ impl AppState {
         media_scheduler: Arc<MediaScheduler>,
         monitor: Arc<SystemMonitor>,
         tag_rule_scheduler: Arc<TagRuleScheduler>,
+        self_use: bool,
     ) -> Self {
         Self {
             db,
@@ -179,6 +185,7 @@ impl AppState {
             media_scheduler,
             monitor,
             tag_rule_scheduler,
+            self_use,
         }
     }
 
@@ -326,6 +333,8 @@ pub async fn serve(
     rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
     monitor: Arc<SystemMonitor>,
     tag_rule_scheduler: Arc<TagRuleScheduler>,
+    relocation_scheduler: Arc<RelocationScheduler>,
+    self_use: bool,
 ) -> Result<(), AppError> {
     let addr = listener.local_addr().map_err(|error| AppError::Server {
         message: format!("failed to read bound web server address: {error}"),
@@ -343,8 +352,9 @@ pub async fn serve(
         media_scheduler,
         monitor,
         tag_rule_scheduler,
+        self_use,
     );
-    let app = app_router(state);
+    let app = app_router(state, relocation_scheduler);
     if !addr.ip().is_loopback() {
         warn!(
             "web server is listening on a non-loopback address; place rflush behind an authenticated reverse proxy and restrict network access"
@@ -365,9 +375,10 @@ pub async fn serve(
         })
 }
 
-fn app_router(state: AppState) -> Router {
+fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -> Router {
     let media = Arc::clone(&state.media);
     let media_scheduler = Arc::clone(&state.media_scheduler);
+    let self_use = state.self_use;
     Router::new()
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/rss", get(list_rss).post(create_rss))
@@ -475,7 +486,10 @@ fn app_router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/{*path}", get(static_asset))
         .with_state(state)
-        .nest("/api/media", media_router(media, media_scheduler))
+        .nest(
+            "/api/media",
+            media_router(media, media_scheduler, relocation_scheduler, self_use),
+        )
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                 info_span!(
@@ -506,10 +520,16 @@ fn cors_layer() -> CorsLayer {
 struct MediaApiState {
     service: Arc<MediaService>,
     scheduler: Arc<MediaScheduler>,
+    relocation_scheduler: Arc<RelocationScheduler>,
 }
 
-fn media_router(service: Arc<MediaService>, scheduler: Arc<MediaScheduler>) -> Router {
-    Router::new()
+fn media_router(
+    service: Arc<MediaService>,
+    scheduler: Arc<MediaScheduler>,
+    relocation_scheduler: Arc<RelocationScheduler>,
+    self_use: bool,
+) -> Router {
+    let router = Router::new()
         .route(
             "/settings",
             get(get_media_settings).put(update_media_settings),
@@ -558,8 +578,415 @@ fn media_router(service: Arc<MediaService>, scheduler: Arc<MediaScheduler>) -> R
             "/downloads",
             get(list_media_downloads).post(queue_media_download),
         )
-        .route("/downloads/{id}", get(get_media_download))
-        .with_state(MediaApiState { service, scheduler })
+        .route("/downloads/{id}", get(get_media_download));
+    let router = if self_use {
+        router
+            .route(
+                "/openlist/settings",
+                get(get_openlist_config).put(update_openlist_config),
+            )
+            .route("/openlist/jobs", get(list_openlist_jobs))
+            .route("/openlist/scan", post(scan_openlist_jobs))
+    } else {
+        router
+    };
+    router.with_state(MediaApiState {
+        service,
+        scheduler,
+        relocation_scheduler,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct OpenListConfigResponse {
+    address: String,
+    api_key: Option<String>,
+    api_key_configured: bool,
+    enabled: bool,
+    target_directory_id: Option<i64>,
+    selected_target_index: Option<usize>,
+    scan_interval_mins: u64,
+    updated_at: String,
+    source_mappings: Vec<OpenListPathMapping>,
+    target_directories: Vec<OpenListTargetDirectory>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenListJobResponse {
+    id: i64,
+    media_download_id: i64,
+    downloader_id: Option<i64>,
+    infohash: String,
+    torrent_name: String,
+    stage: String,
+    source_qb_path: String,
+    source_openlist_path: String,
+    target_openlist_path: String,
+    target_qb_path: String,
+    attempts: u32,
+    next_attempt_at: Option<String>,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+    completed_at: Option<String>,
+}
+
+impl From<MediaRelocationJob> for OpenListJobResponse {
+    fn from(job: MediaRelocationJob) -> Self {
+        Self {
+            id: job.id,
+            media_download_id: job.media_download_id,
+            downloader_id: job.downloader_id,
+            infohash: job.infohash,
+            torrent_name: job.torrent_name,
+            stage: job.stage,
+            source_qb_path: job.source_qb_path,
+            source_openlist_path: job.source_openlist_path,
+            target_openlist_path: job.target_openlist_path,
+            target_qb_path: job.target_qb_path,
+            attempts: job.attempts,
+            next_attempt_at: job.next_attempt_at,
+            last_error: job.last_error,
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            completed_at: job.completed_at,
+        }
+    }
+}
+
+async fn list_openlist_jobs(
+    State(state): State<MediaApiState>,
+) -> Result<Json<Vec<OpenListJobResponse>>, ApiError> {
+    let jobs = state
+        .service
+        .database()
+        .list_media_relocation_jobs(200)
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(jobs.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Debug, Serialize)]
+struct OpenListScanResponse {
+    accepted: bool,
+    discovered: usize,
+    processing_enabled: bool,
+}
+
+async fn scan_openlist_jobs(
+    State(state): State<MediaApiState>,
+) -> Result<Json<OpenListScanResponse>, ApiError> {
+    let db = state.service.database();
+    let config = db.get_openlist_config().await.map_err(media_app_error)?;
+    let discovered = db
+        .enqueue_submitted_media_relocation_jobs()
+        .await
+        .map_err(media_app_error)?;
+    if config.enabled {
+        state.relocation_scheduler.request_scan();
+    }
+    Ok(Json(OpenListScanResponse {
+        accepted: true,
+        discovered,
+        processing_enabled: config.enabled,
+    }))
+}
+
+impl From<OpenListConfig> for OpenListConfigResponse {
+    fn from(config: OpenListConfig) -> Self {
+        Self {
+            address: config.base_url,
+            api_key: None,
+            api_key_configured: !config.api_key.trim().is_empty(),
+            enabled: config.enabled,
+            target_directory_id: config.target_directory_id,
+            selected_target_index: config.selected_target_index,
+            scan_interval_mins: config.scan_interval_secs.div_ceil(60),
+            updated_at: config.updated_at,
+            source_mappings: config.path_mappings,
+            target_directories: config.target_directories,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateOpenListConfigRequest {
+    address: String,
+    api_key: Option<String>,
+    #[serde(default)]
+    clear_api_key: bool,
+    enabled: bool,
+    target_directory_id: Option<i64>,
+    selected_target_index: Option<usize>,
+    scan_interval_mins: u64,
+    #[serde(default)]
+    source_mappings: Vec<OpenListPathMapping>,
+    #[serde(default)]
+    target_directories: Vec<OpenListTargetDirectory>,
+}
+
+async fn get_openlist_config(
+    State(state): State<MediaApiState>,
+) -> Result<Json<OpenListConfigResponse>, ApiError> {
+    let config = state
+        .service
+        .database()
+        .get_openlist_config()
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(config.into()))
+}
+
+async fn update_openlist_config(
+    State(state): State<MediaApiState>,
+    Json(mut payload): Json<UpdateOpenListConfigRequest>,
+) -> Result<Json<OpenListConfigResponse>, ApiError> {
+    normalize_and_validate_openlist_config(&mut payload)?;
+    let db = state.service.database();
+    let qb_ids = db
+        .list_downloaders()
+        .await
+        .map_err(media_app_error)?
+        .into_iter()
+        .filter(|downloader| matches!(downloader.downloader_type.as_str(), "qbittorrent" | "qb"))
+        .map(|downloader| downloader.id)
+        .collect::<std::collections::HashSet<_>>();
+    if payload
+        .source_mappings
+        .iter()
+        .any(|mapping| !qb_ids.contains(&mapping.downloader_id))
+        || payload
+            .target_directories
+            .iter()
+            .any(|target| !qb_ids.contains(&target.downloader_id))
+    {
+        return Err(ApiError::bad_request(
+            "all OpenList mappings must reference qBittorrent downloaders",
+        ));
+    }
+    let current = db.get_openlist_config().await.map_err(media_app_error)?;
+    if payload.clear_api_key
+        && payload
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "api_key and clear_api_key cannot be submitted together",
+        ));
+    }
+    let supplied_key = payload
+        .api_key
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let api_key = if payload.clear_api_key {
+        String::new()
+    } else {
+        supplied_key.unwrap_or(current.api_key)
+    };
+    if payload.enabled && api_key.is_empty() {
+        return Err(ApiError::bad_request("api_key is required when enabled"));
+    }
+    if payload.enabled && api_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "api_key is required when OpenList automation is enabled",
+        ));
+    }
+    let updated = db
+        .update_openlist_config(&OpenListConfig {
+            base_url: payload.address,
+            api_key,
+            enabled: payload.enabled,
+            target_directory_id: payload.target_directory_id,
+            selected_target_index: payload.selected_target_index,
+            scan_interval_secs: payload.scan_interval_mins.saturating_mul(60),
+            updated_at: current.updated_at,
+            path_mappings: payload.source_mappings,
+            target_directories: payload.target_directories,
+        })
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(updated.into()))
+}
+
+fn normalize_and_validate_openlist_config(
+    payload: &mut UpdateOpenListConfigRequest,
+) -> Result<(), ApiError> {
+    payload.address = payload.address.trim().trim_end_matches('/').to_string();
+    if !payload.address.is_empty() {
+        let url = reqwest::Url::parse(&payload.address)
+            .map_err(|_| ApiError::bad_request("openlist base_url is invalid"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(ApiError::bad_request(
+                "openlist base_url must be an absolute HTTP(S) URL",
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ApiError::bad_request(
+                "openlist address must not contain credentials",
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(ApiError::bad_request(
+                "openlist base_url must not contain a query or fragment",
+            ));
+        }
+    }
+    if payload.scan_interval_mins == 0 || payload.scan_interval_mins > 1_440 {
+        return Err(ApiError::bad_request(
+            "scan_interval_mins must be between 1 and 1440",
+        ));
+    }
+    for mapping in &mut payload.source_mappings {
+        if mapping.downloader_id <= 0 {
+            return Err(ApiError::bad_request(
+                "mapping downloader_id must be positive",
+            ));
+        }
+        mapping.qb_path = normalize_absolute_mapping_path(&mapping.qb_path)?;
+        mapping.openlist_path = normalize_absolute_mapping_path(&mapping.openlist_path)?;
+    }
+    for target in &mut payload.target_directories {
+        target.name = target.name.trim().to_string();
+        if target.name.is_empty() || target.name.len() > 100 {
+            return Err(ApiError::bad_request(
+                "target directory name must contain between 1 and 100 bytes",
+            ));
+        }
+        if target.downloader_id <= 0 {
+            return Err(ApiError::bad_request(
+                "target directory downloader_id must be positive",
+            ));
+        }
+        target.openlist_path = normalize_absolute_mapping_path(&target.openlist_path)?;
+        target.qb_path = normalize_absolute_mapping_path(&target.qb_path)?;
+    }
+    validate_non_overlapping_mapping_paths(&payload.source_mappings)?;
+    validate_non_overlapping_target_paths(&payload.target_directories)?;
+    for mapping in &payload.source_mappings {
+        for target in &payload.target_directories {
+            if paths_overlap(&mapping.openlist_path, &target.openlist_path) {
+                return Err(ApiError::bad_request(
+                    "OpenList source mappings and target directories must not overlap",
+                ));
+            }
+        }
+    }
+    if let Some(index) = payload.selected_target_index {
+        if index >= payload.target_directories.len() {
+            return Err(ApiError::bad_request(
+                "selected_target_index is out of range",
+            ));
+        }
+    } else if let Some(id) = payload.target_directory_id
+        && !payload
+            .target_directories
+            .iter()
+            .any(|target| target.id == Some(id))
+    {
+        return Err(ApiError::bad_request(
+            "target_directory_id does not reference a submitted target",
+        ));
+    }
+    if payload.enabled {
+        if payload.address.is_empty() {
+            return Err(ApiError::bad_request("address is required when enabled"));
+        }
+        let has_key = payload
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        if payload.clear_api_key && has_key {
+            return Err(ApiError::bad_request(
+                "api_key and clear_api_key cannot be submitted together",
+            ));
+        }
+        if payload.selected_target_index.is_none() && payload.target_directory_id.is_none() {
+            return Err(ApiError::bad_request(
+                "a target directory must be selected when enabled",
+            ));
+        }
+        if payload.source_mappings.is_empty() || payload.target_directories.is_empty() {
+            return Err(ApiError::bad_request(
+                "path mappings and target directories are required when enabled",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_absolute_mapping_path(value: &str) -> Result<String, ApiError> {
+    let replaced = value.trim().replace('\\', "/");
+    if !replaced.starts_with('/') {
+        return Err(ApiError::bad_request("mapping paths must be absolute"));
+    }
+    let mut segments = Vec::new();
+    for segment in replaced.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return Err(ApiError::bad_request("mapping paths must not contain '..'")),
+            value => segments.push(value),
+        }
+    }
+    Ok(if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    })
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left == "/"
+        || right == "/"
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn validate_non_overlapping_mapping_paths(
+    mappings: &[OpenListPathMapping],
+) -> Result<(), ApiError> {
+    for (index, left) in mappings.iter().enumerate() {
+        for right in &mappings[index + 1..] {
+            if (left.downloader_id == right.downloader_id
+                && paths_overlap(&left.qb_path, &right.qb_path))
+                || paths_overlap(&left.openlist_path, &right.openlist_path)
+            {
+                return Err(ApiError::bad_request(
+                    "path mappings for one downloader must not overlap",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_non_overlapping_target_paths(
+    targets: &[OpenListTargetDirectory],
+) -> Result<(), ApiError> {
+    for (index, left) in targets.iter().enumerate() {
+        for right in &targets[index + 1..] {
+            if left.name == right.name {
+                return Err(ApiError::bad_request(
+                    "target directory names must be unique",
+                ));
+            }
+            if (left.downloader_id == right.downloader_id
+                && paths_overlap(&left.qb_path, &right.qb_path))
+                || paths_overlap(&left.openlist_path, &right.openlist_path)
+            {
+                return Err(ApiError::bad_request(
+                    "target directories for one downloader must not overlap",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -3449,6 +3876,7 @@ mod media_api_tests {
             id: 1,
             tmdb_id: 42,
             media_type: "tv".to_string(),
+            tmdb_is_animation: false,
             title: "Example Show".to_string(),
             original_title: None,
             aliases: Vec::new(),
@@ -3479,9 +3907,17 @@ mod media_api_tests {
         let temp = tempfile::tempdir().unwrap();
         let db = Database::open(temp.path()).await.unwrap();
         let downloaders = DownloaderClientPool::new(db.clone());
+        let relocation_scheduler = RelocationScheduler::new(db.clone(), downloaders.clone(), false);
         let service = MediaService::new(db, downloaders);
         let scheduler = MediaScheduler::new(service.clone());
-        (temp, MediaApiState { service, scheduler })
+        (
+            temp,
+            MediaApiState {
+                service,
+                scheduler,
+                relocation_scheduler,
+            },
+        )
     }
 
     #[tokio::test]
@@ -3616,7 +4052,12 @@ mod media_api_tests {
     fn media_router_builds_with_all_route_groups() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (_temp, state) = runtime.block_on(test_media_state());
-        let _router = media_router(state.service, state.scheduler);
+        let _router = media_router(
+            state.service,
+            state.scheduler,
+            state.relocation_scheduler,
+            false,
+        );
     }
 }
 

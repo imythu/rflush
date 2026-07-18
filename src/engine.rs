@@ -64,8 +64,7 @@ impl DownloadEngine {
             config.global.max_concurrent_downloads
         );
 
-        let (runtimes, mut rss_summaries) =
-            fetch_all_rss(&config, &app_runtime).await?;
+        let (runtimes, mut rss_summaries) = fetch_all_rss(&config, &app_runtime).await?;
 
         let mut torrent_records = Vec::new();
         let mut download_jobs = Vec::new();

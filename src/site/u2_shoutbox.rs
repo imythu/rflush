@@ -103,10 +103,7 @@ pub fn parse_shoutbox(html: &str) -> Result<Vec<TorrentItem>, U2ShoutboxParseErr
             title: seed_name,
             link: None,
             pub_date: None,
-            download_url: format!(
-                "https://u2.dmhy.org/download.php?id={id}",
-                id = seed_id
-            ),
+            download_url: format!("https://u2.dmhy.org/download.php?id={id}", id = seed_id),
             version: 0,
             size_bytes: None,
             seeders: None,
@@ -216,16 +213,12 @@ fn parse_detail_size(document: &Html) -> Option<u64> {
         if let Some(pos) = text.find("大小:") {
             let after = text[pos + "大小:".len()..].trim().to_string();
             // 提取 "82.153 GiB" 部分（到下一个空格或标签文本边界）
-            if let Some(size_str) = after
-                .split_whitespace()
-                .next()
-                .and_then(|num| {
-                    // 找到下一个词（单位）
-                    let rest = &after[num.len()..].trim();
-                    let unit = rest.split_whitespace().next().unwrap_or("");
-                    Some(format!("{} {}", num, unit))
-                })
-            {
+            if let Some(size_str) = after.split_whitespace().next().and_then(|num| {
+                // 找到下一个词（单位）
+                let rest = &after[num.len()..].trim();
+                let unit = rest.split_whitespace().next().unwrap_or("");
+                Some(format!("{} {}", num, unit))
+            }) {
                 return parse_human_size(&size_str);
             }
         }
@@ -371,8 +364,7 @@ fn parse_seeder_table(table_html: &str) -> i32 {
         let connect_secs = parse_connect_time_to_secs(&connect_text);
 
         // 规则 2: 双差生 — 连接 > 30min 且上传 < 1MiB 且速度 < 10 B/s
-        let is_useless =
-            connect_secs > 1800 && upload_bytes < 1048576 && avg_speed < 10;
+        let is_useless = connect_secs > 1800 && upload_bytes < 1048576 && avg_speed < 10;
 
         if !is_useless {
             real_count += 1;
@@ -619,11 +611,7 @@ fn extract_seed_id(href: &str) -> Option<String> {
         .chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+    if id.is_empty() { None } else { Some(id) }
 }
 
 #[cfg(test)]
@@ -931,7 +919,10 @@ mod tests {
     #[test]
     fn speed_parsing() {
         // 142.609 KiB/s → 142.609 * 1024 ≈ 146031 B/s
-        assert_eq!(parse_speed_to_bytes("142.609 KiB/s"), (142.609f64 * 1024.0) as u64);
+        assert_eq!(
+            parse_speed_to_bytes("142.609 KiB/s"),
+            (142.609f64 * 1024.0) as u64
+        );
         assert_eq!(parse_speed_to_bytes("0 B/s"), 0);
         // 0.115 B/s → 0 (truncated)
         assert_eq!(parse_speed_to_bytes("0.115 B/s"), 0);

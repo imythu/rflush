@@ -13,6 +13,8 @@ mod logging;
 mod media;
 mod monitor;
 mod net;
+mod openlist;
+mod relocation;
 mod rss;
 mod sign_in;
 mod site;
@@ -52,6 +54,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
             message: format!("failed to bind {listen_addr}: {error}"),
         })?;
     let db = db::Database::open(&db_dir).await?;
+    let self_use = self_use_enabled(std::env::var("SELF_USE").ok().as_deref());
     let settings = db.get_settings().await?;
     let log_filter = logging::build_log_filter(settings.log_level.as_deref())?;
     logging::init_logging(log_filter);
@@ -102,6 +105,8 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let monitor = std::sync::Arc::new(monitor::SystemMonitor::new(db.clone()));
 
     let tag_rule_scheduler = tag_rule::scheduler::TagRuleScheduler::new(db.clone(), pool.clone());
+    let relocation_scheduler =
+        relocation::RelocationScheduler::new(db.clone(), pool.clone(), self_use);
 
     let media_scheduler_ref = media_scheduler.clone();
     let mut media_scheduler_handle = tokio::spawn(async move {
@@ -134,6 +139,10 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let tag_rule_scheduler_handle = tokio::spawn(async move {
         tag_rule_scheduler_ref.start().await;
     });
+    let relocation_scheduler_ref = relocation_scheduler.clone();
+    let relocation_scheduler_handle = tokio::spawn(async move {
+        relocation_scheduler_ref.start().await;
+    });
 
     let web_result = web::serve(
         listener,
@@ -148,10 +157,13 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         limiter,
         monitor,
         tag_rule_scheduler,
+        relocation_scheduler.clone(),
+        self_use,
     )
     .await;
 
     media_scheduler.stop();
+    relocation_scheduler.stop();
     collector_handle.abort();
     stats_handle.abort();
     scheduler_handle.abort();
@@ -159,6 +171,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     site_stats_handle.abort();
     monitor_handle.abort();
     tag_rule_scheduler_handle.abort();
+    relocation_scheduler_handle.abort();
 
     if tokio::time::timeout(Duration::from_secs(10), &mut media_scheduler_handle)
         .await
@@ -186,6 +199,24 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let _ = site_stats_handle.await;
     let _ = monitor_handle.await;
     let _ = tag_rule_scheduler_handle.await;
+    let _ = relocation_scheduler_handle.await;
 
     web_result
+}
+
+fn self_use_enabled(value: Option<&str>) -> bool {
+    value == Some("true")
+}
+
+#[cfg(test)]
+mod feature_gate_tests {
+    use super::self_use_enabled;
+
+    #[test]
+    fn self_use_requires_exact_true_literal() {
+        assert!(self_use_enabled(Some("true")));
+        for value in [None, Some("TRUE"), Some("1"), Some(" true"), Some("")] {
+            assert!(!self_use_enabled(value));
+        }
+    }
 }

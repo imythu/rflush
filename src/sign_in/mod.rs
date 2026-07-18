@@ -313,7 +313,9 @@ async fn run_cdp_sign_in(
 
         match sign_in_method.as_str() {
             SIGN_IN_METHOD_OPEN_PAGE => run_open_page_sign_in(&mut client, &session_id),
-            SIGN_IN_METHOD_CLOUDFLARE => run_cloudflare_sign_in(&mut client, &session_id, &base_url),
+            SIGN_IN_METHOD_CLOUDFLARE => {
+                run_cloudflare_sign_in(&mut client, &session_id, &base_url)
+            }
             SIGN_IN_METHOD_OCR_CAPTCHA => {
                 run_ocr_captcha_sign_in(&mut client, &session_id, &base_url, ocr_api_key.as_deref())
             }
@@ -324,10 +326,7 @@ async fn run_cdp_sign_in(
     .map_err(|e| format!("签到任务 join 失败: {}", e))?
 }
 
-fn run_open_page_sign_in(
-    client: &mut CdpClient,
-    session_id: &str,
-) -> Result<SignInOutput, String> {
+fn run_open_page_sign_in(client: &mut CdpClient, session_id: &str) -> Result<SignInOutput, String> {
     thread::sleep(Duration::from_secs(7));
     let text = page_text_via_cdp(client, session_id)?;
     if let Some(result) = classify_sign_in_text(&text) {
@@ -590,11 +589,7 @@ fn handle_captcha_if_present(
         return Err("OCR 识别结果为空".to_string());
     }
 
-    let filled = evaluate_bool_via_cdp(
-        client,
-        session_id,
-        &fill_captcha_script(&code),
-    )?;
+    let filled = evaluate_bool_via_cdp(client, session_id, &fill_captcha_script(&code))?;
     if !filled {
         return Err("验证码识别成功但未找到输入框".to_string());
     }
@@ -786,7 +781,10 @@ fn evaluate_bool_via_cdp(
         .unwrap_or(false))
 }
 
-fn build_lightpanda_endpoint(task: &SignInTaskRecord, use_proxy_for_lightpanda: bool) -> Result<String, String> {
+fn build_lightpanda_endpoint(
+    task: &SignInTaskRecord,
+    use_proxy_for_lightpanda: bool,
+) -> Result<String, String> {
     if let Some(endpoint) = task
         .lightpanda_endpoint
         .as_deref()
@@ -956,7 +954,9 @@ mod tests {
             "next after 08:00:01 should be 16:00"
         );
 
-        let now3 = chrono::Utc.with_ymd_and_hms(2026, 6, 27, 7, 59, 30).unwrap();
+        let now3 = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 27, 7, 59, 30)
+            .unwrap();
         let next3 = schedule.after(&now3).next();
         let diff = (next3.unwrap() - now3).num_seconds();
         assert_eq!(diff, 30, "diff at 07:59:30 should be 30s");

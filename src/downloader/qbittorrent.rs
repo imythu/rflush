@@ -2,12 +2,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use qbit_rs::model::{AddTorrentArg, GetTorrentListArg, TorrentSource, TorrentFile};
 use qbit_rs::Qbit;
+use qbit_rs::model::{AddTorrentArg, GetTorrentListArg, TorrentFile, TorrentSource};
 use reqwest::Client;
 use tracing::debug;
 
-use super::{AddTorrentOptions, DownloaderClient, DownloaderTestResult, TorrentInfo};
+use super::{
+    AddTorrentOptions, DownloaderClient, DownloaderTestResult, TorrentFileInfo, TorrentInfo,
+};
 
 pub struct QBittorrentClient {
     qb: Qbit,
@@ -45,7 +47,10 @@ impl DownloaderClient for QBittorrentClient {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<DownloaderTestResult, String>> + Send + '_>> {
         Box::pin(async move {
-            self.qb.login(false).await.map_err(|e| format!("登录失败: {}", e))?;
+            self.qb
+                .login(false)
+                .await
+                .map_err(|e| format!("登录失败: {}", e))?;
             let version = self
                 .qb
                 .get_version()
@@ -99,6 +104,12 @@ impl DownloaderClient for QBittorrentClient {
                 } else {
                     None
                 },
+                skip_checking: if options.skip_checking {
+                    Some("true".to_string())
+                } else {
+                    None
+                },
+                root_folder: options.root_folder.map(|value| value.to_string()),
                 ..Default::default()
             };
 
@@ -246,6 +257,55 @@ impl DownloaderClient for QBittorrentClient {
             Ok(())
         })
     }
+
+    fn export_torrent(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+        let hash = hash.to_string();
+        Box::pin(async move {
+            self.qb
+                .export_torrent(hash)
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| format!("导出种子失败: {}", e))
+        })
+    }
+
+    fn start_torrent(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let hash = hash.to_string();
+        Box::pin(async move {
+            self.qb
+                .start_torrents(vec![hash])
+                .await
+                .map_err(|e| format!("启动种子失败: {}", e))
+        })
+    }
+
+    fn get_torrent_files(
+        &self,
+        hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentFileInfo>, String>> + Send + '_>> {
+        let hash = hash.to_string();
+        Box::pin(async move {
+            self.qb
+                .get_torrent_contents(&hash, None)
+                .await
+                .map(|files| {
+                    files
+                        .into_iter()
+                        .map(|file| TorrentFileInfo {
+                            path: file.name,
+                            size: file.size.min(i64::MAX as u64) as i64,
+                        })
+                        .collect()
+                })
+                .map_err(|e| format!("获取种子文件清单失败: {e}"))
+        })
+    }
 }
 
 impl From<qbit_rs::model::Torrent> for TorrentInfo {
@@ -268,11 +328,9 @@ impl From<qbit_rs::model::Torrent> for TorrentInfo {
             completion_on: t.completion_on.unwrap_or(0),
             num_seeds: t.num_seeds.unwrap_or(0) as i32,
             num_leechs: t.num_leechs.unwrap_or(0) as i32,
-            save_path: t
-                .save_path
-                .clone()
-                .or_else(|| t.content_path.clone())
-                .unwrap_or_default(),
+            save_path: t.save_path.unwrap_or_default(),
+            root_path: t.root_path.unwrap_or_default(),
+            content_path: t.content_path.unwrap_or_default(),
             tags: t.tags.unwrap_or_default(),
             category: t.category.unwrap_or_default(),
             time_active: t.time_active.unwrap_or(0),

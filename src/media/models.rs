@@ -74,6 +74,7 @@ pub struct SubscriptionRecord {
     pub id: i64,
     pub tmdb_id: i64,
     pub media_type: String,
+    pub tmdb_is_animation: bool,
     pub title: String,
     pub original_title: Option<String>,
     pub aliases: Vec<String>,
@@ -103,6 +104,7 @@ pub struct SubscriptionRecord {
 pub struct NewSubscription {
     pub tmdb_id: i64,
     pub media_type: String,
+    pub tmdb_is_animation: bool,
     pub title: String,
     pub original_title: Option<String>,
     #[serde(default)]
@@ -214,6 +216,30 @@ pub fn target_key(
     )
 }
 
+pub fn qb_media_category(target_key: &str) -> &'static str {
+    if target_key.starts_with("movie:") {
+        "电影"
+    } else if target_key.contains(":abs") {
+        "动漫"
+    } else {
+        "电视剧"
+    }
+}
+
+/// Resolve the archive category from both the target numbering and the selected profile.
+/// Some animation series use ordinary SxxExx numbering, so `:abs` alone is insufficient.
+pub fn media_download_category(target_key: &str, tmdb_is_animation: bool) -> &'static str {
+    let category = qb_media_category(target_key);
+    if category != "电视剧" {
+        return category;
+    }
+    if tmdb_is_animation {
+        "动漫"
+    } else {
+        "电视剧"
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -228,12 +254,22 @@ fn default_min_seeders() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::target_key;
+    use super::{media_download_category, qb_media_category, target_key};
 
     #[test]
     fn target_keys_never_depend_on_nullable_database_columns() {
         assert_eq!(target_key("movie", 11, None, None, None), "movie:11");
         assert_eq!(target_key("tv", 22, Some(2), Some(3), None), "tv:22:s02e03");
         assert_eq!(target_key("tv", 33, None, None, Some(123)), "tv:33:abs0123");
+    }
+
+    #[test]
+    fn qb_categories_follow_media_target_kind() {
+        assert_eq!(qb_media_category("movie:11"), "电影");
+        assert_eq!(qb_media_category("tv:22:s02e03"), "电视剧");
+        assert_eq!(qb_media_category("tv:33:abs0123"), "动漫");
+        assert_eq!(qb_media_category("manual:1:2"), "电视剧");
+        assert_eq!(media_download_category("tv:22:s01e01", true), "动漫");
+        assert_eq!(media_download_category("tv:22:s01e01", false), "电视剧");
     }
 }

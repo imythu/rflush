@@ -325,14 +325,15 @@ impl Database {
             let scheduled_at = next_run_at.unwrap_or_else(|| now.clone());
             tx.execute(
                 "INSERT INTO subscriptions
-                 (tmdb_id, media_type, title, original_title, aliases_json, year,
+                 (tmdb_id, media_type, tmdb_is_animation, title, original_title, aliases_json, year,
                   poster_path, season, next_episode, start_episode, absolute_episode,
                   quality_profile_id, downloader_id, save_path, enabled, next_run_at,
                   last_status, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     request.tmdb_id,
                     request.media_type,
+                    request.tmdb_is_animation as i32,
                     request.title,
                     request.original_title,
                     json_string(&request.aliases)?,
@@ -1059,6 +1060,7 @@ impl Database {
         expected_version: i64,
         owner: &str,
         targets: &[SubscriptionTargetSeed],
+        tmdb_is_animation: bool,
     ) -> Result<Option<TargetSyncResult>, AppError> {
         let path = self.path.clone();
         let owner = owner.to_string();
@@ -1072,10 +1074,17 @@ impl Database {
             let changed = tx
                 .execute(
                     "UPDATE subscriptions
-                     SET version = version + 1, updated_at = ?
+                     SET tmdb_is_animation = ?, version = version + 1, updated_at = ?
                      WHERE id = ? AND version = ? AND lease_owner = ?
                        AND lease_until IS NOT NULL AND lease_until >= ?",
-                    params![now, id, expected_version, owner, now],
+                    params![
+                        tmdb_is_animation as i32,
+                        now,
+                        id,
+                        expected_version,
+                        owner,
+                        now
+                    ],
                 )
                 .map_err(sql_error)?;
             if changed == 0 {
@@ -1245,6 +1254,43 @@ impl Database {
             let conn = open_connection(&path)?;
             let now = Utc::now().to_rfc3339();
             enqueue_media_download_row(&conn, &request, &now)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn requeue_missing_manual_media_download(
+        &self,
+        id: i64,
+        expected_version: i64,
+    ) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now().to_rfc3339();
+            let changed = tx
+                .execute(
+                    "UPDATE media_downloads
+                     SET status = 'queued', attempts = 0, next_attempt_at = ?, infohash = NULL,
+                         submitted_at = NULL, lease_owner = NULL, lease_until = NULL,
+                         last_error = NULL, version = version + 1, updated_at = ?
+                     WHERE id = ? AND version = ? AND subscription_id IS NULL
+                       AND status = 'submitted'",
+                    params![now, now, id, expected_version],
+                )
+                .map_err(sql_error)?;
+            if changed == 1 {
+                tx.execute(
+                    "DELETE FROM media_relocation_jobs WHERE media_download_id = ?",
+                    [id],
+                )
+                .map_err(sql_error)?;
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(changed == 1)
         })
         .await
         .map_err(join_error)?
@@ -2039,7 +2085,7 @@ fn recover_media_download_records(
 }
 
 const SUBSCRIPTION_SELECT: &str =
-    "SELECT id, tmdb_id, media_type, title, original_title, aliases_json, year,
+    "SELECT id, tmdb_id, media_type, tmdb_is_animation, title, original_title, aliases_json, year,
             poster_path, season, next_episode, start_episode, absolute_episode,
             quality_profile_id, downloader_id, save_path, enabled, next_run_at,
             lease_owner, lease_until, version, last_status, last_error, last_run_at,
@@ -2114,28 +2160,29 @@ fn map_subscription(row: &Row<'_>) -> rusqlite::Result<SubscriptionRecord> {
         id: row.get(0)?,
         tmdb_id: row.get(1)?,
         media_type: row.get(2)?,
-        title: row.get(3)?,
-        original_title: row.get(4)?,
-        aliases: parse_json_column(row.get(5)?, 5)?,
-        year: row.get(6)?,
-        poster_path: row.get(7)?,
-        season: row.get(8)?,
-        next_episode: row.get(9)?,
-        start_episode: row.get(10)?,
-        absolute_episode: row.get(11)?,
-        quality_profile_id: row.get(12)?,
-        downloader_id: row.get(13)?,
-        save_path: row.get(14)?,
-        enabled: row.get::<_, i32>(15)? != 0,
-        next_run_at: row.get(16)?,
-        lease_owner: row.get(17)?,
-        lease_until: row.get(18)?,
-        version: row.get(19)?,
-        last_status: row.get(20)?,
-        last_error: row.get(21)?,
-        last_run_at: row.get(22)?,
-        created_at: row.get(23)?,
-        updated_at: row.get(24)?,
+        tmdb_is_animation: row.get::<_, i32>(3)? != 0,
+        title: row.get(4)?,
+        original_title: row.get(5)?,
+        aliases: parse_json_column(row.get(6)?, 6)?,
+        year: row.get(7)?,
+        poster_path: row.get(8)?,
+        season: row.get(9)?,
+        next_episode: row.get(10)?,
+        start_episode: row.get(11)?,
+        absolute_episode: row.get(12)?,
+        quality_profile_id: row.get(13)?,
+        downloader_id: row.get(14)?,
+        save_path: row.get(15)?,
+        enabled: row.get::<_, i32>(16)? != 0,
+        next_run_at: row.get(17)?,
+        lease_owner: row.get(18)?,
+        lease_until: row.get(19)?,
+        version: row.get(20)?,
+        last_status: row.get(21)?,
+        last_error: row.get(22)?,
+        last_run_at: row.get(23)?,
+        created_at: row.get(24)?,
+        updated_at: row.get(25)?,
         site_ids: Vec::new(),
     })
 }
@@ -2787,6 +2834,7 @@ mod tests {
         db.create_subscription(&NewSubscription {
             tmdb_id: 42,
             media_type: "tv".to_string(),
+            tmdb_is_animation: false,
             title: "Example Show".to_string(),
             original_title: None,
             aliases: vec!["Example".to_string()],
@@ -2815,6 +2863,7 @@ mod tests {
         NewSubscription {
             tmdb_id,
             media_type: "tv".to_string(),
+            tmdb_is_animation: false,
             title: format!("Test Show {tmdb_id}"),
             original_title: None,
             aliases: Vec::new(),
@@ -2983,13 +3032,9 @@ mod tests {
         );
         let expected = r#"{"queries":["Example Show S01E03"]}"#;
         assert!(
-            db.save_claimed_subscription_last_run_info(
-                created.id,
-                "snapshot-owner",
-                expected,
-            )
-            .await
-            .unwrap()
+            db.save_claimed_subscription_last_run_info(created.id, "snapshot-owner", expected,)
+                .await
+                .unwrap()
         );
         assert_eq!(
             db.get_subscription_last_run_info(created.id)
@@ -3037,7 +3082,11 @@ mod tests {
             .unwrap();
         assert_eq!(refreshed_version, claimed.version + 1);
         assert_eq!(
-            db.get_subscription(created.id).await.unwrap().unwrap().aliases,
+            db.get_subscription(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .aliases,
             aliases
         );
     }
@@ -3885,6 +3934,7 @@ mod tests {
                 claimed.version - 1,
                 "tmdb-worker",
                 &targets,
+                false,
             )
             .await
             .unwrap()
@@ -3898,7 +3948,13 @@ mod tests {
         );
 
         let synced = db
-            .sync_claimed_subscription_targets(created.id, claimed.version, "tmdb-worker", &targets)
+            .sync_claimed_subscription_targets(
+                created.id,
+                claimed.version,
+                "tmdb-worker",
+                &targets,
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -3971,6 +4027,7 @@ mod tests {
                 claimed.version,
                 "retraction-worker",
                 &terminal_targets,
+                false,
             )
             .await
             .unwrap()
@@ -4030,6 +4087,7 @@ mod tests {
         let request = NewSubscription {
             tmdb_id: 77,
             media_type: "tv".to_string(),
+            tmdb_is_animation: false,
             title: "Finite Show".to_string(),
             original_title: None,
             aliases: Vec::new(),
@@ -4120,6 +4178,7 @@ mod tests {
             .create_subscription(&NewSubscription {
                 tmdb_id: 107,
                 media_type: "movie".to_string(),
+                tmdb_is_animation: false,
                 title: "Finished Movie".to_string(),
                 original_title: None,
                 aliases: Vec::new(),

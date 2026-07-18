@@ -41,7 +41,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { api } from "@/lib/api";
+import {
+  OpenListAutomationPanel,
+  type OpenListAutomationSettings,
+} from "@/components/openlist-automation-panel";
+import { api, ApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 type MediaMode = "subscriptions" | "tmdb" | "resources" | "settings";
@@ -159,6 +163,7 @@ type TmdbMedia = {
   year: number | null;
   overview: string;
   poster_path: string | null;
+  is_animation: boolean;
 };
 
 type TmdbDetails = TmdbMedia & {
@@ -332,6 +337,18 @@ const DEFAULT_SETTINGS: MediaSettings = {
   updated_at: "",
 };
 
+const DEFAULT_OPENLIST_SETTINGS: OpenListAutomationSettings = {
+  address: "",
+  api_key: null,
+  api_key_configured: false,
+  enabled: false,
+  scan_interval_mins: 5,
+  source_mappings: [],
+  target_directories: [],
+  target_directory_id: null,
+  clear_api_key: false,
+};
+
 const EMPTY_SUBSCRIPTION_FORM: SubscriptionForm = {
   numberingMode: "season",
   season: 1,
@@ -358,6 +375,21 @@ const EMPTY_RESOURCE_FORM: ResourceForm = {
   downloaderId: "",
   siteIds: [],
 };
+
+const RESOURCE_SITE_IDS_STORAGE_KEY = "rflush.media.resource-site-ids";
+
+function storedResourceSiteIds(): number[] | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = window.localStorage.getItem(RESOURCE_SITE_IDS_STORAGE_KEY);
+    if (value === null) return null;
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return null;
+    return [...new Set(parsed.filter((id): id is number => Number.isInteger(id) && id > 0))];
+  } catch {
+    return null;
+  }
+}
 
 const EMPTY_QUALITY_FORM: QualityForm = {
   name: "",
@@ -860,6 +892,7 @@ export function MediaPage() {
   const [downloads, setDownloads] = useState<MediaDownload[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
   const [downloaders, setDownloaders] = useState<Downloader[]>([]);
+  const [openListSettings, setOpenListSettings] = useState<OpenListAutomationSettings | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -887,10 +920,19 @@ export function MediaPage() {
   const editDetailsGeneration = useRef(0);
   const editSeasonGeneration = useRef(0);
 
-  const [resourceForm, setResourceForm] = useState<ResourceForm>(EMPTY_RESOURCE_FORM);
+  const rememberedResourceSiteIds = useRef<number[] | null>(null);
+  const [resourceForm, setResourceForm] = useState<ResourceForm>(() => {
+    rememberedResourceSiteIds.current = storedResourceSiteIds();
+    return {
+      ...EMPTY_RESOURCE_FORM,
+      siteIds: rememberedResourceSiteIds.current ?? [],
+    };
+  });
   const [resourceCandidates, setResourceCandidates] = useState<ResourceCandidate[]>([]);
   const [resourceErrors, setResourceErrors] = useState<string[]>([]);
+  const [resourceTmdbResults, setResourceTmdbResults] = useState<TmdbMedia[]>([]);
   const [resourceLoading, setResourceLoading] = useState(false);
+  const [queuedCandidateKeys, setQueuedCandidateKeys] = useState<Set<string>>(() => new Set());
   const [resourceSearched, setResourceSearched] = useState(false);
   const [overrideCandidate, setOverrideCandidate] = useState<ResourceCandidate | null>(null);
   const [overrideReason, setOverrideReason] = useState("");
@@ -960,7 +1002,9 @@ export function MediaPage() {
       ...current,
       qualityProfileId: current.qualityProfileId || String(profileRows[0]?.id ?? ""),
       downloaderId: current.downloaderId || String(downloaderRows[0]?.id ?? ""),
-      siteIds: current.siteIds.length > 0 ? current.siteIds : siteRows.map((site) => site.id),
+      siteIds: rememberedResourceSiteIds.current === null
+        ? siteRows.map((site) => site.id)
+        : current.siteIds.filter((id) => siteRows.some((site) => site.id === id)),
     }));
 
     setLoadError(errors.join("；"));
@@ -992,6 +1036,31 @@ export function MediaPage() {
   useEffect(() => {
     void loadData();
   }, [loadData]);
+
+  useEffect(() => {
+    if (initialLoading) return;
+    try {
+      window.localStorage.setItem(RESOURCE_SITE_IDS_STORAGE_KEY, JSON.stringify(resourceForm.siteIds));
+    } catch {
+      // Storage may be unavailable in privacy-restricted browser contexts.
+    }
+    rememberedResourceSiteIds.current = resourceForm.siteIds;
+  }, [initialLoading, resourceForm.siteIds]);
+
+  useEffect(() => {
+    let active = true;
+    void api<unknown>("/api/media/openlist/settings")
+      .then((payload) => {
+        if (!active) return;
+        const loaded = readObject<OpenListAutomationSettings>(payload, ["settings", "data"]);
+        setOpenListSettings({ ...DEFAULT_OPENLIST_SETTINGS, ...loaded, api_key: null, clear_api_key: false });
+      })
+      .catch((error) => {
+        if (!active || (error instanceof ApiError && error.status === 404)) return;
+        setLoadError((current) => [current, `OpenList 设置：${describeUnknown(error)}`].filter(Boolean).join("；"));
+      });
+    return () => { active = false; };
+  }, []);
 
   useEffect(
     () => () => {
@@ -1413,9 +1482,16 @@ export function MediaPage() {
     setResourceLoading(true);
     setResourceSearched(true);
     setResourceErrors([]);
+    setQueuedCandidateKeys(new Set());
     setNotice(null);
     try {
-      const payload = await api<unknown>("/api/media/resources/search", {
+      const tmdbQuery = resourceForm.query.trim() || selectedSearchSubscription?.title || "";
+      const tmdbParams = new URLSearchParams({
+        query: tmdbQuery,
+        media_type: selectedSearchSubscription?.media_type ?? "multi",
+      });
+      const [resourceResult, tmdbResult] = await Promise.allSettled([
+        api<unknown>("/api/media/resources/search", {
         method: "POST",
         body: JSON.stringify({
           query: resourceForm.query.trim() || undefined,
@@ -1424,14 +1500,24 @@ export function MediaPage() {
           quality_profile_id: resourceForm.qualityProfileId ? Number(resourceForm.qualityProfileId) : undefined,
           page_size: 50,
         }),
-      });
+        }),
+        api<unknown>(`/api/media/tmdb/search?${tmdbParams.toString()}`),
+      ]);
+      if (resourceResult.status === "rejected") throw resourceResult.reason;
+      const payload = resourceResult.value;
       const rows = readArray<unknown>(payload, ["candidates", "results", "items", "data"])
         .map(normalizeCandidate)
         .filter((item): item is ResourceCandidate => item !== null);
       setResourceCandidates(rows);
       setResourceErrors(extractSiteErrors(payload));
+      setResourceTmdbResults(
+        tmdbResult.status === "fulfilled"
+          ? readArray<TmdbMedia>(tmdbResult.value, ["results", "items", "data"])
+          : [],
+      );
     } catch (error) {
       setResourceCandidates([]);
+      setResourceTmdbResults([]);
       setResourceErrors([describeUnknown(error)]);
     } finally {
       setResourceLoading(false);
@@ -1445,7 +1531,7 @@ export function MediaPage() {
     }
     setBusyKey(`queue:${candidate.key}`);
     try {
-      await api("/api/media/downloads", {
+      const queued = await api<MediaDownload>("/api/media/downloads", {
         method: "POST",
         body: JSON.stringify({
           candidate_id: candidate.candidateId,
@@ -1457,8 +1543,12 @@ export function MediaPage() {
       });
       setOverrideCandidate(null);
       setOverrideReason("");
+      setQueuedCandidateKeys((current) => new Set(current).add(candidate.key));
       await reloadDownloads();
-      setNotice({ tone: "success", text: "资源已进入下载队列" });
+      setNotice({
+        tone: "success",
+        text: queued.status === "submitted" ? "qB 中仍存在该种子，无需重复入队" : "资源已进入下载队列",
+      });
     } catch (error) {
       setNotice({ tone: "error", text: describeUnknown(error) });
     } finally {
@@ -1481,6 +1571,38 @@ export function MediaPage() {
       setSettings({ ...settings, ...readObject<MediaSettings>(saved, ["settings", "data"]) });
       setClearTmdbToken(false);
       setNotice({ tone: "success", text: "媒体设置已保存" });
+    } catch (error) {
+      setNotice({ tone: "error", text: describeUnknown(error) });
+    } finally {
+      setBusyKey("");
+    }
+  }
+
+  async function saveOpenListSettings() {
+    if (!openListSettings) return;
+    setBusyKey("save-openlist");
+    try {
+      const saved = await api<unknown>("/api/media/openlist/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          ...openListSettings,
+          address: openListSettings.address.trim(),
+          api_key: openListSettings.api_key?.trim() || null,
+          selected_target_index: (() => {
+            const index = openListSettings.target_directories.findIndex(
+              (target) => target.id === openListSettings.target_directory_id,
+            );
+            return index >= 0 ? index : null;
+          })(),
+          target_directories: openListSettings.target_directories.map((target) => ({
+            ...target,
+            id: target.id != null && target.id > 0 ? target.id : undefined,
+          })),
+        }),
+      });
+      const loaded = readObject<OpenListAutomationSettings>(saved, ["settings", "data"]);
+      setOpenListSettings({ ...DEFAULT_OPENLIST_SETTINGS, ...loaded, api_key: null, clear_api_key: false });
+      setNotice({ tone: "success", text: "OpenList 设置已保存" });
     } catch (error) {
       setNotice({ tone: "error", text: describeUnknown(error) });
     } finally {
@@ -1639,10 +1761,12 @@ export function MediaPage() {
           sites={sites}
           downloaders={downloaders}
           candidates={resourceCandidates}
+          tmdbResults={resourceTmdbResults}
           errors={resourceErrors}
           loading={resourceLoading}
           searched={resourceSearched}
           busyKey={busyKey}
+          queuedCandidateKeys={queuedCandidateKeys}
           onSearch={searchResources}
           onQueue={(candidate) => {
             if (candidateNeedsOverride(candidate)) {
@@ -1660,8 +1784,12 @@ export function MediaPage() {
           clearTmdbToken={clearTmdbToken}
           setClearTmdbToken={setClearTmdbToken}
           profiles={profiles}
+          downloaders={downloaders}
+          openListSettings={openListSettings}
+          setOpenListSettings={setOpenListSettings}
           busyKey={busyKey}
           onSaveSettings={() => void saveMediaSettings()}
+          onSaveOpenList={() => void saveOpenListSettings()}
           onAddQuality={() => openQualityEditor()}
           onEditQuality={openQualityEditor}
           onDeleteQuality={setDeleteQuality}
@@ -2406,10 +2534,35 @@ function DelimitedField({ id, label, value, onChange }: { id: string; label: str
   );
 }
 
-function SitePicker({ sites, selected, onChange }: { sites: Site[]; selected: number[]; onChange: (ids: number[]) => void }) {
+function SitePicker({
+  sites,
+  selected,
+  onChange,
+  showSelectAll = false,
+}: {
+  sites: Site[];
+  selected: number[];
+  onChange: (ids: number[]) => void;
+  showSelectAll?: boolean;
+}) {
+  const allSelected = sites.length > 0 && sites.every((site) => selected.includes(site.id));
   return (
     <fieldset className="flex flex-col gap-2">
-      <legend className="text-sm font-medium">搜索站点</legend>
+      <legend className="sr-only">搜索站点</legend>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-sm font-medium" aria-hidden="true">搜索站点</span>
+        {showSelectAll && sites.length > 0 ? (
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-muted">
+            <input
+              type="checkbox"
+              className="size-4 accent-primary"
+              checked={allSelected}
+              onChange={() => onChange(allSelected ? [] : sites.map((site) => site.id))}
+            />
+            <span>{allSelected ? "取消全选" : "全选"}</span>
+          </label>
+        ) : null}
+      </div>
       {sites.length === 0 ? (
         <div className="rounded-2xl border border-border bg-surface-container px-4 py-3 text-sm text-muted">暂无可用站点</div>
       ) : (
@@ -3113,7 +3266,7 @@ function TmdbPanel({
                         <h3 className="line-clamp-2 text-sm font-semibold">{media.title}</h3>
                         {media.original_title ? <p className="mt-1 truncate text-xs text-muted">{media.original_title}</p> : null}
                       </div>
-                      <StatusPill label={media.media_type === "movie" ? "电影" : "剧集"} />
+                      <StatusPill label={tmdbCategoryLabel(media)} />
                     </div>
                     <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted">{media.overview || "暂无简介"}</p>
                     <div className="mt-auto flex items-end justify-between gap-3 pt-4">
@@ -3145,10 +3298,12 @@ function ResourcesPanel({
   sites,
   downloaders,
   candidates,
+  tmdbResults,
   errors,
   loading,
   searched,
   busyKey,
+  queuedCandidateKeys = new Set<string>(),
   onSearch,
   onQueue,
 }: {
@@ -3159,10 +3314,12 @@ function ResourcesPanel({
   sites: Site[];
   downloaders: Downloader[];
   candidates: ResourceCandidate[];
+  tmdbResults: TmdbMedia[];
   errors: string[];
   loading: boolean;
   searched: boolean;
   busyKey: string;
+  queuedCandidateKeys?: ReadonlySet<string>;
   onSearch: (event: FormEvent) => void;
   onQueue: (candidate: ResourceCandidate) => void;
 }) {
@@ -3211,7 +3368,7 @@ function ResourcesPanel({
               <FormSelect label="质量配置" value={form.qualityProfileId} onChange={(qualityProfileId) => setForm((current) => ({ ...current, qualityProfileId }))} options={profiles.map((profile) => ({ value: String(profile.id), label: profile.name }))} />
               <FormSelect label="下载器" value={form.downloaderId} onChange={(downloaderId) => setForm((current) => ({ ...current, downloaderId }))} options={downloaders.map((downloader) => ({ value: String(downloader.id), label: downloader.name }))} />
             </div>
-            <SitePicker sites={sites} selected={form.siteIds} onChange={(siteIds) => setForm((current) => ({ ...current, siteIds }))} />
+            <SitePicker sites={sites} selected={form.siteIds} showSelectAll onChange={(siteIds) => setForm((current) => ({ ...current, siteIds }))} />
             <div className="flex justify-end">
               <Button type="submit" disabled={loading || (!form.query.trim() && !form.subscriptionId) || form.siteIds.length === 0}>
                 {loading ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Search data-icon="inline-start" />}
@@ -3232,6 +3389,8 @@ function ResourcesPanel({
           ))}
         </div>
       ) : null}
+
+      {resourceTmdbResults(tmdbResults)}
 
       {loading ? (
         <LoadingState label="正在并发搜索站点" />
@@ -3275,13 +3434,13 @@ function ResourcesPanel({
                       <TableCell>
                         <div className="flex justify-end">
                           <Button
-                            variant={candidateNeedsOverride(candidate) ? "destructive" : "default"}
+                            variant={queuedCandidateKeys.has(candidate.key) ? "outline" : candidateNeedsOverride(candidate) ? "destructive" : "default"}
                             className="h-8 px-3"
                             disabled={busyKey === `queue:${candidate.key}`}
                             onClick={() => onQueue(candidate)}
                           >
-                            {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Download data-icon="inline-start" />}
-                            {candidateNeedsOverride(candidate) ? "覆盖入队" : "入队"}
+                            {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : queuedCandidateKeys.has(candidate.key) ? <RefreshCw data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                            {queuedCandidateKeys.has(candidate.key) ? "检查并重新入队" : candidateNeedsOverride(candidate) ? "覆盖入队" : "入队"}
                           </Button>
                         </div>
                       </TableCell>
@@ -3310,9 +3469,9 @@ function ResourcesPanel({
                     <DecisionSummary candidate={candidate} />
                   </div>
                   <div className="mt-4 flex justify-end">
-                    <Button variant={candidateNeedsOverride(candidate) ? "destructive" : "default"} className="h-8 px-3" disabled={busyKey === `queue:${candidate.key}`} onClick={() => onQueue(candidate)}>
-                      <Download data-icon="inline-start" />
-                      {candidateNeedsOverride(candidate) ? "覆盖入队" : "加入下载队列"}
+                    <Button variant={queuedCandidateKeys.has(candidate.key) ? "outline" : candidateNeedsOverride(candidate) ? "destructive" : "default"} className="h-8 px-3" disabled={busyKey === `queue:${candidate.key}`} onClick={() => onQueue(candidate)}>
+                      {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : queuedCandidateKeys.has(candidate.key) ? <RefreshCw data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                      {queuedCandidateKeys.has(candidate.key) ? "检查并重新入队" : candidateNeedsOverride(candidate) ? "覆盖入队" : "加入下载队列"}
                     </Button>
                   </div>
                 </article>
@@ -3326,6 +3485,42 @@ function ResourcesPanel({
         <EmptyState icon={Search} title="输入关键词或选择订阅目标" />
       )}
     </div>
+  );
+}
+
+function tmdbCategoryLabel(media: TmdbMedia): string {
+  if (media.media_type === "movie") return "电影";
+  return media.is_animation ? "动漫" : "电视剧";
+}
+
+function resourceTmdbResults(results: TmdbMedia[]) {
+  if (results.length === 0) return null;
+  return (
+    <section aria-label="TMDB 匹配结果" className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="text-sm font-semibold">TMDB 匹配结果</h3>
+        <span className="text-xs text-muted">{results.length} 项</span>
+      </div>
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {results.slice(0, 6).map((media) => (
+          <Card key={`resource-tmdb:${media.media_type}:${media.tmdb_id}`}>
+            <CardContent className="flex gap-3 p-3">
+              <Poster path={media.poster_path} title={media.title} className="w-16 shrink-0" />
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <div className="flex items-start justify-between gap-2">
+                  <h4 className="line-clamp-2 text-sm font-semibold">{media.title}</h4>
+                  <StatusPill label={tmdbCategoryLabel(media)} />
+                </div>
+                {media.original_title ? (
+                  <p className="truncate text-xs text-muted" title={media.original_title}>{media.original_title}</p>
+                ) : null}
+                <p className="mt-auto text-xs text-muted">{media.year ?? "年份未知"} · TMDB {media.tmdb_id}</p>
+              </div>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -3409,8 +3604,12 @@ function SettingsPanel({
   clearTmdbToken,
   setClearTmdbToken,
   profiles,
+  downloaders,
+  openListSettings,
+  setOpenListSettings,
   busyKey,
   onSaveSettings,
+  onSaveOpenList,
   onAddQuality,
   onEditQuality,
   onDeleteQuality,
@@ -3420,8 +3619,12 @@ function SettingsPanel({
   clearTmdbToken: boolean;
   setClearTmdbToken: Dispatch<SetStateAction<boolean>>;
   profiles: QualityProfile[];
+  downloaders: Downloader[];
+  openListSettings: OpenListAutomationSettings | null;
+  setOpenListSettings: Dispatch<SetStateAction<OpenListAutomationSettings | null>>;
   busyKey: string;
   onSaveSettings: () => void;
+  onSaveOpenList: () => void;
   onAddQuality: () => void;
   onEditQuality: (profile: QualityProfile) => void;
   onDeleteQuality: (profile: QualityProfile) => void;
@@ -3485,6 +3688,19 @@ function SettingsPanel({
           </div>
         </CardContent>
       </Card>
+
+      {openListSettings ? (
+        <OpenListAutomationPanel
+          settings={openListSettings}
+          setSettings={(value) => setOpenListSettings((current) => {
+            if (!current) return current;
+            return typeof value === "function" ? value(current) : value;
+          })}
+          downloaders={downloaders}
+          saving={busyKey === "save-openlist"}
+          onSave={onSaveOpenList}
+        />
+      ) : null}
 
       <Card>
         <CardHeader className="flex-row items-center justify-between gap-4">

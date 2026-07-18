@@ -321,6 +321,7 @@ mod tests {
                 year: Some(2026),
                 overview: String::new(),
                 poster_path: None,
+                is_animation: false,
             },
             aliases: Vec::new(),
             number_of_seasons,

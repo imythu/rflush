@@ -80,9 +80,9 @@ pub struct BrushTaskRequest {
     pub max_concurrent: Option<i32>,
     pub download_speed_limit: Option<i64>,
     pub upload_speed_limit: Option<i64>,
-    pub size_ranges: Option<String>,   // JSON array string
-    pub seeder_ranges: Option<String>, // JSON array string
-    pub downloader_ranges: Option<String>, // JSON array string
+    pub size_ranges: Option<String>,        // JSON array string
+    pub seeder_ranges: Option<String>,      // JSON array string
+    pub downloader_ranges: Option<String>,  // JSON array string
     pub downloader_weights: Option<String>, // JSON {qb_id: weight}
     pub min_free_hours: Option<f64>,
     pub delete_mode: Option<String>,

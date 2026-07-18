@@ -63,8 +63,7 @@ pub async fn evaluate_delete_rules(
                 rule_details.push(if passed {
                     "free已到期".to_string()
                 } else {
-                    let remaining_hours =
-                        (free_end_timestamp - now_secs) as f64 / 3600.0;
+                    let remaining_hours = (free_end_timestamp - now_secs) as f64 / 3600.0;
                     format!("free未到期，剩余 {:.1}h", remaining_hours)
                 });
                 if passed {
@@ -208,8 +207,10 @@ pub async fn evaluate_delete_rules(
                 rule_details.push("未完成下载，跳过速度规则".to_string());
             } else {
                 let active_enough = dl_info.time_active > 600;
-                let avg_10min = get_recent_avg_upload_speed(db, task.id, &record.torrent_hash, 10).await;
-                let avg_1min = get_recent_avg_upload_speed(db, task.id, &record.torrent_hash, 1).await;
+                let avg_10min =
+                    get_recent_avg_upload_speed(db, task.id, &record.torrent_hash, 10).await;
+                let avg_1min =
+                    get_recent_avg_upload_speed(db, task.id, &record.torrent_hash, 1).await;
                 match (avg_10min, avg_1min) {
                     // 仅在有足够流量样本时才评估该规则，避免重启/采集滞后导致
                     // 速度被当成 0 从而误删正常做种的种子。
@@ -249,7 +250,8 @@ pub async fn evaluate_delete_rules(
                         rule_details.push("近1分钟流量样本不足，跳过速度规则".to_string());
                     }
                     (None, None) => {
-                        rule_details.push("近10分钟和近1分钟流量样本不足，跳过速度规则".to_string());
+                        rule_details
+                            .push("近10分钟和近1分钟流量样本不足，跳过速度规则".to_string());
                     }
                 }
             }
@@ -391,6 +393,8 @@ mod tests {
             num_seeds: 0,
             num_leechs: 0,
             save_path: String::new(),
+            root_path: String::new(),
+            content_path: String::new(),
             tags: String::new(),
             category: String::new(),
             time_active: 0,

@@ -22,6 +22,7 @@ use super::lease::process_owner_id;
 use super::models::{
     MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS, MediaDownloadRecord, NewMediaDownload,
     NewSubscription, QualityProfileRecord, SubscriptionRecord, SubscriptionTargetRecord,
+    media_download_category,
 };
 use super::progression::{
     ProgressionError, SubscriptionTargetSeedStatus, TargetReadiness, air_date_eligible_at,
@@ -316,6 +317,7 @@ impl MediaService {
         let subscription = NewSubscription {
             tmdb_id: details.media.tmdb_id,
             media_type: media_type.as_str().to_string(),
+            tmdb_is_animation: details.media.is_animation,
             title: details.media.title,
             original_title: details.media.original_title,
             aliases,
@@ -606,11 +608,7 @@ impl MediaService {
                     snapshot.error = Some(error.to_string());
                     snapshot
                 }
-                _ => failed_run_snapshot(
-                    &started_at,
-                    &claimed_target_key,
-                    error.to_string(),
-                ),
+                _ => failed_run_snapshot(&started_at, &claimed_target_key, error.to_string()),
             };
             if let Ok(info) = to_json(&snapshot) {
                 let _ = self
@@ -1017,6 +1015,7 @@ impl MediaService {
                     subscription.version,
                     owner,
                     &plan.targets,
+                    details.media.is_animation,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -1025,6 +1024,7 @@ impl MediaService {
                     )
                 })?;
             subscription.version = synced.version;
+            subscription.tmdb_is_animation = details.media.is_animation;
             target_record = synced.current;
         }
 
@@ -1324,7 +1324,7 @@ impl MediaService {
             site_id: Some(result.site_id),
             downloader_id: Some(downloader_id),
             source_site: result.source_site.clone(),
-            downloader_name: downloader.name,
+            downloader_name: downloader.name.clone(),
             torrent_id: result.torrent_id.clone(),
             title: result.title.clone(),
             size: result.size,
@@ -1343,10 +1343,38 @@ impl MediaService {
                     )
                 });
         }
-        self.db
+        let queued = self
+            .db
             .enqueue_media_download(&new_download)
             .await
-            .map_err(Into::into)
+            .map_err(MediaServiceError::from)?;
+        if queued.status == "submitted"
+            && let Some(infohash) = queued.infohash.as_deref()
+        {
+            let client = self
+                .downloaders
+                .get(&downloader)
+                .await
+                .map_err(MediaServiceError::Downloader)?;
+            let exists = !client
+                .list_torrents_by_hashes(&[infohash.to_string()])
+                .await
+                .map_err(MediaServiceError::Downloader)?
+                .is_empty();
+            if !exists
+                && self
+                    .db
+                    .requeue_missing_manual_media_download(queued.id, queued.version)
+                    .await?
+            {
+                return self
+                    .db
+                    .get_media_download(queued.id)
+                    .await?
+                    .ok_or_else(|| MediaServiceError::NotFound(format!("download {}", queued.id)));
+            }
+        }
+        Ok(queued)
     }
 
     pub async fn process_download(
@@ -1451,18 +1479,25 @@ impl MediaService {
             .get(&downloader)
             .await
             .map_err(MediaServiceError::Downloader)?;
-        let save_path = match submitting.subscription_id {
-            Some(subscription_id) => self
-                .db
-                .get_subscription(subscription_id)
-                .await?
-                .and_then(|subscription| subscription.save_path),
+        let subscription = match submitting.subscription_id {
+            Some(subscription_id) => self.db.get_subscription(subscription_id).await?,
             None => None,
         };
+        let save_path = subscription
+            .as_ref()
+            .and_then(|subscription| subscription.save_path.clone());
         let options = AddTorrentOptions {
             save_path,
-            tags: Some("rflush-media".to_string()),
-            category: Some("rflush-media".to_string()),
+            tags: Some("云母".to_string()),
+            category: Some(
+                media_download_category(
+                    &submitting.target_key,
+                    subscription
+                        .as_ref()
+                        .is_some_and(|subscription| subscription.tmdb_is_animation),
+                )
+                .to_string(),
+            ),
             ..Default::default()
         };
         let filename = format!(
@@ -2126,12 +2161,8 @@ mod tests {
             episode: 6,
             allow_season_pack: false,
         };
-        let original_decision = DecisionEngine::evaluate(
-            &original_target,
-            &release,
-            &profile_to_domain(&profile),
-            31,
-        );
+        let original_decision =
+            DecisionEngine::evaluate(&original_target, &release, &profile_to_domain(&profile), 31);
         assert_eq!(original_decision.rejections.len(), 1);
         assert_eq!(original_decision.rejections[0].code, RejectCode::WrongTitle);
 
@@ -2180,6 +2211,7 @@ mod tests {
             id: 1,
             tmdb_id: 2,
             media_type: "tv".to_string(),
+            tmdb_is_animation: true,
             title: "Anime".to_string(),
             original_title: None,
             aliases: Vec::new(),
@@ -2265,6 +2297,7 @@ mod tests {
             .create_subscription(&NewSubscription {
                 tmdb_id: 42,
                 media_type: "tv".to_string(),
+                tmdb_is_animation: false,
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2348,6 +2381,7 @@ mod tests {
             .create_subscription(&NewSubscription {
                 tmdb_id: 42,
                 media_type: "tv".to_string(),
+                tmdb_is_animation: false,
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2529,6 +2563,7 @@ mod tests {
             .create_subscription(&NewSubscription {
                 tmdb_id: 42,
                 media_type: "movie".to_string(),
+                tmdb_is_animation: false,
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2593,6 +2628,7 @@ mod tests {
             .create_subscription(&NewSubscription {
                 tmdb_id: 42,
                 media_type: "movie".to_string(),
+                tmdb_is_animation: false,
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2609,13 +2645,7 @@ mod tests {
             })
             .await
             .unwrap();
-        install_static_indexer(
-            &service,
-            &db,
-            first_site,
-            vec![resource_search_result(1)],
-        )
-        .await;
+        install_static_indexer(&service, &db, first_site, vec![resource_search_result(1)]).await;
 
         let run = service.run_subscription(subscription.id).await.unwrap();
         let snapshot = service

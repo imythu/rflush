@@ -27,7 +27,10 @@ impl TagRuleScheduler {
             .await
             .map(|s| s.tag_rule_scan_interval_mins.saturating_mul(60).max(60))
             .unwrap_or(420);
-        info!("tag rule scheduler started, scanning every {}s", interval_secs);
+        info!(
+            "tag rule scheduler started, scanning every {}s",
+            interval_secs
+        );
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             interval.tick().await;
@@ -36,7 +39,10 @@ impl TagRuleScheduler {
                 Ok(s) => {
                     let new_secs = s.tag_rule_scan_interval_mins.saturating_mul(60).max(60);
                     if new_secs != interval_secs {
-                        info!("tag rule scan interval changed: {}s -> {}s", interval_secs, new_secs);
+                        info!(
+                            "tag rule scan interval changed: {}s -> {}s",
+                            interval_secs, new_secs
+                        );
                         interval_secs = new_secs;
                         interval = tokio::time::interval(Duration::from_secs(interval_secs));
                     }
@@ -67,21 +73,35 @@ impl TagRuleScheduler {
         debug!("tag scheduler: === 开始扫描 ===");
         debug!("tag scheduler: 已加载 {} 条启用规则", parsed_rules.len());
         for (rule, compiled) in &parsed_rules {
-            let ids_desc = match rule.downloader_ids.as_ref().and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok()) {
+            let ids_desc = match rule
+                .downloader_ids
+                .as_ref()
+                .and_then(|s| serde_json::from_str::<Vec<i64>>(s).ok())
+            {
                 None => "所有".to_string(),
                 Some(ids) if ids.is_empty() => "无".to_string(),
-                Some(ids) => ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(","),
+                Some(ids) => ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
             };
-            let criteria_desc: Vec<String> = compiled.iter().map(|c| match c {
-                CompiledCriteria::Prefix(p) => format!("前缀:{}", p),
-                CompiledCriteria::Suffix(s) => format!("后缀:{}", s),
-                CompiledCriteria::Contains(c) => format!("包含:{}", c),
-                CompiledCriteria::Exact(e) => format!("精确:{}", e),
-                CompiledCriteria::Regex(r) => format!("正则:{}", r.as_str()),
-            }).collect();
+            let criteria_desc: Vec<String> = compiled
+                .iter()
+                .map(|c| match c {
+                    CompiledCriteria::Prefix(p) => format!("前缀:{}", p),
+                    CompiledCriteria::Suffix(s) => format!("后缀:{}", s),
+                    CompiledCriteria::Contains(c) => format!("包含:{}", c),
+                    CompiledCriteria::Exact(e) => format!("精确:{}", e),
+                    CompiledCriteria::Regex(r) => format!("正则:{}", r.as_str()),
+                })
+                .collect();
             debug!(
                 "tag scheduler:   规则[{}] → 标签 '{}' | 匹配条件: [{}] | 实例: {}",
-                rule.name, rule.tag_name, criteria_desc.join(", "), ids_desc
+                rule.name,
+                rule.tag_name,
+                criteria_desc.join(", "),
+                ids_desc
             );
         }
 
@@ -99,28 +119,36 @@ impl TagRuleScheduler {
 
         for downloader in &downloaders {
             // 检查是否有规则需要此下载器
-            let applicable_rules: Vec<_> = parsed_rules.iter().filter(|(rule, _)| {
-                match &rule.downloader_ids {
+            let applicable_rules: Vec<_> = parsed_rules
+                .iter()
+                .filter(|(rule, _)| match &rule.downloader_ids {
                     Some(ids_str) => {
                         let ids: Vec<i64> = serde_json::from_str(ids_str).unwrap_or_default();
                         ids.contains(&downloader.id)
                     }
                     None => true,
-                }
-            }).collect();
+                })
+                .collect();
             if applicable_rules.is_empty() {
-                debug!("tag scheduler: 下载器 '{}' 无适用规则，跳过", downloader.name);
+                debug!(
+                    "tag scheduler: 下载器 '{}' 无适用规则，跳过",
+                    downloader.name
+                );
                 continue;
             }
             debug!(
                 "tag scheduler: 下载器 '{}' 有 {} 条适用规则",
-                downloader.name, applicable_rules.len()
+                downloader.name,
+                applicable_rules.len()
             );
 
             let client = match self.pool.get(downloader).await {
                 Ok(c) => c,
                 Err(e) => {
-                    warn!("tag scheduler: 获取 '{}' 客户端失败: {}", downloader.name, e);
+                    warn!(
+                        "tag scheduler: 获取 '{}' 客户端失败: {}",
+                        downloader.name, e
+                    );
                     continue;
                 }
             };
@@ -135,7 +163,8 @@ impl TagRuleScheduler {
 
             debug!(
                 "tag scheduler: 下载器 '{}' 共 {} 个种子",
-                downloader.name, torrents.len()
+                downloader.name,
+                torrents.len()
             );
             total_torrents += torrents.len();
 
@@ -146,7 +175,9 @@ impl TagRuleScheduler {
                     Err(e) => {
                         debug!(
                             "tag scheduler: 种子 '{}' (hash={}...) 获取tracker失败: {}",
-                            torrent.name, &torrent.hash[..8.min(torrent.hash.len())], e
+                            torrent.name,
+                            &torrent.hash[..8.min(torrent.hash.len())],
+                            e
                         );
                         continue;
                     }
@@ -162,13 +193,18 @@ impl TagRuleScheduler {
                     total_no_tracker += 1;
                     debug!(
                         "tag scheduler: 种子 '{}' (hash={}...) 无可用tracker域名，跳过",
-                        torrent.name, &torrent.hash[..8.min(torrent.hash.len())]
+                        torrent.name,
+                        &torrent.hash[..8.min(torrent.hash.len())]
                     );
                     continue;
                 }
 
-                let existing_tags: Vec<&str> =
-                    torrent.tags.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+                let existing_tags: Vec<&str> = torrent
+                    .tags
+                    .split(',')
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect();
 
                 for (rule, compiled) in &applicable_rules {
                     // 检查种子是否已有该标签
@@ -189,11 +225,17 @@ impl TagRuleScheduler {
                                 total_matched += 1;
                                 debug!(
                                     "tag scheduler: ✓ 种子 '{}' | 域名 '{}' (tracker: {}) | 规则 '{}' 第{}条命中 → 标签 '{}'",
-                                    torrent.name, domain, raw_url, rule.name, criteria_idx + 1, rule.tag_name
+                                    torrent.name,
+                                    domain,
+                                    raw_url,
+                                    rule.name,
+                                    criteria_idx + 1,
+                                    rule.tag_name
                                 );
                                 debug!(
                                     "tag scheduler:   匹配详情: {} ~ '{}'",
-                                    criteria_desc(criteria), domain
+                                    criteria_desc(criteria),
+                                    domain
                                 );
                                 matched = true;
 
@@ -209,7 +251,9 @@ impl TagRuleScheduler {
                                         total_tagged += 1;
                                         info!(
                                             "tag scheduler: 已为种子 '{}' (hash={}...) 添加标签 '{}'",
-                                            torrent.name, &torrent.hash[..8.min(torrent.hash.len())], rule.tag_name
+                                            torrent.name,
+                                            &torrent.hash[..8.min(torrent.hash.len())],
+                                            rule.tag_name
                                         );
                                     }
                                     Err(e) => {
@@ -232,8 +276,14 @@ impl TagRuleScheduler {
                     if !matched {
                         debug!(
                             "tag scheduler: ✗ 种子 '{}' | 规则 '{}' 全部域名均未匹配 (共{}条): [{}]",
-                            torrent.name, rule.name, tracker_domains.len(),
-                            tracker_domains.iter().map(|(_, d)| *d).collect::<Vec<_>>().join(", ")
+                            torrent.name,
+                            rule.name,
+                            tracker_domains.len(),
+                            tracker_domains
+                                .iter()
+                                .map(|(_, d)| *d)
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                     }
                 }
@@ -267,7 +317,11 @@ impl TagRuleScheduler {
                     }
                 }
             }
-            if let Err(e) = self.db.update_tag_rule_stats(rule.id, count, total_size).await {
+            if let Err(e) = self
+                .db
+                .update_tag_rule_stats(rule.id, count, total_size)
+                .await
+            {
                 warn!("tag scheduler: 更新规则 '{}' 统计失败: {}", rule.name, e);
             } else {
                 debug!(
@@ -287,9 +341,8 @@ impl TagRuleScheduler {
     ) -> Result<Vec<(TagRuleRecord, Vec<CompiledCriteria>)>, String> {
         let mut result = Vec::new();
         for rule in rules {
-            let criteria: Vec<TagMatchCriteria> =
-                serde_json::from_str(&rule.match_rules)
-                    .map_err(|e| format!("解析规则 '{}' 的匹配条件失败: {}", rule.name, e))?;
+            let criteria: Vec<TagMatchCriteria> = serde_json::from_str(&rule.match_rules)
+                .map_err(|e| format!("解析规则 '{}' 的匹配条件失败: {}", rule.name, e))?;
             let compiled: Vec<CompiledCriteria> = criteria
                 .into_iter()
                 .map(|c| compile_criteria(&c))
@@ -339,10 +392,17 @@ fn extract_domain(url: &str) -> Option<&str> {
     let host = &after_scheme[..end];
     // 去掉端口号
     let domain = host.split(':').next().unwrap_or(host);
-    if domain.is_empty() { None } else { Some(domain) }
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain)
+    }
 }
 
-fn match_tracker_detailed<'a>(domain: &str, criteria: &'a [CompiledCriteria]) -> Option<(usize, &'a CompiledCriteria)> {
+fn match_tracker_detailed<'a>(
+    domain: &str,
+    criteria: &'a [CompiledCriteria],
+) -> Option<(usize, &'a CompiledCriteria)> {
     if criteria.is_empty() {
         return None;
     }

@@ -51,6 +51,8 @@ pub struct AddTorrentOptions {
     pub ratio_limit: Option<f64>,
     pub inactive_seeding_time_limit: Option<i64>,
     pub paused: bool,
+    pub skip_checking: bool,
+    pub root_folder: Option<bool>,
 }
 
 /// 下载器中的种子信息
@@ -70,10 +72,18 @@ pub struct TorrentInfo {
     pub num_seeds: i32,
     pub num_leechs: i32,
     pub save_path: String,
+    pub root_path: String,
+    pub content_path: String,
     pub tags: String,
     pub category: String,
     pub time_active: i64,
     pub last_activity: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TorrentFileInfo {
+    pub path: String,
+    pub size: i64,
 }
 
 /// 下载器测试结果
@@ -123,7 +133,11 @@ pub trait DownloaderClient: Send + Sync {
             let all = self.list_torrents(None).await?;
             Ok(all
                 .into_iter()
-                .filter(|torrent| hashes.iter().any(|hash| torrent.hash.eq_ignore_ascii_case(hash)))
+                .filter(|torrent| {
+                    hashes
+                        .iter()
+                        .any(|hash| torrent.hash.eq_ignore_ascii_case(hash))
+                })
                 .collect())
         })
     }
@@ -184,6 +198,27 @@ pub trait DownloaderClient: Send + Sync {
         hashes: Vec<String>,
         tags: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
+    fn export_torrent(
+        &self,
+        _hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+        Box::pin(async { Err("当前下载器不支持导出种子".to_string()) })
+    }
+
+    fn start_torrent(
+        &self,
+        _hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Err("当前下载器不支持启动种子".to_string()) })
+    }
+
+    fn get_torrent_files(
+        &self,
+        _hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentFileInfo>, String>> + Send + '_>> {
+        Box::pin(async { Err("当前下载器不支持读取种子文件清单".to_string()) })
+    }
 }
 
 pub fn calculate_pending_download_bytes(torrents: &[TorrentInfo]) -> u64 {
@@ -224,12 +259,7 @@ impl DownloaderClientPool {
         &self,
         record: &DownloaderRecord,
     ) -> Result<Arc<dyn DownloaderClient>, String> {
-        let proxy = self
-            .db
-            .get_settings()
-            .await
-            .ok()
-            .and_then(|s| s.proxy);
+        let proxy = self.db.get_settings().await.ok().and_then(|s| s.proxy);
 
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache.get(&record.id) {

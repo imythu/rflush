@@ -10,8 +10,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::brush::{
     BrushTaskLastRunInfo, BrushTaskRecord, BrushTorrentRecord, LastRunAddedTorrent,
-    LastRunDownloaderCandidate, LastRunDownloaderSkipped, LastRunFailedTorrent, average_upload_speed,
-    calculate_ratio, in_any_range, is_in_active_window, parse_ranges,
+    LastRunDownloaderCandidate, LastRunDownloaderSkipped, LastRunFailedTorrent,
+    average_upload_speed, calculate_ratio, in_any_range, is_in_active_window, parse_ranges,
 };
 use crate::collector::DownloaderSnapshotCollector;
 use crate::db::Database;
@@ -410,8 +410,7 @@ impl BrushScheduler {
         let http = self.http.clone();
         info!("[刷流][{}] 手动触发执行 (id={})", task_name, task_id);
         let handle = tokio::spawn(async move {
-            if let Err(e) =
-                execute_brush_task(&db, &pool, execution_config, &http, "manual").await
+            if let Err(e) = execute_brush_task(&db, &pool, execution_config, &http, "manual").await
             {
                 error!("[刷流][{}] 手动执行失败: {}", task_name, e);
             }
@@ -552,19 +551,23 @@ async fn execute_brush_task_inner(
     info!("[刷流][{}] 开始执行任务 (id={})", task.name, task.id);
 
     // 1. 加载所有绑定下载器，并执行 per-qb 空间门禁
-    let mut qb_clients: HashMap<i64, (DownloaderRecord, Arc<dyn DownloaderClient>)> = HashMap::new();
+    let mut qb_clients: HashMap<i64, (DownloaderRecord, Arc<dyn DownloaderClient>)> =
+        HashMap::new();
     let mut qb_free_space: HashMap<i64, u64> = HashMap::new();
     for dl_id in &task.downloader_ids {
         let dl_record = match db.get_downloader(*dl_id).await.map_err(|e| e.to_string())? {
             Some(r) => r,
             None => {
                 warn!("[刷流][{}] 下载器 id={} 不存在，跳过", task.name, dl_id);
-                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
-                    id: *dl_id,
-                    name: format!("#{}", dl_id),
-                    reason: "not_exist".to_string(),
-                    detail: None,
-                });
+                last_run_info
+                    .downloaders
+                    .skipped
+                    .push(LastRunDownloaderSkipped {
+                        id: *dl_id,
+                        name: format!("#{}", dl_id),
+                        reason: "not_exist".to_string(),
+                        detail: None,
+                    });
                 continue;
             }
         };
@@ -575,12 +578,15 @@ async fn execute_brush_task_inner(
                     "[刷流][{}] 创建下载器 '{}' 客户端失败: {}",
                     task.name, dl_record.name, e
                 );
-                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
-                    id: *dl_id,
-                    name: dl_record.name.clone(),
-                    reason: "client_create_failed".to_string(),
-                    detail: Some(e.to_string()),
-                });
+                last_run_info
+                    .downloaders
+                    .skipped
+                    .push(LastRunDownloaderSkipped {
+                        id: *dl_id,
+                        name: dl_record.name.clone(),
+                        reason: "client_create_failed".to_string(),
+                        detail: Some(e.to_string()),
+                    });
                 continue;
             }
         };
@@ -593,12 +599,15 @@ async fn execute_brush_task_inner(
                     "[刷流][{}] 下载器 '{}' 获取剩余空间失败: {}，跳过该下载器",
                     task.name, dl_record.name, e
                 );
-                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
-                    id: *dl_id,
-                    name: dl_record.name.clone(),
-                    reason: "free_space_fetch_failed".to_string(),
-                    detail: Some(e.to_string()),
-                });
+                last_run_info
+                    .downloaders
+                    .skipped
+                    .push(LastRunDownloaderSkipped {
+                        id: *dl_id,
+                        name: dl_record.name.clone(),
+                        reason: "free_space_fetch_failed".to_string(),
+                        detail: Some(e.to_string()),
+                    });
                 continue;
             }
         };
@@ -607,32 +616,44 @@ async fn execute_brush_task_inner(
             if free < min_bytes {
                 info!(
                     "[刷流][{}] 下载器 '{}' 剩余空间 {:.2} GB < 最低 {:.2} GB，本轮排除",
-                    task.name, dl_record.name, bytes_to_gb(free), min_gb
+                    task.name,
+                    dl_record.name,
+                    bytes_to_gb(free),
+                    min_gb
                 );
-                last_run_info.downloaders.skipped.push(LastRunDownloaderSkipped {
-                    id: *dl_id,
-                    name: dl_record.name.clone(),
-                    reason: "space_insufficient".to_string(),
-                    detail: Some(format!(
-                        "free {:.2} GB < min {:.2} GB",
-                        bytes_to_gb(free),
-                        min_gb
-                    )),
-                });
+                last_run_info
+                    .downloaders
+                    .skipped
+                    .push(LastRunDownloaderSkipped {
+                        id: *dl_id,
+                        name: dl_record.name.clone(),
+                        reason: "space_insufficient".to_string(),
+                        detail: Some(format!(
+                            "free {:.2} GB < min {:.2} GB",
+                            bytes_to_gb(free),
+                            min_gb
+                        )),
+                    });
                 continue;
             }
         }
         let dl_weight = task.get_downloader_weight(*dl_id).unwrap_or(1);
         info!(
             "[刷流][{}] 下载器 '{}' 进入候选 (剩余 {:.2} GB, 权重 {})",
-            task.name, dl_record.name, bytes_to_gb(free), dl_weight
+            task.name,
+            dl_record.name,
+            bytes_to_gb(free),
+            dl_weight
         );
-        last_run_info.downloaders.candidates.push(LastRunDownloaderCandidate {
-            id: *dl_id,
-            name: dl_record.name.clone(),
-            free_space_gb: bytes_to_gb(free),
-            weight: dl_weight,
-        });
+        last_run_info
+            .downloaders
+            .candidates
+            .push(LastRunDownloaderCandidate {
+                id: *dl_id,
+                name: dl_record.name.clone(),
+                free_space_gb: bytes_to_gb(free),
+                weight: dl_weight,
+            });
         qb_clients.insert(*dl_id, (dl_record, dl_client));
         qb_free_space.insert(*dl_id, free);
     }
@@ -667,8 +688,7 @@ async fn execute_brush_task_inner(
                 Some(c) => c,
                 None => continue,
             };
-            let hashes: Vec<String> =
-                records.iter().map(|r| r.torrent_hash.clone()).collect();
+            let hashes: Vec<String> = records.iter().map(|r| r.torrent_hash.clone()).collect();
             let existing = match client.list_torrents_by_hashes(&hashes).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -887,10 +907,7 @@ async fn execute_brush_task_inner(
             .filter(|value| !value.is_empty());
         if let Some(ref tid) = item_torrent_id {
             if existing_torrent_ids.contains(tid) {
-                debug!(
-                    "[刷流][{}] 跳过: 种子已存在且未移除 id={}",
-                    task.name, tid
-                );
+                debug!("[刷流][{}] 跳过: 种子已存在且未移除 id={}", task.name, tid);
                 skipped_existing += 1;
                 continue;
             }
@@ -1175,9 +1192,7 @@ async fn execute_brush_task_inner(
         let mut added_to_qb: Option<i64> = None;
         while !candidates.is_empty() {
             let pick = weighted_random_pick(&candidates, |dl_id| {
-                task.get_downloader_weight(*dl_id)
-                    .unwrap_or(1)
-                    .max(1) as u64
+                task.get_downloader_weight(*dl_id).unwrap_or(1).max(1) as u64
             });
             let (dl_record, dl_client) = match qb_clients.get(&pick) {
                 Some(pair) => pair.clone(),
@@ -1619,6 +1634,8 @@ mod tests {
                 num_seeds: 0,
                 num_leechs: 0,
                 save_path: String::new(),
+                root_path: String::new(),
+                content_path: String::new(),
                 tags: String::new(),
                 category: String::new(),
                 time_active: 0,
@@ -1639,6 +1656,8 @@ mod tests {
                 num_seeds: 0,
                 num_leechs: 0,
                 save_path: String::new(),
+                root_path: String::new(),
+                content_path: String::new(),
                 tags: String::new(),
                 category: String::new(),
                 time_active: 0,
@@ -1668,17 +1687,11 @@ fn spawn_delete_torrent_standalone(
     let pending = pending.clone();
 
     tokio::spawn(async move {
-        pending
-            .write()
-            .await
-            .insert((task_id, hash.clone()));
+        pending.write().await.insert((task_id, hash.clone()));
 
         let short_hash = &hash[..8.min(hash.len())];
 
-        info!(
-            "[删种][{}] hash={} → 尝试暂停种子",
-            task_name, short_hash
-        );
+        info!("[删种][{}] hash={} → 尝试暂停种子", task_name, short_hash);
         match client.pause_torrent(&hash).await {
             Ok(()) => {}
             Err(e) if e.contains("404") => {
@@ -1734,17 +1747,11 @@ fn spawn_delete_torrent_standalone(
         match client.list_torrents(None).await {
             Ok(all) => {
                 if all.iter().any(|t| t.hash.eq_ignore_ascii_case(&hash)) {
-                    warn!(
-                        "[删种][{}] 删除后种子仍存在，保持 active 状态",
-                        task_name
-                    );
+                    warn!("[删种][{}] 删除后种子仍存在，保持 active 状态", task_name);
                     pending.write().await.remove(&(task_id, hash));
                     return;
                 }
-                info!(
-                    "[删种][{}] 确认种子已不在下载器中，标记为已移除",
-                    task_name
-                );
+                info!("[删种][{}] 确认种子已不在下载器中，标记为已移除", task_name);
             }
             Err(list_err) => {
                 warn!(

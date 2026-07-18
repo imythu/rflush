@@ -63,6 +63,7 @@ pub struct TmdbMedia {
     pub year: Option<u32>,
     pub overview: String,
     pub poster_path: Option<String>,
+    pub is_animation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +233,8 @@ struct RawMedia {
     first_air_date: Option<String>,
     overview: Option<String>,
     poster_path: Option<String>,
+    #[serde(default)]
+    genre_ids: Vec<i64>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +252,13 @@ struct RawDetails {
     status: Option<String>,
     alternative_titles: Option<RawAlternativeTitles>,
     translations: Option<RawTranslations>,
+    #[serde(default)]
+    genres: Vec<RawGenre>,
+}
+
+#[derive(Deserialize)]
+struct RawGenre {
+    id: i64,
 }
 
 #[derive(Default, Deserialize)]
@@ -334,6 +344,7 @@ fn map_media(raw: RawMedia, media_type: TmdbMediaType) -> TmdbMedia {
         year: date.as_deref().and_then(parse_year),
         overview: raw.overview.unwrap_or_default(),
         poster_path: clean_optional(raw.poster_path),
+        is_animation: raw.genre_ids.contains(&16),
     }
 }
 
@@ -375,6 +386,7 @@ fn map_details(raw: RawDetails, media_type: TmdbMediaType) -> Result<TmdbDetails
             year: date.as_deref().and_then(parse_year),
             overview: raw.overview.unwrap_or_default(),
             poster_path: clean_optional(raw.poster_path),
+            is_animation: raw.genres.iter().any(|genre| genre.id == 16),
         },
         aliases,
         number_of_seasons: raw.number_of_seasons,
@@ -463,7 +475,7 @@ mod tests {
     fn maps_multi_search_and_ignores_people() {
         let raw: RawSearchResponse = serde_json::from_str(
             r#"{"results":[
-                {"id":1,"media_type":"tv","name":"百日成王","original_name":"The King","first_air_date":"2025-01-02"},
+                {"id":1,"media_type":"tv","name":"百日成王","original_name":"The King","first_air_date":"2025-01-02","genre_ids":[16]},
                 {"id":2,"media_type":"movie","title":"沙丘2","original_title":"Dune: Part Two","release_date":"2024-03-01"},
                 {"id":3,"media_type":"person","name":"Somebody"}
             ]}"#,
@@ -472,6 +484,7 @@ mod tests {
         let mapped = map_search_results(raw, "multi");
         assert_eq!(mapped.len(), 2);
         assert_eq!(mapped[0].year, Some(2025));
+        assert!(mapped[0].is_animation);
         assert_eq!(mapped[1].media_type, TmdbMediaType::Movie);
     }
 
@@ -484,6 +497,20 @@ mod tests {
         .unwrap();
         let details = map_details(raw, TmdbMediaType::Tv).unwrap();
         assert_eq!(details.aliases, vec!["Original", "Alias"]);
+    }
+
+    #[test]
+    fn details_identifies_animation_from_tmdb_genre_id() {
+        let raw: RawDetails = serde_json::from_str(
+            r#"{"id":7,"name":"百日成王","genres":[{"id":16,"name":"Animation"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            map_details(raw, TmdbMediaType::Tv)
+                .unwrap()
+                .media
+                .is_animation
+        );
     }
 
     #[test]
@@ -507,9 +534,7 @@ mod tests {
             vec!["Bai Ri Cheng Wang", "Crowned in a Hundred Days"]
         );
         assert_eq!(
-            map_details(movie, TmdbMediaType::Movie)
-                .unwrap()
-                .aliases,
+            map_details(movie, TmdbMediaType::Movie).unwrap().aliases,
             vec!["Dune: Part Two", "Dune Part Two"]
         );
     }

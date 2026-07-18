@@ -14,6 +14,11 @@ use crate::site::{SiteRecord, SiteStatsRecord, SiteWithStats, UserStats};
 use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
 mod media;
+mod openlist;
+
+pub use openlist::{
+    MediaRelocationJob, OpenListConfig, OpenListPathMapping, OpenListTargetDirectory,
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -2874,6 +2879,7 @@ impl Database {
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tmdb_id INTEGER NOT NULL,
                     media_type TEXT NOT NULL CHECK (media_type IN ('tv', 'movie')),
+                    tmdb_is_animation INTEGER NOT NULL DEFAULT 0,
                     title TEXT NOT NULL,
                     original_title TEXT,
                     aliases_json TEXT NOT NULL DEFAULT '[]',
@@ -2958,9 +2964,112 @@ impl Database {
                     ON media_downloads(status, next_attempt_at, lease_until);
                 CREATE INDEX IF NOT EXISTS idx_media_downloads_subscription
                     ON media_downloads(subscription_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS openlist_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    base_url TEXT NOT NULL DEFAULT '',
+                    api_key TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    target_directory_id INTEGER,
+                    scan_interval_secs INTEGER NOT NULL DEFAULT 30,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS openlist_path_mappings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    downloader_id INTEGER NOT NULL REFERENCES downloaders(id) ON DELETE CASCADE,
+                    qb_path TEXT NOT NULL,
+                    openlist_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(downloader_id, qb_path),
+                    UNIQUE(downloader_id, openlist_path)
+                );
+
+                CREATE TABLE IF NOT EXISTS openlist_target_directories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    downloader_id INTEGER NOT NULL REFERENCES downloaders(id) ON DELETE CASCADE,
+                    openlist_path TEXT NOT NULL,
+                    qb_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(downloader_id, openlist_path),
+                    UNIQUE(downloader_id, qb_path)
+                );
+
+                CREATE TABLE IF NOT EXISTS media_relocation_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_download_id INTEGER NOT NULL UNIQUE REFERENCES media_downloads(id) ON DELETE CASCADE,
+                    downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+                    infohash TEXT NOT NULL,
+                    source_qb_path TEXT NOT NULL,
+                    source_openlist_path TEXT NOT NULL,
+                    source_content_openlist_path TEXT NOT NULL DEFAULT '',
+                    target_openlist_path TEXT NOT NULL,
+                    target_qb_path TEXT NOT NULL,
+                    target_content_qb_path TEXT NOT NULL DEFAULT '',
+                    target_downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+                    copy_items_json TEXT NOT NULL DEFAULT '[]',
+                    source_files_json TEXT NOT NULL DEFAULT '[]',
+                    target_root_folder INTEGER,
+                    torrent_name TEXT NOT NULL,
+                    stage TEXT NOT NULL DEFAULT 'waiting_download',
+                    openlist_task_id TEXT,
+                    torrent_data BLOB,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    lease_owner TEXT,
+                    lease_until TEXT,
+                    version INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_media_relocation_jobs_due
+                    ON media_relocation_jobs(stage, next_attempt_at, lease_until);
                 ",
             )
             .map_err(sql_error)?;
+
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "source_content_openlist_path",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN source_content_openlist_path TEXT NOT NULL DEFAULT ''",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "target_content_qb_path",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN target_content_qb_path TEXT NOT NULL DEFAULT ''",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "target_downloader_id",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN target_downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "copy_items_json",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN copy_items_json TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "source_files_json",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN source_files_json TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "target_root_folder",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN target_root_folder INTEGER",
+            )?;
 
             migrate_media_download_infohash_uniqueness(&conn)?;
 
@@ -2970,8 +3079,33 @@ impl Database {
                 "last_run_info",
                 "ALTER TABLE subscriptions ADD COLUMN last_run_info TEXT",
             )?;
+            let had_tmdb_animation_classification =
+                column_exists(&conn, "subscriptions", "tmdb_is_animation");
+            ensure_column(
+                &conn,
+                "subscriptions",
+                "tmdb_is_animation",
+                "ALTER TABLE subscriptions ADD COLUMN tmdb_is_animation INTEGER NOT NULL DEFAULT 0",
+            )?;
+            if !had_tmdb_animation_classification {
+                let classification_refresh_at = Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE subscriptions
+                     SET next_run_at = ?, last_status = NULL
+                     WHERE media_type = 'tv' AND enabled = 1",
+                    [&classification_refresh_at],
+                )
+                .map_err(sql_error)?;
+            }
 
             let media_now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT OR IGNORE INTO openlist_settings
+                 (id, base_url, api_key, enabled, target_directory_id, scan_interval_secs, updated_at)
+                 VALUES (1, '', '', 0, NULL, 30, ?)",
+                [&media_now],
+            )
+            .map_err(sql_error)?;
             conn.execute(
                 "INSERT OR IGNORE INTO media_settings
                  (id, tmdb_token, tmdb_language, scan_interval_mins, max_search_queries, search_concurrency, updated_at)
@@ -2993,6 +3127,75 @@ impl Database {
                 params![media_now, media_now],
             )
             .map_err(sql_error)?;
+
+            let quality_presets = [
+                (
+                    "4K 高画质",
+                    r#"["2160p"]"#,
+                    r#"["2160p"]"#,
+                    r#"["480p","360p"]"#,
+                    r#"["remux","bluray","web-dl"]"#,
+                    r#"["remux","bluray","web-dl"]"#,
+                    r#"["h265","av1","h264"]"#,
+                    "[]",
+                    0,
+                    70,
+                    1,
+                ),
+                (
+                    "1080p 均衡",
+                    r#"["1080p","720p"]"#,
+                    r#"["1080p","720p"]"#,
+                    r#"["2160p","480p","360p"]"#,
+                    r#"["web-dl","bluray","webrip","hdtv"]"#,
+                    r#"["web-dl","bluray","webrip","hdtv"]"#,
+                    r#"["h265","h264","av1"]"#,
+                    "[]",
+                    0,
+                    65,
+                    1,
+                ),
+                (
+                    "动漫优先",
+                    r#"["1080p","2160p","720p"]"#,
+                    r#"["2160p","1080p","720p"]"#,
+                    r#"["480p","360p"]"#,
+                    r#"["web-dl","bluray","webrip"]"#,
+                    r#"["web-dl","bluray","webrip"]"#,
+                    r#"["h265","h264","av1"]"#,
+                    "[]",
+                    1,
+                    60,
+                    1,
+                ),
+                (
+                    "省空间 HEVC",
+                    r#"["1080p","720p"]"#,
+                    r#"["1080p","720p"]"#,
+                    r#"["2160p","480p","360p"]"#,
+                    r#"["web-dl","webrip","hdtv"]"#,
+                    r#"["web-dl","webrip","hdtv"]"#,
+                    r#"["h265","av1","h264"]"#,
+                    "[]",
+                    0,
+                    60,
+                    1,
+                ),
+            ];
+            for preset in quality_presets {
+                conn.execute(
+                    "INSERT OR IGNORE INTO quality_profiles
+                     (name, resolution_order, allowed_resolutions, blocked_resolutions,
+                      source_order, allowed_sources, codec_order, blocked_codecs,
+                      allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        preset.0, preset.1, preset.2, preset.3, preset.4, preset.5, preset.6,
+                        preset.7, preset.8, preset.9, preset.10, media_now, media_now
+                    ],
+                )
+                .map_err(sql_error)?;
+            }
 
             ensure_column(
                 &conn,

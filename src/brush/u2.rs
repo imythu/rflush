@@ -22,14 +22,20 @@ fn u2_headers<'a>(
     buf.push(("Referer", referer));
     buf.push(("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"));
     buf.push(("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"));
-    buf.push(("Accept-Language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6"));
+    buf.push((
+        "Accept-Language",
+        "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
+    ));
     buf.push(("DNT", "1"));
     buf.push(("Upgrade-Insecure-Requests", "1"));
     buf.push(("Sec-Fetch-Dest", "iframe"));
     buf.push(("Sec-Fetch-Mode", "navigate"));
     buf.push(("Sec-Fetch-Site", "same-origin"));
     buf.push(("Sec-Fetch-User", "?1"));
-    buf.push(("sec-ch-ua", "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\""));
+    buf.push((
+        "sec-ch-ua",
+        "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+    ));
     buf.push(("sec-ch-ua-mobile", "?0"));
     buf.push(("sec-ch-ua-platform", "\"Windows\""));
     buf.push(("Cache-Control", "max-age=0"));
@@ -37,10 +43,7 @@ fn u2_headers<'a>(
 }
 
 /// 从站点配置中提取 U2 Cookie。
-pub async fn get_u2_site_cookie(
-    task: &BrushTaskRecord,
-    db: &Database,
-) -> Result<String, String> {
+pub async fn get_u2_site_cookie(task: &BrushTaskRecord, db: &Database) -> Result<String, String> {
     let site_id = task
         .site_id
         .ok_or_else(|| "U2 shoutbox 需要关联站点以获取 Cookie".to_string())?;
@@ -51,10 +54,8 @@ pub async fn get_u2_site_cookie(
         .map_err(|e| format!("加载站点失败: {}", e))?
         .ok_or_else(|| format!("站点不存在: site_id={}", site_id))?;
 
-    let auth: crate::site::SiteAuth =
-        serde_json::from_str(&site.auth_config).map_err(|e| {
-            format!("解析站点认证配置失败 (site_id={site_id}): {e}")
-        })?;
+    let auth: crate::site::SiteAuth = serde_json::from_str(&site.auth_config)
+        .map_err(|e| format!("解析站点认证配置失败 (site_id={site_id}): {e}"))?;
 
     Ok(match &auth {
         crate::site::SiteAuth::Cookie { cookie } => cookie.clone(),
@@ -68,11 +69,7 @@ pub async fn get_u2_site_cookie(
 }
 
 /// 使用站点 Cookie 预热 U2 会话，访问 /index.php 保持登录状态。
-async fn warmup_session(
-    task: &BrushTaskRecord,
-    cookie: &str,
-    http: &AppHttpClient,
-) {
+async fn warmup_session(task: &BrushTaskRecord, cookie: &str, http: &AppHttpClient) {
     let url = "https://u2.dmhy.org/index.php";
     let referer = "https://u2.dmhy.org/index.php";
     let mut buf = Vec::new();
@@ -85,7 +82,8 @@ async fn warmup_session(
         Ok(resp) => {
             warn!(
                 "[刷流][{}] U2 会话预热 HTTP {}",
-                task.name, resp.status.as_u16()
+                task.name,
+                resp.status.as_u16()
             );
         }
         Err(e) => {
@@ -127,12 +125,9 @@ pub async fn fetch_shoutbox_html(
 }
 
 /// 使用 U2 shoutbox 解析器解析 HTML 并构造 `FeedSnapshot`。
-pub fn parse_shoutbox_snapshot(
-    html: &str,
-    task_name: &str,
-) -> Result<rss::FeedSnapshot, String> {
-    let mut items = u2_shoutbox::parse_shoutbox(html)
-        .map_err(|e| format!("U2 shoutbox 解析失败: {}", e))?;
+pub fn parse_shoutbox_snapshot(html: &str, task_name: &str) -> Result<rss::FeedSnapshot, String> {
+    let mut items =
+        u2_shoutbox::parse_shoutbox(html).map_err(|e| format!("U2 shoutbox 解析失败: {}", e))?;
 
     if items.is_empty() {
         let preview: String = html.chars().take(500).collect();
@@ -232,14 +227,8 @@ pub async fn enrich_item(
 
     // ── 请求 viewpeerlist.php 获取精准做种/下载数 ─────────────────
     {
-        let peer_list_url = format!(
-            "https://u2.dmhy.org/viewpeerlist.php?id={}",
-            item.guid
-        );
-        let peer_referer = format!(
-            "https://u2.dmhy.org/details.php?id={}&hits=1",
-            item.guid
-        );
+        let peer_list_url = format!("https://u2.dmhy.org/viewpeerlist.php?id={}", item.guid);
+        let peer_referer = format!("https://u2.dmhy.org/details.php?id={}&hits=1", item.guid);
 
         let mut buf2 = Vec::new();
         let peer_headers = u2_headers(&cookie, &peer_referer, &mut buf2);

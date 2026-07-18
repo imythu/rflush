@@ -277,8 +277,15 @@ mod tests {
 
         assert!(should_trigger_at(&task, now));
 
-        task.last_run_at = Some(Utc.with_ymd_and_hms(2026, 6, 27, 8, 0, 20).unwrap().to_rfc3339());
+        task.last_run_at = Some(
+            Utc.with_ymd_and_hms(2026, 6, 27, 8, 0, 20)
+                .unwrap()
+                .to_rfc3339(),
+        );
 
-        assert!(!should_trigger_at(&task, now + chrono::Duration::seconds(25)));
+        assert!(!should_trigger_at(
+            &task,
+            now + chrono::Duration::seconds(25)
+        ));
     }
 }

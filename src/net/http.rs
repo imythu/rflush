@@ -165,7 +165,8 @@ impl AppHttpClient {
         let mut req = self.inner.get(url);
         for (name, value) in extra_headers {
             req = req.header(
-                HeaderName::from_bytes(name.as_bytes()).unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
+                HeaderName::from_bytes(name.as_bytes())
+                    .unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
                 HeaderValue::from_bytes(value.as_bytes())
                     .unwrap_or_else(|_| HeaderValue::from_static("")),
             );
