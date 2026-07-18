@@ -184,6 +184,16 @@ mod tests {
     }
 
     #[test]
+    fn tmdb_archive_uses_primary_genre_only() {
+        let media_type = "电视剧";
+        let genres = ["动画", "动作冒险", "科幻奇幻"];
+        assert_eq!(
+            format!("云母/{}/{}/{}", media_type, genres[0], 2025),
+            "云母/电视剧/动画/2025"
+        );
+    }
+
+    #[test]
     fn historical_jobs_require_a_valid_sha1_infohash() {
         assert!(valid_infohash("eadb91a4769b1fad89e0dd3a930523e7fc5814b8"));
         assert!(!valid_infohash(""));
@@ -417,15 +427,17 @@ impl RelocationScheduler {
             .await
             .map_err(|e| e.to_string())?
             .ok_or("追剧下载记录不存在")?;
-        let tmdb_is_animation = match download.subscription_id {
+        let subscription = match download.subscription_id {
             Some(subscription_id) => self
                 .db
                 .get_subscription(subscription_id)
                 .await
-                .map_err(|e| e.to_string())?
-                .is_some_and(|subscription| subscription.tmdb_is_animation),
-            None => false,
+                .map_err(|e| e.to_string())?,
+            None => None,
         };
+        let tmdb_is_animation = subscription
+            .as_ref()
+            .is_some_and(|item| item.tmdb_is_animation);
 
         match expected_stage.as_str() {
             "waiting_download" => {
@@ -476,12 +488,27 @@ impl RelocationScheduler {
                     .iter()
                     .find(|target| target.id == config.target_directory_id)
                     .ok_or("未选择 OpenList 目标目录")?;
-                let media_type = media_download_category(&download.target_key, tmdb_is_animation);
+                let primary_type = if download.target_key.starts_with("movie:") {
+                    "电影"
+                } else {
+                    "电视剧"
+                };
                 let year = serde_json::from_str::<serde_json::Value>(&download.release_json)
                     .ok()
                     .and_then(|value| value.get("year").and_then(|year| year.as_u64()))
                     .map(|year| year as u32);
-                let relative_dir = category_year_directory(media_type, year);
+                let primary_genre = subscription
+                    .as_ref()
+                    .and_then(|item| item.tmdb_genres.first())
+                    .map(|genre| genre.name.as_str())
+                    .unwrap_or("其他");
+                let relative_dir = format!(
+                    "云母/{}/{}/{}",
+                    primary_type,
+                    primary_genre,
+                    year.map(|value| value.to_string())
+                        .unwrap_or_else(|| "年份未知".to_string())
+                );
                 let content_qb_path = normalize_path(&content_path)?;
                 let content_openlist_path =
                     translate_path(&content_qb_path, &mapping.qb_path, &mapping.openlist_path)?;

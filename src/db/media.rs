@@ -325,15 +325,16 @@ impl Database {
             let scheduled_at = next_run_at.unwrap_or_else(|| now.clone());
             tx.execute(
                 "INSERT INTO subscriptions
-                 (tmdb_id, media_type, tmdb_is_animation, title, original_title, aliases_json, year,
+                 (tmdb_id, media_type, tmdb_is_animation, tmdb_genres_json, title, original_title, aliases_json, year,
                   poster_path, season, next_episode, start_episode, absolute_episode,
                   quality_profile_id, downloader_id, save_path, enabled, next_run_at,
                   last_status, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     request.tmdb_id,
                     request.media_type,
                     request.tmdb_is_animation as i32,
+                    json_string(&request.tmdb_genres)?,
                     request.title,
                     request.original_title,
                     json_string(&request.aliases)?,
@@ -1061,10 +1062,12 @@ impl Database {
         owner: &str,
         targets: &[SubscriptionTargetSeed],
         tmdb_is_animation: bool,
+        tmdb_genres: &[crate::media::tmdb::TmdbGenre],
     ) -> Result<Option<TargetSyncResult>, AppError> {
         let path = self.path.clone();
         let owner = owner.to_string();
         let targets = targets.to_vec();
+        let tmdb_genres = json_string(&tmdb_genres.to_vec())?;
         tokio::task::spawn_blocking(move || {
             let mut conn = open_connection(&path)?;
             let tx = conn
@@ -1074,11 +1077,12 @@ impl Database {
             let changed = tx
                 .execute(
                     "UPDATE subscriptions
-                     SET tmdb_is_animation = ?, version = version + 1, updated_at = ?
+                     SET tmdb_is_animation = ?, tmdb_genres_json = ?, version = version + 1, updated_at = ?
                      WHERE id = ? AND version = ? AND lease_owner = ?
                        AND lease_until IS NOT NULL AND lease_until >= ?",
                     params![
                         tmdb_is_animation as i32,
+                        tmdb_genres,
                         now,
                         id,
                         expected_version,
@@ -2085,7 +2089,7 @@ fn recover_media_download_records(
 }
 
 const SUBSCRIPTION_SELECT: &str =
-    "SELECT id, tmdb_id, media_type, tmdb_is_animation, title, original_title, aliases_json, year,
+    "SELECT id, tmdb_id, media_type, tmdb_is_animation, tmdb_genres_json, title, original_title, aliases_json, year,
             poster_path, season, next_episode, start_episode, absolute_episode,
             quality_profile_id, downloader_id, save_path, enabled, next_run_at,
             lease_owner, lease_until, version, last_status, last_error, last_run_at,
@@ -2161,28 +2165,29 @@ fn map_subscription(row: &Row<'_>) -> rusqlite::Result<SubscriptionRecord> {
         tmdb_id: row.get(1)?,
         media_type: row.get(2)?,
         tmdb_is_animation: row.get::<_, i32>(3)? != 0,
-        title: row.get(4)?,
-        original_title: row.get(5)?,
-        aliases: parse_json_column(row.get(6)?, 6)?,
-        year: row.get(7)?,
-        poster_path: row.get(8)?,
-        season: row.get(9)?,
-        next_episode: row.get(10)?,
-        start_episode: row.get(11)?,
-        absolute_episode: row.get(12)?,
-        quality_profile_id: row.get(13)?,
-        downloader_id: row.get(14)?,
-        save_path: row.get(15)?,
-        enabled: row.get::<_, i32>(16)? != 0,
-        next_run_at: row.get(17)?,
-        lease_owner: row.get(18)?,
-        lease_until: row.get(19)?,
-        version: row.get(20)?,
-        last_status: row.get(21)?,
-        last_error: row.get(22)?,
-        last_run_at: row.get(23)?,
-        created_at: row.get(24)?,
-        updated_at: row.get(25)?,
+        tmdb_genres: parse_json_column(row.get(4)?, 4)?,
+        title: row.get(5)?,
+        original_title: row.get(6)?,
+        aliases: parse_json_column(row.get(7)?, 7)?,
+        year: row.get(8)?,
+        poster_path: row.get(9)?,
+        season: row.get(10)?,
+        next_episode: row.get(11)?,
+        start_episode: row.get(12)?,
+        absolute_episode: row.get(13)?,
+        quality_profile_id: row.get(14)?,
+        downloader_id: row.get(15)?,
+        save_path: row.get(16)?,
+        enabled: row.get::<_, i32>(17)? != 0,
+        next_run_at: row.get(18)?,
+        lease_owner: row.get(19)?,
+        lease_until: row.get(20)?,
+        version: row.get(21)?,
+        last_status: row.get(22)?,
+        last_error: row.get(23)?,
+        last_run_at: row.get(24)?,
+        created_at: row.get(25)?,
+        updated_at: row.get(26)?,
         site_ids: Vec::new(),
     })
 }
@@ -2835,6 +2840,7 @@ mod tests {
             tmdb_id: 42,
             media_type: "tv".to_string(),
             tmdb_is_animation: false,
+            tmdb_genres: Vec::new(),
             title: "Example Show".to_string(),
             original_title: None,
             aliases: vec!["Example".to_string()],
@@ -2864,6 +2870,7 @@ mod tests {
             tmdb_id,
             media_type: "tv".to_string(),
             tmdb_is_animation: false,
+            tmdb_genres: Vec::new(),
             title: format!("Test Show {tmdb_id}"),
             original_title: None,
             aliases: Vec::new(),
@@ -3935,6 +3942,7 @@ mod tests {
                 "tmdb-worker",
                 &targets,
                 false,
+                &[],
             )
             .await
             .unwrap()
@@ -3954,6 +3962,7 @@ mod tests {
                 "tmdb-worker",
                 &targets,
                 false,
+                &[],
             )
             .await
             .unwrap()
@@ -4028,6 +4037,7 @@ mod tests {
                 "retraction-worker",
                 &terminal_targets,
                 false,
+                &[],
             )
             .await
             .unwrap()
@@ -4088,6 +4098,7 @@ mod tests {
             tmdb_id: 77,
             media_type: "tv".to_string(),
             tmdb_is_animation: false,
+            tmdb_genres: Vec::new(),
             title: "Finite Show".to_string(),
             original_title: None,
             aliases: Vec::new(),
@@ -4179,6 +4190,7 @@ mod tests {
                 tmdb_id: 107,
                 media_type: "movie".to_string(),
                 tmdb_is_animation: false,
+                tmdb_genres: Vec::new(),
                 title: "Finished Movie".to_string(),
                 original_title: None,
                 aliases: Vec::new(),

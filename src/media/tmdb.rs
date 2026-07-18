@@ -64,6 +64,13 @@ pub struct TmdbMedia {
     pub overview: String,
     pub poster_path: Option<String>,
     pub is_animation: bool,
+    pub genres: Vec<TmdbGenre>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TmdbGenre {
+    pub id: i64,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +266,8 @@ struct RawDetails {
 #[derive(Deserialize)]
 struct RawGenre {
     id: i64,
+    #[serde(rename = "name")]
+    _name: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -338,13 +347,21 @@ fn map_media(raw: RawMedia, media_type: TmdbMediaType) -> TmdbMedia {
     let original_title = clean_distinct(original_title, Some(&title));
     TmdbMedia {
         tmdb_id: raw.id,
-        media_type,
+        media_type: media_type.clone(),
         title,
         original_title,
         year: date.as_deref().and_then(parse_year),
         overview: raw.overview.unwrap_or_default(),
         poster_path: clean_optional(raw.poster_path),
         is_animation: raw.genre_ids.contains(&16),
+        genres: raw
+            .genre_ids
+            .into_iter()
+            .map(|id| TmdbGenre {
+                id,
+                name: genre_name_zh(&media_type, id).to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -380,18 +397,59 @@ fn map_details(raw: RawDetails, media_type: TmdbMediaType) -> Result<TmdbDetails
     Ok(TmdbDetails {
         media: TmdbMedia {
             tmdb_id: raw.id,
-            media_type,
+            media_type: media_type.clone(),
             title,
             original_title,
             year: date.as_deref().and_then(parse_year),
             overview: raw.overview.unwrap_or_default(),
             poster_path: clean_optional(raw.poster_path),
             is_animation: raw.genres.iter().any(|genre| genre.id == 16),
+            genres: raw
+                .genres
+                .into_iter()
+                .map(|genre| TmdbGenre {
+                    id: genre.id,
+                    name: genre_name_zh(&media_type, genre.id).to_string(),
+                })
+                .collect(),
         },
         aliases,
         number_of_seasons: raw.number_of_seasons,
         status: clean_optional(raw.status),
     })
+}
+
+fn genre_name_zh(media_type: &TmdbMediaType, id: i64) -> &'static str {
+    match (media_type, id) {
+        (_, 16) => "动画",
+        (_, 18) => "剧情",
+        (_, 35) => "喜剧",
+        (_, 80) => "犯罪",
+        (_, 99) => "纪录",
+        (_, 10751) => "家庭",
+        (_, 10752) => "战争",
+        (_, 10749) => "爱情",
+        (_, 9648) => "悬疑",
+        (_, 10759) => "动作冒险",
+        (_, 10762) => "儿童",
+        (_, 10763) => "新闻",
+        (_, 10764) => "真人秀",
+        (_, 10765) => "科幻奇幻",
+        (_, 10766) => "肥皂剧",
+        (_, 10767) => "脱口秀",
+        (_, 10768) => "战争政治",
+        (TmdbMediaType::Movie, 28) => "动作",
+        (TmdbMediaType::Movie, 12) => "冒险",
+        (TmdbMediaType::Movie, 14) => "奇幻",
+        (TmdbMediaType::Movie, 27) => "恐怖",
+        (TmdbMediaType::Movie, 36) => "历史",
+        (TmdbMediaType::Movie, 53) => "惊悚",
+        (TmdbMediaType::Movie, 878) => "科幻",
+        (TmdbMediaType::Movie, 10402) => "音乐",
+        (TmdbMediaType::Movie, 10770) => "电视电影",
+        (TmdbMediaType::Movie, 37) => "西部",
+        _ => "其他",
+    }
 }
 
 fn map_season(raw: RawSeason, tmdb_id: i64, fallback_season: u32) -> TmdbSeason {

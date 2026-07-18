@@ -318,6 +318,7 @@ impl MediaService {
             tmdb_id: details.media.tmdb_id,
             media_type: media_type.as_str().to_string(),
             tmdb_is_animation: details.media.is_animation,
+            tmdb_genres: details.media.genres.clone(),
             title: details.media.title,
             original_title: details.media.original_title,
             aliases,
@@ -1016,6 +1017,7 @@ impl MediaService {
                     owner,
                     &plan.targets,
                     details.media.is_animation,
+                    &details.media.genres,
                 )
                 .await?
                 .ok_or_else(|| {
@@ -1025,6 +1027,7 @@ impl MediaService {
                 })?;
             subscription.version = synced.version;
             subscription.tmdb_is_animation = details.media.is_animation;
+            subscription.tmdb_genres = details.media.genres;
             target_record = synced.current;
         }
 
@@ -2212,6 +2215,7 @@ mod tests {
             tmdb_id: 2,
             media_type: "tv".to_string(),
             tmdb_is_animation: true,
+            tmdb_genres: Vec::new(),
             title: "Anime".to_string(),
             original_title: None,
             aliases: Vec::new(),
@@ -2298,6 +2302,7 @@ mod tests {
                 tmdb_id: 42,
                 media_type: "tv".to_string(),
                 tmdb_is_animation: false,
+                tmdb_genres: Vec::new(),
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2382,6 +2387,7 @@ mod tests {
                 tmdb_id: 42,
                 media_type: "tv".to_string(),
                 tmdb_is_animation: false,
+                tmdb_genres: Vec::new(),
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2564,6 +2570,7 @@ mod tests {
                 tmdb_id: 42,
                 media_type: "movie".to_string(),
                 tmdb_is_animation: false,
+                tmdb_genres: Vec::new(),
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),
@@ -2629,6 +2636,7 @@ mod tests {
                 tmdb_id: 42,
                 media_type: "movie".to_string(),
                 tmdb_is_animation: false,
+                tmdb_genres: Vec::new(),
                 title: "Example Show".to_string(),
                 original_title: None,
                 aliases: Vec::new(),

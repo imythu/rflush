@@ -2880,6 +2880,7 @@ impl Database {
                     tmdb_id INTEGER NOT NULL,
                     media_type TEXT NOT NULL CHECK (media_type IN ('tv', 'movie')),
                     tmdb_is_animation INTEGER NOT NULL DEFAULT 0,
+                    tmdb_genres_json TEXT NOT NULL DEFAULT '[]',
                     title TEXT NOT NULL,
                     original_title TEXT,
                     aliases_json TEXT NOT NULL DEFAULT '[]',
@@ -3096,6 +3097,13 @@ impl Database {
                     [&classification_refresh_at],
                 )
                 .map_err(sql_error)?;
+            }
+            let had_tmdb_genres = column_exists(&conn, "subscriptions", "tmdb_genres_json");
+            ensure_column(&conn, "subscriptions", "tmdb_genres_json",
+                "ALTER TABLE subscriptions ADD COLUMN tmdb_genres_json TEXT NOT NULL DEFAULT '[]'")?;
+            if !had_tmdb_genres {
+                let refresh_at = Utc::now().to_rfc3339();
+                conn.execute("UPDATE subscriptions SET next_run_at = ?, last_status = NULL WHERE enabled = 1", [&refresh_at]).map_err(sql_error)?;
             }
 
             let media_now = Utc::now().to_rfc3339();

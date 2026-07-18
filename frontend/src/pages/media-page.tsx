@@ -82,6 +82,8 @@ type Subscription = {
   id: number;
   tmdb_id: number;
   media_type: MediaType | string;
+  tmdb_is_animation: boolean;
+  tmdb_genres: TmdbGenre[];
   title: string;
   original_title: string | null;
   aliases: string[];
@@ -164,7 +166,10 @@ type TmdbMedia = {
   overview: string;
   poster_path: string | null;
   is_animation: boolean;
+  genres: TmdbGenre[];
 };
+
+type TmdbGenre = { id: number; name: string };
 
 type TmdbDetails = TmdbMedia & {
   aliases: string[];
@@ -2680,8 +2685,12 @@ function SubscriptionsPanel({
                             <div className="flex min-w-[230px] items-center gap-3">
                               <Poster path={subscription.poster_path} title={subscription.title} className="w-11 shrink-0" />
                               <div className="min-w-0">
-                                <div className="max-w-[260px] truncate font-semibold" title={subscription.title}>{subscription.title}</div>
-                                <div className="mt-0.5 text-xs text-muted">{subscription.year ?? "-"} · {subscription.media_type === "movie" ? "电影" : "剧集"}</div>
+                                <div className="flex max-w-[280px] items-center gap-2">
+                                  <div className="truncate font-semibold" title={subscription.title}>{subscription.title}</div>
+                                  <StatusPill label={subscriptionCategoryLabel(subscription)} />
+                                </div>
+                                <div className="mt-0.5 text-xs text-muted">{subscription.year ?? "年份未知"}</div>
+                                <GenrePills genres={subscription.tmdb_genres} />
                               </div>
                             </div>
                           </TableCell>
@@ -2777,9 +2786,11 @@ function SubscriptionsPanel({
                           <div className="flex items-start justify-between gap-3">
                             <div className="min-w-0">
                               <h3 className="truncate text-sm font-semibold">{subscription.title}</h3>
-                              <p className="mt-1 text-xs text-muted">
-                                {subscriptionTargetLabel(subscription, true)}
-                              </p>
+                              <div className="mt-1 flex flex-wrap items-center gap-2">
+                                <StatusPill label={subscriptionCategoryLabel(subscription)} />
+                                <GenrePills genres={subscription.tmdb_genres} />
+                                <span className="text-xs text-muted">{subscriptionTargetLabel(subscription, true)}</span>
+                              </div>
                             </div>
                             <StatusPill label={status.label} tone={status.tone} />
                           </div>
@@ -3268,6 +3279,7 @@ function TmdbPanel({
                       </div>
                       <StatusPill label={tmdbCategoryLabel(media)} />
                     </div>
+                    <GenrePills genres={media.genres} />
                     <p className="mt-2 line-clamp-3 text-xs leading-5 text-muted">{media.overview || "暂无简介"}</p>
                     <div className="mt-auto flex items-end justify-between gap-3 pt-4">
                       <span className="text-xs text-muted">{media.year ?? "年份未知"}</span>
@@ -3493,6 +3505,17 @@ function tmdbCategoryLabel(media: TmdbMedia): string {
   return media.is_animation ? "动漫" : "电视剧";
 }
 
+function subscriptionCategoryLabel(subscription: Subscription): string {
+  return subscription.media_type === "movie" ? "电影" : "电视剧";
+}
+
+function GenrePills({ genres }: { genres: TmdbGenre[] }) {
+  if (!genres?.length) return null;
+  return <div className="flex flex-wrap gap-1">{genres.map((genre) => (
+    <StatusPill key={genre.id} label={genre.name} />
+  ))}</div>;
+}
+
 function resourceTmdbResults(results: TmdbMedia[]) {
   if (results.length === 0) return null;
   return (
@@ -3511,6 +3534,7 @@ function resourceTmdbResults(results: TmdbMedia[]) {
                   <h4 className="line-clamp-2 text-sm font-semibold">{media.title}</h4>
                   <StatusPill label={tmdbCategoryLabel(media)} />
                 </div>
+                <GenrePills genres={media.genres} />
                 {media.original_title ? (
                   <p className="truncate text-xs text-muted" title={media.original_title}>{media.original_title}</p>
                 ) : null}

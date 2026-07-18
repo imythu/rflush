@@ -3877,6 +3877,7 @@ mod media_api_tests {
             tmdb_id: 42,
             media_type: "tv".to_string(),
             tmdb_is_animation: false,
+            tmdb_genres: Vec::new(),
             title: "Example Show".to_string(),
             original_title: None,
             aliases: Vec::new(),

@@ -322,6 +322,7 @@ mod tests {
                 overview: String::new(),
                 poster_path: None,
                 is_animation: false,
+                genres: Vec::new(),
             },
             aliases: Vec::new(),
             number_of_seasons,

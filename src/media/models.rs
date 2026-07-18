@@ -1,3 +1,4 @@
+use super::tmdb::TmdbGenre;
 use serde::{Deserialize, Serialize};
 
 pub const MEDIA_DOWNLOAD_MAX_ATTEMPTS: u32 = 5;
@@ -75,6 +76,7 @@ pub struct SubscriptionRecord {
     pub tmdb_id: i64,
     pub media_type: String,
     pub tmdb_is_animation: bool,
+    pub tmdb_genres: Vec<TmdbGenre>,
     pub title: String,
     pub original_title: Option<String>,
     pub aliases: Vec<String>,
@@ -105,6 +107,7 @@ pub struct NewSubscription {
     pub tmdb_id: i64,
     pub media_type: String,
     pub tmdb_is_animation: bool,
+    pub tmdb_genres: Vec<TmdbGenre>,
     pub title: String,
     pub original_title: Option<String>,
     #[serde(default)]
