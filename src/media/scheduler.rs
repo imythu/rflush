@@ -129,6 +129,7 @@ impl MediaScheduler {
         });
     }
 
+    #[allow(dead_code)]
     pub fn is_stopped(&self) -> bool {
         self.control.borrow().stopped
     }

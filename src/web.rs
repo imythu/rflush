@@ -543,6 +543,7 @@ fn media_router(
             "/quality-profiles",
             get(list_quality_profiles).post(create_quality_profile),
         )
+        .route("/quality-profiles/reset", post(reset_quality_profiles))
         .route(
             "/quality-profiles/{id}",
             get(get_quality_profile)
@@ -1236,6 +1237,19 @@ async fn create_quality_profile(
         .await
         .map_err(media_app_error)?;
     Ok((StatusCode::CREATED, Json(profile)))
+}
+
+async fn reset_quality_profiles(
+    State(state): State<MediaApiState>,
+) -> Result<Json<Vec<QualityProfileRecord>>, ApiError> {
+    Ok(Json(
+        state
+            .service
+            .database()
+            .reset_quality_profiles()
+            .await
+            .map_err(media_app_error)?,
+    ))
 }
 
 async fn update_quality_profile(

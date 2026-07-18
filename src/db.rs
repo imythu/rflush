@@ -3121,85 +3121,138 @@ impl Database {
                 [&media_now],
             )
             .map_err(sql_error)?;
+            // Replace the legacy built-in profiles once while preserving user-created rules.
+            if column_exists(&conn, "subscriptions", "quality_profile_id") {
+                conn.execute(
+                    "UPDATE subscriptions SET quality_profile_id = 1
+                     WHERE quality_profile_id IN (
+                       SELECT id FROM quality_profiles
+                       WHERE name IN ('4K 高画质', '1080p 均衡', '动漫优先', '省空间 HEVC', '影音优先', '省空间', '电影推荐', '动漫推荐')
+                     )",
+                    [],
+                )
+                .map_err(sql_error)?;
+            }
+            conn.execute(
+                "DELETE FROM quality_profiles
+                 WHERE id <> 1
+                   AND name IN ('4K 高画质', '1080p 均衡', '动漫优先', '省空间 HEVC', '影音优先', '省空间', '电影推荐', '动漫推荐')",
+                [],
+            )
+            .map_err(sql_error)?;
+            conn.execute(
+                "UPDATE quality_profiles
+                 SET name = '电视剧 · 日常', resolution_order = '[\"1080p\",\"2160p\",\"720p\"]',
+                     allowed_resolutions = '[\"2160p\",\"1080p\",\"720p\"]',
+                     blocked_resolutions = '[\"480p\"]',
+                     source_order = '[\"WEB-DL\",\"BluRay\",\"WEBRip\"]',
+                     allowed_sources = '[\"WEB-DL\",\"BluRay\",\"WEBRip\"]',
+                     codec_order = '[\"H265\",\"H264\",\"AV1\"]', blocked_codecs = '[]',
+                     allow_unknown_quality = 0, minimum_score = 65, min_seeders = 1, updated_at = ?
+                 WHERE id = 1 AND name IN ('高清优先', '日常均衡', '电视剧推荐')",
+                [&media_now],
+            )
+            .map_err(sql_error)?;
+            conn.execute(
+                "UPDATE quality_profiles
+                 SET resolution_order = '[\"2160p\",\"1080p\",\"720p\"]', updated_at = ?
+                 WHERE name = '动漫 · 日常'",
+                [&media_now],
+            )
+            .map_err(sql_error)?;
             conn.execute(
                 "INSERT OR IGNORE INTO quality_profiles
                  (id, name, resolution_order, allowed_resolutions, blocked_resolutions,
                   source_order, allowed_sources, codec_order, blocked_codecs,
                   allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
-                 VALUES (1, '高清优先', '[\"1080p\",\"2160p\",\"720p\"]',
-                         '[\"2160p\",\"1080p\",\"720p\"]', '[\"480p\",\"360p\"]',
-                         '[\"web-dl\",\"bluray\",\"webrip\",\"hdtv\"]',
-                         '[\"web-dl\",\"bluray\",\"webrip\",\"hdtv\"]',
-                         '[\"h265\",\"hevc\",\"av1\",\"h264\"]', '[]',
-                         0, 80, 1, ?, ?)",
+                 VALUES (1, '电视剧 · 日常', '[\"1080p\",\"2160p\",\"720p\"]',
+                         '[\"2160p\",\"1080p\",\"720p\"]', '[\"480p\"]',
+                         '[\"WEB-DL\",\"BluRay\",\"WEBRip\"]',
+                         '[\"WEB-DL\",\"BluRay\",\"WEBRip\"]',
+                         '[\"H265\",\"H264\",\"AV1\"]', '[]',
+                         0, 65, 1, ?, ?)",
                 params![media_now, media_now],
             )
             .map_err(sql_error)?;
 
             let quality_presets = [
                 (
-                    "4K 高画质",
-                    r#"["2160p"]"#,
-                    r#"["2160p"]"#,
-                    r#"["480p","360p"]"#,
-                    r#"["remux","bluray","web-dl"]"#,
-                    r#"["remux","bluray","web-dl"]"#,
-                    r#"["h265","av1","h264"]"#,
-                    "[]",
-                    0,
-                    70,
-                    1,
-                ),
-                (
-                    "1080p 均衡",
-                    r#"["1080p","720p"]"#,
-                    r#"["1080p","720p"]"#,
-                    r#"["2160p","480p","360p"]"#,
-                    r#"["web-dl","bluray","webrip","hdtv"]"#,
-                    r#"["web-dl","bluray","webrip","hdtv"]"#,
-                    r#"["h265","h264","av1"]"#,
+                    "电视剧 · 4K",
+                    r#"["2160p","1080p"]"#,
+                    r#"["2160p","1080p"]"#,
+                    r#"["720p","480p"]"#,
+                    r#"["WEB-DL","BluRay","WEBRip"]"#,
+                    r#"["WEB-DL","BluRay","WEBRip"]"#,
+                    r#"["H265","AV1","H264"]"#,
                     "[]",
                     0,
                     65,
                     1,
                 ),
                 (
-                    "动漫优先",
+                    "电影 · 收藏",
+                    r#"["2160p","1080p"]"#,
+                    r#"["2160p","1080p"]"#,
+                    r#"["720p","480p"]"#,
+                    r#"["REMUX","BluRay","WEB-DL"]"#,
+                    r#"["REMUX","BluRay","WEB-DL"]"#,
+                    r#"["H265","AV1","H264"]"#,
+                    "[]",
+                    0,
+                    70,
+                    1,
+                ),
+                (
+                    "电影 · 均衡",
+                    r#"["2160p","1080p","720p"]"#,
+                    r#"["2160p","1080p","720p"]"#,
+                    r#"["480p"]"#,
+                    r#"["BluRay","WEB-DL","WEBRip"]"#,
+                    r#"["BluRay","WEB-DL","WEBRip"]"#,
+                    r#"["H265","H264","AV1"]"#,
+                    "[]",
+                    0,
+                    65,
+                    1,
+                ),
+                (
+                    "动漫 · 日常",
                     r#"["1080p","2160p","720p"]"#,
                     r#"["2160p","1080p","720p"]"#,
-                    r#"["480p","360p"]"#,
-                    r#"["web-dl","bluray","webrip"]"#,
-                    r#"["web-dl","bluray","webrip"]"#,
-                    r#"["h265","h264","av1"]"#,
+                    r#"["480p"]"#,
+                    r#"["BluRay","WEB-DL","WEBRip"]"#,
+                    r#"["BluRay","WEB-DL","WEBRip"]"#,
+                    r#"["H265","H264","AV1"]"#,
                     "[]",
                     1,
                     60,
                     1,
                 ),
                 (
-                    "省空间 HEVC",
+                    "动漫 · 省空间",
                     r#"["1080p","720p"]"#,
                     r#"["1080p","720p"]"#,
-                    r#"["2160p","480p","360p"]"#,
-                    r#"["web-dl","webrip","hdtv"]"#,
-                    r#"["web-dl","webrip","hdtv"]"#,
-                    r#"["h265","av1","h264"]"#,
+                    r#"["2160p","480p"]"#,
+                    r#"["WEB-DL","WEBRip","BluRay"]"#,
+                    r#"["WEB-DL","WEBRip","BluRay"]"#,
+                    r#"["H265","AV1","H264"]"#,
                     "[]",
-                    0,
-                    60,
+                    1,
+                    55,
                     1,
                 ),
             ];
             for preset in quality_presets {
                 conn.execute(
-                    "INSERT OR IGNORE INTO quality_profiles
+                    "INSERT INTO quality_profiles
                      (name, resolution_order, allowed_resolutions, blocked_resolutions,
                       source_order, allowed_sources, codec_order, blocked_codecs,
                       allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                     WHERE NOT EXISTS (SELECT 1 FROM quality_profiles WHERE name = ?)",
                     params![
                         preset.0, preset.1, preset.2, preset.3, preset.4, preset.5, preset.6,
-                        preset.7, preset.8, preset.9, preset.10, media_now, media_now
+                        preset.7, preset.8, preset.9, preset.10, media_now, media_now, preset.0
                     ],
                 )
                 .map_err(sql_error)?;

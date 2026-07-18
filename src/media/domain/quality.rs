@@ -161,6 +161,7 @@ impl QualityProfile {
         accepted_assessment(self, resolution, source, codec, "quality is allowed")
     }
 
+    #[allow(dead_code)]
     pub fn quality_rank(&self, release: &ReleaseInfo) -> u64 {
         let resolution = preference_rank(&self.resolution_order, release.resolution.as_deref());
         let source = preference_rank(&self.source_order, release.source.as_deref());

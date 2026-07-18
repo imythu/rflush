@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::site::{SiteAuth, SiteRecord, SiteType};
 
+#[allow(unused_imports)]
 pub use pool::{AggregateSearchResult, IndexerAggregator, IndexerPool, SiteSearchError};
 
 const DEFAULT_PAGE: u32 = 1;
@@ -42,6 +43,7 @@ pub struct SearchRequest {
 }
 
 impl SearchRequest {
+    #[allow(dead_code)]
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
@@ -146,6 +148,7 @@ impl SearchResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct IndexerCapabilities {
     pub search: bool,
     pub fetch_torrent: bool,
@@ -193,6 +196,7 @@ pub type IndexerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, IndexerErr
 pub trait IndexerAdapter: Send + Sync {
     fn site_id(&self) -> i64;
     fn site_name(&self) -> &str;
+    #[allow(dead_code)]
     fn capabilities(&self) -> IndexerCapabilities;
 
     fn search<'a>(&'a self, request: &'a SearchRequest) -> IndexerFuture<'a, Vec<SearchResult>>;
@@ -261,6 +265,7 @@ pub fn normalize_base_url(raw: &str) -> Result<Url, IndexerError> {
 }
 
 /// Resolve a candidate and reject scheme, host or port changes.
+#[allow(dead_code)]
 pub fn validate_same_origin_url(base_url: &str, candidate: &str) -> Result<String, IndexerError> {
     let base = normalize_base_url(base_url)?;
     resolve_same_origin_url(&base, candidate).map(|url| url.to_string())

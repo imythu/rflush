@@ -28,6 +28,7 @@ pub struct IndexerPool {
     cache: Mutex<HashMap<i64, CachedIndexer>>,
 }
 
+#[allow(dead_code)]
 impl IndexerPool {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {

@@ -219,6 +219,94 @@ impl Database {
         .map_err(join_error)?
     }
 
+    pub async fn reset_quality_profiles(&self) -> Result<Vec<QualityProfileRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn.transaction().map_err(sql_error)?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO quality_profiles
+                 (id, name, resolution_order, allowed_resolutions, blocked_resolutions,
+                  source_order, allowed_sources, codec_order, blocked_codecs,
+                  allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
+                 VALUES (1, '电视剧 · 日常', '[\"1080p\",\"2160p\",\"720p\"]',
+                         '[\"2160p\",\"1080p\",\"720p\"]', '[\"480p\"]',
+                         '[\"WEB-DL\",\"BluRay\",\"WEBRip\"]', '[\"WEB-DL\",\"BluRay\",\"WEBRip\"]',
+                         '[\"H265\",\"H264\",\"AV1\"]', '[]', 0, 65, 1, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                   name = excluded.name, resolution_order = excluded.resolution_order,
+                   allowed_resolutions = excluded.allowed_resolutions,
+                   blocked_resolutions = excluded.blocked_resolutions,
+                   source_order = excluded.source_order, allowed_sources = excluded.allowed_sources,
+                   codec_order = excluded.codec_order, blocked_codecs = excluded.blocked_codecs,
+                   allow_unknown_quality = excluded.allow_unknown_quality,
+                   minimum_score = excluded.minimum_score, min_seeders = excluded.min_seeders,
+                   updated_at = excluded.updated_at",
+                params![now, now],
+            )
+            .map_err(sql_error)?;
+            tx.execute("UPDATE subscriptions SET quality_profile_id = 1", [])
+                .map_err(sql_error)?;
+            tx.execute("DELETE FROM quality_profiles WHERE id <> 1", [])
+                .map_err(sql_error)?;
+            for preset in [
+                (
+                    "电视剧 · 4K", "[\"2160p\",\"1080p\"]", "[\"2160p\",\"1080p\"]",
+                    "[\"720p\",\"480p\"]", "[\"WEB-DL\",\"BluRay\",\"WEBRip\"]",
+                    "[\"WEB-DL\",\"BluRay\",\"WEBRip\"]", "[\"H265\",\"AV1\",\"H264\"]", 0, 65,
+                ),
+                (
+                    "电影 · 收藏", "[\"2160p\",\"1080p\"]", "[\"2160p\",\"1080p\"]",
+                    "[\"720p\",\"480p\"]", "[\"REMUX\",\"BluRay\",\"WEB-DL\"]",
+                    "[\"REMUX\",\"BluRay\",\"WEB-DL\"]", "[\"H265\",\"AV1\",\"H264\"]", 0, 70,
+                ),
+                (
+                    "电影 · 均衡", "[\"1080p\",\"2160p\",\"720p\"]", "[\"2160p\",\"1080p\",\"720p\"]",
+                    "[\"480p\"]", "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
+                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]", "[\"H265\",\"H264\",\"AV1\"]", 0, 65,
+                ),
+                (
+                    "动漫 · 日常", "[\"2160p\",\"1080p\",\"720p\"]", "[\"2160p\",\"1080p\",\"720p\"]",
+                    "[\"480p\"]", "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
+                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]", "[\"H265\",\"H264\",\"AV1\"]", 1, 60,
+                ),
+                (
+                    "动漫 · 省空间", "[\"1080p\",\"720p\"]", "[\"1080p\",\"720p\"]",
+                    "[\"2160p\",\"480p\"]", "[\"WEB-DL\",\"WEBRip\",\"BluRay\"]",
+                    "[\"WEB-DL\",\"WEBRip\",\"BluRay\"]", "[\"H265\",\"AV1\",\"H264\"]", 1, 55,
+                ),
+            ] {
+                tx.execute(
+                    "INSERT INTO quality_profiles
+                     (name, resolution_order, allowed_resolutions, blocked_resolutions,
+                      source_order, allowed_sources, codec_order, blocked_codecs,
+                      allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, 1, ?, ?)",
+                    params![preset.0, preset.1, preset.2, preset.3, preset.4, preset.5, preset.6, preset.7, preset.8, now, now],
+                )
+                .map_err(sql_error)?;
+            }
+            tx.commit().map_err(sql_error)?;
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, name, resolution_order, allowed_resolutions,
+                            blocked_resolutions, source_order, allowed_sources,
+                            codec_order, blocked_codecs, allow_unknown_quality,
+                            minimum_score, min_seeders, created_at, updated_at
+                     FROM quality_profiles ORDER BY id",
+                )
+                .map_err(sql_error)?;
+            stmt.query_map([], map_quality_profile)
+                .map_err(sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn list_subscriptions(&self) -> Result<Vec<SubscriptionRecord>, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
@@ -2804,6 +2892,27 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn resetting_quality_profiles_rebuilds_all_six_defaults() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+
+        let profiles = db.reset_quality_profiles().await.unwrap();
+        let names: Vec<&str> = profiles.iter().map(|profile| profile.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "电视剧 · 日常",
+                "电视剧 · 4K",
+                "电影 · 收藏",
+                "电影 · 均衡",
+                "动漫 · 日常",
+                "动漫 · 省空间",
+            ]
+        );
+    }
 
     async fn database_with_media_references() -> (tempfile::TempDir, Database, i64, i64) {
         let dir = tempdir().unwrap();

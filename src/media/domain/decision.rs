@@ -23,6 +23,7 @@ pub enum RejectCode {
 }
 
 impl RejectCode {
+    #[allow(dead_code)]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::WrongMedia => "wrong_media",

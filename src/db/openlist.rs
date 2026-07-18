@@ -401,6 +401,7 @@ impl Database {
         .map_err(join_error)?
     }
 
+    #[allow(dead_code)]
     pub async fn get_media_relocation_job(
         &self,
         id: i64,

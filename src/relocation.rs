@@ -53,6 +53,7 @@ pub fn translate_path(path: &str, from: &str, to: &str) -> Result<String, String
     }
 }
 
+#[allow(dead_code)]
 pub fn validate_non_overlapping(paths: &[String]) -> Result<(), String> {
     let mut normalized = paths
         .iter()
@@ -97,6 +98,7 @@ fn decode_openlist_task_ids(value: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn category_directory(media_type: &str, year: Option<u32>) -> String {
     let category = match media_type.trim().to_ascii_lowercase().as_str() {
         "movie" | "电影" => "电影".to_string(),
@@ -111,6 +113,7 @@ pub fn category_directory(media_type: &str, year: Option<u32>) -> String {
     category
 }
 
+#[allow(dead_code)]
 pub fn category_year_directory(media_type: &str, year: Option<u32>) -> String {
     let category = category_directory(media_type, None);
     year.map(|year| format!("{category}/{year}"))

@@ -12,6 +12,7 @@ import {
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
   CircleDashed,
   CircleX,
   Download,
@@ -25,9 +26,11 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   Send,
   Settings2,
+  ShieldCheck,
   SlidersHorizontal,
   Trash2,
   Tv,
@@ -329,6 +332,8 @@ type QualityForm = {
   minSeeders: number;
 };
 
+type QualityPreset = "tv-balanced" | "tv-4k" | "movie-collection" | "movie-balanced" | "anime-balanced" | "anime-compact" | "custom";
+
 type Notice = { tone: "success" | "error"; text: string };
 type UnknownRecord = Record<string, unknown>;
 
@@ -409,6 +414,81 @@ const EMPTY_QUALITY_FORM: QualityForm = {
   minimumScore: 80,
   minSeeders: 1,
 };
+
+const QUALITY_PRESETS: Array<{
+  id: Exclude<QualityPreset, "custom">;
+  name: string;
+  description: string;
+  detail: string;
+  form: Omit<QualityForm, "name">;
+}> = [
+  {
+    id: "tv-balanced",
+    name: "电视剧 · 日常",
+    description: "1080p WEB-DL 优先，更新快且稳定",
+    detail: "兼顾画质、体积和日常追更速度",
+    form: {
+      resolutionOrder: "1080p, 2160p, 720p", allowedResolutions: "2160p, 1080p, 720p", blockedResolutions: "480p",
+      sourceOrder: "WEB-DL, BluRay, WEBRip", allowedSources: "WEB-DL, BluRay, WEBRip", codecOrder: "H265, H264, AV1",
+      blockedCodecs: "", allowUnknownQuality: false, minimumScore: 65, minSeeders: 1,
+    },
+  },
+  {
+    id: "tv-4k",
+    name: "电视剧 · 4K",
+    description: "4K WEB-DL 优先，适合大屏追剧",
+    detail: "保留 1080p 作为备选，避免长时间等不到资源",
+    form: {
+      resolutionOrder: "2160p, 1080p", allowedResolutions: "2160p, 1080p", blockedResolutions: "720p, 480p",
+      sourceOrder: "WEB-DL, BluRay, WEBRip", allowedSources: "WEB-DL, BluRay, WEBRip", codecOrder: "H265, AV1, H264",
+      blockedCodecs: "", allowUnknownQuality: false, minimumScore: 65, minSeeders: 1,
+    },
+  },
+  {
+    id: "movie-collection",
+    name: "电影 · 收藏",
+    description: "优先 4K、REMUX 和 BluRay",
+    detail: "适合收藏电影，文件通常较大",
+    form: {
+      resolutionOrder: "2160p, 1080p", allowedResolutions: "2160p, 1080p", blockedResolutions: "720p, 480p",
+      sourceOrder: "REMUX, BluRay, WEB-DL", allowedSources: "REMUX, BluRay, WEB-DL", codecOrder: "H265, AV1, H264",
+      blockedCodecs: "", allowUnknownQuality: false, minimumScore: 70, minSeeders: 1,
+    },
+  },
+  {
+    id: "movie-balanced",
+    name: "电影 · 均衡",
+    description: "1080p BluRay / WEB-DL 优先",
+    detail: "画质稳定、体积适中，适合日常观影",
+    form: {
+      resolutionOrder: "1080p, 2160p, 720p", allowedResolutions: "2160p, 1080p, 720p", blockedResolutions: "480p",
+      sourceOrder: "BluRay, WEB-DL, WEBRip", allowedSources: "BluRay, WEB-DL, WEBRip", codecOrder: "H265, H264, AV1",
+      blockedCodecs: "", allowUnknownQuality: false, minimumScore: 65, minSeeders: 1,
+    },
+  },
+  {
+    id: "anime-balanced",
+    name: "动漫 · 日常",
+    description: "4K 优先，兼容常见字幕组命名",
+    detail: "优先 BluRay / WEB-DL，并接受信息不完整的发布",
+    form: {
+      resolutionOrder: "2160p, 1080p, 720p", allowedResolutions: "2160p, 1080p, 720p", blockedResolutions: "480p",
+      sourceOrder: "BluRay, WEB-DL, WEBRip", allowedSources: "BluRay, WEB-DL, WEBRip", codecOrder: "H265, H264, AV1",
+      blockedCodecs: "", allowUnknownQuality: true, minimumScore: 60, minSeeders: 1,
+    },
+  },
+  {
+    id: "anime-compact",
+    name: "动漫 · 省空间",
+    description: "优先 H.265 / AV1 的 1080p 版本",
+    detail: "适合长期追番和存储空间有限的设备",
+    form: {
+      resolutionOrder: "1080p, 720p", allowedResolutions: "1080p, 720p", blockedResolutions: "2160p, 480p",
+      sourceOrder: "WEB-DL, WEBRip, BluRay", allowedSources: "WEB-DL, WEBRip, BluRay", codecOrder: "H265, AV1, H264",
+      blockedCodecs: "", allowUnknownQuality: true, minimumScore: 55, minSeeders: 1,
+    },
+  },
+];
 
 const MODES: Array<{ value: MediaMode; label: string; icon: typeof Tv }> = [
   { value: "subscriptions", label: "订阅", icon: Tv },
@@ -944,8 +1024,13 @@ export function MediaPage() {
 
   const [qualityDialogOpen, setQualityDialogOpen] = useState(false);
   const [editingQuality, setEditingQuality] = useState<QualityProfile | null>(null);
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("tv-balanced");
+  const [qualityAdvancedOpen, setQualityAdvancedOpen] = useState(false);
   const [qualityForm, setQualityForm] = useState<QualityForm>(EMPTY_QUALITY_FORM);
   const [deleteQuality, setDeleteQuality] = useState<QualityProfile | null>(null);
+  const [resetQualityOpen, setResetQualityOpen] = useState(false);
+  const [resetQualityConfirmOpen, setResetQualityConfirmOpen] = useState(false);
+  const [resetQualityError, setResetQualityError] = useState("");
   const [deleteSubscription, setDeleteSubscription] = useState<Subscription | null>(null);
   const [runDetailsSubscription, setRunDetailsSubscription] = useState<Subscription | null>(null);
   const [runDetails, setRunDetails] = useState<SubscriptionRunSnapshot | null>(null);
@@ -1632,9 +1717,16 @@ export function MediaPage() {
             minimumScore: profile.minimum_score,
             minSeeders: profile.min_seeders,
           }
-        : EMPTY_QUALITY_FORM,
+        : { name: "", ...QUALITY_PRESETS[0].form },
     );
     setQualityDialogOpen(true);
+    setQualityPreset(profile ? "custom" : "tv-balanced");
+    setQualityAdvancedOpen(Boolean(profile));
+  }
+
+  function applyQualityPreset(preset: (typeof QUALITY_PRESETS)[number]) {
+    setQualityPreset(preset.id);
+    setQualityForm((current) => ({ ...current, ...preset.form, name: current.name || preset.name }));
   }
 
   async function saveQualityProfile() {
@@ -1678,6 +1770,24 @@ export function MediaPage() {
       setNotice({ tone: "success", text: "质量配置已删除" });
     } catch (error) {
       setNotice({ tone: "error", text: describeUnknown(error) });
+    } finally {
+      setBusyKey("");
+    }
+  }
+
+  async function resetQualityProfiles() {
+    setBusyKey("reset-quality");
+    setResetQualityError("");
+    try {
+      await api("/api/media/quality-profiles/reset", { method: "POST" });
+      setResetQualityOpen(false);
+      setResetQualityConfirmOpen(false);
+      await loadData();
+      setNotice({ tone: "success", text: "已恢复 6 套默认质量配置" });
+    } catch (error) {
+      const message = describeUnknown(error);
+      setResetQualityError(message);
+      setNotice({ tone: "error", text: message });
     } finally {
       setBusyKey("");
     }
@@ -1796,6 +1906,7 @@ export function MediaPage() {
           onSaveSettings={() => void saveMediaSettings()}
           onSaveOpenList={() => void saveOpenListSettings()}
           onAddQuality={() => openQualityEditor()}
+          onResetQuality={() => setResetQualityOpen(true)}
           onEditQuality={openQualityEditor}
           onDeleteQuality={setDeleteQuality}
         />
@@ -2009,30 +2120,67 @@ export function MediaPage() {
         open={qualityDialogOpen}
         onClose={() => setQualityDialogOpen(false)}
         title={editingQuality ? "编辑质量配置" : "新建质量配置"}
-        description="分辨率、来源与编码规则"
+        description="先选一个观看偏好，需要时再微调专业参数"
         escMode="double"
         panelClassName="max-w-3xl"
       >
-        <div className="flex flex-col gap-5 p-4 sm:p-6">
+        <div className="flex flex-col gap-6 p-4 sm:p-6">
           <div className="flex flex-col gap-2">
             <Label htmlFor="quality-name">名称</Label>
-            <Input id="quality-name" value={qualityForm.name} onChange={(event) => setQualityForm((current) => ({ ...current, name: event.target.value }))} />
+            <Input id="quality-name" placeholder="例如：客厅电视" value={qualityForm.name} onChange={(event) => setQualityForm((current) => ({ ...current, name: event.target.value }))} />
           </div>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <DelimitedField id="quality-resolution-order" label="分辨率优先级" value={qualityForm.resolutionOrder} onChange={(resolutionOrder) => setQualityForm((current) => ({ ...current, resolutionOrder }))} />
-            <DelimitedField id="quality-allowed-resolution" label="允许的分辨率" value={qualityForm.allowedResolutions} onChange={(allowedResolutions) => setQualityForm((current) => ({ ...current, allowedResolutions }))} />
-            <DelimitedField id="quality-blocked-resolution" label="拒绝的分辨率" value={qualityForm.blockedResolutions} onChange={(blockedResolutions) => setQualityForm((current) => ({ ...current, blockedResolutions }))} />
-            <DelimitedField id="quality-source-order" label="来源优先级" value={qualityForm.sourceOrder} onChange={(sourceOrder) => setQualityForm((current) => ({ ...current, sourceOrder }))} />
-            <DelimitedField id="quality-allowed-source" label="允许的来源" value={qualityForm.allowedSources} onChange={(allowedSources) => setQualityForm((current) => ({ ...current, allowedSources }))} />
-            <DelimitedField id="quality-codec-order" label="编码优先级" value={qualityForm.codecOrder} onChange={(codecOrder) => setQualityForm((current) => ({ ...current, codecOrder }))} />
-            <DelimitedField id="quality-blocked-codec" label="拒绝的编码" value={qualityForm.blockedCodecs} onChange={(blockedCodecs) => setQualityForm((current) => ({ ...current, blockedCodecs }))} />
-            <FormNumber id="quality-minimum-score" label="最低匹配分" min={0} max={100} value={qualityForm.minimumScore} onChange={(minimumScore) => setQualityForm((current) => ({ ...current, minimumScore }))} />
-            <FormNumber id="quality-min-seeders" label="最低做种数" min={0} value={qualityForm.minSeeders} onChange={(minSeeders) => setQualityForm((current) => ({ ...current, minSeeders }))} />
+          <fieldset className="flex flex-col gap-3">
+            <legend className="text-sm font-medium">观看偏好</legend>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {QUALITY_PRESETS.map((preset) => {
+                const active = qualityPreset === preset.id;
+                return (
+                  <button key={preset.id} type="button" aria-pressed={active} onClick={() => applyQualityPreset(preset)} className={cn("cursor-pointer rounded-xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", active ? "border-primary bg-primary/10" : "border-border bg-surface-container/35 hover:bg-surface-container")}>
+                    <span className="flex items-center justify-between gap-2 text-sm font-semibold">{preset.name}{active ? <CheckCircle2 className="size-4 text-primary" /> : null}</span>
+                    <span className="mt-2 block text-xs leading-5 text-muted">{preset.description}</span>
+                    <span className="mt-2 block text-[11px] leading-4 text-muted">{preset.detail}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </fieldset>
+
+          <div className="rounded-xl border border-border bg-surface-container/35 p-4">
+            <div className="flex items-start gap-3">
+              <ShieldCheck className="mt-0.5 size-5 shrink-0 text-primary" />
+              <div className="min-w-0">
+                <div className="text-sm font-semibold">当前会优先寻找</div>
+                <div className="mt-2 flex flex-wrap gap-2"><TokenList values={[...splitValues(qualityForm.resolutionOrder).slice(0, 2), ...splitValues(qualityForm.sourceOrder).slice(0, 2), ...splitValues(qualityForm.codecOrder).slice(0, 1)]} /></div>
+                <p className="mt-2 text-xs leading-5 text-muted">原盘 / REMUX、DIY、HDR、杜比视界、杜比全景声、10bit 等特性仍会保留在资源标题中供你确认；当前自动筛选以分辨率、片源和视频编码为准。</p>
+              </div>
+            </div>
           </div>
-          <label className="flex cursor-pointer items-center gap-3 rounded-2xl border border-border bg-surface-container/45 px-4 py-3 text-sm">
-            <input type="checkbox" className="size-4 accent-primary" checked={qualityForm.allowUnknownQuality} onChange={(event) => setQualityForm((current) => ({ ...current, allowUnknownQuality: event.target.checked }))} />
-            允许未识别质量
-          </label>
+
+          <div className="overflow-hidden rounded-xl border border-border">
+            <button type="button" aria-expanded={qualityAdvancedOpen} className="flex w-full cursor-pointer items-center justify-between gap-3 bg-surface-container/35 px-4 py-3 text-left text-sm font-semibold hover:bg-surface-container" onClick={() => setQualityAdvancedOpen((open) => !open)}>
+              高级设置 <ChevronDown className={cn("size-4 transition-transform", qualityAdvancedOpen && "rotate-180")} />
+            </button>
+            {qualityAdvancedOpen ? (
+              <div className="flex flex-col gap-4 border-t border-border p-4">
+                <p className="text-xs leading-5 text-muted">越靠前越优先；“允许”留空表示不限制。仅在你熟悉片源命名时修改。</p>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <DelimitedField id="quality-resolution-order" label="分辨率优先级" value={qualityForm.resolutionOrder} onChange={(resolutionOrder) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, resolutionOrder })); }} />
+                  <DelimitedField id="quality-allowed-resolution" label="允许的分辨率" value={qualityForm.allowedResolutions} onChange={(allowedResolutions) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, allowedResolutions })); }} />
+                  <DelimitedField id="quality-blocked-resolution" label="拒绝的分辨率" value={qualityForm.blockedResolutions} onChange={(blockedResolutions) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, blockedResolutions })); }} />
+                  <DelimitedField id="quality-source-order" label="片源优先级" value={qualityForm.sourceOrder} onChange={(sourceOrder) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, sourceOrder })); }} />
+                  <DelimitedField id="quality-allowed-source" label="允许的片源" value={qualityForm.allowedSources} onChange={(allowedSources) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, allowedSources })); }} />
+                  <DelimitedField id="quality-codec-order" label="视频编码优先级" value={qualityForm.codecOrder} onChange={(codecOrder) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, codecOrder })); }} />
+                  <DelimitedField id="quality-blocked-codec" label="拒绝的视频编码" value={qualityForm.blockedCodecs} onChange={(blockedCodecs) => { setQualityPreset("custom"); setQualityForm((current) => ({ ...current, blockedCodecs })); }} />
+                  <FormNumber id="quality-minimum-score" label="最低匹配分" min={0} max={100} value={qualityForm.minimumScore} onChange={(minimumScore) => setQualityForm((current) => ({ ...current, minimumScore }))} />
+                  <FormNumber id="quality-min-seeders" label="最低做种数" min={0} value={qualityForm.minSeeders} onChange={(minSeeders) => setQualityForm((current) => ({ ...current, minSeeders }))} />
+                </div>
+                <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-surface-container/35 px-4 py-3 text-sm">
+                  <input type="checkbox" className="size-4 accent-primary" checked={qualityForm.allowUnknownQuality} onChange={(event) => setQualityForm((current) => ({ ...current, allowUnknownQuality: event.target.checked }))} />
+                  <span><span className="block font-medium">允许信息不完整的资源</span><span className="mt-1 block text-xs text-muted">可能增加结果，但也更容易下载到不符合预期的版本</span></span>
+                </label>
+              </div>
+            ) : null}
+          </div>
           <div className="flex flex-wrap justify-end gap-2 border-t border-border pt-4">
             <Button variant="outline" onClick={() => setQualityDialogOpen(false)}>取消</Button>
             <Button disabled={!qualityForm.name.trim() || busyKey === "save-quality"} onClick={() => void saveQualityProfile()}>
@@ -2068,6 +2216,51 @@ export function MediaPage() {
           <Button variant="destructive" disabled={busyKey.startsWith("delete-quality:")} onClick={() => void confirmDeleteQuality()}>
             {busyKey.startsWith("delete-quality:") ? "删除中" : "确认删除"}
           </Button>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={resetQualityOpen}
+        onClose={() => setResetQualityOpen(false)}
+        title="恢复默认质量配置"
+        description="此操作会覆盖当前质量配置，请先确认影响范围。"
+      >
+        <div className="flex flex-col gap-5 p-4 sm:p-6">
+          <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-4 text-sm">
+            <div className="flex items-center gap-2 font-semibold text-destructive"><AlertCircle className="size-4" />重置将产生以下后果</div>
+            <ul className="mt-3 flex list-disc flex-col gap-2 pl-5 text-muted">
+              <li>删除全部现有质量配置，包括你手动创建和修改的配置。</li>
+              <li>重新建立动漫、电视剧、电影共 6 套内置推荐方案。</li>
+              <li>所有现有订阅统一改用“电视剧 · 日常”。</li>
+            </ul>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setResetQualityOpen(false)}>取消</Button>
+            <Button variant="destructive" onClick={() => { setResetQualityError(""); setResetQualityOpen(false); setResetQualityConfirmOpen(true); }}>
+              继续
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={resetQualityConfirmOpen}
+        onClose={() => setResetQualityConfirmOpen(false)}
+        title="再次确认重置"
+        description="质量配置及订阅关联即将被永久修改，此操作无法撤销。"
+      >
+        <div className="flex flex-col gap-5 p-4 sm:p-6">
+          <p className="text-sm leading-6 text-muted">确认后，现有自定义规则无法找回。正在追更的动漫和电影也会先切换到“电视剧 · 日常”，需要你之后按需重新选择质量配置。</p>
+          {resetQualityError ? (
+            <div role="alert" className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">重置失败：{resetQualityError}</div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setResetQualityConfirmOpen(false)}>返回</Button>
+            <Button variant="destructive" disabled={busyKey === "reset-quality"} onClick={() => void resetQualityProfiles()}>
+              {busyKey === "reset-quality" ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <RotateCcw data-icon="inline-start" />}
+              {busyKey === "reset-quality" ? "重置中" : "确认重置"}
+            </Button>
+          </div>
         </div>
       </Dialog>
 
@@ -3635,6 +3828,7 @@ function SettingsPanel({
   onSaveSettings,
   onSaveOpenList,
   onAddQuality,
+  onResetQuality,
   onEditQuality,
   onDeleteQuality,
 }: {
@@ -3650,6 +3844,7 @@ function SettingsPanel({
   onSaveSettings: () => void;
   onSaveOpenList: () => void;
   onAddQuality: () => void;
+  onResetQuality: () => void;
   onEditQuality: (profile: QualityProfile) => void;
   onDeleteQuality: (profile: QualityProfile) => void;
 }) {
@@ -3732,9 +3927,14 @@ function SettingsPanel({
             <CardTitle>质量配置</CardTitle>
             <CardDescription>{profiles.length} 套下载规则</CardDescription>
           </div>
-          <Button onClick={onAddQuality}>
-            <Plus data-icon="inline-start" />新建
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={onResetQuality}>
+              <RotateCcw data-icon="inline-start" />恢复默认
+            </Button>
+            <Button onClick={onAddQuality}>
+              <Plus data-icon="inline-start" />新建
+            </Button>
+          </div>
         </CardHeader>
         <CardContent>
           {profiles.length === 0 ? (

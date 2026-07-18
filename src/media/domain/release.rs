@@ -50,6 +50,7 @@ impl Default for ReleaseParser {
 }
 
 impl ReleaseParser {
+    #[allow(dead_code)]
     pub fn new(max_episode_range: u32) -> Self {
         Self {
             max_episode_range,
@@ -57,6 +58,7 @@ impl ReleaseParser {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_limits(max_episode_range: u32, latest_year: u32) -> Self {
         Self {
             max_episode_range,

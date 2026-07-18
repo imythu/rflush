@@ -931,7 +931,6 @@ pub fn normalize_sign_in_method(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::TimeZone;
 
     #[test]

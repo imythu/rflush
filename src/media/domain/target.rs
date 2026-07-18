@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum MediaType {
     Movie,
     Tv,
@@ -46,6 +47,7 @@ pub enum MediaTarget {
 }
 
 impl MediaTarget {
+    #[allow(dead_code)]
     pub fn media_type(&self) -> MediaType {
         match self {
             Self::Movie { .. } => MediaType::Movie,
