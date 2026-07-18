@@ -568,14 +568,24 @@ impl Database {
                     .optional()
                     .map_err(sql_error)?
                 };
-                if existing_target_status.as_deref() == Some("submitted")
-                    || (key != current_key
-                        && (existing_target_status.as_deref() == Some("queued")
-                            || current_target_status.as_deref() == Some("queued")))
+                if key != current_key
+                    && (existing_target_status.as_deref() == Some("queued")
+                        || current_target_status.as_deref() == Some("queued"))
                 {
                     return Err(invalid(
-                        "cannot move a subscription cursor to a submitted or active target",
+                        "cannot move a subscription cursor while the source or destination target is active",
                     ));
+                }
+                if existing_target_status.as_deref() == Some("submitted") {
+                    let dedupe_key = format!("subscription:{id}:{key}");
+                    tx.execute(
+                        "UPDATE media_downloads
+                         SET dedupe_key = dedupe_key || ':history:' || id,
+                             updated_at = ?
+                         WHERE subscription_id = ? AND target_key = ? AND dedupe_key = ?",
+                        params![now, id, key, dedupe_key],
+                    )
+                    .map_err(sql_error)?;
                 }
             }
             let new_start_episode = if current.media_type == "tv" {
@@ -4513,6 +4523,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submitted_destination_can_be_selected_again() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = db
+            .create_subscription(&test_tv_subscription_request(
+                206,
+                1,
+                10,
+                site_id,
+                downloader_id,
+            ))
+            .await
+            .unwrap();
+        let destination_key = target_key("tv", 206, Some(1), Some(9), None);
+        let now = Utc::now().to_rfc3339();
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "INSERT INTO subscription_targets
+             (subscription_id, target_key, season, episode, status, created_at, updated_at)
+             VALUES (?, ?, 1, 9, 'submitted', ?, ?)",
+            params![created.id, destination_key, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let moved = db
+            .update_subscription(
+                created.id,
+                created.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(9),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(moved.next_episode, Some(9));
+        assert_eq!(
+            db.get_subscription_target(created.id, &destination_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "metadata_pending"
+        );
+    }
+
+    #[tokio::test]
     async fn subscription_edits_reanchor_metadata_without_crossing_active_targets() {
         let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
         let created = db
@@ -4574,26 +4639,24 @@ mod tests {
         assert_eq!(reanchored.status, "metadata_pending");
         assert_eq!(reanchored.air_date, None);
 
-        for (season, episode) in [(1, 5), (1, 6)] {
-            assert!(
-                db.update_subscription(
-                    created.id,
-                    moved.version,
-                    &UpdateSubscription {
-                        season: Some(season),
-                        next_episode: Some(episode),
-                        absolute_episode: None,
-                        quality_profile_id: 1,
-                        downloader_id,
-                        site_ids: vec![site_id],
-                        save_path: None,
-                        enabled: true,
-                    },
-                )
-                .await
-                .is_err()
-            );
-        }
+        assert!(
+            db.update_subscription(
+                created.id,
+                moved.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(6),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .is_err()
+        );
 
         let conn = open_connection(&db.path).unwrap();
         conn.execute(
