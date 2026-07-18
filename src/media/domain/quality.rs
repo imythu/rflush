@@ -163,11 +163,23 @@ impl QualityProfile {
 
     #[allow(dead_code)]
     pub fn quality_rank(&self, release: &ReleaseInfo) -> u64 {
-        let resolution = preference_rank(&self.resolution_order, release.resolution.as_deref());
-        let source = preference_rank(&self.source_order, release.source.as_deref());
-        let codec = preference_rank(&self.codec_order, release.codec.as_deref());
+        combined_rank(
+            self.resolution_rank(release),
+            self.source_rank(release),
+            self.codec_rank(release),
+        )
+    }
 
-        combined_rank(resolution, source, codec)
+    pub fn resolution_rank(&self, release: &ReleaseInfo) -> u64 {
+        preference_rank(&self.resolution_order, release.resolution.as_deref())
+    }
+
+    pub fn source_rank(&self, release: &ReleaseInfo) -> u64 {
+        preference_rank(&self.source_order, release.source.as_deref())
+    }
+
+    pub fn codec_rank(&self, release: &ReleaseInfo) -> u64 {
+        preference_rank(&self.codec_order, release.codec.as_deref())
     }
 
     fn unknown_or_allowed(&self, release: &ReleaseInfo) -> QualityAssessment {
@@ -328,6 +340,8 @@ mod tests {
             resolution: resolution.map(str::to_owned),
             codec: codec.map(str::to_owned),
             source: source.map(str::to_owned),
+            hdr_formats: Vec::new(),
+            bit_depth: None,
             revision: None,
             release_group: None,
             matched_rule: "quality_only".into(),

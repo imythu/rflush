@@ -18,6 +18,10 @@ pub struct ReleaseInfo {
     pub resolution: Option<String>,
     pub codec: Option<String>,
     pub source: Option<String>,
+    #[serde(default)]
+    pub hdr_formats: Vec<String>,
+    #[serde(default)]
+    pub bit_depth: Option<u8>,
     pub revision: Option<String>,
     pub release_group: Option<String>,
     pub matched_rule: String,
@@ -75,6 +79,8 @@ impl ReleaseParser {
         let resolution = parse_resolution(raw_title);
         let codec = parse_codec(raw_title);
         let source = parse_source(raw_title);
+        let hdr_formats = parse_hdr_formats(raw_title);
+        let bit_depth = parse_bit_depth(raw_title);
         let mut revision = parse_revision(raw_title);
         let mut release_group = parse_release_group(raw_title);
         let parsed_year = self.parse_movie_year(raw_title);
@@ -123,7 +129,12 @@ impl ReleaseParser {
         } else {
             let quality_start = first_quality_marker(raw_title).unwrap_or(raw_title.len());
             title = title_before(raw_title, quality_start);
-            matched_rule = if resolution.is_some() || codec.is_some() || source.is_some() {
+            matched_rule = if resolution.is_some()
+                || codec.is_some()
+                || source.is_some()
+                || !hdr_formats.is_empty()
+                || bit_depth.is_some()
+            {
                 "quality_only"
             } else {
                 "unknown"
@@ -148,6 +159,8 @@ impl ReleaseParser {
             resolution,
             codec,
             source,
+            hdr_formats,
+            bit_depth,
             revision,
             release_group,
             matched_rule: matched_rule.to_owned(),
@@ -520,6 +533,34 @@ fn parse_source(title: &str) -> Option<String> {
     }
 }
 
+fn parse_hdr_formats(title: &str) -> Vec<String> {
+    let mut formats = Vec::new();
+    if dolby_vision_regex().is_match(title) {
+        formats.push("Dolby Vision".to_owned());
+    }
+    if hdr10_plus_regex().is_match(title) {
+        formats.push("HDR10+".to_owned());
+    } else if hdr10_regex().is_match(title) {
+        formats.push("HDR10".to_owned());
+    }
+    if hlg_regex().is_match(title) {
+        formats.push("HLG".to_owned());
+    }
+    if hdr_regex().is_match(title) {
+        formats.push("HDR".to_owned());
+    }
+    formats
+}
+
+fn parse_bit_depth(title: &str) -> Option<u8> {
+    if hi10p_regex().is_match(title) {
+        return Some(10);
+    }
+    bit_depth_regex()
+        .captures(title)
+        .and_then(|captures| captures["value"].parse().ok())
+}
+
 fn parse_revision(title: &str) -> Option<String> {
     if let Some(captures) = attached_revision_regex().captures(title) {
         return Some(captures["value"].to_ascii_lowercase());
@@ -572,6 +613,13 @@ fn first_quality_marker(title: &str) -> Option<usize> {
         hdtv_regex(),
         dvd_regex(),
         cam_regex(),
+        dolby_vision_regex(),
+        hdr10_plus_regex(),
+        hdr10_regex(),
+        hlg_regex(),
+        hdr_regex(),
+        bit_depth_regex(),
+        hi10p_regex(),
         attached_revision_regex(),
     ]
     .into_iter()
@@ -707,6 +755,25 @@ regex_fn!(
     r"(?i)(?:^|[^a-z0-9])(?:hdcam|cam|telesync|ts)(?:[^a-z0-9]|$)"
 );
 regex_fn!(
+    dolby_vision_regex,
+    r"(?i)(?:^|[^a-z0-9])(?:dv|dovi|dolby[ ._-]*vision)(?:[^a-z0-9]|$)"
+);
+regex_fn!(
+    hdr10_plus_regex,
+    r"(?i)(?:^|[^a-z0-9])hdr[ ._-]*10(?:[ ._-]*plus|\+)(?:[^a-z0-9]|$)"
+);
+regex_fn!(
+    hdr10_regex,
+    r"(?i)(?:^|[^a-z0-9])hdr[ ._-]*10(?:[^a-z0-9+]|$)"
+);
+regex_fn!(hlg_regex, r"(?i)(?:^|[^a-z0-9])hlg(?:[^a-z0-9]|$)");
+regex_fn!(hdr_regex, r"(?i)(?:^|[^a-z0-9])hdr(?:[^a-z0-9]|$)");
+regex_fn!(
+    bit_depth_regex,
+    r"(?i)(?:^|[^a-z0-9])(?P<value>8|10|12)[ ._-]*bit(?:[^a-z0-9]|$)"
+);
+regex_fn!(hi10p_regex, r"(?i)(?:^|[^a-z0-9])hi10p(?:[^a-z0-9]|$)");
+regex_fn!(
     revision_regex,
     r"(?i)(?:^|[^a-z0-9])(?P<value>repack\d*|proper|real|v[2-9]\d*)(?:[^a-z0-9]|$)"
 );
@@ -814,7 +881,7 @@ mod tests {
     #[test]
     fn parses_movie_and_all_quality_fields() {
         let release = parser()
-            .parse("Dune.Part.Two.2024.2160p.UHD.BluRay.REMUX.HEVC.PROPER-GROUP")
+            .parse("Dune.Part.Two.2024.2160p.UHD.BluRay.REMUX.DV.HDR10+.HEVC.10bit.PROPER-GROUP")
             .unwrap();
 
         assert_eq!(release.title, "Dune Part Two");
@@ -822,7 +889,30 @@ mod tests {
         assert_eq!(release.resolution.as_deref(), Some("2160p"));
         assert_eq!(release.codec.as_deref(), Some("H265"));
         assert_eq!(release.source.as_deref(), Some("REMUX"));
+        assert_eq!(release.hdr_formats, vec!["Dolby Vision", "HDR10+"]);
+        assert_eq!(release.bit_depth, Some(10));
         assert_eq!(release.revision.as_deref(), Some("PROPER"));
+    }
+
+    #[test]
+    fn parses_hdr_variants_without_confusing_dolby_audio() {
+        let hdr = parser()
+            .parse("Example.Show.S01E01.2160p.WEB-DL.HDR10.HLG.HEVC.12-bit")
+            .unwrap();
+        assert_eq!(hdr.hdr_formats, vec!["HDR10", "HLG"]);
+        assert_eq!(hdr.bit_depth, Some(12));
+
+        let atmos = parser()
+            .parse("Example.Show.S01E01.1080p.WEB-DL.DDP5.1.Atmos.H264")
+            .unwrap();
+        assert!(atmos.hdr_formats.is_empty());
+        assert_eq!(atmos.bit_depth, None);
+
+        let anime = parser()
+            .parse("[Group] Example - 01 [1080p][Hi10P][HDR]")
+            .unwrap();
+        assert_eq!(anime.hdr_formats, vec!["HDR"]);
+        assert_eq!(anime.bit_depth, Some(10));
     }
 
     #[test]
@@ -876,5 +966,28 @@ mod tests {
         let json = serde_json::to_string(&release).unwrap();
         let restored: ReleaseInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, release);
+    }
+
+    #[test]
+    fn old_release_snapshots_default_new_video_fields() {
+        let value = serde_json::json!({
+            "raw_title": "Show S01E01 1080p WEB-DL",
+            "title": "Show",
+            "alternate_titles": [],
+            "year": null,
+            "season": 1,
+            "episodes": [1],
+            "absolute_episodes": [],
+            "full_season": false,
+            "resolution": "1080p",
+            "codec": null,
+            "source": "WEB-DL",
+            "revision": null,
+            "release_group": null,
+            "matched_rule": "standard_episode"
+        });
+        let restored: ReleaseInfo = serde_json::from_value(value).unwrap();
+        assert!(restored.hdr_formats.is_empty());
+        assert_eq!(restored.bit_depth, None);
     }
 }

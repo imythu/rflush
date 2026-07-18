@@ -477,19 +477,27 @@ impl MediaService {
                             DecisionEngine::evaluate(target, &release, profile, result.seeders)
                         },
                     );
-                    let sort_key = decision.as_ref().map(|decision| {
-                        SortKey::from_decision(
-                            decision,
-                            result.seeders,
-                            result.publish_time,
-                            priorities.get(&result.site_id).copied().unwrap_or(u32::MAX),
-                            stable_release_key(
-                                &result.source_site,
-                                &result.torrent_id,
-                                &result.title,
-                            ),
-                        )
-                    });
+                    let sort_key = decision
+                        .as_ref()
+                        .zip(request.target.as_ref())
+                        .zip(domain_profile.as_ref())
+                        .map(|((decision, target), profile)| {
+                            SortKey::from_candidate(
+                                decision,
+                                profile,
+                                target,
+                                &release,
+                                result.size,
+                                result.seeders,
+                                result.publish_time,
+                                priorities.get(&result.site_id).copied().unwrap_or(u32::MAX),
+                                stable_release_key(
+                                    &result.source_site,
+                                    &result.torrent_id,
+                                    &result.title,
+                                ),
+                            )
+                        });
                     candidates.push(ResourceCandidate {
                         candidate_id: String::new(),
                         result,
@@ -1914,8 +1922,12 @@ fn reevaluate_resource_candidates(
             .as_ref()
             .map(|sort_key| sort_key.site_priority)
             .unwrap_or(u32::MAX);
-        candidate.sort_key = Some(SortKey::from_decision(
+        candidate.sort_key = Some(SortKey::from_candidate(
             &decision,
+            &domain_profile,
+            target,
+            release,
+            candidate.result.size,
             candidate.result.seeders,
             candidate.result.publish_time,
             site_priority,

@@ -248,6 +248,8 @@ type ReleaseInfo = {
   resolution: string | null;
   codec: string | null;
   source: string | null;
+  hdr_formats: string[];
+  bit_depth: number | null;
   revision: string | null;
   release_group: string | null;
   matched_rule: string;
@@ -268,6 +270,16 @@ type MatchDecision = {
   explanations: string[];
 };
 
+type CandidateSortKey = {
+  resolution_rank: number;
+  video_feature_rank: number;
+  source_rank: number;
+  size_fitness: number;
+  size_per_item: number;
+  size_target: number;
+  codec_rank: number;
+};
+
 type ResourceCandidate = {
   candidateId: string;
   key: string;
@@ -275,6 +287,7 @@ type ResourceCandidate = {
   release: ReleaseInfo | null;
   parseError: string | null;
   decision: MatchDecision | null;
+  sortKey: CandidateSortKey | null;
   rank: number;
   raw: Record<string, unknown>;
 };
@@ -769,7 +782,15 @@ function compactEpisodeList(episodes: number[], prefix = ""): string {
 
 function releaseQualityFields(release: ReleaseInfo | null | undefined): string[] {
   if (!release) return [];
-  return [release.resolution, release.source, release.codec, release.revision, releaseScopeLabel(release)]
+  return [
+    release.resolution,
+    ...(release.hdr_formats ?? []),
+    release.bit_depth ? `${release.bit_depth}bit` : null,
+    release.source,
+    release.codec,
+    release.revision,
+    releaseScopeLabel(release),
+  ]
     .filter((field): field is string => Boolean(field));
 }
 
@@ -875,6 +896,8 @@ function normalizeCandidate(value: unknown, index: number): ResourceCandidate | 
       resolution: optionalString(value.release.resolution),
       codec: optionalString(value.release.codec),
       source: optionalString(value.release.source),
+      hdr_formats: stringList(value.release.hdr_formats),
+      bit_depth: value.release.bit_depth == null ? null : numberValue(value.release.bit_depth),
       revision: optionalString(value.release.revision),
       release_group: optionalString(value.release.release_group),
       matched_rule: optionalString(value.release.matched_rule) ?? "unknown",
@@ -906,6 +929,19 @@ function normalizeCandidate(value: unknown, index: number): ResourceCandidate | 
     };
   }
 
+  const sortKeyRaw = isRecord(value.sort_key) ? value.sort_key : null;
+  const sortKey: CandidateSortKey | null = sortKeyRaw
+    ? {
+        resolution_rank: numberValue(sortKeyRaw.resolution_rank),
+        video_feature_rank: numberValue(sortKeyRaw.video_feature_rank),
+        source_rank: numberValue(sortKeyRaw.source_rank),
+        size_fitness: numberValue(sortKeyRaw.size_fitness),
+        size_per_item: numberValue(sortKeyRaw.size_per_item),
+        size_target: numberValue(sortKeyRaw.size_target),
+        codec_rank: numberValue(sortKeyRaw.codec_rank),
+      }
+    : null;
+
   return {
     candidateId,
     key: candidateId,
@@ -913,6 +949,7 @@ function normalizeCandidate(value: unknown, index: number): ResourceCandidate | 
     release,
     parseError: value.parse_error == null ? null : describeUnknown(value.parse_error),
     decision,
+    sortKey,
     rank: numberValue(value.rank, index + 1),
     raw: value,
   };
@@ -2151,7 +2188,7 @@ export function MediaPage() {
               <div className="min-w-0">
                 <div className="text-sm font-semibold">当前会优先寻找</div>
                 <div className="mt-2 flex flex-wrap gap-2"><TokenList values={[...splitValues(qualityForm.resolutionOrder).slice(0, 2), ...splitValues(qualityForm.sourceOrder).slice(0, 2), ...splitValues(qualityForm.codecOrder).slice(0, 1)]} /></div>
-                <p className="mt-2 text-xs leading-5 text-muted">原盘 / REMUX、DIY、HDR、杜比视界、杜比全景声、10bit 等特性仍会保留在资源标题中供你确认；当前自动筛选以分辨率、片源和视频编码为准。</p>
+                <p className="mt-2 text-xs leading-5 text-muted">自动排序依次比较分辨率、片源、体积充足度、杜比视界 / HDR / 位深、视频编码和做种数；只有体积达到参考线后才启用视频特性加成。</p>
               </div>
             </div>
           </div>
@@ -3374,7 +3411,7 @@ function candidateProcessingOutcome(
     return { label: "未下载", detail: `标题解析失败：${candidate.parseError}`, tone: "negative" };
   }
   if (candidate.decision?.accepted) {
-    return { label: "符合但未选", detail: "通过全部规则，但综合排序低于最终选择。", tone: "neutral" };
+    return { label: "符合但未选", detail: "通过全部规则，但在分辨率、片源、体积充足度、视频特性、编码或做种数的逐级排序中低于最终选择。", tone: "neutral" };
   }
   if (candidate.decision) {
     return {
@@ -3746,8 +3783,7 @@ function ReleaseSummary({ candidate }: { candidate: ResourceCandidate }) {
     return <div className="max-w-56 text-xs text-destructive">解析失败：{candidate.parseError}</div>;
   }
   if (!candidate.release) return <span className="text-xs text-muted">无解析数据</span>;
-  const episode = releaseScopeLabel(candidate.release);
-  const fields = [candidate.release.resolution, candidate.release.source, candidate.release.codec, episode].filter(Boolean);
+  const fields = releaseQualityFields(candidate.release);
   return (
     <div className="max-w-56 text-xs">
       <div className="flex flex-wrap gap-1.5">
@@ -3791,6 +3827,7 @@ function DecisionSummary({ candidate }: { candidate: ResourceCandidate }) {
       <div className="max-w-64 text-xs">
         <DecisionBadge candidate={candidate} />
         {breakdown ? <div className="mt-1.5 text-muted">{breakdown}</div> : null}
+        <CandidateRankingSummary candidate={candidate} />
       </div>
     );
   }
@@ -3800,6 +3837,26 @@ function DecisionSummary({ candidate }: { candidate: ResourceCandidate }) {
       <div className="mt-1.5 text-destructive" title={candidate.decision.rejections.map(rejectionText).join("；")}>
         {candidate.decision.rejections.map(rejectionText).join("；") || "不符合匹配规则"}
       </div>
+    </div>
+  );
+}
+
+function CandidateRankingSummary({ candidate }: { candidate: ResourceCandidate }) {
+  const sortKey = candidate.sortKey;
+  if (!sortKey || sortKey.size_target <= 0) return null;
+  const fitness = Math.max(0, Math.min(100, Math.floor(sortKey.size_fitness / 10)));
+  const normalized = sortKey.size_per_item === candidate.result.size ? "体积" : "单集体积";
+  const hasVideoFeatures = Boolean(candidate.release?.hdr_formats.length)
+    || (candidate.release?.bit_depth ?? 0) >= 10;
+  const featureStatus = hasVideoFeatures
+    ? ` · 视频特性加成${sortKey.video_feature_rank > 0 ? "已启用" : "未启用"}`
+    : "";
+  return (
+    <div
+      className="mt-1.5 text-muted"
+      title={`${normalized} ${formatBytes(sortKey.size_per_item)}，充足参考 ${formatBytes(sortKey.size_target)}`}
+    >
+      {normalized}充足度 {fitness}%{featureStatus} · {candidate.result.seeders} 做种
     </div>
   );
 }

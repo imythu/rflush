@@ -1307,7 +1307,7 @@ components:
 
     ReleaseInfo:
       type: object
-      required: [raw_title, title, alternate_titles, year, season, episodes, absolute_episodes, full_season, resolution, codec, source, revision, release_group, matched_rule]
+      required: [raw_title, title, alternate_titles, year, season, episodes, absolute_episodes, full_season, resolution, codec, source, hdr_formats, bit_depth, revision, release_group, matched_rule]
       properties:
         raw_title: {type: string}
         title: {type: string}
@@ -1320,6 +1320,10 @@ components:
         resolution: {type: string, nullable: true}
         codec: {type: string, nullable: true}
         source: {type: string, nullable: true}
+        hdr_formats:
+          type: array
+          items: {type: string, enum: [Dolby Vision, HDR10+, HDR10, HLG, HDR]}
+        bit_depth: {type: integer, format: int32, nullable: true, enum: [8, 10, 12]}
         revision: {type: string, nullable: true}
         release_group: {type: string, nullable: true}
         matched_rule: {type: string}
@@ -1358,11 +1362,22 @@ components:
 
     SortKey:
       type: object
-      required: [accepted, score, quality_rank, seeders, publish_time, site_priority, stable_release_key]
+      description: >-
+        Deterministic best-first key. Ordering is accepted, resolution, source, size
+        fitness, eligible video features, codec, seeders, score, publish time, site
+        priority, stable key. Video features rank as zero until size fitness reaches 1000.
+      required: [accepted, score, quality_rank, resolution_rank, video_feature_rank, source_rank, size_fitness, size_per_item, size_target, codec_rank, seeders, publish_time, site_priority, stable_release_key]
       properties:
         accepted: {type: boolean}
         score: {type: integer, format: int32, minimum: 0}
         quality_rank: {type: integer, format: int64, minimum: 0}
+        resolution_rank: {type: integer, format: int64, minimum: 0}
+        video_feature_rank: {type: integer, format: int32, minimum: 0}
+        source_rank: {type: integer, format: int64, minimum: 0}
+        size_fitness: {type: integer, format: int32, minimum: 0, maximum: 1000}
+        size_per_item: {type: integer, format: int64, minimum: 0}
+        size_target: {type: integer, format: int64, minimum: 1}
+        codec_rank: {type: integer, format: int64, minimum: 0}
         seeders: {type: integer, format: int32, minimum: 0}
         publish_time: {type: string, format: date-time, nullable: true}
         site_priority: {type: integer, format: int32, minimum: 0}

@@ -320,6 +320,8 @@ struct ReleaseInfo {
     resolution: Option<String>,
     codec: Option<String>,
     source: Option<String>,
+    hdr_formats: Vec<String>,
+    bit_depth: Option<u8>,
     revision: Option<String>,
     release_group: Option<String>,
     matched_rule: String,
@@ -333,7 +335,7 @@ struct ReleaseInfo {
 3. 动画字幕组 + 绝对集、绝对集范围。
 4. 季包/全集。
 5. 电影标题 + 年份。
-6. 独立质量、编码、来源和 revision 解析。
+6. 独立质量、编码、来源、HDR / Dolby Vision、位深和 revision 解析。
 
 范围展开必须限制最大长度，反向范围直接拒绝。数字标题如 `The 100`、`3x3 Eyes`、`Blade Runner 2049` 必须有专门回归测试。
 
@@ -372,15 +374,22 @@ struct ReleaseInfo {
 
 ```text
 accepted DESC,
-score DESC,
-quality_rank DESC,
+resolution_rank DESC,
+source_rank DESC,
+size_fitness DESC,
+video_feature_rank DESC,
+codec_rank DESC,
 seeders DESC,
+score DESC,
 publish_time DESC,
 site_priority ASC,
 stable_release_key ASC
 ```
 
-最后的稳定键保证不同网络返回顺序不会改变最佳资源。
+`size_fitness` 按媒体类型、分辨率、集数和编码效率计算 0..1000 的体积充足度，达到参考体积后封顶，
+避免把文件大小当成无限增益。只有 `size_fitness = 1000` 时才启用 `video_feature_rank`，依次区分
+Dolby Vision（带 HDR 回退优先）、HDR10+、HDR10、HLG / HDR 和 10bit。片长不可用时体积充足度只是软排序信号，
+不作为拒绝条件。最后的稳定键保证不同网络返回顺序不会改变最佳资源。
 
 ## 7. 搜索查询生成
 
