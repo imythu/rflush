@@ -134,6 +134,38 @@ pub fn join_path(root: &str, child: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    fn relocation_job(stage: &str) -> MediaRelocationJob {
+        MediaRelocationJob {
+            id: 1,
+            media_download_id: 1,
+            downloader_id: Some(1),
+            infohash: "eadb91a4769b1fad89e0dd3a930523e7fc5814b8".to_string(),
+            source_qb_path: "/source".to_string(),
+            source_openlist_path: "/source".to_string(),
+            source_content_openlist_path: "/source/show".to_string(),
+            target_openlist_path: "/target".to_string(),
+            target_qb_path: "/target".to_string(),
+            target_content_qb_path: "/target/show".to_string(),
+            target_downloader_id: Some(1),
+            copy_items_json: "[]".to_string(),
+            source_files_json: "[]".to_string(),
+            target_root_folder: Some(true),
+            torrent_name: "show".to_string(),
+            stage: stage.to_string(),
+            openlist_task_id: None,
+            torrent_data: None,
+            attempts: 0,
+            next_attempt_at: None,
+            lease_owner: None,
+            lease_until: None,
+            version: 0,
+            last_error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+        }
+    }
+
     #[test]
     fn prefix_is_segment_aware() {
         assert!(is_path_prefix("/pt", "/pt/a"));
@@ -187,12 +219,64 @@ mod tests {
     }
 
     #[test]
-    fn tmdb_archive_uses_primary_genre_only() {
-        let media_type = "电视剧";
-        let genres = ["动画", "动作冒险", "科幻奇幻"];
+    fn tmdb_archive_uses_primary_genre_and_tmdb_year() {
         assert_eq!(
-            format!("云母/{}/{}/{}", media_type, genres[0], 2025),
+            archive_relative_directory("电视剧", "动画", Some(2025)),
             "云母/电视剧/动画/2025"
+        );
+        assert_eq!(
+            archive_relative_directory("电影", "剧情", None),
+            "云母/电影/剧情/年份未知"
+        );
+    }
+
+    #[test]
+    fn completed_copy_waits_thirty_seconds_before_the_next_stage() {
+        let before = Utc::now();
+        let mut job = relocation_job("copying");
+
+        mark_copy_succeeded(&mut job);
+
+        let deadline =
+            chrono::DateTime::parse_from_rfc3339(job.next_attempt_at.as_deref().unwrap())
+                .unwrap()
+                .with_timezone(&Utc);
+        assert_eq!(job.stage, "copy_succeeded");
+        let delay = deadline.signed_duration_since(before).num_seconds();
+        assert!((COPY_SETTLE_DELAY_SECONDS - 1..=COPY_SETTLE_DELAY_SECONDS).contains(&delay));
+        assert_eq!(
+            relocation_scheduler_delay(
+                600,
+                job.next_attempt_at.as_deref(),
+                deadline - ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS),
+            ),
+            COPY_SETTLE_DELAY_SECONDS as u64
+        );
+        assert_eq!(relocation_scheduler_delay(600, None, before), 600);
+    }
+
+    #[test]
+    fn target_qb_false_success_becomes_a_recordable_failure() {
+        let infohash = "eadb91a4769b1fad89e0dd3a930523e7fc5814b8";
+        let false_success = resolve_target_qb_submission(infohash, None, Ok(false)).unwrap_err();
+        assert!(false_success.contains("添加接口返回成功"));
+        assert!(false_success.contains(infohash));
+
+        let explicit_failure = resolve_target_qb_submission(
+            infohash,
+            Some("connection refused".to_string()),
+            Ok(false),
+        )
+        .unwrap_err();
+        assert!(explicit_failure.contains("connection refused"));
+
+        assert!(
+            resolve_target_qb_submission(
+                infohash,
+                Some("duplicate response".to_string()),
+                Ok(true),
+            )
+            .is_ok()
         );
     }
 
@@ -279,6 +363,10 @@ use crate::downloader::{
 };
 use crate::media::models::media_download_category;
 use crate::openlist::OpenListClient;
+
+const COPY_SETTLE_DELAY_SECONDS: i64 = 30;
+const TARGET_QB_CONFIRM_ATTEMPTS: usize = 5;
+const TARGET_QB_CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
 
 pub struct RelocationScheduler {
     db: Database,
@@ -379,7 +467,16 @@ impl RelocationScheduler {
                 }
             }
         }
-        Ok(config.scan_interval_secs)
+        let next_attempt_at = self
+            .db
+            .next_media_relocation_attempt_at()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(relocation_scheduler_delay(
+            config.scan_interval_secs,
+            next_attempt_at.as_deref(),
+            Utc::now(),
+        ))
     }
 
     async fn process_one(
@@ -441,6 +538,7 @@ impl RelocationScheduler {
         let tmdb_is_animation = subscription
             .as_ref()
             .is_some_and(|item| item.tmdb_is_animation);
+        job.next_attempt_at = None;
 
         match expected_stage.as_str() {
             "waiting_download" => {
@@ -496,22 +594,14 @@ impl RelocationScheduler {
                 } else {
                     "电视剧"
                 };
-                let year = serde_json::from_str::<serde_json::Value>(&download.release_json)
-                    .ok()
-                    .and_then(|value| value.get("year").and_then(|year| year.as_u64()))
-                    .map(|year| year as u32);
+                let tmdb_year = subscription.as_ref().and_then(|item| item.year);
                 let primary_genre = subscription
                     .as_ref()
                     .and_then(|item| item.tmdb_genres.first())
                     .map(|genre| genre.name.as_str())
                     .unwrap_or("其他");
-                let relative_dir = format!(
-                    "云母/{}/{}/{}",
-                    primary_type,
-                    primary_genre,
-                    year.map(|value| value.to_string())
-                        .unwrap_or_else(|| "年份未知".to_string())
-                );
+                let relative_dir =
+                    archive_relative_directory(primary_type, primary_genre, tmdb_year);
                 let content_qb_path = normalize_path(&content_path)?;
                 let content_openlist_path =
                     translate_path(&content_qb_path, &mapping.qb_path, &mapping.openlist_path)?;
@@ -551,12 +641,11 @@ impl RelocationScheduler {
                 }
                 job.openlist_task_id =
                     encode_openlist_task_ids(tasks.iter().map(|task| task.id.clone()));
-                job.stage = if tasks.is_empty() {
-                    "copy_succeeded"
+                if tasks.is_empty() {
+                    mark_copy_succeeded(&mut job);
                 } else {
-                    "copying"
+                    job.stage = "copying".to_string();
                 }
-                .to_string();
             }
             "copying" => {
                 let task_ids = decode_openlist_task_ids(
@@ -576,7 +665,7 @@ impl RelocationScheduler {
                     }
                 }
                 if all_succeeded {
-                    job.stage = "copy_succeeded".to_string();
+                    mark_copy_succeeded(&mut job);
                 } else {
                     job.next_attempt_at =
                         Some((Utc::now() + ChronoDuration::seconds(30)).to_rfc3339());
@@ -624,14 +713,13 @@ impl RelocationScheduler {
                     }
                     job.openlist_task_id =
                         encode_openlist_task_ids(tasks.iter().map(|task| task.id.clone()));
-                    job.stage = if tasks.is_empty() {
-                        "copy_succeeded"
+                    if tasks.is_empty() {
+                        mark_copy_succeeded(&mut job);
                     } else {
-                        "copying"
+                        job.stage = "copying".to_string();
+                        job.next_attempt_at =
+                            Some((Utc::now() + ChronoDuration::seconds(10)).to_rfc3339());
                     }
-                    .to_string();
-                    job.next_attempt_at =
-                        Some((Utc::now() + ChronoDuration::seconds(10)).to_rfc3339());
                 } else {
                     job.torrent_data = Some(source_qb.export_torrent(&job.infohash).await?);
                     job.stage = "torrent_exported".to_string();
@@ -663,7 +751,7 @@ impl RelocationScheduler {
                     }
                 } else {
                     let torrent = job.torrent_data.clone().ok_or("导出的种子数据缺失")?;
-                    target_qb
+                    let submission_error = target_qb
                         .add_torrent(
                             torrent,
                             &format!("{}.torrent", job.infohash),
@@ -683,7 +771,11 @@ impl RelocationScheduler {
                                 ..Default::default()
                             },
                         )
-                        .await?;
+                        .await
+                        .err();
+                    let confirmation =
+                        confirm_target_qb_torrent(target_qb.as_ref(), &job.infohash).await;
+                    resolve_target_qb_submission(&job.infohash, submission_error, confirmation)?;
                     job.stage = "target_qb_submitted".to_string();
                 }
             }
@@ -775,10 +867,106 @@ impl RelocationScheduler {
         job.last_error = Some(error);
         let backoff = 30_i64.saturating_mul(1_i64 << job.attempts.min(6));
         job.next_attempt_at = Some((Utc::now() + ChronoDuration::seconds(backoff)).to_rfc3339());
-        let _ = self
+        match self
             .db
             .update_media_relocation_job(&job, expected_version, &expected_stage)
-            .await;
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => error!(
+                "failed to record media relocation job {} error because its state changed",
+                job.id
+            ),
+            Err(record_error) => error!(
+                "failed to record media relocation job {} error: {}",
+                job.id, record_error
+            ),
+        }
+    }
+}
+
+fn archive_relative_directory(
+    primary_type: &str,
+    primary_genre: &str,
+    tmdb_year: Option<u32>,
+) -> String {
+    format!(
+        "云母/{}/{}/{}",
+        primary_type,
+        primary_genre,
+        tmdb_year
+            .map(|year| year.to_string())
+            .unwrap_or_else(|| "年份未知".to_string())
+    )
+}
+
+fn relocation_scheduler_delay(
+    configured_delay_secs: u64,
+    next_attempt_at: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> u64 {
+    let configured_delay_secs = configured_delay_secs.max(5);
+    let Some(next_attempt_at) = next_attempt_at else {
+        return configured_delay_secs;
+    };
+    let Ok(next_attempt_at) = chrono::DateTime::parse_from_rfc3339(next_attempt_at) else {
+        return 5;
+    };
+    let remaining_ms = next_attempt_at
+        .with_timezone(&Utc)
+        .signed_duration_since(now)
+        .num_milliseconds()
+        .max(0) as u64;
+    let remaining_secs = remaining_ms.saturating_add(999) / 1_000;
+    configured_delay_secs.min(remaining_secs.max(5))
+}
+
+fn mark_copy_succeeded(job: &mut MediaRelocationJob) {
+    job.stage = "copy_succeeded".to_string();
+    job.next_attempt_at =
+        Some((Utc::now() + ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS)).to_rfc3339());
+}
+
+async fn confirm_target_qb_torrent(
+    target_qb: &dyn DownloaderClient,
+    infohash: &str,
+) -> Result<bool, String> {
+    let hashes = [infohash.to_string()];
+    let mut last_result = Ok(false);
+    for attempt in 0..TARGET_QB_CONFIRM_ATTEMPTS {
+        match target_qb.list_torrents_by_hashes(&hashes).await {
+            Ok(torrents)
+                if torrents
+                    .iter()
+                    .any(|torrent| torrent.hash.eq_ignore_ascii_case(infohash)) =>
+            {
+                return Ok(true);
+            }
+            Ok(_) => last_result = Ok(false),
+            Err(error) => last_result = Err(error),
+        }
+        if attempt + 1 < TARGET_QB_CONFIRM_ATTEMPTS {
+            tokio::time::sleep(TARGET_QB_CONFIRM_INTERVAL).await;
+        }
+    }
+    last_result
+}
+
+fn resolve_target_qb_submission(
+    infohash: &str,
+    submission_error: Option<String>,
+    confirmation: Result<bool, String>,
+) -> Result<(), String> {
+    match confirmation {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(submission_error.map_or_else(
+            || format!("目标 qB 提交失败: 添加接口返回成功，但核验未发现种子 {infohash}"),
+            |error| format!("目标 qB 提交失败: {error}; 核验未发现种子 {infohash}"),
+        )),
+        Err(confirmation_error) => Err(submission_error.map_or_else(
+            || format!("目标 qB 提交结果核验失败: {confirmation_error}"),
+            |error| format!("目标 qB 提交失败: {error}; 提交结果核验失败: {confirmation_error}"),
+        )),
     }
 }
 

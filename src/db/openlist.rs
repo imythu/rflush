@@ -178,6 +178,27 @@ impl Database {
         .map_err(join_error)?
     }
 
+    pub async fn next_media_relocation_attempt_at(&self) -> Result<Option<String>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let now = Utc::now().to_rfc3339();
+            conn.query_row(
+                "SELECT COALESCE(next_attempt_at, ?) FROM media_relocation_jobs
+                 WHERE stage NOT IN ('completed', 'cancelled')
+                 ORDER BY CASE WHEN next_attempt_at IS NULL THEN 0 ELSE 1 END,
+                          next_attempt_at
+                 LIMIT 1",
+                [now],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn update_media_relocation_job(
         &self,
         job: &MediaRelocationJob,
@@ -516,6 +537,10 @@ mod tests {
         claimed.copy_items_json = "[\"Show\"]".to_string();
         claimed.source_files_json = "[\"Show/E01.mkv\"]".to_string();
         claimed.target_root_folder = Some(true);
+        claimed.attempts = 1;
+        claimed.last_error = Some("目标 qB 提交失败: test".to_string());
+        let next_attempt_at = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339();
+        claimed.next_attempt_at = Some(next_attempt_at.clone());
         assert!(
             db.update_media_relocation_job(&claimed, expected_version, &expected_stage)
                 .await
@@ -529,5 +554,12 @@ mod tests {
         assert_eq!(stored.copy_items_json, "[\"Show\"]");
         assert_eq!(stored.source_files_json, "[\"Show/E01.mkv\"]");
         assert_eq!(stored.target_root_folder, Some(true));
+        assert_eq!(stored.attempts, 1);
+        assert_eq!(stored.last_error.as_deref(), Some("目标 qB 提交失败: test"));
+        assert_eq!(stored.next_attempt_at.as_deref(), Some(next_attempt_at.as_str()));
+        assert_eq!(
+            db.next_media_relocation_attempt_at().await.unwrap(),
+            Some(next_attempt_at)
+        );
     }
 }
