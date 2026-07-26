@@ -3013,6 +3013,10 @@ impl Database {
                     target_downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
                     copy_items_json TEXT NOT NULL DEFAULT '[]',
                     source_files_json TEXT NOT NULL DEFAULT '[]',
+                    source_manifest_json TEXT NOT NULL DEFAULT '[]',
+                    copy_checkpoint_json TEXT,
+                    copy_lock_acquired INTEGER NOT NULL DEFAULT 0,
+                    manifest_cursor INTEGER NOT NULL DEFAULT 0,
                     target_root_folder INTEGER,
                     torrent_name TEXT NOT NULL,
                     stage TEXT NOT NULL DEFAULT 'waiting_download',
@@ -3064,6 +3068,30 @@ impl Database {
                 "media_relocation_jobs",
                 "source_files_json",
                 "ALTER TABLE media_relocation_jobs ADD COLUMN source_files_json TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "source_manifest_json",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN source_manifest_json TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "copy_checkpoint_json",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN copy_checkpoint_json TEXT",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "copy_lock_acquired",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN copy_lock_acquired INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "manifest_cursor",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN manifest_cursor INTEGER NOT NULL DEFAULT 0",
             )?;
             ensure_column(
                 &conn,

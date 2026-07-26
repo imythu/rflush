@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -45,6 +46,7 @@ use crate::media::service::{
 use crate::media::tmdb::{TmdbDetails, TmdbError, TmdbMedia, TmdbMediaType, TmdbSeason};
 use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
+use crate::openlist::{OpenListClient, OpenListTask};
 use crate::relocation::RelocationScheduler;
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
@@ -361,18 +363,21 @@ pub async fn serve(
         );
     }
     info!("web server listening on http://{}", addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            if let Err(error) = tokio::signal::ctrl_c().await {
-                info!("failed to listen for Ctrl+C: {}", error);
-            } else {
-                info!("Ctrl+C received, shutting down web server");
-            }
-        })
-        .await
-        .map_err(|e| AppError::Server {
-            message: format!("server exited: {}", e),
-        })
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            info!("failed to listen for Ctrl+C: {}", error);
+        } else {
+            info!("Ctrl+C received, shutting down web server");
+        }
+    })
+    .await
+    .map_err(|e| AppError::Server {
+        message: format!("server exited: {}", e),
+    })
 }
 
 fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -> Router {
@@ -588,6 +593,10 @@ fn media_router(
                 get(get_openlist_config).put(update_openlist_config),
             )
             .route("/openlist/jobs", get(list_openlist_jobs))
+            .route(
+                "/openlist/jobs/{id}/resolve-copy",
+                post(resolve_openlist_copy),
+            )
             .route("/openlist/scan", post(scan_openlist_jobs))
     } else {
         router
@@ -621,11 +630,16 @@ struct OpenListJobResponse {
     infohash: String,
     torrent_name: String,
     stage: String,
+    version: i64,
     source_qb_path: String,
     source_openlist_path: String,
     target_openlist_path: String,
     target_qb_path: String,
     attempts: u32,
+    openlist_task_ids: Vec<String>,
+    copy_checkpoint: Option<OpenListCheckpointSummary>,
+    copy_lock_acquired: bool,
+    manifest_cursor: usize,
     next_attempt_at: Option<String>,
     last_error: Option<String>,
     created_at: String,
@@ -633,8 +647,21 @@ struct OpenListJobResponse {
     completed_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct OpenListCheckpointSummary {
+    path: String,
+    size: i64,
+    phase: String,
+    submitted_at: Option<String>,
+}
+
 impl From<MediaRelocationJob> for OpenListJobResponse {
     fn from(job: MediaRelocationJob) -> Self {
+        let openlist_task_ids = decode_openlist_job_task_ids(job.openlist_task_id.as_deref());
+        let copy_checkpoint = job
+            .copy_checkpoint_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok());
         Self {
             id: job.id,
             media_download_id: job.media_download_id,
@@ -642,11 +669,16 @@ impl From<MediaRelocationJob> for OpenListJobResponse {
             infohash: job.infohash,
             torrent_name: job.torrent_name,
             stage: job.stage,
+            version: job.version,
             source_qb_path: job.source_qb_path,
             source_openlist_path: job.source_openlist_path,
             target_openlist_path: job.target_openlist_path,
             target_qb_path: job.target_qb_path,
             attempts: job.attempts,
+            openlist_task_ids,
+            copy_checkpoint,
+            copy_lock_acquired: job.copy_lock_acquired,
+            manifest_cursor: job.manifest_cursor,
             next_attempt_at: job.next_attempt_at,
             last_error: job.last_error,
             created_at: job.created_at,
@@ -666,6 +698,152 @@ async fn list_openlist_jobs(
         .await
         .map_err(media_app_error)?;
     Ok(Json(jobs.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveOpenListCopyRequest {
+    resolution: String,
+    expected_version: i64,
+    #[serde(default)]
+    confirm_task_terminated: bool,
+}
+
+async fn resolve_openlist_copy(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(payload): Json<ResolveOpenListCopyRequest>,
+) -> Result<Json<OpenListJobResponse>, ApiError> {
+    require_loopback_copy_resolution(peer)?;
+    let resolution = payload.resolution.trim();
+    if !matches!(resolution, "force_retry" | "recheck" | "cancel") {
+        return Err(ApiError::bad_request(
+            "resolution must be force_retry, recheck, or cancel",
+        ));
+    }
+    if matches!(resolution, "force_retry" | "cancel") && !payload.confirm_task_terminated {
+        return Err(ApiError::bad_request(
+            "force_retry and cancel require confirm_task_terminated=true",
+        ));
+    }
+    let db = state.service.database();
+    let current = db
+        .get_media_relocation_job(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("OpenList relocation job not found"))?;
+    if current.version != payload.expected_version {
+        return Err(ApiError::conflict(
+            "OpenList relocation job version changed; reload before resolving",
+        ));
+    }
+    if current.stage != "copy_manual_review"
+        && !(current.stage == "copying" && current.copy_checkpoint_json.is_none())
+        && !(current.stage == "manifest_required" && resolution == "cancel")
+    {
+        return Err(ApiError::conflict(
+            "OpenList relocation job is not awaiting this manual resolution",
+        ));
+    }
+    if matches!(resolution, "force_retry" | "cancel") {
+        reject_running_openlist_tasks(db, &current).await?;
+    }
+    if !db
+        .resolve_media_relocation_copy(
+            id,
+            resolution,
+            payload.expected_version,
+            payload.confirm_task_terminated,
+        )
+        .await
+        .map_err(media_app_error)?
+    {
+        return Err(ApiError::conflict(
+            "OpenList relocation job changed or cannot apply this resolution",
+        ));
+    }
+    state.relocation_scheduler.request_scan();
+    let updated = db
+        .get_media_relocation_job(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("OpenList relocation job not found"))?;
+    Ok(Json(updated.into()))
+}
+
+fn require_loopback_copy_resolution(peer: SocketAddr) -> Result<(), ApiError> {
+    if peer.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "OpenList copy resolution is restricted to loopback requests",
+        ))
+    }
+}
+
+fn decode_openlist_job_task_ids(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(value)
+        .unwrap_or_else(|_| vec![value.to_string()])
+        .into_iter()
+        .filter(|id| !id.trim().is_empty())
+        .collect()
+}
+
+async fn reject_running_openlist_tasks(
+    db: &Database,
+    job: &MediaRelocationJob,
+) -> Result<(), ApiError> {
+    let task_ids = decode_openlist_job_task_ids(job.openlist_task_id.as_deref());
+    if task_ids.is_empty() {
+        return Ok(());
+    }
+    let config = db.get_openlist_config().await.map_err(media_app_error)?;
+    let client = manual_resolution_openlist_client(&config.base_url, &config.api_key).inspect_err(
+        |error| {
+            warn!(job_id = job.id, message = %error.message, "could not construct OpenList client before manual resolution");
+        },
+    )?;
+    for task_id in task_ids {
+        let result = client.task_info_if_exists(&task_id).await;
+        if let Err(error) = &result {
+            warn!(
+                job_id = job.id,
+                task_id,
+                %error,
+                "OpenList task state is uncertain during confirmed manual resolution"
+            );
+        }
+        require_terminal_or_missing_openlist_task(&task_id, result)?;
+    }
+    Ok(())
+}
+
+fn manual_resolution_openlist_client(
+    base_url: &str,
+    api_key: &str,
+) -> Result<OpenListClient, ApiError> {
+    OpenListClient::new(base_url, api_key).map_err(|_| {
+        ApiError::conflict("OpenList client is unavailable; task termination could not be verified")
+    })
+}
+
+fn require_terminal_or_missing_openlist_task(
+    task_id: &str,
+    result: Result<Option<OpenListTask>, String>,
+) -> Result<(), ApiError> {
+    match result {
+        Ok(None) => Ok(()),
+        Ok(Some(task)) if task.succeeded() || task.terminal_failure() => Ok(()),
+        Ok(Some(_)) => Err(ApiError::conflict(format!(
+            "OpenList task {task_id} is still active; manual resolution was rejected"
+        ))),
+        Err(_) => Err(ApiError::conflict(format!(
+            "OpenList task {task_id} state could not be verified; manual resolution was rejected"
+        ))),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3779,6 +3957,13 @@ impl ApiError {
         }
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -3898,6 +4083,55 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod media_api_tests {
     use super::*;
+
+    #[test]
+    fn openlist_copy_resolution_is_loopback_only() {
+        assert!(require_loopback_copy_resolution("127.0.0.1:1234".parse().unwrap()).is_ok());
+        assert!(require_loopback_copy_resolution("[::1]:1234".parse().unwrap()).is_ok());
+        let error =
+            require_loopback_copy_resolution("192.0.2.1:1234".parse().unwrap()).unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            decode_openlist_job_task_ids(Some("[\"task-a\",\"task-b\"]")),
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
+        assert_eq!(
+            decode_openlist_job_task_ids(Some("legacy-task")),
+            vec!["legacy-task".to_string()]
+        );
+    }
+
+    #[test]
+    fn openlist_manual_resolution_fails_closed_when_task_state_is_uncertain() {
+        assert!(manual_resolution_openlist_client("", "").is_err());
+        assert!(
+            require_terminal_or_missing_openlist_task(
+                "task-a",
+                Err("request timed out".to_string())
+            )
+            .is_err()
+        );
+        assert!(require_terminal_or_missing_openlist_task("task-a", Ok(None)).is_ok());
+
+        let mut task = OpenListTask {
+            id: "task-a".to_string(),
+            name: String::new(),
+            state: 0,
+            status: String::new(),
+            progress: 0.0,
+            total_bytes: 0,
+            error: String::new(),
+        };
+        assert!(
+            require_terminal_or_missing_openlist_task("task-a", Ok(Some(task.clone()))).is_err()
+        );
+        task.state = 2;
+        assert!(
+            require_terminal_or_missing_openlist_task("task-a", Ok(Some(task.clone()))).is_ok()
+        );
+        task.state = 7;
+        assert!(require_terminal_or_missing_openlist_task("task-a", Ok(Some(task))).is_ok());
+    }
 
     fn subscription_with_status(status: Option<&str>) -> SubscriptionRecord {
         SubscriptionRecord {

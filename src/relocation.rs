@@ -70,16 +70,6 @@ pub fn validate_non_overlapping(paths: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-pub fn parent_and_name(path: &str) -> Result<(String, String), String> {
-    let path = normalize_path(path)?;
-    if path == "/" {
-        return Err("根目录不能作为复制对象".to_string());
-    }
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("/", path.as_str()));
-    let parent = if parent.is_empty() { "/" } else { parent };
-    Ok((parent.to_string(), name.to_string()))
-}
-
 fn encode_openlist_task_ids(ids: impl IntoIterator<Item = String>) -> Option<String> {
     let ids = ids
         .into_iter()
@@ -98,9 +88,29 @@ fn decode_openlist_task_ids(value: &str) -> Vec<String> {
         .collect()
 }
 
+async fn any_openlist_task_active(
+    openlist: &OpenListClient,
+    job: &MediaRelocationJob,
+) -> Result<bool, String> {
+    let task_ids = job
+        .openlist_task_id
+        .as_deref()
+        .map(decode_openlist_task_ids)
+        .unwrap_or_default();
+    for task_id in task_ids {
+        if let Some(task) = openlist.task_info_if_exists(&task_id).await?
+            && !task.succeeded()
+            && !task.terminal_failure()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[allow(dead_code)]
 pub fn category_directory(media_type: &str, year: Option<u32>) -> String {
-    let category = match media_type.trim().to_ascii_lowercase().as_str() {
+    match media_type.trim().to_ascii_lowercase().as_str() {
         "movie" | "电影" => "电影".to_string(),
         "anime" | "动漫" => "动漫".to_string(),
         "concert" | "演唱会" => "演唱会".to_string(),
@@ -109,8 +119,7 @@ pub fn category_directory(media_type: &str, year: Option<u32>) -> String {
             .unwrap_or_else(|| "年份".to_string()),
         "tv" | "电视" | "电视剧" => "电视剧".to_string(),
         _ => "电视剧".to_string(),
-    };
-    category
+    }
 }
 
 #[allow(dead_code)]
@@ -133,38 +142,6 @@ pub fn join_path(root: &str, child: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn relocation_job(stage: &str) -> MediaRelocationJob {
-        MediaRelocationJob {
-            id: 1,
-            media_download_id: 1,
-            downloader_id: Some(1),
-            infohash: "eadb91a4769b1fad89e0dd3a930523e7fc5814b8".to_string(),
-            source_qb_path: "/source".to_string(),
-            source_openlist_path: "/source".to_string(),
-            source_content_openlist_path: "/source/show".to_string(),
-            target_openlist_path: "/target".to_string(),
-            target_qb_path: "/target".to_string(),
-            target_content_qb_path: "/target/show".to_string(),
-            target_downloader_id: Some(1),
-            copy_items_json: "[]".to_string(),
-            source_files_json: "[]".to_string(),
-            target_root_folder: Some(true),
-            torrent_name: "show".to_string(),
-            stage: stage.to_string(),
-            openlist_task_id: None,
-            torrent_data: None,
-            attempts: 0,
-            next_attempt_at: None,
-            lease_owner: None,
-            lease_until: None,
-            version: 0,
-            last_error: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            completed_at: None,
-        }
-    }
 
     #[test]
     fn prefix_is_segment_aware() {
@@ -189,12 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn parent_name_handles_top_level() {
-        assert_eq!(
-            parent_and_name("/file.mkv").unwrap(),
-            ("/".into(), "file.mkv".into())
-        );
-        assert!(parent_and_name("/").is_err());
+    fn relocation_rejects_identical_source_and_target_paths() {
+        assert!(validate_distinct_path_pairs("/src", "/src", "/qb-a", "/qb-b").is_err());
+        assert!(validate_distinct_path_pairs("/src", "/dst", "/qb", "/qb").is_err());
+        assert!(validate_distinct_path_pairs("/src", "/dst", "/qb-a", "/qb-b").is_ok());
     }
 
     #[test]
@@ -231,23 +206,13 @@ mod tests {
     }
 
     #[test]
-    fn completed_copy_waits_thirty_seconds_before_the_next_stage() {
+    fn scheduler_honors_copy_settle_deadline() {
         let before = Utc::now();
-        let mut job = relocation_job("copying");
-
-        mark_copy_succeeded(&mut job);
-
-        let deadline =
-            chrono::DateTime::parse_from_rfc3339(job.next_attempt_at.as_deref().unwrap())
-                .unwrap()
-                .with_timezone(&Utc);
-        assert_eq!(job.stage, "copy_succeeded");
-        let delay = deadline.signed_duration_since(before).num_seconds();
-        assert!((COPY_SETTLE_DELAY_SECONDS - 1..=COPY_SETTLE_DELAY_SECONDS).contains(&delay));
+        let deadline = before + ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS);
         assert_eq!(
             relocation_scheduler_delay(
                 600,
-                job.next_attempt_at.as_deref(),
+                Some(&deadline.to_rfc3339()),
                 deadline - ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS),
             ),
             COPY_SETTLE_DELAY_SECONDS as u64
@@ -333,10 +298,6 @@ mod tests {
             torrent_top_level_items(&files).unwrap(),
             vec!["Show".to_string(), "poster.jpg".to_string()]
         );
-        assert_eq!(
-            manifest_parent_directories(&files),
-            vec!["Show/Season 01".to_string(), "Show".to_string()]
-        );
         assert!(normalize_manifest_path("../outside.mkv").is_err());
     }
 
@@ -348,12 +309,206 @@ mod tests {
         );
         assert_eq!(relative_path("/pt/Show", "/pt/Show").unwrap(), "");
     }
+
+    #[test]
+    fn source_manifest_snapshot_preserves_path_and_size() {
+        let manifest = normalize_torrent_manifest(vec![
+            TorrentFileInfo {
+                path: "Show/E02.mkv".to_string(),
+                size: 20,
+            },
+            TorrentFileInfo {
+                path: "Show/E01.mkv".to_string(),
+                size: 10,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            manifest,
+            vec![
+                ManifestFile {
+                    path: "Show/E01.mkv".to_string(),
+                    size: 10,
+                },
+                ManifestFile {
+                    path: "Show/E02.mkv".to_string(),
+                    size: 20,
+                },
+            ]
+        );
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert_eq!(decode_source_manifest(&json).unwrap(), Some(manifest));
+        assert_eq!(decode_source_manifest("[]").unwrap(), None);
+    }
+
+    #[test]
+    fn ambiguous_submission_never_becomes_prepared_automatically() {
+        let checkpoint = CopyCheckpoint {
+            path: "Show/E01.mkv".to_string(),
+            size: 10,
+            phase: CopyCheckpointPhase::Uncertain,
+            submitted_at: Some((Utc::now() - ChronoDuration::hours(1)).to_rfc3339()),
+        };
+        assert_eq!(
+            uncertain_submission_next_check(&checkpoint, Utc::now()).unwrap(),
+            None
+        );
+        assert_eq!(
+            decode_copy_checkpoint(&encode_copy_checkpoint(&checkpoint).unwrap())
+                .unwrap()
+                .phase,
+            CopyCheckpointPhase::Uncertain
+        );
+    }
+
+    #[test]
+    fn copy_checkpoint_must_match_authoritative_manifest() {
+        let checkpoint = CopyCheckpoint {
+            path: "Show/E01.mkv".to_string(),
+            size: 11,
+            phase: CopyCheckpointPhase::Prepared,
+            submitted_at: None,
+        };
+        assert!(
+            validate_checkpoint_against_manifest(
+                &checkpoint,
+                "[{\"path\":\"Show/E01.mkv\",\"size\":10}]"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mixed_copy_tasks_preserve_in_flight_or_uncertain_work() {
+        assert_eq!(
+            decide_copy_tasks(&[
+                CopyTaskObservation::Failed,
+                CopyTaskObservation::Pending,
+                CopyTaskObservation::Missing,
+            ])
+            .unwrap(),
+            CopyTaskDecision::Wait
+        );
+        assert_eq!(
+            decide_copy_tasks(&[CopyTaskObservation::Failed, CopyTaskObservation::Missing,])
+                .unwrap(),
+            CopyTaskDecision::VerifyTarget
+        );
+        assert_eq!(
+            decide_copy_tasks(&[CopyTaskObservation::Failed, CopyTaskObservation::Failed,])
+                .unwrap(),
+            CopyTaskDecision::AllFailed
+        );
+        assert_eq!(
+            decide_copy_tasks(&[CopyTaskObservation::Succeeded, CopyTaskObservation::Failed,])
+                .unwrap(),
+            CopyTaskDecision::VerifyTarget
+        );
+
+        let mut new_checkpoint = Some(
+            encode_copy_checkpoint(&CopyCheckpoint {
+                path: "Show/E01.mkv".to_string(),
+                size: 10,
+                phase: CopyCheckpointPhase::Prepared,
+                submitted_at: None,
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            prepare_read_only_copy_reconcile(&mut new_checkpoint, Utc::now()).unwrap(),
+            "copy_submitting"
+        );
+        assert_eq!(
+            decode_copy_checkpoint(new_checkpoint.as_deref().unwrap())
+                .unwrap()
+                .phase,
+            CopyCheckpointPhase::Uncertain
+        );
+        let mut legacy_checkpoint = None;
+        assert_eq!(
+            prepare_read_only_copy_reconcile(&mut legacy_checkpoint, Utc::now()).unwrap(),
+            "copy_legacy_reconcile"
+        );
+        let old_pending = encode_copy_checkpoint(&CopyCheckpoint {
+            path: "Show/E01.mkv".to_string(),
+            size: 10,
+            phase: CopyCheckpointPhase::Uncertain,
+            submitted_at: Some(
+                (Utc::now() - ChronoDuration::seconds(COPY_TASK_PENDING_MANUAL_SECONDS + 1))
+                    .to_rfc3339(),
+            ),
+        })
+        .unwrap();
+        assert!(checkpoint_pending_timed_out(Some(&old_pending), Utc::now()).unwrap());
+        assert!(!checkpoint_pending_timed_out(None, Utc::now()).unwrap());
+    }
+
+    #[test]
+    fn manifest_cursor_batches_without_skipping_final_verification_boundary() {
+        assert_eq!(manifest_scan_end(0, 250).unwrap(), MANIFEST_FILES_PER_PASS);
+        assert_eq!(
+            manifest_scan_end(MANIFEST_FILES_PER_PASS, 250).unwrap(),
+            MANIFEST_FILES_PER_PASS * 2
+        );
+        assert_eq!(manifest_scan_end(200, 250).unwrap(), 250);
+        assert_eq!(manifest_scan_end(250, 250).unwrap(), 250);
+        assert!(manifest_scan_end(251, 250).is_err());
+    }
+
+    #[test]
+    fn old_advanced_jobs_require_sized_manifest_recovery() {
+        for stage in [
+            "torrent_exported",
+            "source_qb_removed",
+            "target_qb_submitted",
+            "target_qb_starting",
+        ] {
+            assert!(advanced_stage_requires_manifest(stage));
+        }
+        assert!(!advanced_stage_requires_manifest("source_removed"));
+        assert!(
+            validate_manifest_paths_snapshot(
+                &[ManifestFile {
+                    path: "Show/E01.mkv".to_string(),
+                    size: 10,
+                }],
+                "[\"Show/E02.mkv\"]",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            manifest_from_torrent_data(b"d4:infod6:lengthi12e4:name8:file.mkvee").unwrap(),
+            vec![ManifestFile {
+                path: "file.mkv".to_string(),
+                size: 12,
+            }]
+        );
+    }
+
+    #[test]
+    fn checkpoint_returns_its_authoritative_manifest_cursor() {
+        let checkpoint = CopyCheckpoint {
+            path: "Show/E02.mkv".to_string(),
+            size: 20,
+            phase: CopyCheckpointPhase::Prepared,
+            submitted_at: None,
+        };
+        assert_eq!(
+            validate_checkpoint_against_manifest(
+                &checkpoint,
+                "[{\"path\":\"Show/E01.mkv\",\"size\":10},{\"path\":\"Show/E02.mkv\",\"size\":20}]",
+            )
+            .unwrap(),
+            1
+        );
+    }
 }
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
@@ -362,11 +517,54 @@ use crate::downloader::{
     AddTorrentOptions, DownloaderClient, DownloaderClientPool, TorrentFileInfo, TorrentInfo,
 };
 use crate::media::models::media_download_category;
-use crate::openlist::OpenListClient;
+use crate::media::torrent::torrent_file_manifest;
+use crate::openlist::{ManifestFileState, OpenListClient};
 
 const COPY_SETTLE_DELAY_SECONDS: i64 = 30;
+const COPY_SUBMISSION_ATTENTION_SECONDS: i64 = 300;
+const COPY_TASK_PENDING_MANUAL_SECONDS: i64 = 24 * 60 * 60;
+const MANIFEST_FILES_PER_PASS: usize = 100;
+const RELOCATION_LEASE_SECONDS: i64 = 120;
+const RELOCATION_LEASE_HEARTBEAT_SECONDS: u64 = 30;
 const TARGET_QB_CONFIRM_ATTEMPTS: usize = 5;
 const TARGET_QB_CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManifestFile {
+    path: String,
+    size: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CopyCheckpointPhase {
+    Prepared,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CopyCheckpoint {
+    path: String,
+    size: i64,
+    phase: CopyCheckpointPhase,
+    #[serde(default)]
+    submitted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyTaskObservation {
+    Pending,
+    Succeeded,
+    Failed,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyTaskDecision {
+    Wait,
+    AllFailed,
+    VerifyTarget,
+}
 
 pub struct RelocationScheduler {
     db: Database,
@@ -448,17 +646,17 @@ impl RelocationScheduler {
         }
         // A job has several idempotent local transitions after an OpenList copy finishes.
         // Drain those transitions now instead of making each one wait a full scan interval.
-        for _ in 0..8 {
+        for _ in 0..32 {
             let jobs = self
                 .db
-                .claim_due_media_relocation_jobs(&self.owner, 120, 10)
+                .claim_due_media_relocation_jobs(&self.owner, RELOCATION_LEASE_SECONDS, 1)
                 .await
                 .map_err(|e| e.to_string())?;
             if jobs.is_empty() {
                 break;
             }
             for job in jobs {
-                if let Err(error) = self.process_one(&config, job.clone()).await {
+                if let Err(error) = self.process_one_with_lease(&config, job.clone()).await {
                     warn!(
                         "media relocation job {} failed at {}: {}",
                         job.id, job.stage, error
@@ -479,6 +677,36 @@ impl RelocationScheduler {
         ))
     }
 
+    async fn process_one_with_lease(
+        &self,
+        config: &OpenListConfig,
+        job: MediaRelocationJob,
+    ) -> Result<(), String> {
+        let lease_owner = job.lease_owner.clone().ok_or("迁移任务 lease owner 缺失")?;
+        let process = self.process_one(config, job.clone());
+        tokio::pin!(process);
+        loop {
+            tokio::select! {
+                result = &mut process => return result,
+                _ = tokio::time::sleep(Duration::from_secs(RELOCATION_LEASE_HEARTBEAT_SECONDS)) => {
+                    let renewed = self.db
+                        .renew_media_relocation_lease(
+                            job.id,
+                            job.version,
+                            &job.stage,
+                            &lease_owner,
+                            RELOCATION_LEASE_SECONDS,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if !renewed {
+                        return Err("迁移任务 lease 已变化，已停止当前处理".to_string());
+                    }
+                }
+            }
+        }
+    }
+
     async fn process_one(
         &self,
         config: &OpenListConfig,
@@ -494,6 +722,54 @@ impl RelocationScheduler {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("下载器 {downloader_id} 不存在"))?;
         let source_qb = self.pool.get(&downloader).await?;
+        if expected_stage != "waiting_download" {
+            validate_distinct_relocation_paths(&job)?;
+        }
+        if advanced_stage_requires_manifest(&expected_stage)
+            && decode_source_manifest(&job.source_manifest_json)?.is_none()
+        {
+            let torrents = source_qb
+                .list_torrents_by_hashes(&[job.infohash.clone()])
+                .await?;
+            let recovered = if torrents.is_empty() {
+                job.torrent_data
+                    .as_deref()
+                    .ok_or_else(|| "qB 中已无种子且导出的 torrent_data 缺失".to_string())
+                    .and_then(manifest_from_torrent_data)
+            } else {
+                normalize_torrent_manifest(source_qb.get_torrent_files(&job.infohash).await?)
+            };
+            match recovered.and_then(|manifest| {
+                validate_manifest_paths_snapshot(&manifest, &job.source_files_json)?;
+                Ok(manifest)
+            }) {
+                Ok(manifest) => {
+                    job.source_files_json = encode_manifest_paths(&manifest)?;
+                    job.source_manifest_json = serde_json::to_string(&manifest)
+                        .map_err(|error| format!("序列化恢复的种子文件大小快照失败: {error}"))?;
+                    job.manifest_cursor = manifest.len();
+                    job.next_attempt_at = Some(Utc::now().to_rfc3339());
+                    job.last_error = None;
+                }
+                Err(recovery_error) => {
+                    job.stage = "manifest_required".to_string();
+                    job.copy_lock_acquired = false;
+                    job.next_attempt_at = None;
+                    job.last_error = Some(format!(
+                        "旧迁移任务在阶段 {expected_stage} 无法恢复带大小的权威 manifest，已停止自动清理: {recovery_error}"
+                    ));
+                }
+            }
+            let updated = self
+                .db
+                .update_media_relocation_job(&job, expected_version, &expected_stage)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !updated {
+                return Err("迁移任务状态已被其他 worker 修改".to_string());
+            }
+            return Ok(());
+        }
         let target_qb = if expected_stage == "waiting_download" {
             None
         } else {
@@ -606,9 +882,12 @@ impl RelocationScheduler {
                 let content_openlist_path =
                     translate_path(&content_qb_path, &mapping.qb_path, &mapping.openlist_path)?;
                 let root_qb_path = normalize_optional_path(&torrent.root_path)?;
-                let source_files = normalize_torrent_file_paths(
-                    source_qb.get_torrent_files(&job.infohash).await?,
-                )?;
+                let source_manifest =
+                    normalize_torrent_manifest(source_qb.get_torrent_files(&job.infohash).await?)?;
+                let source_files = source_manifest
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect::<Vec<_>>();
                 let copy_items = torrent_top_level_items(&source_files)?;
                 job.source_qb_path = save_qb_path;
                 job.source_openlist_path = translate_path(
@@ -619,6 +898,8 @@ impl RelocationScheduler {
                 job.source_content_openlist_path = content_openlist_path;
                 job.source_files_json = serde_json::to_string(&source_files)
                     .map_err(|e| format!("序列化种子文件清单失败: {e}"))?;
+                job.source_manifest_json = serde_json::to_string(&source_manifest)
+                    .map_err(|e| format!("序列化种子文件大小快照失败: {e}"))?;
                 job.copy_items_json = serde_json::to_string(&copy_items)
                     .map_err(|e| format!("序列化种子顶级项目失败: {e}"))?;
                 job.target_openlist_path = join_path(&target.openlist_path, &relative_dir)?;
@@ -631,99 +912,312 @@ impl RelocationScheduler {
                 };
                 job.target_downloader_id = Some(target.downloader_id);
                 job.target_root_folder = Some(root_qb_path.is_some());
-                let mut tasks = Vec::new();
-                for item in &copy_items {
-                    tasks.extend(
-                        openlist
-                            .copy(&job.source_openlist_path, &job.target_openlist_path, item)
-                            .await?,
-                    );
-                }
-                job.openlist_task_id =
-                    encode_openlist_task_ids(tasks.iter().map(|task| task.id.clone()));
-                if tasks.is_empty() {
-                    mark_copy_succeeded(&mut job);
+                validate_distinct_relocation_paths(&job)?;
+                job.openlist_task_id = None;
+                job.copy_checkpoint_json = None;
+                job.copy_lock_acquired = false;
+                job.manifest_cursor = 0;
+                job.stage = "copy_reconcile".to_string();
+            }
+            "copy_reconcile" | "copy_legacy_reconcile" => {
+                if !self
+                    .acquire_copy_lock(&mut job, expected_version, &expected_stage)
+                    .await?
+                {
+                    job.next_attempt_at =
+                        Some((Utc::now() + ChronoDuration::seconds(30)).to_rfc3339());
+                } else if let Some(manifest) = decode_source_manifest(&job.source_manifest_json)? {
+                    let end = manifest_scan_end(job.manifest_cursor, manifest.len())?;
+                    let mut missing = None;
+                    for (index, file) in manifest
+                        .iter()
+                        .enumerate()
+                        .take(end)
+                        .skip(job.manifest_cursor)
+                    {
+                        match openlist
+                            .inspect_manifest_file(
+                                &job.source_openlist_path,
+                                &job.target_openlist_path,
+                                &file.path,
+                                file.size,
+                            )
+                            .await?
+                        {
+                            ManifestFileState::Present => {}
+                            ManifestFileState::Missing => {
+                                missing = Some((index, file.clone()));
+                                break;
+                            }
+                        }
+                        job.manifest_cursor = index + 1;
+                    }
+                    if let Some((index, file)) = missing {
+                        job.manifest_cursor = index;
+                        if expected_stage == "copy_legacy_reconcile" {
+                            job.stage = "copy_manual_review".to_string();
+                            job.next_attempt_at = None;
+                            job.last_error = Some(format!(
+                                "旧复制任务目标缺少 manifest 文件，未自动重提，请人工核验: {}",
+                                file.path
+                            ));
+                        } else {
+                            job.copy_checkpoint_json =
+                                Some(encode_copy_checkpoint(&CopyCheckpoint {
+                                    path: file.path,
+                                    size: file.size,
+                                    phase: CopyCheckpointPhase::Prepared,
+                                    submitted_at: None,
+                                })?);
+                            job.openlist_task_id = None;
+                            job.stage = "copy_submitting".to_string();
+                        }
+                    } else if job.manifest_cursor < manifest.len() {
+                        job.next_attempt_at = Some(Utc::now().to_rfc3339());
+                    } else {
+                        verify_openlist_manifest(&openlist, &job, &manifest, false).await?;
+                        if expected_stage == "copy_legacy_reconcile"
+                            && any_openlist_task_active(&openlist, &job).await?
+                        {
+                            job.stage = "copy_manual_review".to_string();
+                            job.next_attempt_at = None;
+                            job.last_error = Some(
+                                "旧 OpenList 复制任务仍在运行；只读 manifest 已核验，但在任务终止前不会释放锁或继续迁移"
+                                    .to_string(),
+                            );
+                        } else {
+                            let _source = find_completed_torrent(
+                                source_qb
+                                    .list_torrents_by_hashes(&[job.infohash.clone()])
+                                    .await?,
+                            )?;
+                            job.torrent_data = Some(source_qb.export_torrent(&job.infohash).await?);
+                            job.copy_checkpoint_json = None;
+                            job.openlist_task_id = None;
+                            job.copy_lock_acquired = false;
+                            job.stage = "torrent_exported".to_string();
+                        }
+                    }
                 } else {
-                    job.stage = "copying".to_string();
+                    let manifest = normalize_torrent_manifest(
+                        source_qb.get_torrent_files(&job.infohash).await?,
+                    )?;
+                    validate_manifest_paths_snapshot(&manifest, &job.source_files_json)?;
+                    job.source_files_json = encode_manifest_paths(&manifest)?;
+                    job.source_manifest_json = serde_json::to_string(&manifest)
+                        .map_err(|error| format!("序列化旧种子文件大小快照失败: {error}"))?;
+                    job.manifest_cursor = 0;
+                }
+            }
+            "copy_submitting" => {
+                if !self
+                    .acquire_copy_lock(&mut job, expected_version, &expected_stage)
+                    .await?
+                {
+                    job.next_attempt_at =
+                        Some((Utc::now() + ChronoDuration::seconds(30)).to_rfc3339());
+                } else {
+                    let mut checkpoint = decode_copy_checkpoint(
+                        job.copy_checkpoint_json
+                            .as_deref()
+                            .ok_or("复制 checkpoint 缺失")?,
+                    )?;
+                    let checkpoint_index = validate_checkpoint_against_manifest(
+                        &checkpoint,
+                        &job.source_manifest_json,
+                    )?;
+                    if checkpoint_index != job.manifest_cursor {
+                        return Err(format!(
+                            "复制 checkpoint 与 manifest cursor 不一致: {checkpoint_index} != {}",
+                            job.manifest_cursor
+                        ));
+                    }
+                    match openlist
+                        .inspect_manifest_file(
+                            &job.source_openlist_path,
+                            &job.target_openlist_path,
+                            &checkpoint.path,
+                            checkpoint.size,
+                        )
+                        .await?
+                    {
+                        ManifestFileState::Present => {
+                            job.manifest_cursor = checkpoint_index + 1;
+                            job.copy_checkpoint_json = None;
+                            job.openlist_task_id = None;
+                            job.stage = "copy_reconcile".to_string();
+                        }
+                        ManifestFileState::Missing => match checkpoint.phase {
+                            CopyCheckpointPhase::Prepared => {
+                                checkpoint.phase = CopyCheckpointPhase::Uncertain;
+                                checkpoint.submitted_at = Some(Utc::now().to_rfc3339());
+                                let checkpoint_json = encode_copy_checkpoint(&checkpoint)?;
+                                let owner = job
+                                    .lease_owner
+                                    .as_deref()
+                                    .ok_or("迁移任务 lease owner 缺失")?;
+                                let checkpointed = self
+                                    .db
+                                    .checkpoint_media_relocation_copy_submission(
+                                        job.id,
+                                        expected_version,
+                                        &expected_stage,
+                                        owner,
+                                        &checkpoint_json,
+                                    )
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                                if !checkpointed {
+                                    return Err(
+                                        "复制提交前 checkpoint 写入失败，已拒绝调用 OpenList"
+                                            .to_string(),
+                                    );
+                                }
+                                job.copy_checkpoint_json = Some(checkpoint_json);
+                                let tasks = openlist
+                                    .copy_manifest_file(
+                                        &job.source_openlist_path,
+                                        &job.target_openlist_path,
+                                        &checkpoint.path,
+                                        checkpoint.size,
+                                    )
+                                    .await?;
+                                job.openlist_task_id = encode_openlist_task_ids(
+                                    tasks.iter().map(|task| task.id.clone()),
+                                );
+                                if tasks.is_empty() {
+                                    job.next_attempt_at = Some(
+                                        (Utc::now() + ChronoDuration::seconds(10)).to_rfc3339(),
+                                    );
+                                } else {
+                                    job.stage = "copying".to_string();
+                                    job.next_attempt_at = Some(
+                                        (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339(),
+                                    );
+                                }
+                            }
+                            CopyCheckpointPhase::Uncertain => {
+                                let now = Utc::now();
+                                match uncertain_submission_next_check(&checkpoint, now)? {
+                                    Some(next_check) => {
+                                        job.next_attempt_at = Some(next_check.to_rfc3339());
+                                    }
+                                    None => {
+                                        job.stage = "copy_manual_review".to_string();
+                                        job.next_attempt_at = None;
+                                        job.last_error = Some(format!(
+                                            "OpenList 复制提交结果不确定且目标文件仍未出现，已拒绝自动重复提交，请人工核验后调用 resolve-copy: {}",
+                                            checkpoint.path
+                                        ));
+                                    }
+                                }
+                            }
+                        },
+                    }
                 }
             }
             "copying" => {
-                let task_ids = decode_openlist_task_ids(
-                    job.openlist_task_id.as_deref().ok_or("复制任务 ID 缺失")?,
-                );
-                if task_ids.is_empty() {
-                    return Err("复制任务 ID 缺失".to_string());
-                }
-                let mut all_succeeded = true;
-                for task_id in task_ids {
-                    let task = openlist.task_info(&task_id).await?;
-                    if task.terminal_failure() {
-                        return Err(format!("OpenList 复制失败: {}", task.error));
-                    }
-                    if !task.succeeded() {
-                        all_succeeded = false;
-                    }
-                }
-                if all_succeeded {
-                    mark_copy_succeeded(&mut job);
-                } else {
+                if !self
+                    .acquire_copy_lock(&mut job, expected_version, &expected_stage)
+                    .await?
+                {
                     job.next_attempt_at =
                         Some((Utc::now() + ChronoDuration::seconds(30)).to_rfc3339());
+                } else {
+                    let task_ids = job
+                        .openlist_task_id
+                        .as_deref()
+                        .map(decode_openlist_task_ids)
+                        .unwrap_or_default();
+                    if task_ids.is_empty() {
+                        job.stage = "copy_manual_review".to_string();
+                        job.next_attempt_at = None;
+                        job.last_error = Some(
+                            "复制任务 ID 缺失，无法证明原任务已终止；已拒绝自动重提".to_string(),
+                        );
+                    } else {
+                        let mut observations = Vec::with_capacity(task_ids.len());
+                        let mut failure_messages = Vec::new();
+                        for task_id in task_ids {
+                            match openlist.task_info_if_exists(&task_id).await? {
+                                None => observations.push(CopyTaskObservation::Missing),
+                                Some(task) if task.terminal_failure() => {
+                                    observations.push(CopyTaskObservation::Failed);
+                                    if !task.error.trim().is_empty() {
+                                        failure_messages.push(task.error);
+                                    }
+                                }
+                                Some(task) if task.succeeded() => {
+                                    observations.push(CopyTaskObservation::Succeeded);
+                                }
+                                Some(_) => observations.push(CopyTaskObservation::Pending),
+                            }
+                        }
+                        match decide_copy_tasks(&observations)? {
+                            CopyTaskDecision::Wait => {
+                                if checkpoint_pending_timed_out(
+                                    job.copy_checkpoint_json.as_deref(),
+                                    Utc::now(),
+                                )? {
+                                    job.stage = "copy_manual_review".to_string();
+                                    job.next_attempt_at = None;
+                                    job.last_error = Some(
+                                        "OpenList 复制任务长时间未终止，已停止自动轮询并保留目标锁；请人工 recheck 或确认终止后 force_retry/cancel"
+                                            .to_string(),
+                                    );
+                                } else {
+                                    job.next_attempt_at = Some(
+                                        (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339(),
+                                    );
+                                }
+                            }
+                            CopyTaskDecision::AllFailed => {
+                                if job.copy_checkpoint_json.is_some() {
+                                    warn!(
+                                        "all OpenList copy tasks for relocation job {} failed: {}",
+                                        job.id,
+                                        failure_messages.join("; ")
+                                    );
+                                    job.openlist_task_id = None;
+                                    job.copy_checkpoint_json = None;
+                                    job.stage = "copy_reconcile".to_string();
+                                    job.next_attempt_at = Some(
+                                        (Utc::now()
+                                            + ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS))
+                                        .to_rfc3339(),
+                                    );
+                                } else {
+                                    job.stage = "copy_manual_review".to_string();
+                                    job.next_attempt_at = None;
+                                    job.last_error = Some(
+                                        "旧复制任务全部失败，但缺少逐文件 checkpoint；已拒绝自动重提"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            CopyTaskDecision::VerifyTarget => {
+                                job.stage = prepare_read_only_copy_reconcile(
+                                    &mut job.copy_checkpoint_json,
+                                    Utc::now(),
+                                )?
+                                .to_string();
+                                job.next_attempt_at = Some(
+                                    (Utc::now()
+                                        + ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS))
+                                    .to_rfc3339(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             "copy_succeeded" => {
-                let _source = find_completed_torrent(
-                    source_qb
-                        .list_torrents_by_hashes(&[job.infohash.clone()])
-                        .await?,
-                )?;
-                let source_files = decode_string_list(&job.source_files_json, "种子文件清单")?;
-                let copy_items = decode_string_list(&job.copy_items_json, "种子顶级项目")?;
-                let mut repair_required = false;
-                for file in &source_files {
-                    let source_path = join_path(&job.source_openlist_path, file)?;
-                    let copied_path = join_path(&job.target_openlist_path, file)?;
-                    let source_object = openlist.stat(&source_path).await?;
-                    if source_object.is_dir {
-                        return Err(format!("qB 文件清单项目不是文件: {file}"));
-                    }
-                    match openlist.stat_if_exists(&copied_path).await? {
-                        Some(copied) if !copied.is_dir && copied.size == source_object.size => {}
-                        Some(copied) if copied.is_dir => {
-                            return Err(format!(
-                                "目标路径应为文件但实际是目录，已拒绝自动覆盖: {copied_path}"
-                            ));
-                        }
-                        Some(_) => {
-                            let (target_dir, target_name) = parent_and_name(&copied_path)?;
-                            openlist.remove_if_exists(&target_dir, &target_name).await?;
-                            repair_required = true;
-                        }
-                        None => repair_required = true,
-                    }
-                }
-                if repair_required {
-                    let mut tasks = Vec::new();
-                    for item in &copy_items {
-                        tasks.extend(
-                            openlist
-                                .copy(&job.source_openlist_path, &job.target_openlist_path, item)
-                                .await?,
-                        );
-                    }
-                    job.openlist_task_id =
-                        encode_openlist_task_ids(tasks.iter().map(|task| task.id.clone()));
-                    if tasks.is_empty() {
-                        mark_copy_succeeded(&mut job);
-                    } else {
-                        job.stage = "copying".to_string();
-                        job.next_attempt_at =
-                            Some((Utc::now() + ChronoDuration::seconds(10)).to_rfc3339());
-                    }
-                } else {
-                    job.torrent_data = Some(source_qb.export_torrent(&job.infohash).await?);
-                    job.stage = "torrent_exported".to_string();
-                }
+                // Compatibility with jobs persisted by older versions. The authoritative
+                // manifest reconciliation below is required before export and source removal.
+                job.openlist_task_id = None;
+                job.copy_checkpoint_json = None;
+                job.manifest_cursor = 0;
+                job.stage = "copy_legacy_reconcile".to_string();
             }
             "torrent_exported" => {
                 let existing = source_qb
@@ -811,14 +1305,16 @@ impl RelocationScheduler {
                     job.next_attempt_at =
                         Some((Utc::now() + ChronoDuration::seconds(10)).to_rfc3339());
                 } else {
-                    let source_files = decode_string_list(&job.source_files_json, "种子文件清单")?;
-                    if source_files.is_empty() {
-                        return Err("种子文件清单为空，已拒绝自动删除源文件".to_string());
-                    }
+                    let manifest = decode_source_manifest(&job.source_manifest_json)?
+                        .ok_or("带大小的权威种子 manifest 为空，已拒绝自动删除源文件")?;
+                    validate_manifest_paths_snapshot(&manifest, &job.source_files_json)?;
                     let referenced_by_other_torrents =
                         source_paths_referenced_by_other_torrents(source_qb.as_ref(), &job).await?;
-                    for file in &source_files {
-                        let path = join_path(&job.source_openlist_path, file)?;
+                    // This full source/target verification is intentionally adjacent to source
+                    // deletion. Earlier cursor checks are only progress checkpoints.
+                    verify_openlist_manifest(&openlist, &job, &manifest, true).await?;
+                    for file in &manifest {
+                        let path = join_path(&job.source_openlist_path, &file.path)?;
                         if referenced_by_other_torrents.contains(&path) {
                             warn!(
                                 "media relocation job {} retained source file referenced by another torrent: {}",
@@ -826,12 +1322,19 @@ impl RelocationScheduler {
                             );
                             continue;
                         }
-                        let (source_dir, source_name) = parent_and_name(&path)?;
-                        openlist.remove_if_exists(&source_dir, &source_name).await?;
-                    }
-                    for directory in manifest_parent_directories(&source_files) {
-                        let path = join_path(&job.source_openlist_path, &directory)?;
-                        openlist.remove_empty_directory_if_exists(&path).await?;
+                        if !verify_openlist_manifest_file(&openlist, &job, file, true).await? {
+                            continue;
+                        }
+                        // OpenList has no conditional delete primitive. The removal helper
+                        // re-stats the source once more to minimize, but cannot eliminate, the
+                        // server-side stat-to-remove race.
+                        openlist
+                            .remove_manifest_file_if_exists(
+                                &job.source_openlist_path,
+                                &file.path,
+                                file.size,
+                            )
+                            .await?;
                     }
                     job.stage = "source_removed".to_string();
                 }
@@ -848,7 +1351,12 @@ impl RelocationScheduler {
             "completed" | "cancelled" => return Ok(()),
             stage => return Err(format!("未知迁移阶段: {stage}")),
         }
-        job.last_error = None;
+        if !matches!(
+            job.stage.as_str(),
+            "copy_manual_review" | "manifest_required"
+        ) {
+            job.last_error = None;
+        }
         let updated = self
             .db
             .update_media_relocation_job(&job, expected_version, &expected_stage)
@@ -860,18 +1368,49 @@ impl RelocationScheduler {
         Ok(())
     }
 
+    async fn acquire_copy_lock(
+        &self,
+        job: &mut MediaRelocationJob,
+        expected_version: i64,
+        expected_stage: &str,
+    ) -> Result<bool, String> {
+        if job.copy_lock_acquired {
+            return Ok(true);
+        }
+        let owner = job
+            .lease_owner
+            .as_deref()
+            .ok_or("迁移任务 lease owner 缺失")?;
+        let acquired = self
+            .db
+            .try_acquire_media_relocation_target_lock(
+                job.id,
+                expected_version,
+                expected_stage,
+                owner,
+                &job.target_openlist_path,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if acquired {
+            job.copy_lock_acquired = true;
+        }
+        Ok(acquired)
+    }
+
     async fn record_retry(&self, mut job: MediaRelocationJob, error: String) {
-        let expected_version = job.version;
-        let expected_stage = job.stage.clone();
         job.attempts = job.attempts.saturating_add(1);
         job.last_error = Some(error);
         let backoff = 30_i64.saturating_mul(1_i64 << job.attempts.min(6));
         job.next_attempt_at = Some((Utc::now() + ChronoDuration::seconds(backoff)).to_rfc3339());
-        match self
-            .db
-            .update_media_relocation_job(&job, expected_version, &expected_stage)
-            .await
-        {
+        let Some(_) = job.lease_owner.as_deref() else {
+            error!(
+                "failed to record media relocation job {} error because lease owner is missing",
+                job.id
+            );
+            return;
+        };
+        match self.db.record_media_relocation_retry(&job).await {
             Ok(true) => {}
             Ok(false) => error!(
                 "failed to record media relocation job {} error because its state changed",
@@ -919,12 +1458,6 @@ fn relocation_scheduler_delay(
         .max(0) as u64;
     let remaining_secs = remaining_ms.saturating_add(999) / 1_000;
     configured_delay_secs.min(remaining_secs.max(5))
-}
-
-fn mark_copy_succeeded(job: &mut MediaRelocationJob) {
-    job.stage = "copy_succeeded".to_string();
-    job.next_attempt_at =
-        Some((Utc::now() + ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS)).to_rfc3339());
 }
 
 async fn confirm_target_qb_torrent(
@@ -1034,8 +1567,9 @@ async fn validate_target_torrent_manifest(
     target_qb: &dyn DownloaderClient,
     job: &MediaRelocationJob,
 ) -> Result<(), String> {
-    let expected = decode_string_list(&job.source_files_json, "源种子文件清单")?;
-    let actual = normalize_torrent_file_paths(target_qb.get_torrent_files(&job.infohash).await?)?;
+    let actual = normalize_torrent_manifest(target_qb.get_torrent_files(&job.infohash).await?)?;
+    let expected = decode_source_manifest(&job.source_manifest_json)?
+        .ok_or("目标 qB 校验缺少带大小的权威源 manifest")?;
     if actual != expected {
         return Err("目标 qB 的种子文件结构与源种子不一致，已拒绝删除源文件".to_string());
     }
@@ -1112,19 +1646,32 @@ fn relative_path(path: &str, root: &str) -> Result<String, String> {
 }
 
 fn normalize_torrent_file_paths(files: Vec<TorrentFileInfo>) -> Result<Vec<String>, String> {
+    Ok(normalize_torrent_manifest(files)?
+        .into_iter()
+        .map(|file| file.path)
+        .collect())
+}
+
+fn normalize_torrent_manifest(files: Vec<TorrentFileInfo>) -> Result<Vec<ManifestFile>, String> {
     let mut normalized = std::collections::BTreeMap::new();
     for file in files {
         let path = normalize_manifest_path(&file.path)?;
-        if let Some(previous_size) = normalized.insert(path.clone(), file.size) {
-            if previous_size != file.size {
-                return Err(format!("种子文件清单包含冲突路径: {path}"));
-            }
+        if file.size < 0 {
+            return Err(format!("种子文件大小无效: {path}={}", file.size));
+        }
+        if let Some(previous_size) = normalized.insert(path.clone(), file.size)
+            && previous_size != file.size
+        {
+            return Err(format!("种子文件清单包含冲突路径: {path}"));
         }
     }
     if normalized.is_empty() {
         return Err("种子文件清单为空".to_string());
     }
-    Ok(normalized.into_keys().collect())
+    Ok(normalized
+        .into_iter()
+        .map(|(path, size)| ManifestFile { path, size })
+        .collect())
 }
 
 fn normalize_manifest_path(path: &str) -> Result<String, String> {
@@ -1166,25 +1713,296 @@ fn decode_string_list(value: &str, label: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn manifest_parent_directories(files: &[String]) -> Vec<String> {
-    let mut directories = std::collections::BTreeSet::new();
-    for file in files {
-        let mut parts = file.split('/').collect::<Vec<_>>();
-        parts.pop();
-        while !parts.is_empty() {
-            directories.insert(parts.join("/"));
-            parts.pop();
-        }
+fn decode_source_manifest(value: &str) -> Result<Option<Vec<ManifestFile>>, String> {
+    let files = serde_json::from_str::<Vec<ManifestFile>>(value)
+        .map_err(|error| format!("解析种子文件大小快照失败: {error}"))?;
+    if files.is_empty() {
+        return Ok(None);
     }
-    let mut directories = directories.into_iter().collect::<Vec<_>>();
-    directories.sort_by(|left, right| {
-        right
-            .matches('/')
-            .count()
-            .cmp(&left.matches('/').count())
-            .then_with(|| right.cmp(left))
-    });
-    directories
+    let normalized = normalize_torrent_manifest(
+        files
+            .into_iter()
+            .map(|file| TorrentFileInfo {
+                path: file.path,
+                size: file.size,
+            })
+            .collect(),
+    )?;
+    Ok(Some(normalized))
+}
+
+fn encode_manifest_paths(manifest: &[ManifestFile]) -> Result<String, String> {
+    serde_json::to_string(
+        &manifest
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| format!("序列化种子文件路径快照失败: {error}"))
+}
+
+fn manifest_from_torrent_data(data: &[u8]) -> Result<Vec<ManifestFile>, String> {
+    let files = torrent_file_manifest(data)
+        .map_err(|error| format!("解析导出的 torrent_data manifest 失败: {error}"))?;
+    normalize_torrent_manifest(
+        files
+            .into_iter()
+            .map(|file| TorrentFileInfo {
+                path: file.path,
+                size: file.size,
+            })
+            .collect(),
+    )
+}
+
+fn validate_manifest_paths_snapshot(
+    manifest: &[ManifestFile],
+    paths_json: &str,
+) -> Result<(), String> {
+    let paths = decode_string_list(paths_json, "种子文件路径快照")?;
+    if paths.is_empty()
+        || paths
+            == manifest
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+    {
+        Ok(())
+    } else {
+        Err("带大小的权威 manifest 与原种子文件路径快照不一致".to_string())
+    }
+}
+
+async fn verify_openlist_manifest(
+    openlist: &OpenListClient,
+    job: &MediaRelocationJob,
+    manifest: &[ManifestFile],
+    allow_missing_source: bool,
+) -> Result<(), String> {
+    if manifest.is_empty() {
+        return Err("带大小的权威 manifest 为空".to_string());
+    }
+    for file in manifest {
+        verify_openlist_manifest_file(openlist, job, file, allow_missing_source).await?;
+    }
+    Ok(())
+}
+
+async fn verify_openlist_manifest_file(
+    openlist: &OpenListClient,
+    job: &MediaRelocationJob,
+    file: &ManifestFile,
+    allow_missing_source: bool,
+) -> Result<bool, String> {
+    let expected_name = file.path.rsplit('/').next().unwrap_or_default();
+    let source_path = join_path(&job.source_openlist_path, &file.path)?;
+    let source_exists = match openlist.stat_if_exists(&source_path).await? {
+        Some(source) => {
+            validate_openlist_manifest_object(
+                &source,
+                expected_name,
+                file.size,
+                "源",
+                &source_path,
+            )?;
+            true
+        }
+        None if allow_missing_source => false,
+        None => return Err(format!("OpenList 源 manifest 文件不存在: {source_path}")),
+    };
+    let target_path = join_path(&job.target_openlist_path, &file.path)?;
+    let target = openlist
+        .stat_if_exists(&target_path)
+        .await?
+        .ok_or_else(|| format!("OpenList 目标 manifest 文件不存在: {target_path}"))?;
+    validate_openlist_manifest_object(&target, expected_name, file.size, "目标", &target_path)?;
+    Ok(source_exists)
+}
+
+fn validate_openlist_manifest_object(
+    object: &crate::openlist::OpenListObject,
+    expected_name: &str,
+    expected_size: i64,
+    side: &str,
+    path: &str,
+) -> Result<(), String> {
+    if object.is_dir {
+        return Err(format!(
+            "OpenList {side} manifest 路径是目录而非文件: {path}"
+        ));
+    }
+    if object.name != expected_name {
+        return Err(format!(
+            "OpenList {side} manifest 文件名不匹配: {:?} != {:?}",
+            object.name, expected_name
+        ));
+    }
+    if object.size != expected_size {
+        return Err(format!(
+            "OpenList {side} manifest 文件大小不匹配: {path} ({} != {expected_size})",
+            object.size
+        ));
+    }
+    Ok(())
+}
+
+fn advanced_stage_requires_manifest(stage: &str) -> bool {
+    matches!(
+        stage,
+        "torrent_exported" | "source_qb_removed" | "target_qb_submitted" | "target_qb_starting"
+    )
+}
+
+fn validate_distinct_relocation_paths(job: &MediaRelocationJob) -> Result<(), String> {
+    validate_distinct_path_pairs(
+        &job.source_openlist_path,
+        &job.target_openlist_path,
+        &job.source_qb_path,
+        &job.target_qb_path,
+    )
+}
+
+fn validate_distinct_path_pairs(
+    source_openlist: &str,
+    target_openlist: &str,
+    source_qb: &str,
+    target_qb: &str,
+) -> Result<(), String> {
+    let source_openlist = normalize_path(source_openlist)?;
+    let target_openlist = normalize_path(target_openlist)?;
+    if source_openlist == target_openlist {
+        return Err(format!(
+            "源与目标 OpenList 路径相同，已拒绝迁移: {source_openlist}"
+        ));
+    }
+    let source_qb = normalize_path(source_qb)?;
+    let target_qb = normalize_path(target_qb)?;
+    if source_qb == target_qb {
+        return Err(format!("源与目标 qB 路径相同，已拒绝迁移: {source_qb}"));
+    }
+    Ok(())
+}
+
+fn manifest_scan_end(cursor: usize, manifest_len: usize) -> Result<usize, String> {
+    if cursor > manifest_len {
+        return Err(format!("manifest cursor 越界: {cursor} > {manifest_len}"));
+    }
+    Ok(cursor
+        .saturating_add(MANIFEST_FILES_PER_PASS)
+        .min(manifest_len))
+}
+
+fn decide_copy_tasks(observations: &[CopyTaskObservation]) -> Result<CopyTaskDecision, String> {
+    if observations.is_empty() {
+        return Err("OpenList 复制任务观察结果为空".to_string());
+    }
+    if observations.contains(&CopyTaskObservation::Pending) {
+        return Ok(CopyTaskDecision::Wait);
+    }
+    if observations
+        .iter()
+        .all(|state| *state == CopyTaskObservation::Failed)
+    {
+        return Ok(CopyTaskDecision::AllFailed);
+    }
+    Ok(CopyTaskDecision::VerifyTarget)
+}
+
+fn prepare_read_only_copy_reconcile(
+    checkpoint_json: &mut Option<String>,
+    now: chrono::DateTime<Utc>,
+) -> Result<&'static str, String> {
+    let Some(value) = checkpoint_json.as_deref() else {
+        return Ok("copy_legacy_reconcile");
+    };
+    let mut checkpoint = decode_copy_checkpoint(value)?;
+    checkpoint.phase = CopyCheckpointPhase::Uncertain;
+    checkpoint
+        .submitted_at
+        .get_or_insert_with(|| now.to_rfc3339());
+    *checkpoint_json = Some(encode_copy_checkpoint(&checkpoint)?);
+    Ok("copy_submitting")
+}
+
+fn checkpoint_pending_timed_out(
+    checkpoint_json: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> Result<bool, String> {
+    let Some(value) = checkpoint_json else {
+        return Ok(false);
+    };
+    let checkpoint = decode_copy_checkpoint(value)?;
+    let Some(submitted_at) = checkpoint.submitted_at.as_deref() else {
+        return Ok(false);
+    };
+    let submitted_at = chrono::DateTime::parse_from_rfc3339(submitted_at)
+        .map_err(|error| format!("解析复制 checkpoint 提交时间失败: {error}"))?
+        .with_timezone(&Utc);
+    Ok(now.signed_duration_since(submitted_at)
+        >= ChronoDuration::seconds(COPY_TASK_PENDING_MANUAL_SECONDS))
+}
+
+fn encode_copy_checkpoint(checkpoint: &CopyCheckpoint) -> Result<String, String> {
+    serde_json::to_string(checkpoint)
+        .map_err(|error| format!("序列化 OpenList 复制 checkpoint 失败: {error}"))
+}
+
+fn decode_copy_checkpoint(value: &str) -> Result<CopyCheckpoint, String> {
+    let mut checkpoint = serde_json::from_str::<CopyCheckpoint>(value)
+        .map_err(|error| format!("解析 OpenList 复制 checkpoint 失败: {error}"))?;
+    checkpoint.path = normalize_manifest_path(&checkpoint.path)?;
+    if checkpoint.size < 0 {
+        return Err(format!(
+            "OpenList 复制 checkpoint 文件大小无效: {}={}",
+            checkpoint.path, checkpoint.size
+        ));
+    }
+    Ok(checkpoint)
+}
+
+fn validate_checkpoint_against_manifest(
+    checkpoint: &CopyCheckpoint,
+    manifest_json: &str,
+) -> Result<usize, String> {
+    let manifest = decode_source_manifest(manifest_json)?
+        .ok_or("种子文件大小快照缺失，无法校验复制 checkpoint")?;
+    manifest
+        .iter()
+        .position(|file| file.path == checkpoint.path && file.size == checkpoint.size)
+        .ok_or_else(|| {
+            format!(
+                "OpenList 复制 checkpoint 不在权威种子清单中: {}",
+                checkpoint.path
+            )
+        })
+}
+
+fn copy_submission_attention_at(
+    checkpoint: &CopyCheckpoint,
+) -> Result<chrono::DateTime<Utc>, String> {
+    let submitted_at = checkpoint
+        .submitted_at
+        .as_deref()
+        .ok_or("uncertain 复制 checkpoint 缺少提交时间")?;
+    let submitted_at = chrono::DateTime::parse_from_rfc3339(submitted_at)
+        .map_err(|error| format!("解析复制 checkpoint 提交时间失败: {error}"))?
+        .with_timezone(&Utc);
+    Ok(submitted_at + ChronoDuration::seconds(COPY_SUBMISSION_ATTENTION_SECONDS))
+}
+
+fn uncertain_submission_next_check(
+    checkpoint: &CopyCheckpoint,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<chrono::DateTime<Utc>>, String> {
+    let attention_at = copy_submission_attention_at(checkpoint)?;
+    if attention_at <= now {
+        Ok(None)
+    } else {
+        Ok(Some(std::cmp::min(
+            attention_at,
+            now + ChronoDuration::seconds(30),
+        )))
+    }
 }
 
 fn valid_infohash(value: &str) -> bool {
