@@ -235,6 +235,30 @@ impl OpenListClient {
         }
     }
 
+    pub async fn create_directory_tree_if_missing(&self, path: &str) -> Result<(), String> {
+        if path == "/" {
+            return Ok(());
+        }
+        if !path.starts_with('/') || path.contains('\0') || path.contains('\\') {
+            return Err(format!("OpenList 目标目录路径无效: {path:?}"));
+        }
+        let components = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect::<Vec<_>>();
+        if components.is_empty() || components.iter().any(|name| !valid_child_name(name)) {
+            return Err(format!("OpenList 目标目录路径无效: {path:?}"));
+        }
+
+        let mut current = String::new();
+        for component in components {
+            current.push('/');
+            current.push_str(component);
+            self.create_directory_if_missing(&current).await?;
+        }
+        Ok(())
+    }
+
     pub async fn inspect_manifest_file(
         &self,
         src_root: &str,
@@ -251,7 +275,7 @@ impl OpenListClient {
         let (file_name, directories) = components
             .split_last()
             .ok_or_else(|| "OpenList manifest 文件路径为空".to_string())?;
-        self.create_directory_if_missing(dst_root).await?;
+        self.create_directory_tree_if_missing(dst_root).await?;
         let (source_dir, target_dir) = self
             .ensure_manifest_directories(src_root.to_string(), dst_root.to_string(), directories)
             .await?;
@@ -817,6 +841,60 @@ mod tests {
         assert_eq!(
             state.mkdirs,
             vec!["/dst/Show".to_string(), "/dst/Show/Season".to_string()]
+        );
+        drop(state);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn manifest_copy_creates_only_missing_target_directories_top_down() {
+        let mut fake = FakeOpenListState::default();
+        fake.mkdir_visibility_delay = 2;
+        for (path, value) in [
+            ("/cmcc", object("cmcc", 0, true)),
+            ("/cmcc/Download", object("Download", 0, true)),
+            ("/src/Show", object("Show", 0, true)),
+            ("/src/Show/E01.mkv", object("E01.mkv", 300, false)),
+        ] {
+            fake.objects.insert(path.to_string(), value);
+        }
+        let state = Arc::new(Mutex::new(fake));
+        let app = Router::new()
+            .route("/api/fs/get", post(fake_get))
+            .route("/api/fs/mkdir", post(fake_mkdir))
+            .route("/api/fs/copy", post(fake_copy))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OpenListClient::new(&format!("http://{address}"), "test-key").unwrap();
+        client
+            .copy_manifest_file(
+                "/src",
+                "/cmcc/Download/media/2024",
+                "Show/E01.mkv",
+                300,
+            )
+            .await
+            .unwrap();
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.mkdirs,
+            vec![
+                "/cmcc/Download/media".to_string(),
+                "/cmcc/Download/media/2024".to_string(),
+                "/cmcc/Download/media/2024/Show".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.copies,
+            vec![(
+                "/src/Show".to_string(),
+                "/cmcc/Download/media/2024/Show".to_string(),
+                "E01.mkv".to_string(),
+            )]
         );
         drop(state);
         server.abort();
