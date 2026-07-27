@@ -6,6 +6,7 @@ import {
   Download,
   FileText,
   HardDrive,
+  FolderInput,
   History,
   LayoutDashboard,
   Menu,
@@ -45,6 +46,7 @@ type AppPage =
   | "history"
   | "sites"
   | "downloaders"
+  | "torrent-transfer"
   | "brush-tasks"
   | "sign-in"
   | "tag-rules"
@@ -59,6 +61,7 @@ const SettingsPage = lazy(() => import("@/pages/settings-page").then((module) =>
 const TasksPage = lazy(() => import("@/pages/tasks-page").then((module) => ({ default: module.TasksPage })));
 const SitesPage = lazy(() => import("@/pages/sites-page").then((module) => ({ default: module.SitesPage })));
 const DownloadersPage = lazy(() => import("@/pages/downloaders-page").then((module) => ({ default: module.DownloadersPage })));
+const TorrentTransferPage = lazy(() => import("@/pages/torrent-transfer-page").then((module) => ({ default: module.TorrentTransferPage })));
 const BrushTasksPage = lazy(() => import("@/pages/brush-tasks-page").then((module) => ({ default: module.BrushTasksPage })));
 const SignInPage = lazy(() => import("@/pages/sign-in-page").then((module) => ({ default: module.SignInPage })));
 const TagRulesPage = lazy(() => import("@/pages/tag-rules-page").then((module) => ({ default: module.TagRulesPage })));
@@ -97,6 +100,13 @@ const navItems: Array<{
     label: "下载器",
     description: "管理下载客户端与空间状态",
     icon: HardDrive,
+    group: "brush",
+  },
+  {
+    key: "torrent-transfer",
+    label: "种子转移",
+    description: "选择 qBittorrent 种子并跟踪 OpenList 转移进度",
+    icon: FolderInput,
     group: "brush",
   },
   {
@@ -175,6 +185,7 @@ function readPageFromHash(): AppPage {
     "history",
     "sites",
     "downloaders",
+    "torrent-transfer",
     "brush-tasks",
     "sign-in",
     "tag-rules",
@@ -736,6 +747,7 @@ export default function App() {
               {page === "history" ? <HistoryPage history={history} /> : null}
               {page === "sites" ? <SitesPage /> : null}
               {page === "downloaders" ? <DownloadersPage /> : null}
+              {page === "torrent-transfer" ? <TorrentTransferPage /> : null}
               {page === "brush-tasks" ? <BrushTasksPage /> : null}
               {page === "sign-in" ? <SignInPage /> : null}
               {page === "tag-rules" ? <TagRulesPage /> : null}

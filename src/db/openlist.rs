@@ -77,6 +77,52 @@ pub struct MediaRelocationJob {
 }
 
 impl Database {
+    pub async fn list_manual_media_relocation_jobs(
+        &self,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(Vec<MediaRelocationJob>, usize), AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let page = page.max(1);
+            let page_size = page_size.clamp(1, 100);
+            let total = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM media_relocation_jobs WHERE media_download_id IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sql_error)?
+                .max(0) as usize;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, media_download_id, downloader_id, infohash, source_qb_path,
+                            source_openlist_path, target_openlist_path, target_qb_path, torrent_name,
+                            stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
+                            lease_owner, lease_until, version, last_error, created_at, updated_at,
+                            completed_at, source_content_openlist_path, target_content_qb_path,
+                            target_downloader_id, copy_items_json, source_files_json,
+                            target_root_folder, source_manifest_json, copy_checkpoint_json,
+                            copy_lock_acquired, manifest_cursor
+                     FROM media_relocation_jobs WHERE media_download_id IS NULL
+                     ORDER BY id DESC LIMIT ? OFFSET ?",
+                )
+                .map_err(sql_error)?;
+            let records = stmt
+                .query_map(
+                    [page_size as i64, ((page - 1) * page_size) as i64],
+                    map_media_relocation_job,
+                )
+                .map_err(sql_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(sql_error)?;
+            Ok((records, total))
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn enqueue_manual_media_relocation_jobs(
         &self,
         downloader_id: i64,
@@ -1181,5 +1227,27 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].media_download_id, None);
         assert_eq!(jobs[0].torrent_name, "manual torrent");
+
+        let second = vec![(
+            "0123456789012345678901234567890123456789".to_string(),
+            "newer manual torrent".to_string(),
+        )];
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(downloader_id, &second)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+        let (first_page, total) = db
+            .list_manual_media_relocation_jobs(1, 1)
+            .await
+            .unwrap();
+        let (second_page, _) = db
+            .list_manual_media_relocation_jobs(2, 1)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(first_page[0].torrent_name, "newer manual torrent");
+        assert_eq!(second_page[0].torrent_name, "manual torrent");
     }
 }

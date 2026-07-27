@@ -598,6 +598,7 @@ fn media_router(
                 get(get_openlist_config).put(update_openlist_config),
             )
             .route("/openlist/jobs", get(list_openlist_jobs))
+            .route("/openlist/manual-jobs", get(list_manual_openlist_jobs))
             .route(
                 "/openlist/jobs/{id}/resolve-copy",
                 post(resolve_openlist_copy),
@@ -703,6 +704,40 @@ async fn list_openlist_jobs(
         .await
         .map_err(media_app_error)?;
     Ok(Json(jobs.into_iter().map(Into::into).collect()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ManualOpenListJobsQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManualOpenListJobsResponse {
+    page: usize,
+    page_size: usize,
+    total: usize,
+    records: Vec<OpenListJobResponse>,
+}
+
+async fn list_manual_openlist_jobs(
+    State(state): State<MediaApiState>,
+    Query(query): Query<ManualOpenListJobsQuery>,
+) -> Result<Json<ManualOpenListJobsResponse>, ApiError> {
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let (records, total) = state
+        .service
+        .database()
+        .list_manual_media_relocation_jobs(page, page_size)
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(ManualOpenListJobsResponse {
+        page,
+        page_size,
+        total,
+        records: records.into_iter().map(OpenListJobResponse::from).collect(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
