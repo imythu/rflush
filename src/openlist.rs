@@ -8,6 +8,9 @@ use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+const DIRECTORY_VISIBILITY_ATTEMPTS: usize = 20;
+const DIRECTORY_VISIBILITY_DELAY: Duration = Duration::from_millis(250);
+
 type ManifestDirectoryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(String, String), String>> + Send + 'a>>;
 
@@ -208,17 +211,26 @@ impl OpenListClient {
             Some(object) if object.is_dir => Ok(()),
             Some(_) => Err(format!("OpenList 目标路径应为目录但实际是文件: {path}")),
             None => {
-                match self
+                let create_result = self
                     .post_empty("/api/fs/mkdir", &MkdirRequest { path })
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(create_error) => match self.stat_if_exists(path).await? {
-                        Some(object) if object.is_dir => Ok(()),
-                        Some(_) => Err(format!("OpenList 目标路径应为目录但实际是文件: {path}")),
-                        None => Err(create_error),
-                    },
+                    .await;
+                for attempt in 0..DIRECTORY_VISIBILITY_ATTEMPTS {
+                    match self.stat_if_exists(path).await? {
+                        Some(object) if object.is_dir => return Ok(()),
+                        Some(_) => {
+                            return Err(format!(
+                                "OpenList 目标路径应为目录但实际是文件: {path}"
+                            ));
+                        }
+                        None if attempt + 1 < DIRECTORY_VISIBILITY_ATTEMPTS => {
+                            tokio::time::sleep(DIRECTORY_VISIBILITY_DELAY).await;
+                        }
+                        None => {}
+                    }
                 }
+                Err(create_result.err().unwrap_or_else(|| {
+                    format!("OpenList 创建目录后长时间不可见: {path}")
+                }))
             }
         }
     }
@@ -505,6 +517,8 @@ mod tests {
         removes: Vec<(String, String)>,
         mkdirs: Vec<String>,
         objects: BTreeMap<String, Value>,
+        mkdir_visibility_delay: usize,
+        pending_mkdirs: HashMap<String, (String, usize)>,
     }
 
     type SharedFakeState = Arc<Mutex<FakeOpenListState>>;
@@ -530,10 +544,24 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        state
-            .lock()
-            .unwrap()
-            .objects
+        let mut state = state.lock().unwrap();
+        let ready = state
+            .pending_mkdirs
+            .get_mut(&path)
+            .and_then(|(_, remaining)| {
+                if *remaining == 0 {
+                    Some(())
+                } else {
+                    *remaining -= 1;
+                    None
+                }
+            })
+            .is_some();
+        if ready {
+            let (name, _) = state.pending_mkdirs.remove(&path).unwrap();
+            state.objects.insert(path.clone(), object(&name, 0, true));
+        }
+        state.objects
             .get(&path)
             .cloned()
             .map(success)
@@ -552,7 +580,12 @@ mod tests {
         let name = path.rsplit('/').next().unwrap_or_default().to_string();
         let mut state = state.lock().unwrap();
         state.mkdirs.push(path.clone());
-        state.objects.insert(path, object(&name, 0, true));
+        if state.mkdir_visibility_delay == 0 {
+            state.objects.insert(path, object(&name, 0, true));
+        } else {
+            let delay = state.mkdir_visibility_delay;
+            state.pending_mkdirs.insert(path, (name, delay - 1));
+        }
         success(Value::Null)
     }
 
@@ -737,6 +770,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_copy_recurses_only_through_declared_file_path() {
         let mut fake = FakeOpenListState::default();
+        fake.mkdir_visibility_delay = 2;
         fake.objects
             .insert("/dst".to_string(), object("dst", 0, true));
         fake.objects

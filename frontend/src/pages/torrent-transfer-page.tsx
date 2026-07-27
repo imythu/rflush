@@ -24,6 +24,8 @@ type TransferJob = {
   torrent_name: string;
   stage: string;
   attempts: number;
+  copy_checkpoint: { path: string; size: number; phase: string; submitted_at: string | null } | null;
+  manual_resolution_allowed: boolean;
   copy_lock_acquired: boolean;
   last_error: string | null;
   created_at: string;
@@ -92,7 +94,7 @@ export function TorrentTransferPage() {
   const pagedTorrents = filteredTorrents.slice((torrentPage - 1) * TORRENT_PAGE_SIZE, torrentPage * TORRENT_PAGE_SIZE);
   const pageSelected = pagedTorrents.length > 0 && pagedTorrents.every((torrent) => selected.has(torrent.hash));
   const jobPageCount = Math.max(1, Math.ceil(jobTotal / JOB_PAGE_SIZE));
-  const blockingJobs = jobs.filter((job) => job.stage === "copy_manual_review" && job.copy_lock_acquired);
+  const blockingJobs = jobs.filter((job) => job.manual_resolution_allowed && job.copy_lock_acquired);
 
   async function loadJobs(page = jobPage, silent = false) {
     if (!silent) setJobsLoading(true);
@@ -264,10 +266,13 @@ export function TorrentTransferPage() {
             </div>
           </div>)}
           {jobsLoading ? <div className="py-10 text-center text-sm text-muted">加载任务中...</div> : jobs.length === 0 ? <div className="py-10 text-center text-sm text-muted">暂无转移任务</div> : <div className="divide-y divide-border rounded-lg border border-border">{jobs.map((job) => {
-            const stage = job.stage === "copying" && !job.copy_lock_acquired
-              ? { label: "等待目标目录解锁", progress: 25 }
-              : STAGES[job.stage] ?? { label: job.stage, progress: 0 };
-            const failed = job.stage === "cancelled" || job.stage === "copy_manual_review" || job.stage === "manifest_required";
+            const legacyCopyNeedsReview = job.stage === "copying" && job.manual_resolution_allowed;
+            const stage = legacyCopyNeedsReview
+              ? { label: "旧任务待确认", progress: 25 }
+              : job.stage === "copying" && !job.copy_lock_acquired
+                ? { label: "等待目标目录解锁", progress: 25 }
+                : STAGES[job.stage] ?? { label: job.stage, progress: 0 };
+            const failed = legacyCopyNeedsReview || job.stage === "cancelled" || job.stage === "copy_manual_review" || job.stage === "manifest_required";
             const complete = job.stage === "completed";
             const StatusIcon = complete ? CheckCircle2 : failed ? AlertCircle : Clock3;
             return <div key={job.id} className="grid gap-3 px-4 py-3 lg:grid-cols-[minmax(0,1fr)_12rem_9rem_9rem_auto] lg:items-center">
@@ -275,7 +280,7 @@ export function TorrentTransferPage() {
               <div><div className="h-1.5 overflow-hidden rounded-full bg-surface-container-high"><div className={`h-full rounded-full transition-[width] duration-300 ${failed ? "bg-destructive" : "bg-primary"}`} style={{ width: `${stage.progress}%` }} /></div><div className="mt-1 text-right text-[11px] text-muted">{stage.progress}%</div></div>
               <div className={`flex items-center gap-1.5 text-xs font-medium ${complete ? "text-primary" : failed ? "text-destructive" : "text-foreground"}`}><StatusIcon className={`h-4 w-4 ${!complete && !failed ? "animate-pulse" : ""}`} />{stage.label}</div>
               <div className="text-xs text-muted">{formatDate(job.updated_at)}</div>
-              {job.stage === "copy_manual_review" ? <div className="flex flex-wrap gap-2 lg:justify-end">
+              {job.manual_resolution_allowed ? <div className="flex flex-wrap gap-2 lg:justify-end">
                 <Button variant="outline" className="h-8 px-3 text-xs" disabled={resolvingJobId === job.id} onClick={() => void resolveJob(job, "recheck")}>重新检查</Button>
                 <Button className="h-8 px-3 text-xs" disabled={resolvingJobId === job.id} onClick={() => void resolveJob(job, "force_retry")}>{resolvingJobId === job.id ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}确认并重试</Button>
               </div> : <div />}

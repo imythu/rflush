@@ -644,6 +644,7 @@ struct OpenListJobResponse {
     attempts: u32,
     openlist_task_ids: Vec<String>,
     copy_checkpoint: Option<OpenListCheckpointSummary>,
+    manual_resolution_allowed: bool,
     copy_lock_acquired: bool,
     manifest_cursor: usize,
     next_attempt_at: Option<String>,
@@ -668,6 +669,8 @@ impl From<MediaRelocationJob> for OpenListJobResponse {
             .copy_checkpoint_json
             .as_deref()
             .and_then(|value| serde_json::from_str(value).ok());
+        let manual_resolution_allowed = job.stage == "copy_manual_review"
+            || (job.stage == "copying" && job.copy_checkpoint_json.is_none());
         Self {
             id: job.id,
             media_download_id: job.media_download_id,
@@ -683,6 +686,7 @@ impl From<MediaRelocationJob> for OpenListJobResponse {
             attempts: job.attempts,
             openlist_task_ids,
             copy_checkpoint,
+            manual_resolution_allowed,
             copy_lock_acquired: job.copy_lock_acquired,
             manifest_cursor: job.manifest_cursor,
             next_attempt_at: job.next_attempt_at,
