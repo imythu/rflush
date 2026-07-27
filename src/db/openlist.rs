@@ -108,7 +108,11 @@ impl Database {
                             copy_lock_acquired, manifest_cursor
                      FROM media_relocation_jobs
                      WHERE media_download_id IS NULL OR manual_requested_at IS NOT NULL
-                     ORDER BY id DESC LIMIT ? OFFSET ?",
+                     ORDER BY CASE
+                         WHEN stage IN ('copy_manual_review', 'manifest_required') THEN 0
+                         WHEN stage IN ('completed', 'cancelled') THEN 2
+                         ELSE 1 END,
+                         id DESC LIMIT ? OFFSET ?",
                 )
                 .map_err(sql_error)?;
             let records = stmt

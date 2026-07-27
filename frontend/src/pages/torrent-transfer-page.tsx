@@ -92,6 +92,7 @@ export function TorrentTransferPage() {
   const pagedTorrents = filteredTorrents.slice((torrentPage - 1) * TORRENT_PAGE_SIZE, torrentPage * TORRENT_PAGE_SIZE);
   const pageSelected = pagedTorrents.length > 0 && pagedTorrents.every((torrent) => selected.has(torrent.hash));
   const jobPageCount = Math.max(1, Math.ceil(jobTotal / JOB_PAGE_SIZE));
+  const blockingJobs = jobs.filter((job) => job.stage === "copy_manual_review" && job.copy_lock_acquired);
 
   async function loadJobs(page = jobPage, silent = false) {
     if (!silent) setJobsLoading(true);
@@ -251,6 +252,17 @@ export function TorrentTransferPage() {
       <Card className="rounded-2xl">
         <CardHeader><div className="flex items-center justify-between gap-3"><div><CardTitle>全部转移任务</CardTitle><div className="mt-1 text-xs text-muted">共 {jobTotal} 条，每 5 秒自动刷新</div></div><Button variant="outline" className="size-9 px-0" onClick={() => void loadJobs()} aria-label="刷新转移任务" title="刷新"><RefreshCw className="h-4 w-4" /></Button></div></CardHeader>
         <CardContent>
+          {blockingJobs.map((job) => <div key={`blocker-${job.id}`} className="mb-4 flex flex-col gap-3 rounded-lg border border-destructive/35 bg-destructive/10 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-sm font-semibold text-destructive"><AlertCircle className="h-4 w-4" />目标目录被任务 #{job.id} 锁定</div>
+              <div className="mt-1 truncate text-sm" title={job.torrent_name}>{job.torrent_name}</div>
+              {job.last_error ? <div className="mt-1 line-clamp-2 text-xs text-muted" title={job.last_error}>{job.last_error}</div> : null}
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <Button variant="outline" disabled={resolvingJobId === job.id} onClick={() => void resolveJob(job, "recheck")}>重新检查</Button>
+              <Button disabled={resolvingJobId === job.id} onClick={() => void resolveJob(job, "force_retry")}>{resolvingJobId === job.id ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}确认并重试</Button>
+            </div>
+          </div>)}
           {jobsLoading ? <div className="py-10 text-center text-sm text-muted">加载任务中...</div> : jobs.length === 0 ? <div className="py-10 text-center text-sm text-muted">暂无转移任务</div> : <div className="divide-y divide-border rounded-lg border border-border">{jobs.map((job) => {
             const stage = job.stage === "copying" && !job.copy_lock_acquired
               ? { label: "等待目标目录解锁", progress: 25 }
