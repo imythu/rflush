@@ -24,6 +24,7 @@ type TransferJob = {
   torrent_name: string;
   stage: string;
   attempts: number;
+  copy_lock_acquired: boolean;
   last_error: string | null;
   created_at: string;
   updated_at: string;
@@ -251,7 +252,9 @@ export function TorrentTransferPage() {
         <CardHeader><div className="flex items-center justify-between gap-3"><div><CardTitle>全部转移任务</CardTitle><div className="mt-1 text-xs text-muted">共 {jobTotal} 条，每 5 秒自动刷新</div></div><Button variant="outline" className="size-9 px-0" onClick={() => void loadJobs()} aria-label="刷新转移任务" title="刷新"><RefreshCw className="h-4 w-4" /></Button></div></CardHeader>
         <CardContent>
           {jobsLoading ? <div className="py-10 text-center text-sm text-muted">加载任务中...</div> : jobs.length === 0 ? <div className="py-10 text-center text-sm text-muted">暂无转移任务</div> : <div className="divide-y divide-border rounded-lg border border-border">{jobs.map((job) => {
-            const stage = STAGES[job.stage] ?? { label: job.stage, progress: 0 };
+            const stage = job.stage === "copying" && !job.copy_lock_acquired
+              ? { label: "等待目标目录解锁", progress: 25 }
+              : STAGES[job.stage] ?? { label: job.stage, progress: 0 };
             const failed = job.stage === "cancelled" || job.stage === "copy_manual_review" || job.stage === "manifest_required";
             const complete = job.stage === "completed";
             const StatusIcon = complete ? CheckCircle2 : failed ? AlertCircle : Clock3;

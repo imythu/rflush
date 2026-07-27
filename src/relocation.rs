@@ -440,7 +440,7 @@ mod tests {
         })
         .unwrap();
         assert!(checkpoint_pending_timed_out(Some(&old_pending), Utc::now()).unwrap());
-        assert!(!checkpoint_pending_timed_out(None, Utc::now()).unwrap());
+        assert!(checkpoint_pending_timed_out(None, Utc::now()).unwrap());
     }
 
     #[test]
@@ -1166,16 +1166,21 @@ impl RelocationScheduler {
                         }
                         match decide_copy_tasks(&observations)? {
                             CopyTaskDecision::Wait => {
+                                let legacy_without_checkpoint =
+                                    job.copy_checkpoint_json.is_none();
                                 if checkpoint_pending_timed_out(
                                     job.copy_checkpoint_json.as_deref(),
                                     Utc::now(),
                                 )? {
                                     job.stage = "copy_manual_review".to_string();
                                     job.next_attempt_at = None;
-                                    job.last_error = Some(
+                                    job.last_error = Some(if legacy_without_checkpoint {
+                                        "旧 OpenList 复制任务仍显示运行中但缺少提交 checkpoint，已停止无限轮询；请确认旧任务已终止后重试"
+                                            .to_string()
+                                    } else {
                                         "OpenList 复制任务长时间未终止，已停止自动轮询并保留目标锁；请人工 recheck 或确认终止后 force_retry/cancel"
-                                            .to_string(),
-                                    );
+                                            .to_string()
+                                    });
                                 } else {
                                     job.next_attempt_at = Some(
                                         (Utc::now() + ChronoDuration::seconds(30)).to_rfc3339(),
@@ -1940,7 +1945,7 @@ fn checkpoint_pending_timed_out(
     now: chrono::DateTime<Utc>,
 ) -> Result<bool, String> {
     let Some(value) = checkpoint_json else {
-        return Ok(false);
+        return Ok(true);
     };
     let checkpoint = decode_copy_checkpoint(value)?;
     let Some(submitted_at) = checkpoint.submitted_at.as_deref() else {
