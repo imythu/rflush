@@ -135,6 +135,8 @@ struct ListRequest<'a> {
 struct ListResult {
     #[serde(default)]
     content: Vec<OpenListObject>,
+    #[serde(default)]
+    total: usize,
 }
 
 #[derive(Serialize)]
@@ -243,9 +245,12 @@ impl OpenListClient {
                         None => {}
                     }
                 }
-                Err(create_result.err().unwrap_or_else(|| {
-                    format!("OpenList 创建目录后长时间不可见: {path}")
-                }))
+                let reason = create_result
+                    .err()
+                    .unwrap_or_else(|| format!("创建目录后长时间不可见: {path}"));
+                Err(format!(
+                    "OpenList 目录创建未确认，已停止自动重试: {path}: {reason}"
+                ))
             }
         }
     }
@@ -255,19 +260,32 @@ impl OpenListClient {
         path: &str,
     ) -> Result<Option<OpenListObject>, String> {
         let (parent, name) = remote_parent_and_name(path)?;
-        let result: ListResult = self
-            .post(
-                "/api/fs/list",
-                &ListRequest {
-                    path: &parent,
-                    password: "",
-                    page: 1,
-                    per_page: 0,
-                    refresh: true,
-                },
-            )
-            .await?;
-        Ok(result.content.into_iter().find(|object| object.name == name))
+        const PAGE_SIZE: usize = 200;
+        let mut page = 1;
+        loop {
+            let result: ListResult = self
+                .post(
+                    "/api/fs/list",
+                    &ListRequest {
+                        path: &parent,
+                        password: "",
+                        page,
+                        per_page: PAGE_SIZE,
+                        refresh: true,
+                    },
+                )
+                .await?;
+            if let Some(object) = result.content.iter().find(|object| object.name == name) {
+                return Ok(Some(object.clone()));
+            }
+            let seen = (page - 1)
+                .saturating_mul(PAGE_SIZE)
+                .saturating_add(result.content.len());
+            if result.content.is_empty() || seen >= result.total {
+                return Ok(None);
+            }
+            page += 1;
+        }
     }
 
     pub async fn create_directory_tree_if_missing(&self, path: &str) -> Result<(), String> {
@@ -676,7 +694,12 @@ mod tests {
         } else {
             format!("{}/", parent.trim_end_matches('/'))
         };
-        let content = state
+        let page = body.get("page").and_then(Value::as_u64).unwrap_or(1) as usize;
+        let per_page = body
+            .get("per_page")
+            .and_then(Value::as_u64)
+            .unwrap_or(200) as usize;
+        let all_content = state
             .lock()
             .unwrap()
             .objects
@@ -686,7 +709,13 @@ mod tests {
                 (!child.is_empty() && !child.contains('/')).then_some(object.clone())
             })
             .collect::<Vec<_>>();
-        success(json!({"content": content, "total": content.len()}))
+        let total = all_content.len();
+        let content = all_content
+            .into_iter()
+            .skip(page.saturating_sub(1).saturating_mul(per_page))
+            .take(per_page)
+            .collect::<Vec<_>>();
+        success(json!({"content": content, "total": total}))
     }
 
     async fn fake_copy(
@@ -980,6 +1009,39 @@ mod tests {
             )]
         );
         drop(state);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn directory_dedupe_scans_all_refreshed_list_pages() {
+        let mut fake = FakeOpenListState::default();
+        fake.objects
+            .insert("/dst".to_string(), object("dst", 0, true));
+        for index in 0..250 {
+            let name = format!("item-{index:03}");
+            fake.objects
+                .insert(format!("/dst/{name}"), object(&name, 0, true));
+        }
+        fake.objects.insert(
+            "/dst/zz-target".to_string(),
+            object("zz-target", 0, true),
+        );
+        let state = Arc::new(Mutex::new(fake));
+        let app = Router::new()
+            .route("/api/fs/get", post(fake_get))
+            .route("/api/fs/list", post(fake_list))
+            .route("/api/fs/mkdir", post(fake_mkdir))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = OpenListClient::new(&format!("http://{address}"), "test-key").unwrap();
+        client
+            .create_directory_if_missing("/dst/zz-target")
+            .await
+            .unwrap();
+        assert!(state.lock().unwrap().mkdirs.is_empty());
         server.abort();
     }
 

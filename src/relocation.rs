@@ -253,6 +253,16 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_directory_creation_is_not_automatically_retried() {
+        assert!(directory_error_requires_manual_review(
+            "OpenList 目录创建未确认，已停止自动重试: /dst/show"
+        ));
+        assert!(!directory_error_requires_manual_review(
+            "temporary OpenList request timeout"
+        ));
+    }
+
+    #[test]
     fn qb_completion_timestamp_and_seeding_states_override_byte_rounding() {
         assert!(torrent_is_complete(1, 99, 100, "downloading"));
         assert!(torrent_is_complete(0, 99, 100, "stalledUP"));
@@ -528,6 +538,10 @@ const RELOCATION_LEASE_SECONDS: i64 = 120;
 const RELOCATION_LEASE_HEARTBEAT_SECONDS: u64 = 30;
 const TARGET_QB_CONFIRM_ATTEMPTS: usize = 5;
 const TARGET_QB_CONFIRM_INTERVAL: Duration = Duration::from_millis(300);
+
+fn directory_error_requires_manual_review(error: &str) -> bool {
+    error.contains("OpenList 目录创建未确认，已停止自动重试")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ManifestFile {
@@ -1418,8 +1432,33 @@ impl RelocationScheduler {
     }
 
     async fn record_retry(&self, mut job: MediaRelocationJob, error: String) {
+        let expected_stage = job.stage.clone();
         job.attempts = job.attempts.saturating_add(1);
         job.last_error = Some(error);
+        if job
+            .last_error
+            .as_deref()
+            .is_some_and(directory_error_requires_manual_review)
+        {
+            job.stage = "copy_manual_review".to_string();
+            job.next_attempt_at = None;
+            match self
+                .db
+                .update_media_relocation_job(&job, job.version, &expected_stage)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => error!(
+                    "failed to stop media relocation job {} because its state changed",
+                    job.id
+                ),
+                Err(record_error) => error!(
+                    "failed to stop media relocation job {}: {}",
+                    job.id, record_error
+                ),
+            }
+            return;
+        }
         let backoff = 30_i64.saturating_mul(1_i64 << job.attempts.min(6));
         job.next_attempt_at = Some((Utc::now() + ChronoDuration::seconds(backoff)).to_rfc3339());
         let Some(_) = job.lease_owner.as_deref() else {
