@@ -75,7 +75,7 @@ impl OpenListTask {
     }
 
     pub fn terminal_failure(&self) -> bool {
-        matches!(self.state, 4 | 7)
+        matches!(self.state, 4 | 5 | 7) || !self.error.trim().is_empty()
     }
 }
 
@@ -120,6 +120,21 @@ struct PathRequest<'a> {
 #[derive(Serialize)]
 struct MkdirRequest<'a> {
     path: &'a str,
+}
+
+#[derive(Serialize)]
+struct ListRequest<'a> {
+    path: &'a str,
+    password: &'a str,
+    page: usize,
+    per_page: usize,
+    refresh: bool,
+}
+
+#[derive(Deserialize)]
+struct ListResult {
+    #[serde(default)]
+    content: Vec<OpenListObject>,
 }
 
 #[derive(Serialize)]
@@ -207,7 +222,7 @@ impl OpenListClient {
     }
 
     pub async fn create_directory_if_missing(&self, path: &str) -> Result<(), String> {
-        match self.stat_if_exists(path).await? {
+        match self.refreshed_directory_if_exists(path).await? {
             Some(object) if object.is_dir => Ok(()),
             Some(_) => Err(format!("OpenList 目标路径应为目录但实际是文件: {path}")),
             None => {
@@ -233,6 +248,26 @@ impl OpenListClient {
                 }))
             }
         }
+    }
+
+    async fn refreshed_directory_if_exists(
+        &self,
+        path: &str,
+    ) -> Result<Option<OpenListObject>, String> {
+        let (parent, name) = remote_parent_and_name(path)?;
+        let result: ListResult = self
+            .post(
+                "/api/fs/list",
+                &ListRequest {
+                    path: &parent,
+                    password: "",
+                    page: 1,
+                    per_page: 0,
+                    refresh: true,
+                },
+            )
+            .await?;
+        Ok(result.content.into_iter().find(|object| object.name == name))
     }
 
     pub async fn create_directory_tree_if_missing(&self, path: &str) -> Result<(), String> {
@@ -512,6 +547,20 @@ fn remote_child_path(parent: &str, name: &str) -> Result<String, String> {
     })
 }
 
+fn remote_parent_and_name(path: &str) -> Result<(String, String), String> {
+    let path = path.trim_end_matches('/');
+    if !path.starts_with('/') || path.is_empty() || path == "/" {
+        return Err(format!("OpenList 目录路径无效: {path:?}"));
+    }
+    let (parent, name) = path
+        .rsplit_once('/')
+        .ok_or_else(|| format!("OpenList 目录路径无效: {path:?}"))?;
+    if !valid_child_name(name) {
+        return Err(format!("OpenList 目录路径无效: {path:?}"));
+    }
+    Ok((if parent.is_empty() { "/" } else { parent }.to_string(), name.to_string()))
+}
+
 fn is_not_found_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("not found")
@@ -611,6 +660,33 @@ mod tests {
             state.pending_mkdirs.insert(path, (name, delay - 1));
         }
         success(Value::Null)
+    }
+
+    async fn fake_list(
+        State(state): State<SharedFakeState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(body.get("refresh").and_then(Value::as_bool), Some(true));
+        let parent = body
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("/");
+        let prefix = if parent == "/" {
+            "/".to_string()
+        } else {
+            format!("{}/", parent.trim_end_matches('/'))
+        };
+        let content = state
+            .lock()
+            .unwrap()
+            .objects
+            .iter()
+            .filter_map(|(path, object)| {
+                let child = path.strip_prefix(&prefix)?;
+                (!child.is_empty() && !child.contains('/')).then_some(object.clone())
+            })
+            .collect::<Vec<_>>();
+        success(json!({"content": content, "total": content.len()}))
     }
 
     async fn fake_copy(
@@ -716,6 +792,11 @@ mod tests {
         task.state = 7;
         assert!(!task.succeeded());
         assert!(task.terminal_failure());
+        task.state = 5;
+        assert!(task.terminal_failure());
+        task.state = 1;
+        task.error = "destination directory not found".to_string();
+        assert!(task.terminal_failure());
     }
 
     #[tokio::test]
@@ -813,6 +894,7 @@ mod tests {
         let state = Arc::new(Mutex::new(fake));
         let app = Router::new()
             .route("/api/fs/get", post(fake_get))
+            .route("/api/fs/list", post(fake_list))
             .route("/api/fs/mkdir", post(fake_mkdir))
             .route("/api/fs/copy", post(fake_copy))
             .with_state(state.clone());
@@ -861,6 +943,7 @@ mod tests {
         let state = Arc::new(Mutex::new(fake));
         let app = Router::new()
             .route("/api/fs/get", post(fake_get))
+            .route("/api/fs/list", post(fake_list))
             .route("/api/fs/mkdir", post(fake_mkdir))
             .route("/api/fs/copy", post(fake_copy))
             .with_state(state.clone());
@@ -915,6 +998,7 @@ mod tests {
         let state = Arc::new(Mutex::new(fake));
         let app = Router::new()
             .route("/api/fs/get", post(fake_get))
+            .route("/api/fs/list", post(fake_list))
             .route("/api/fs/mkdir", post(fake_mkdir))
             .route("/api/fs/copy", post(fake_copy))
             .with_state(state.clone());
@@ -947,6 +1031,7 @@ mod tests {
         let state = Arc::new(Mutex::new(fake));
         let app = Router::new()
             .route("/api/fs/get", post(fake_get))
+            .route("/api/fs/list", post(fake_list))
             .route("/api/fs/mkdir", post(fake_mkdir))
             .route("/api/fs/copy", post(fake_copy))
             .with_state(state.clone());

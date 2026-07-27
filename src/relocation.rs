@@ -1194,14 +1194,17 @@ impl RelocationScheduler {
                                         job.id,
                                         failure_messages.join("; ")
                                     );
-                                    job.openlist_task_id = None;
-                                    job.copy_checkpoint_json = None;
-                                    job.stage = "copy_reconcile".to_string();
-                                    job.next_attempt_at = Some(
-                                        (Utc::now()
-                                            + ChronoDuration::seconds(COPY_SETTLE_DELAY_SECONDS))
-                                        .to_rfc3339(),
-                                    );
+                                    job.stage = "copy_manual_review".to_string();
+                                    job.next_attempt_at = None;
+                                    job.last_error = Some(if failure_messages.is_empty() {
+                                        "OpenList 复制任务失败，已停止自动重提；请核验目录后手动重试"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "OpenList 复制任务失败，已停止自动重提: {}",
+                                            failure_messages.join("; ")
+                                        )
+                                    });
                                 } else {
                                     job.stage = "copy_manual_review".to_string();
                                     job.next_attempt_at = None;
