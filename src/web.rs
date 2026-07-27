@@ -449,6 +449,11 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
             "/api/downloaders/{id}/default-path",
             get(get_downloader_default_path),
         )
+        .route("/api/downloaders/{id}/torrents", get(list_downloader_torrents))
+        .route(
+            "/api/downloaders/{id}/openlist-transfer",
+            post(create_openlist_transfer),
+        )
         // 刷流任务
         .route(
             "/api/brush-tasks",
@@ -625,7 +630,7 @@ struct OpenListConfigResponse {
 #[derive(Debug, Serialize)]
 struct OpenListJobResponse {
     id: i64,
-    media_download_id: i64,
+    media_download_id: Option<i64>,
     downloader_id: Option<i64>,
     infohash: String,
     torrent_name: String,
@@ -3343,6 +3348,157 @@ async fn get_downloader_default_path(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(serde_json::json!({ "path": path })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloaderTorrentQuery {
+    keyword: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TransferableTorrentResponse {
+    hash: String,
+    name: String,
+    size: i64,
+    save_path: String,
+    category: String,
+    tags: String,
+    added_on: i64,
+}
+
+async fn list_downloader_torrents(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<DownloaderTorrentQuery>,
+) -> Result<Json<Vec<TransferableTorrentResponse>>, ApiError> {
+    if !state.self_use {
+        return Err(ApiError::not_found("功能不可用"));
+    }
+    let downloader = state
+        .db
+        .get_downloader(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
+    if !matches!(downloader.downloader_type.as_str(), "qbittorrent" | "qb") {
+        return Err(ApiError::bad_request("仅支持 qBittorrent 下载器"));
+    }
+    let client = state.pool.get(&downloader).await.map_err(ApiError::bad_request)?;
+    let keyword = query.keyword.unwrap_or_default().trim().to_lowercase();
+    let mut torrents = client
+        .list_torrents(None)
+        .await
+        .map_err(ApiError::bad_gateway)?
+        .into_iter()
+        .filter(|torrent| {
+            torrent.completion_on > 0
+                || (torrent.size > 0 && torrent.downloaded >= torrent.size)
+                || matches!(
+                    torrent.state.to_ascii_lowercase().as_str(),
+                    "uploading" | "stalledup" | "queuedup" | "forcedup" | "pausedup"
+                        | "stoppedup" | "checkingup"
+                )
+        })
+        .filter(|torrent| {
+            keyword.is_empty()
+                || torrent.name.to_lowercase().contains(&keyword)
+                || torrent.hash.to_lowercase().contains(&keyword)
+        })
+        .map(|torrent| TransferableTorrentResponse {
+            hash: torrent.hash,
+            name: torrent.name,
+            size: torrent.size,
+            save_path: torrent.save_path,
+            category: torrent.category,
+            tags: torrent.tags,
+            added_on: torrent.added_on,
+        })
+        .collect::<Vec<_>>();
+    torrents.sort_by(|left, right| right.added_on.cmp(&left.added_on));
+    Ok(Json(torrents))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateOpenListTransferRequest {
+    hashes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateOpenListTransferResponse {
+    created: usize,
+    skipped: usize,
+}
+
+async fn create_openlist_transfer(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<CreateOpenListTransferRequest>,
+) -> Result<Json<CreateOpenListTransferResponse>, ApiError> {
+    if !state.self_use {
+        return Err(ApiError::not_found("功能不可用"));
+    }
+    if payload.hashes.is_empty() || payload.hashes.len() > 100 {
+        return Err(ApiError::bad_request("请选择 1 到 100 个种子"));
+    }
+    let downloader = state
+        .db
+        .get_downloader(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
+    if !matches!(downloader.downloader_type.as_str(), "qbittorrent" | "qb") {
+        return Err(ApiError::bad_request("仅支持 qBittorrent 下载器"));
+    }
+    let config = state.db.get_openlist_config().await.map_err(media_app_error)?;
+    if !config.enabled || config.target_directory_id.is_none() {
+        return Err(ApiError::bad_request("请先启用 OpenList 自动归档并选择目标目录"));
+    }
+    if !config.path_mappings.iter().any(|mapping| mapping.downloader_id == id) {
+        return Err(ApiError::bad_request("该下载器尚未配置 OpenList 来源路径映射"));
+    }
+
+    let mut hashes = payload
+        .hashes
+        .into_iter()
+        .map(|hash| hash.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    if hashes.iter().any(|hash| hash.len() != 40 || !hash.bytes().all(|c| c.is_ascii_hexdigit())) {
+        return Err(ApiError::bad_request("种子 hash 格式无效"));
+    }
+    let client = state.pool.get(&downloader).await.map_err(ApiError::bad_request)?;
+    let torrents = client
+        .list_torrents_by_hashes(&hashes)
+        .await
+        .map_err(ApiError::bad_gateway)?;
+    if torrents.len() != hashes.len() {
+        return Err(ApiError::bad_request("部分种子已不存在，请刷新后重试"));
+    }
+    if torrents.iter().any(|torrent| {
+        torrent.completion_on <= 0
+            && (torrent.size <= 0 || torrent.downloaded < torrent.size)
+            && !matches!(
+                torrent.state.to_ascii_lowercase().as_str(),
+                "uploading"
+                    | "stalledup"
+                    | "queuedup"
+                    | "forcedup"
+                    | "pausedup"
+                    | "stoppedup"
+                    | "checkingup"
+            )
+    }) {
+        return Err(ApiError::bad_request("只能转移已下载完成的种子"));
+    }
+    let selected = torrents
+        .into_iter()
+        .map(|torrent| (torrent.hash.to_ascii_lowercase(), torrent.name))
+        .collect::<Vec<_>>();
+    let (created, skipped) = state
+        .db
+        .enqueue_manual_media_relocation_jobs(id, &selected)
+        .await
+        .map_err(media_app_error)?;
+    Ok(Json(CreateOpenListTransferResponse { created, skipped }))
 }
 
 // ========== Brush Tasks API ==========

@@ -3001,7 +3001,7 @@ impl Database {
 
                 CREATE TABLE IF NOT EXISTS media_relocation_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    media_download_id INTEGER NOT NULL UNIQUE REFERENCES media_downloads(id) ON DELETE CASCADE,
+                    media_download_id INTEGER UNIQUE REFERENCES media_downloads(id) ON DELETE CASCADE,
                     downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
                     infohash TEXT NOT NULL,
                     source_qb_path TEXT NOT NULL,
@@ -3099,6 +3099,7 @@ impl Database {
                 "target_root_folder",
                 "ALTER TABLE media_relocation_jobs ADD COLUMN target_root_folder INTEGER",
             )?;
+            migrate_media_relocation_jobs_for_manual_transfers(&conn)?;
 
             migrate_media_download_infohash_uniqueness(&conn)?;
 
@@ -3608,6 +3609,72 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Res
         return Ok(());
     }
     conn.execute(sql, []).map_err(sql_error)?;
+    Ok(())
+}
+
+fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Result<(), AppError> {
+    let media_download_not_null = conn
+        .prepare("PRAGMA table_info(media_relocation_jobs)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)? != 0))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(sql_error)?
+        .into_iter()
+        .find_map(|(name, not_null)| (name == "media_download_id").then_some(not_null))
+        .unwrap_or(false);
+    if !media_download_not_null {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction().map_err(sql_error)?;
+    tx.execute_batch(
+        "ALTER TABLE media_relocation_jobs RENAME TO media_relocation_jobs_legacy;
+         CREATE TABLE media_relocation_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            media_download_id INTEGER UNIQUE REFERENCES media_downloads(id) ON DELETE CASCADE,
+            downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+            infohash TEXT NOT NULL, source_qb_path TEXT NOT NULL,
+            source_openlist_path TEXT NOT NULL,
+            source_content_openlist_path TEXT NOT NULL DEFAULT '',
+            target_openlist_path TEXT NOT NULL, target_qb_path TEXT NOT NULL,
+            target_content_qb_path TEXT NOT NULL DEFAULT '',
+            target_downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL,
+            copy_items_json TEXT NOT NULL DEFAULT '[]',
+            source_files_json TEXT NOT NULL DEFAULT '[]',
+            source_manifest_json TEXT NOT NULL DEFAULT '[]',
+            copy_checkpoint_json TEXT, copy_lock_acquired INTEGER NOT NULL DEFAULT 0,
+            manifest_cursor INTEGER NOT NULL DEFAULT 0, target_root_folder INTEGER,
+            torrent_name TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'waiting_download',
+            openlist_task_id TEXT, torrent_data BLOB, attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT, lease_owner TEXT, lease_until TEXT,
+            version INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+         );
+         INSERT INTO media_relocation_jobs
+           (id, media_download_id, downloader_id, infohash, source_qb_path,
+            source_openlist_path, source_content_openlist_path, target_openlist_path,
+            target_qb_path, target_content_qb_path, target_downloader_id,
+            copy_items_json, source_files_json, source_manifest_json,
+            copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
+            torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
+            lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at)
+         SELECT id, media_download_id, downloader_id, infohash, source_qb_path,
+            source_openlist_path, source_content_openlist_path, target_openlist_path,
+            target_qb_path, target_content_qb_path, target_downloader_id,
+            copy_items_json, source_files_json, source_manifest_json,
+            copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
+            torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
+            lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at
+         FROM media_relocation_jobs_legacy;
+         DROP TABLE media_relocation_jobs_legacy;
+         CREATE INDEX idx_media_relocation_jobs_due
+           ON media_relocation_jobs(stage, next_attempt_at, lease_until);",
+    )
+    .map_err(sql_error)?;
+    tx.commit().map_err(sql_error)?;
     Ok(())
 }
 

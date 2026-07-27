@@ -169,6 +169,16 @@ export type DownloaderSpaceStats = {
   incomplete_count: number;
 };
 
+export type TransferableTorrent = {
+  hash: string;
+  name: string;
+  size: number;
+  save_path: string;
+  category: string;
+  tags: string;
+  added_on: number;
+};
+
 export type BrushTaskRecord = {
   id: number;
   name: string;

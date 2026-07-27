@@ -44,7 +44,7 @@ pub struct OpenListConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaRelocationJob {
     pub id: i64,
-    pub media_download_id: i64,
+    pub media_download_id: Option<i64>,
     pub downloader_id: Option<i64>,
     pub infohash: String,
     pub source_qb_path: String,
@@ -77,6 +77,55 @@ pub struct MediaRelocationJob {
 }
 
 impl Database {
+    pub async fn enqueue_manual_media_relocation_jobs(
+        &self,
+        downloader_id: i64,
+        torrents: &[(String, String)],
+    ) -> Result<(usize, usize), AppError> {
+        let path = self.path.clone();
+        let torrents = torrents.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now().to_rfc3339();
+            let mut inserted = 0;
+            let mut skipped = 0;
+            for (infohash, name) in torrents {
+                let active = tx
+                    .query_row(
+                        "SELECT 1 FROM media_relocation_jobs
+                         WHERE downloader_id=? AND lower(infohash)=lower(?)
+                           AND stage NOT IN ('completed', 'cancelled') LIMIT 1",
+                        params![downloader_id, infohash],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(sql_error)?
+                    .is_some();
+                if active {
+                    skipped += 1;
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO media_relocation_jobs
+                     (media_download_id, downloader_id, infohash, source_qb_path,
+                      source_openlist_path, target_openlist_path, target_qb_path,
+                      torrent_name, stage, created_at, updated_at)
+                     VALUES (NULL, ?, ?, '', '', '', '', ?, 'waiting_download', ?, ?)",
+                    params![downloader_id, infohash, name, now, now],
+                )
+                .map_err(sql_error)?;
+                inserted += 1;
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok((inserted, skipped))
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn list_media_relocation_jobs(
         &self,
         limit: usize,
@@ -800,6 +849,15 @@ mod tests {
         assert!(columns.iter().any(|name| name == "copy_lock_acquired"));
         assert!(columns.iter().any(|name| name == "manifest_cursor"));
         assert!(columns.iter().any(|name| name == "target_root_folder"));
+        let media_download_not_null: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('media_relocation_jobs')
+                 WHERE name='media_download_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(media_download_not_null, 0);
 
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         let now = chrono::Utc::now().to_rfc3339();
@@ -1092,5 +1150,36 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.stage, "cancelled");
         assert!(!cancelled.copy_lock_acquired);
+    }
+
+    #[tokio::test]
+    async fn manual_relocation_jobs_are_idempotent_while_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let downloader_id = db
+            .create_downloader("qb", "qbittorrent", "http://127.0.0.1:8080", "", "")
+            .await
+            .unwrap();
+        let torrents = vec![(
+            "eadb91a4769b1fad89e0dd3a930523e7fc5814b8".to_string(),
+            "manual torrent".to_string(),
+        )];
+
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(downloader_id, &torrents)
+                .await
+                .unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(downloader_id, &torrents)
+                .await
+                .unwrap(),
+            (0, 1)
+        );
+        let jobs = db.list_media_relocation_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].media_download_id, None);
+        assert_eq!(jobs[0].torrent_name, "manual torrent");
     }
 }

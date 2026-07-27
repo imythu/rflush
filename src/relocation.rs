@@ -797,13 +797,17 @@ impl RelocationScheduler {
             Some(self.pool.get(&record).await?)
         };
         let openlist = OpenListClient::new(&config.base_url, &config.api_key)?;
-        let download = self
-            .db
-            .get_media_download(job.media_download_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("追剧下载记录不存在")?;
-        let subscription = match download.subscription_id {
+        let download = match job.media_download_id {
+            Some(id) => Some(
+                self.db
+                    .get_media_download(id)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("追剧下载记录不存在")?,
+            ),
+            None => None,
+        };
+        let subscription = match download.as_ref().and_then(|item| item.subscription_id) {
             Some(subscription_id) => self
                 .db
                 .get_subscription(subscription_id)
@@ -865,19 +869,20 @@ impl RelocationScheduler {
                     .iter()
                     .find(|target| target.id == config.target_directory_id)
                     .ok_or("未选择 OpenList 目标目录")?;
-                let primary_type = if download.target_key.starts_with("movie:") {
-                    "电影"
-                } else {
-                    "电视剧"
-                };
-                let tmdb_year = subscription.as_ref().and_then(|item| item.year);
-                let primary_genre = subscription
-                    .as_ref()
-                    .and_then(|item| item.tmdb_genres.first())
-                    .map(|genre| genre.name.as_str())
-                    .unwrap_or("其他");
-                let relative_dir =
-                    archive_relative_directory(primary_type, primary_genre, tmdb_year);
+                let relative_dir = download.as_ref().map(|download| {
+                    let primary_type = if download.target_key.starts_with("movie:") {
+                        "电影"
+                    } else {
+                        "电视剧"
+                    };
+                    let tmdb_year = subscription.as_ref().and_then(|item| item.year);
+                    let primary_genre = subscription
+                        .as_ref()
+                        .and_then(|item| item.tmdb_genres.first())
+                        .map(|genre| genre.name.as_str())
+                        .unwrap_or("其他");
+                    archive_relative_directory(primary_type, primary_genre, tmdb_year)
+                });
                 let content_qb_path = normalize_path(&content_path)?;
                 let content_openlist_path =
                     translate_path(&content_qb_path, &mapping.qb_path, &mapping.openlist_path)?;
@@ -902,8 +907,14 @@ impl RelocationScheduler {
                     .map_err(|e| format!("序列化种子文件大小快照失败: {e}"))?;
                 job.copy_items_json = serde_json::to_string(&copy_items)
                     .map_err(|e| format!("序列化种子顶级项目失败: {e}"))?;
-                job.target_openlist_path = join_path(&target.openlist_path, &relative_dir)?;
-                job.target_qb_path = join_path(&target.qb_path, &relative_dir)?;
+                job.target_openlist_path = match relative_dir.as_deref() {
+                    Some(relative_dir) => join_path(&target.openlist_path, relative_dir)?,
+                    None => normalize_path(&target.openlist_path)?,
+                };
+                job.target_qb_path = match relative_dir.as_deref() {
+                    Some(relative_dir) => join_path(&target.qb_path, relative_dir)?,
+                    None => normalize_path(&target.qb_path)?,
+                };
                 let content_suffix = relative_path(&content_qb_path, &job.source_qb_path)?;
                 job.target_content_qb_path = if content_suffix.is_empty() {
                     job.target_qb_path.clone()
@@ -1252,13 +1263,13 @@ impl RelocationScheduler {
                             &AddTorrentOptions {
                                 save_path: Some(job.target_qb_path.clone()),
                                 tags: Some("云母".to_string()),
-                                category: Some(
+                                category: download.as_ref().map(|download| {
                                     media_download_category(
                                         &download.target_key,
                                         tmdb_is_animation,
                                     )
-                                    .to_string(),
-                                ),
+                                    .to_string()
+                                }),
                                 paused: true,
                                 skip_checking: true,
                                 root_folder: job.target_root_folder,

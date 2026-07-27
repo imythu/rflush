@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Edit, Plus, TestTubeDiagonal, Trash2 } from "lucide-react";
+import { ArrowRight, CheckSquare2, Edit, FolderInput, LoaderCircle, Plus, Search, TestTubeDiagonal, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -16,7 +16,13 @@ import {
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
-import type { DownloaderRecord, DownloaderSpaceStats, DownloaderTestResult } from "@/types";
+import type { DownloaderRecord, DownloaderSpaceStats, DownloaderTestResult, TransferableTorrent } from "@/types";
+
+type OpenListSettingsSummary = {
+  enabled: boolean;
+  target_directory_id: number | null;
+  target_directories: Array<{ id?: number; name: string; openlist_root: string }>;
+};
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -61,6 +67,14 @@ export function DownloadersPage() {
 
   const [testResult, setTestResult] = useState<DownloaderTestResult | null>(null);
   const [testing, setTesting] = useState<number | null>(null);
+  const [transferSource, setTransferSource] = useState<DownloaderRecord | null>(null);
+  const [transferTorrents, setTransferTorrents] = useState<TransferableTorrent[]>([]);
+  const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set());
+  const [transferKeyword, setTransferKeyword] = useState("");
+  const [transferLoading, setTransferLoading] = useState(false);
+  const [transferring, setTransferring] = useState(false);
+  const [transferError, setTransferError] = useState("");
+  const [openListSettings, setOpenListSettings] = useState<OpenListSettingsSummary | null>(null);
 
   function loadDownloaders() {
     setLoading(true);
@@ -183,6 +197,85 @@ export function DownloadersPage() {
     }
   }
 
+  async function openTransfer(downloader: DownloaderRecord) {
+    setTransferSource(downloader);
+    setTransferTorrents([]);
+    setSelectedHashes(new Set());
+    setTransferKeyword("");
+    setTransferError("");
+    setTransferLoading(true);
+    try {
+      const [torrents, settings] = await Promise.all([
+        api<TransferableTorrent[]>(`/api/downloaders/${downloader.id}/torrents`),
+        api<OpenListSettingsSummary>("/api/media/openlist/settings"),
+      ]);
+      setTransferTorrents(torrents);
+      setOpenListSettings(settings);
+    } catch (error) {
+      setTransferError((error as Error).message || "加载种子失败");
+    } finally {
+      setTransferLoading(false);
+    }
+  }
+
+  function closeTransfer() {
+    if (transferring) return;
+    setTransferSource(null);
+    setTransferTorrents([]);
+    setSelectedHashes(new Set());
+    setTransferError("");
+  }
+
+  function toggleTorrent(hash: string) {
+    setSelectedHashes((current) => {
+      const next = new Set(current);
+      if (next.has(hash)) next.delete(hash);
+      else next.add(hash);
+      return next;
+    });
+  }
+
+  async function submitTransfer() {
+    if (!transferSource || selectedHashes.size === 0) return;
+    setTransferring(true);
+    setTransferError("");
+    try {
+      const result = await api<{ created: number; skipped: number }>(`/api/downloaders/${transferSource.id}/openlist-transfer`, {
+        method: "POST",
+        body: JSON.stringify({ hashes: [...selectedHashes] }),
+      });
+      await api("/api/media/openlist/scan", { method: "POST" }).catch(() => undefined);
+      setTransferSource(null);
+      setTransferTorrents([]);
+      setSelectedHashes(new Set());
+      setMessage(`已创建 ${result.created} 个转移任务${result.skipped ? `，跳过 ${result.skipped} 个进行中的任务` : ""}`);
+    } catch (error) {
+      setTransferError((error as Error).message || "创建转移任务失败");
+    } finally {
+      setTransferring(false);
+    }
+  }
+
+  const normalizedKeyword = transferKeyword.trim().toLowerCase();
+  const visibleTorrents = transferTorrents.filter((torrent) =>
+    !normalizedKeyword
+      || torrent.name.toLowerCase().includes(normalizedKeyword)
+      || torrent.hash.toLowerCase().includes(normalizedKeyword),
+  );
+  const visibleAllSelected = visibleTorrents.length > 0 && visibleTorrents.every((torrent) => selectedHashes.has(torrent.hash));
+  const selectedTarget = openListSettings?.target_directories.find((target) => target.id === openListSettings.target_directory_id);
+
+  function toggleVisibleTorrents() {
+    setSelectedHashes((current) => {
+      const next = new Set(current);
+      visibleTorrents.forEach((torrent) => {
+        if (visibleAllSelected) next.delete(torrent.hash);
+        else next.add(torrent.hash);
+      });
+      return next;
+    });
+  }
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -297,6 +390,10 @@ export function DownloadersPage() {
                               <TestTubeDiagonal className="mr-2 h-4 w-4" />
                               {testing === d.id ? "测试中..." : "测试连接"}
                             </Button>
+                            <Button variant="outline" onClick={() => void openTransfer(d)}>
+                              <FolderInput className="mr-2 h-4 w-4" />
+                              转移种子
+                            </Button>
                             <Button variant="outline" onClick={() => openEdit(d)}>
                               <Edit className="mr-2 h-4 w-4" />
                               编辑
@@ -354,6 +451,10 @@ export function DownloadersPage() {
                       <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openEdit(d)}>
                         <Edit className="mr-1.5 h-3.5 w-3.5" />
                         编辑
+                      </Button>
+                      <Button variant="outline" className="h-7 px-2.5 text-[11px]" onClick={() => void openTransfer(d)}>
+                        <FolderInput className="mr-1.5 h-3.5 w-3.5" />
+                        转移种子
                       </Button>
                       <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteTarget(d)}>
                         <Trash2 className="mr-1.5 h-3.5 w-3.5" />
@@ -466,6 +567,82 @@ export function DownloadersPage() {
             </Button>
             <Button disabled={saving || !form.name || !form.url} onClick={handleSave}>
               {saving ? "保存中..." : "保存"}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={transferSource !== null}
+        onClose={closeTransfer}
+        title={transferSource ? `从 ${transferSource.name} 转移种子` : "转移种子"}
+        description="选择已完成的 qBittorrent 任务，复制到当前 OpenList 目标并恢复做种。"
+        panelClassName="max-w-6xl"
+      >
+        <div className="flex min-h-[32rem] flex-col p-4 sm:p-6">
+          <div className="mb-4 flex flex-col gap-3 border-b border-border pb-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="min-w-0 text-sm">
+              <div className="flex items-center gap-2 font-medium">
+                <FolderInput className="h-4 w-4 text-primary" />
+                目标：{selectedTarget ? `${selectedTarget.name} · ${selectedTarget.openlist_root}` : "未配置"}
+              </div>
+              <div className="mt-1 text-xs text-muted">已选择 {selectedHashes.size} 个，共 {transferTorrents.length} 个可转移任务</div>
+            </div>
+            <div className="relative w-full lg:w-80">
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+              <Input
+                value={transferKeyword}
+                onChange={(event) => setTransferKeyword(event.target.value)}
+                placeholder="搜索名称或 info hash"
+                aria-label="搜索可转移种子"
+                className="pl-9"
+              />
+            </div>
+          </div>
+
+          {transferError ? <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">{transferError}</div> : null}
+          {transferLoading ? (
+            <div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted"><LoaderCircle className="h-4 w-4 animate-spin" />加载种子列表</div>
+          ) : visibleTorrents.length === 0 ? (
+            <div className="flex flex-1 items-center justify-center text-sm text-muted">{transferTorrents.length ? "没有匹配的种子" : "没有已完成的种子"}</div>
+          ) : (
+            <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border">
+              <Table>
+                <TableHeader className="sticky top-0 z-10 bg-card">
+                  <TableRow>
+                    <TableHead className="w-12">
+                      <button type="button" onClick={toggleVisibleTorrents} aria-label={visibleAllSelected ? "取消全选当前结果" : "全选当前结果"} className="flex size-8 items-center justify-center rounded-md text-muted transition-colors hover:bg-accent hover:text-foreground">
+                        <CheckSquare2 className={`h-4 w-4 ${visibleAllSelected ? "text-primary" : ""}`} />
+                      </button>
+                    </TableHead>
+                    <TableHead>种子</TableHead><TableHead>大小</TableHead><TableHead>保存路径</TableHead><TableHead>分类 / 标签</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {visibleTorrents.map((torrent) => {
+                    const checked = selectedHashes.has(torrent.hash);
+                    return (
+                      <TableRow key={torrent.hash} className={checked ? "bg-primary/5" : undefined}>
+                        <TableCell>
+                          <input type="checkbox" className="size-4 cursor-pointer accent-primary" checked={checked} onChange={() => toggleTorrent(torrent.hash)} aria-label={`选择 ${torrent.name}`} />
+                        </TableCell>
+                        <TableCell><div className="max-w-md truncate font-medium" title={torrent.name}>{torrent.name}</div><div className="mt-1 font-mono text-xs text-muted">{torrent.hash.slice(0, 12)}</div></TableCell>
+                        <TableCell className="whitespace-nowrap">{formatBytes(torrent.size)}</TableCell>
+                        <TableCell><div className="max-w-xs truncate text-xs text-muted" title={torrent.save_path}>{torrent.save_path}</div></TableCell>
+                        <TableCell className="text-xs text-muted">{[torrent.category, torrent.tags].filter(Boolean).join(" · ") || "-"}</TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+
+          <div className="mt-4 flex flex-col-reverse gap-2 border-t border-border pt-4 sm:flex-row sm:items-center sm:justify-end">
+            <Button variant="outline" onClick={closeTransfer} disabled={transferring}>取消</Button>
+            <Button onClick={() => void submitTransfer()} disabled={transferring || selectedHashes.size === 0 || !openListSettings?.enabled || !selectedTarget}>
+              {transferring ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <ArrowRight className="mr-2 h-4 w-4" />}
+              {transferring ? "创建中" : `转移 ${selectedHashes.size} 个种子`}
             </Button>
           </div>
         </div>
