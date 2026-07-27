@@ -18,6 +18,7 @@ type OpenListSettingsSummary = {
 
 type TransferJob = {
   id: number;
+  version: number;
   downloader_id: number | null;
   infohash: string;
   torrent_name: string;
@@ -79,6 +80,7 @@ export function TorrentTransferPage() {
   const [jobPage, setJobPage] = useState(1);
   const [jobTotal, setJobTotal] = useState(0);
   const [jobsLoading, setJobsLoading] = useState(true);
+  const [resolvingJobId, setResolvingJobId] = useState<number | null>(null);
 
   const selectedTarget = settings?.target_directories.find((target) => target.id === settings.target_directory_id);
   const filteredTorrents = useMemo(() => {
@@ -175,6 +177,31 @@ export function TorrentTransferPage() {
     }
   }
 
+  async function resolveJob(job: TransferJob, resolution: "recheck" | "force_retry") {
+    const confirmed = resolution === "force_retry"
+      ? window.confirm("仅在确认 OpenList 中没有正在运行的旧复制任务后继续。是否强制重新提交复制？")
+      : true;
+    if (!confirmed) return;
+    setResolvingJobId(job.id);
+    setError("");
+    try {
+      await api(`/api/media/openlist/jobs/${job.id}/resolve-copy`, {
+        method: "POST",
+        body: JSON.stringify({
+          resolution,
+          expected_version: job.version,
+          confirm_task_terminated: resolution === "force_retry",
+        }),
+      });
+      await loadJobs(jobPage, true);
+      setNotice(resolution === "force_retry" ? "已重新提交任务" : "已安排重新检查");
+    } catch (resolveError) {
+      setError((resolveError as Error).message || "处理任务失败");
+    } finally {
+      setResolvingJobId(null);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div>
@@ -228,7 +255,16 @@ export function TorrentTransferPage() {
             const failed = job.stage === "cancelled" || job.stage === "copy_manual_review" || job.stage === "manifest_required";
             const complete = job.stage === "completed";
             const StatusIcon = complete ? CheckCircle2 : failed ? AlertCircle : Clock3;
-            return <div key={job.id} className="grid gap-3 px-4 py-3 lg:grid-cols-[minmax(0,1fr)_12rem_9rem_9rem] lg:items-center"><div className="min-w-0"><div className="truncate text-sm font-medium" title={job.torrent_name}>{job.torrent_name}</div><div className="mt-1 text-xs text-muted">{downloaders.find((item) => item.id === job.downloader_id)?.name ?? `下载器 #${job.downloader_id ?? "-"}`} · {job.infohash.slice(0, 12)}</div>{job.last_error ? <div className="mt-1 line-clamp-2 text-xs text-destructive" title={job.last_error}>{job.last_error}</div> : null}</div><div><div className="h-1.5 overflow-hidden rounded-full bg-surface-container-high"><div className={`h-full rounded-full transition-[width] duration-300 ${failed ? "bg-destructive" : "bg-primary"}`} style={{ width: `${stage.progress}%` }} /></div><div className="mt-1 text-right text-[11px] text-muted">{stage.progress}%</div></div><div className={`flex items-center gap-1.5 text-xs font-medium ${complete ? "text-primary" : failed ? "text-destructive" : "text-foreground"}`}><StatusIcon className={`h-4 w-4 ${!complete && !failed ? "animate-pulse" : ""}`} />{stage.label}</div><div className="text-xs text-muted">{formatDate(job.updated_at)}</div></div>;
+            return <div key={job.id} className="grid gap-3 px-4 py-3 lg:grid-cols-[minmax(0,1fr)_12rem_9rem_9rem_auto] lg:items-center">
+              <div className="min-w-0"><div className="truncate text-sm font-medium" title={job.torrent_name}>{job.torrent_name}</div><div className="mt-1 text-xs text-muted">{downloaders.find((item) => item.id === job.downloader_id)?.name ?? `下载器 #${job.downloader_id ?? "-"}`} · {job.infohash.slice(0, 12)}</div>{job.last_error ? <div className="mt-1 line-clamp-2 text-xs text-destructive" title={job.last_error}>{job.last_error}</div> : null}</div>
+              <div><div className="h-1.5 overflow-hidden rounded-full bg-surface-container-high"><div className={`h-full rounded-full transition-[width] duration-300 ${failed ? "bg-destructive" : "bg-primary"}`} style={{ width: `${stage.progress}%` }} /></div><div className="mt-1 text-right text-[11px] text-muted">{stage.progress}%</div></div>
+              <div className={`flex items-center gap-1.5 text-xs font-medium ${complete ? "text-primary" : failed ? "text-destructive" : "text-foreground"}`}><StatusIcon className={`h-4 w-4 ${!complete && !failed ? "animate-pulse" : ""}`} />{stage.label}</div>
+              <div className="text-xs text-muted">{formatDate(job.updated_at)}</div>
+              {job.stage === "copy_manual_review" ? <div className="flex flex-wrap gap-2 lg:justify-end">
+                <Button variant="outline" className="h-8 px-3 text-xs" disabled={resolvingJobId === job.id} onClick={() => void resolveJob(job, "recheck")}>重新检查</Button>
+                <Button className="h-8 px-3 text-xs" disabled={resolvingJobId === job.id} onClick={() => void resolveJob(job, "force_retry")}>{resolvingJobId === job.id ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}确认并重试</Button>
+              </div> : <div />}
+            </div>;
           })}</div>}
           <div className="mt-4 flex items-center justify-between gap-3"><span className="text-xs text-muted">第 {jobPage} / {jobPageCount} 页</span><div className="flex gap-2"><Button variant="outline" disabled={jobPage <= 1} onClick={() => setJobPage((page) => page - 1)}>上一页</Button><Button variant="outline" disabled={jobPage >= jobPageCount} onClick={() => setJobPage((page) => page + 1)}>下一页</Button></div></div>
         </CardContent>
