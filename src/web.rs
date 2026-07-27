@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -751,10 +751,8 @@ struct ResolveOpenListCopyRequest {
 async fn resolve_openlist_copy(
     State(state): State<MediaApiState>,
     Path(id): Path<i64>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(payload): Json<ResolveOpenListCopyRequest>,
 ) -> Result<Json<OpenListJobResponse>, ApiError> {
-    require_loopback_copy_resolution(peer)?;
     let resolution = payload.resolution.trim();
     if !matches!(resolution, "force_retry" | "recheck" | "cancel") {
         return Err(ApiError::bad_request(
@@ -809,16 +807,6 @@ async fn resolve_openlist_copy(
         .map_err(media_app_error)?
         .ok_or_else(|| ApiError::not_found("OpenList relocation job not found"))?;
     Ok(Json(updated.into()))
-}
-
-fn require_loopback_copy_resolution(peer: SocketAddr) -> Result<(), ApiError> {
-    if peer.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(ApiError::forbidden(
-            "OpenList copy resolution is restricted to loopback requests",
-        ))
-    }
 }
 
 fn decode_openlist_job_task_ids(value: Option<&str>) -> Vec<String> {
@@ -4148,13 +4136,6 @@ impl ApiError {
         }
     }
 
-    fn forbidden(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
-        }
-    }
-
     fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -4276,12 +4257,7 @@ mod media_api_tests {
     use super::*;
 
     #[test]
-    fn openlist_copy_resolution_is_loopback_only() {
-        assert!(require_loopback_copy_resolution("127.0.0.1:1234".parse().unwrap()).is_ok());
-        assert!(require_loopback_copy_resolution("[::1]:1234".parse().unwrap()).is_ok());
-        let error =
-            require_loopback_copy_resolution("192.0.2.1:1234".parse().unwrap()).unwrap_err();
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    fn openlist_task_ids_accept_current_and_legacy_formats() {
         assert_eq!(
             decode_openlist_job_task_ids(Some("[\"task-a\",\"task-b\"]")),
             vec!["task-a".to_string(), "task-b".to_string()]
