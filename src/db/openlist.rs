@@ -89,7 +89,8 @@ impl Database {
             let page_size = page_size.clamp(1, 100);
             let total = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM media_relocation_jobs WHERE media_download_id IS NULL",
+                    "SELECT COUNT(*) FROM media_relocation_jobs
+                     WHERE media_download_id IS NULL OR manual_requested_at IS NOT NULL",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -105,7 +106,8 @@ impl Database {
                             target_downloader_id, copy_items_json, source_files_json,
                             target_root_folder, source_manifest_json, copy_checkpoint_json,
                             copy_lock_acquired, manifest_cursor
-                     FROM media_relocation_jobs WHERE media_download_id IS NULL
+                     FROM media_relocation_jobs
+                     WHERE media_download_id IS NULL OR manual_requested_at IS NOT NULL
                      ORDER BY id DESC LIMIT ? OFFSET ?",
                 )
                 .map_err(sql_error)?;
@@ -139,18 +141,24 @@ impl Database {
             let mut inserted = 0;
             let mut skipped = 0;
             for (infohash, name) in torrents {
-                let active = tx
+                let active_id = tx
                     .query_row(
-                        "SELECT 1 FROM media_relocation_jobs
+                        "SELECT id FROM media_relocation_jobs
                          WHERE downloader_id=? AND lower(infohash)=lower(?)
                            AND stage NOT IN ('completed', 'cancelled') LIMIT 1",
                         params![downloader_id, infohash],
-                        |_| Ok(()),
+                        |row| row.get::<_, i64>(0),
                     )
                     .optional()
-                    .map_err(sql_error)?
-                    .is_some();
-                if active {
+                    .map_err(sql_error)?;
+                if let Some(active_id) = active_id {
+                    tx.execute(
+                        "UPDATE media_relocation_jobs
+                         SET manual_requested_at=COALESCE(manual_requested_at, ?)
+                         WHERE id=?",
+                        params![now, active_id],
+                    )
+                    .map_err(sql_error)?;
                     skipped += 1;
                     continue;
                 }
@@ -158,9 +166,9 @@ impl Database {
                     "INSERT INTO media_relocation_jobs
                      (media_download_id, downloader_id, infohash, source_qb_path,
                       source_openlist_path, target_openlist_path, target_qb_path,
-                      torrent_name, stage, created_at, updated_at)
-                     VALUES (NULL, ?, ?, '', '', '', '', ?, 'waiting_download', ?, ?)",
-                    params![downloader_id, infohash, name, now, now],
+                      torrent_name, stage, manual_requested_at, created_at, updated_at)
+                     VALUES (NULL, ?, ?, '', '', '', '', ?, 'waiting_download', ?, ?, ?)",
+                    params![downloader_id, infohash, name, now, now, now],
                 )
                 .map_err(sql_error)?;
                 inserted += 1;
@@ -1249,5 +1257,44 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(first_page[0].torrent_name, "newer manual torrent");
         assert_eq!(second_page[0].torrent_name, "manual torrent");
+    }
+
+    #[tokio::test]
+    async fn manual_request_exposes_an_existing_automatic_relocation_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let downloader_id = db
+            .create_downloader("qb", "qbittorrent", "http://127.0.0.1:8080", "", "")
+            .await
+            .unwrap();
+        let hash = "483dcc0e0b7fd8ff3b136f496fd1ae580b421fe0";
+        let conn = super::open_connection(&dir.path().join("rflush.db")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              torrent_name, stage, created_at, updated_at)
+             VALUES (999, ?, ?, '', '', '', '', 'automatic torrent',
+                     'waiting_download', ?, ?)",
+            rusqlite::params![downloader_id, hash, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                downloader_id,
+                &[(hash.to_string(), "selected torrent".to_string())],
+            )
+            .await
+            .unwrap(),
+            (0, 1)
+        );
+        let (jobs, total) = db.list_manual_media_relocation_jobs(1, 20).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(jobs[0].torrent_name, "automatic torrent");
+        assert_eq!(jobs[0].media_download_id, Some(999));
     }
 }

@@ -3018,6 +3018,7 @@ impl Database {
                     copy_lock_acquired INTEGER NOT NULL DEFAULT 0,
                     manifest_cursor INTEGER NOT NULL DEFAULT 0,
                     target_root_folder INTEGER,
+                    manual_requested_at TEXT,
                     torrent_name TEXT NOT NULL,
                     stage TEXT NOT NULL DEFAULT 'waiting_download',
                     openlist_task_id TEXT,
@@ -3098,6 +3099,12 @@ impl Database {
                 "media_relocation_jobs",
                 "target_root_folder",
                 "ALTER TABLE media_relocation_jobs ADD COLUMN target_root_folder INTEGER",
+            )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "manual_requested_at",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN manual_requested_at TEXT",
             )?;
             migrate_media_relocation_jobs_for_manual_transfers(&conn)?;
 
@@ -3647,6 +3654,7 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             source_manifest_json TEXT NOT NULL DEFAULT '[]',
             copy_checkpoint_json TEXT, copy_lock_acquired INTEGER NOT NULL DEFAULT 0,
             manifest_cursor INTEGER NOT NULL DEFAULT 0, target_root_folder INTEGER,
+            manual_requested_at TEXT,
             torrent_name TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'waiting_download',
             openlist_task_id TEXT, torrent_data BLOB, attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT, lease_owner TEXT, lease_until TEXT,
@@ -3659,6 +3667,7 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             target_qb_path, target_content_qb_path, target_downloader_id,
             copy_items_json, source_files_json, source_manifest_json,
             copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
+            manual_requested_at,
             torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
             lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at)
          SELECT id, media_download_id, downloader_id, infohash, source_qb_path,
@@ -3666,6 +3675,7 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             target_qb_path, target_content_qb_path, target_downloader_id,
             copy_items_json, source_files_json, source_manifest_json,
             copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
+            manual_requested_at,
             torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
             lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at
          FROM media_relocation_jobs_legacy;
