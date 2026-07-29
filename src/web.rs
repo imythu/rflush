@@ -2179,9 +2179,9 @@ fn validate_media_settings(payload: &UpdateMediaSettingsRequest) -> Result<(), A
             "scan_interval_mins must be between 1 and 10080",
         ));
     }
-    if !(1..=32).contains(&payload.max_search_queries) {
+    if !(2..=32).contains(&payload.max_search_queries) {
         return Err(ApiError::bad_request(
-            "max_search_queries must be between 1 and 32",
+            "max_search_queries must be between 2 and 32",
         ));
     }
     if !(1..=16).contains(&payload.search_concurrency) {

@@ -421,19 +421,20 @@ impl MediaService {
             ),
             (None, _) => None,
         };
-        let queries = if let Some(query) = request
+        let (mut queries, fallback_queries) = if let Some(query) = request
             .query
             .as_deref()
             .map(str::trim)
             .filter(|query| !query.is_empty())
         {
-            vec![query.to_string()]
+            (vec![query.to_string()], Vec::new())
         } else if let Some(target) = &request.target {
-            QueryGenerator::new(media_settings.max_search_queries)
-                .generate(&SearchCriteria::from(target))
-                .into_iter()
-                .map(|query| query.query)
-                .collect()
+            let plan = QueryGenerator::new(media_settings.max_search_queries)
+                .generate_plan(&SearchCriteria::from(target));
+            (
+                plan.primary.into_iter().map(|query| query.query).collect(),
+                plan.fallback.into_iter().map(|query| query.query).collect(),
+            )
         } else {
             return Err(MediaServiceError::Invalid(
                 "query or target is required".to_string(),
@@ -450,9 +451,34 @@ impl MediaService {
             .collect();
         let (indexers, mut setup_errors, priorities) =
             self.resolve_indexers(&request.site_ids).await?;
-        let aggregate = IndexerAggregator::new(media_settings.search_concurrency)
-            .search(&indexers, &search_requests)
-            .await;
+        let aggregator = IndexerAggregator::new(media_settings.search_concurrency);
+        let mut aggregate = aggregator.search(&indexers, &search_requests).await;
+
+        let should_fallback =
+            !fallback_queries.is_empty()
+                && aggregate.successful_requests > 0
+                && request.target.as_ref().zip(profile.as_ref()).is_some_and(
+                    |(target, profile)| {
+                        !self.has_accepted_search_result(&aggregate.results, target, profile)
+                    },
+                );
+        if should_fallback {
+            let fallback_requests: Vec<_> = fallback_queries
+                .into_iter()
+                .map(|query| SearchRequest {
+                    query,
+                    page: 1,
+                    page_size,
+                })
+                .collect();
+            queries.extend(
+                fallback_requests
+                    .iter()
+                    .map(|request| request.query.clone()),
+            );
+            let fallback = aggregator.search(&indexers, &fallback_requests).await;
+            aggregate = aggregate.merge(fallback);
+        }
         setup_errors.extend(aggregate.errors.clone());
         let candidates = self
             .finalize_resource_candidates(
@@ -469,6 +495,20 @@ impl MediaService {
             errors: setup_errors,
             total_sites: aggregate.total_sites,
             successful_sites: aggregate.successful_sites,
+        })
+    }
+
+    fn has_accepted_search_result(
+        &self,
+        results: &[SearchResult],
+        target: &MediaTarget,
+        profile: &QualityProfileRecord,
+    ) -> bool {
+        let profile = profile_to_domain(profile);
+        results.iter().any(|result| {
+            self.parser.parse(&result.title).is_ok_and(|release| {
+                DecisionEngine::evaluate(target, &release, &profile, result.seeders).accepted
+            })
         })
     }
 
@@ -2362,7 +2402,7 @@ impl From<reqwest::Error> for MediaServiceError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
@@ -2380,6 +2420,14 @@ mod tests {
         site_id: i64,
         site_name: String,
         results: Vec<SearchResult>,
+    }
+
+    struct QueryAwareIndexer {
+        site_id: i64,
+        site_name: String,
+        outcomes: HashMap<String, Result<Vec<SearchResult>, IndexerError>>,
+        default_outcome: Result<Vec<SearchResult>, IndexerError>,
+        calls: Arc<StdMutex<Vec<String>>>,
     }
 
     struct TorrentIndexer {
@@ -2562,6 +2610,47 @@ mod tests {
         }
     }
 
+    impl IndexerAdapter for QueryAwareIndexer {
+        fn site_id(&self) -> i64 {
+            self.site_id
+        }
+
+        fn site_name(&self) -> &str {
+            &self.site_name
+        }
+
+        fn capabilities(&self) -> IndexerCapabilities {
+            IndexerCapabilities {
+                search: true,
+                fetch_torrent: false,
+                api_search: true,
+                html_search: false,
+            }
+        }
+
+        fn search<'a>(
+            &'a self,
+            request: &'a SearchRequest,
+        ) -> IndexerFuture<'a, Vec<SearchResult>> {
+            let query = request.query.clone();
+            self.calls.lock().unwrap().push(query.clone());
+            let outcome = self
+                .outcomes
+                .get(&query)
+                .cloned()
+                .unwrap_or_else(|| self.default_outcome.clone());
+            Box::pin(async move { outcome })
+        }
+
+        fn fetch_torrent<'a>(&'a self, _result: &'a SearchResult) -> IndexerFuture<'a, Vec<u8>> {
+            Box::pin(async move {
+                Err(IndexerError::Configuration(
+                    "query-aware test indexer cannot fetch torrents".to_string(),
+                ))
+            })
+        }
+    }
+
     async fn test_service() -> (
         tempfile::TempDir,
         Arc<MediaService>,
@@ -2652,6 +2741,69 @@ mod tests {
                 }),
             )
             .await;
+    }
+
+    async fn install_query_aware_indexer(
+        service: &MediaService,
+        db: &Database,
+        site_id: i64,
+        outcomes: HashMap<String, Result<Vec<SearchResult>, IndexerError>>,
+        default_outcome: Result<Vec<SearchResult>, IndexerError>,
+    ) -> Arc<StdMutex<Vec<String>>> {
+        let site = db.get_site(site_id).await.unwrap().unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        service
+            .indexers
+            .insert_for_test(
+                &site,
+                None,
+                Arc::new(QueryAwareIndexer {
+                    site_id,
+                    site_name: site.name.clone(),
+                    outcomes,
+                    default_outcome,
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .await;
+        calls
+    }
+
+    fn episode_search_result(site_id: i64, torrent_id: &str, title: &str) -> SearchResult {
+        SearchResult {
+            site_id,
+            source_site: format!("test-site-{site_id}"),
+            torrent_id: torrent_id.to_string(),
+            title: title.to_string(),
+            detail_url: None,
+            download_locator: Some(torrent_id.to_string()),
+            magnet: None,
+            size: 146_374_137,
+            seeders: 31,
+            leechers: 0,
+            publish_time: None,
+        }
+    }
+
+    fn episode_search_request(
+        site_ids: Vec<i64>,
+        titles: Vec<&str>,
+        query: Option<&str>,
+    ) -> ResourceSearchRequest {
+        ResourceSearchRequest {
+            query: query.map(str::to_string),
+            site_ids,
+            target: Some(MediaTarget::Episode {
+                tmdb_id: 42,
+                titles: titles.into_iter().map(str::to_string).collect(),
+                year: None,
+                season: 1,
+                episode: 3,
+                allow_season_pack: false,
+            }),
+            quality_profile_id: Some(1),
+            page_size: Some(50),
+        }
     }
 
     fn test_torrent(name: &str) -> Vec<u8> {
@@ -3758,6 +3910,366 @@ mod tests {
                 .get(&format!("candidate-{CANDIDATE_CACHE_CAPACITY}"))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn target_search_falls_back_when_numbered_results_do_not_match_the_episode() {
+        let (_dir, service, db, first_site, _second_site, _downloader_id) = test_service().await;
+        let repeated_wrong = episode_search_result(
+            first_site,
+            "wrong-episode",
+            "Example.Show.S01E02.1080p.WEB-DL.H264",
+        );
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "Example Show".to_string(),
+            Ok(vec![
+                repeated_wrong.clone(),
+                episode_search_result(
+                    first_site,
+                    "wrong-season",
+                    "Example.Show.S02E03.1080p.WEB-DL.H264",
+                ),
+                episode_search_result(
+                    first_site,
+                    "matching-episode",
+                    "Example.Show.S01E03.1080p.WEB-DL.H264",
+                ),
+            ]),
+        );
+        let calls = install_query_aware_indexer(
+            &service,
+            &db,
+            first_site,
+            outcomes,
+            Ok(vec![repeated_wrong]),
+        )
+        .await;
+
+        let response = service
+            .search_resources(&episode_search_request(
+                vec![first_site],
+                vec!["Example Show"],
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.queries,
+            vec![
+                "Example Show S01E03",
+                "Example Show S1E3",
+                "Example Show 03",
+                "Example Show",
+            ]
+        );
+        let accepted: Vec<_> = response
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.accepted)
+            })
+            .collect();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].result.torrent_id, "matching-episode");
+        assert_eq!(
+            response.candidates.len(),
+            3,
+            "cross-stage duplicates must collapse"
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.last().map(String::as_str), Some("Example Show"));
+    }
+
+    #[tokio::test]
+    async fn subscription_scan_queues_exactly_one_episode_found_by_title_only_fallback() {
+        let (_dir, service, db, first_site, _second_site, downloader_id) = test_service().await;
+        let target_key = crate::media::models::target_key("tv", 42, Some(1), Some(3), None);
+        let subscription = db
+            .create_subscription_with_targets(
+                &NewSubscription {
+                    tmdb_id: 42,
+                    media_type: "tv".to_string(),
+                    tmdb_is_animation: false,
+                    tmdb_genres: Vec::new(),
+                    title: "Example Show".to_string(),
+                    original_title: None,
+                    aliases: Vec::new(),
+                    year: None,
+                    poster_path: None,
+                    season: Some(1),
+                    start_episode: Some(3),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![first_site],
+                    save_path: None,
+                    enabled: true,
+                },
+                &[crate::media::progression::SubscriptionTargetSeed {
+                    target_key: target_key.clone(),
+                    season: 1,
+                    episode: 3,
+                    absolute_episode: None,
+                    air_date: Some("2020-01-01".to_string()),
+                    status: SubscriptionTargetSeedStatus::Pending,
+                }],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "Example Show".to_string(),
+            Ok(vec![episode_search_result(
+                first_site,
+                "fallback-subscription-episode",
+                "Example.Show.S01E03.1080p.WEB-DL.H264",
+            )]),
+        );
+        install_query_aware_indexer(
+            &service,
+            &db,
+            first_site,
+            outcomes,
+            Ok(vec![episode_search_result(
+                first_site,
+                "wrong-subscription-episode",
+                "Example.Show.S01E02.1080p.WEB-DL.H264",
+            )]),
+        )
+        .await;
+
+        let run = service.run_subscription(subscription.id).await.unwrap();
+        let snapshot = service
+            .get_subscription_last_run(subscription.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let downloads = db
+            .list_media_downloads(None, Some("queued"), 100, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(run.target_key, target_key);
+        assert_eq!(run.query_count, 4);
+        assert_eq!(run.accepted_count, 1);
+        assert_eq!(
+            run.download
+                .as_ref()
+                .map(|download| download.torrent_id.as_str()),
+            Some("fallback-subscription-episode")
+        );
+        assert_eq!(downloads.len(), 1);
+        assert_eq!(downloads[0].torrent_id, "fallback-subscription-episode");
+        assert_eq!(snapshot.queries.len(), run.query_count);
+        assert_eq!(
+            snapshot.best_candidate_id,
+            run.download
+                .as_ref()
+                .and_then(|download| snapshot
+                    .candidates
+                    .iter()
+                    .find(|candidate| { candidate.result.torrent_id == download.torrent_id }))
+                .map(|candidate| candidate.candidate_id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn target_search_does_not_fall_back_after_a_numbered_candidate_is_accepted() {
+        let (_dir, service, db, first_site, _second_site, _downloader_id) = test_service().await;
+        let calls = install_query_aware_indexer(
+            &service,
+            &db,
+            first_site,
+            HashMap::new(),
+            Ok(vec![episode_search_result(
+                first_site,
+                "matching-numbered",
+                "Example.Show.S01E03.1080p.WEB-DL.H264",
+            )]),
+        )
+        .await;
+
+        let response = service
+            .search_resources(&episode_search_request(
+                vec![first_site],
+                vec!["Example Show"],
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.queries.len(), 3);
+        assert!(!response.queries.iter().any(|query| query == "Example Show"));
+        assert!(response.candidates.iter().any(|candidate| {
+            candidate
+                .decision
+                .as_ref()
+                .is_some_and(|decision| decision.accepted)
+        }));
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query == "Example Show")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_resource_query_is_never_expanded_or_given_a_fallback() {
+        let (_dir, service, db, first_site, _second_site, _downloader_id) = test_service().await;
+        let calls =
+            install_query_aware_indexer(&service, &db, first_site, HashMap::new(), Ok(Vec::new()))
+                .await;
+
+        let response = service
+            .search_resources(&episode_search_request(
+                vec![first_site],
+                vec!["Example Show"],
+                Some(" Custom S01E03 "),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.queries, vec!["Custom S01E03"]);
+        assert_eq!(*calls.lock().unwrap(), vec!["Custom S01E03"]);
+    }
+
+    #[tokio::test]
+    async fn fallback_respects_the_total_query_budget_and_the_two_query_minimum() {
+        let (_dir, service, db, first_site, _second_site, _downloader_id) = test_service().await;
+        let mut settings = db.get_media_settings().await.unwrap();
+        settings.max_search_queries = 4;
+        db.update_media_settings(&settings).await.unwrap();
+        let calls =
+            install_query_aware_indexer(&service, &db, first_site, HashMap::new(), Ok(Vec::new()))
+                .await;
+
+        let response = service
+            .search_resources(&episode_search_request(
+                vec![first_site],
+                vec!["Example Show", "Original Title", "Third Alias"],
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.queries,
+            vec![
+                "Example Show S01E03",
+                "Example Show S1E3",
+                "Example Show",
+                "Original Title",
+            ]
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4);
+        assert_eq!(
+            response.queries.iter().collect::<HashSet<_>>().len(),
+            response.queries.len()
+        );
+
+        settings.max_search_queries = 1;
+        let normalized = db.update_media_settings(&settings).await.unwrap();
+        assert_eq!(normalized.max_search_queries, 2);
+    }
+
+    #[tokio::test]
+    async fn failed_numbered_requests_do_not_trigger_a_title_only_fallback() {
+        let (_dir, service, db, first_site, _second_site, _downloader_id) = test_service().await;
+        let mut outcomes = HashMap::new();
+        outcomes.insert(
+            "Example Show".to_string(),
+            Ok(vec![episode_search_result(
+                first_site,
+                "would-match",
+                "Example.Show.S01E03.1080p.WEB-DL.H264",
+            )]),
+        );
+        let calls = install_query_aware_indexer(
+            &service,
+            &db,
+            first_site,
+            outcomes,
+            Err(IndexerError::Http("tracker unavailable".to_string())),
+        )
+        .await;
+
+        let response = service
+            .search_resources(&episode_search_request(
+                vec![first_site],
+                vec!["Example Show"],
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.queries.len(), 3);
+        assert_eq!(response.errors.len(), 3);
+        assert_eq!(response.successful_sites, 0);
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|query| query == "Example Show")
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_search_counts_sites_that_succeed_in_different_phases_once_each() {
+        let (_dir, service, db, first_site, second_site, _downloader_id) = test_service().await;
+        let mut first_outcomes = HashMap::new();
+        first_outcomes.insert(
+            "Example Show".to_string(),
+            Err(IndexerError::Http("fallback failed".to_string())),
+        );
+        install_query_aware_indexer(&service, &db, first_site, first_outcomes, Ok(Vec::new()))
+            .await;
+        let mut second_outcomes = HashMap::new();
+        second_outcomes.insert(
+            "Example Show".to_string(),
+            Ok(vec![episode_search_result(
+                second_site,
+                "matching-fallback",
+                "Example.Show.S01E03.1080p.WEB-DL.H264",
+            )]),
+        );
+        install_query_aware_indexer(
+            &service,
+            &db,
+            second_site,
+            second_outcomes,
+            Err(IndexerError::Http("numbered search failed".to_string())),
+        )
+        .await;
+
+        let response = service
+            .search_resources(&episode_search_request(
+                vec![first_site, second_site],
+                vec!["Example Show"],
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.successful_sites, 2);
+        assert_eq!(response.errors.len(), 4);
+        assert!(response.candidates.iter().any(|candidate| {
+            candidate.result.torrent_id == "matching-fallback"
+                && candidate
+                    .decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.accepted)
+        }));
     }
 
     #[tokio::test]

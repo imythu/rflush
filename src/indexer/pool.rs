@@ -163,6 +163,36 @@ pub struct AggregateSearchResult {
     pub total_queries: usize,
     pub successful_sites: usize,
     pub successful_requests: usize,
+    #[serde(skip)]
+    successful_site_ids: HashSet<i64>,
+}
+
+impl AggregateSearchResult {
+    pub(crate) fn merge(mut self, other: Self) -> Self {
+        self.results.extend(other.results);
+        self.results = deduplicate_results(self.results);
+
+        self.errors.extend(other.errors);
+        self.errors.sort_by(|left, right| {
+            left.site_id
+                .cmp(&right.site_id)
+                .then_with(|| left.query.cmp(&right.query))
+                .then_with(|| left.code.cmp(&right.code))
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        self.errors.dedup();
+
+        self.total_sites = self.total_sites.max(other.total_sites);
+        self.total_queries += other.total_queries;
+        self.successful_requests += other.successful_requests;
+        let reported_successful_sites = self.successful_sites.max(other.successful_sites);
+        self.successful_site_ids.extend(other.successful_site_ids);
+        self.successful_sites = self
+            .successful_site_ids
+            .len()
+            .max(reported_successful_sites);
+        self
+    }
 }
 
 pub struct IndexerAggregator {
@@ -266,6 +296,7 @@ impl IndexerAggregator {
             total_queries,
             successful_sites: successful_sites.len(),
             successful_requests,
+            successful_site_ids: successful_sites,
         }
     }
 }
@@ -319,6 +350,31 @@ fn dedupe_key(result: &SearchResult) -> String {
         }
     }
     format!("site:{}:{}", result.site_id, result.torrent_id)
+}
+
+fn deduplicate_results(results: Vec<SearchResult>) -> Vec<SearchResult> {
+    let mut deduplicated = HashMap::<String, SearchResult>::new();
+    for result in results {
+        let key = dedupe_key(&result);
+        match deduplicated.get_mut(&key) {
+            Some(current) if result_is_preferred(&result, current) => *current = result,
+            None => {
+                deduplicated.insert(key, result);
+            }
+            _ => {}
+        }
+    }
+    let mut results: Vec<_> = deduplicated.into_values().collect();
+    results.sort_by(|left, right| {
+        right
+            .publish_time
+            .cmp(&left.publish_time)
+            .then_with(|| right.seeders.cmp(&left.seeders))
+            .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+            .then_with(|| left.site_id.cmp(&right.site_id))
+            .then_with(|| left.torrent_id.cmp(&right.torrent_id))
+    });
+    results
 }
 
 fn magnet_info_hash(magnet: &str) -> Option<String> {

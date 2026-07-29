@@ -69,6 +69,12 @@ pub struct SearchQuery {
     pub source_title: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchQueryPlan {
+    pub primary: Vec<SearchQuery>,
+    pub fallback: Vec<SearchQuery>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryGenerator {
     pub max_queries: usize,
@@ -200,6 +206,45 @@ impl QueryGenerator {
 
         queries
     }
+
+    pub fn generate_plan(&self, criteria: &SearchCriteria) -> SearchQueryPlan {
+        let mut fallback = self.generate_title_fallbacks(criteria);
+        if fallback.is_empty() || self.max_queries < 2 {
+            return SearchQueryPlan {
+                primary: self.generate(criteria),
+                fallback: Vec::new(),
+            };
+        }
+
+        // Keep the configured limit as a total budget across both stages. At most half of the
+        // budget is reserved for title-only fallbacks, leaving numbered queries as the primary
+        // strategy even when a target has many aliases.
+        let fallback_reserve = fallback.len().min(self.max_queries / 2);
+        let primary = Self::new(self.max_queries - fallback_reserve).generate(criteria);
+        fallback.truncate(self.max_queries.saturating_sub(primary.len()));
+
+        SearchQueryPlan { primary, fallback }
+    }
+
+    fn generate_title_fallbacks(&self, criteria: &SearchCriteria) -> Vec<SearchQuery> {
+        let titles = match criteria {
+            SearchCriteria::Episode { titles, .. } | SearchCriteria::Anime { titles, .. } => titles,
+            SearchCriteria::Movie { .. } | SearchCriteria::Season { .. } => return Vec::new(),
+        };
+        let mut queries = Vec::new();
+        let mut seen = HashSet::new();
+        for title in clean_titles(titles) {
+            push_query(
+                &mut queries,
+                &mut seen,
+                self.max_queries,
+                title.clone(),
+                4,
+                &title,
+            );
+        }
+        queries
+    }
 }
 
 fn clean_titles(titles: &[String]) -> Vec<String> {
@@ -308,6 +353,12 @@ mod tests {
             text(&QueryGenerator::default().generate(&anime)),
             vec!["One Piece 007", "One Piece 7", "One Piece S01E07"]
         );
+        let anime_plan = QueryGenerator::default().generate_plan(&anime);
+        assert_eq!(
+            text(&anime_plan.primary),
+            vec!["One Piece 007", "One Piece 7", "One Piece S01E07"]
+        );
+        assert_eq!(text(&anime_plan.fallback), vec!["One Piece"]);
 
         let season = SearchCriteria::Season {
             titles: vec!["庆余年".into()],
@@ -317,5 +368,63 @@ mod tests {
             text(&QueryGenerator::default().generate(&season)),
             vec!["庆余年 S02", "庆余年 Season 2", "庆余年 第2季"]
         );
+    }
+
+    #[test]
+    fn episode_plan_reserves_title_only_fallbacks_within_the_total_budget() {
+        let criteria = SearchCriteria::Episode {
+            titles: vec!["Example Show".into(), "Original Title".into()],
+            season: 1,
+            episode: 3,
+        };
+        let plan = QueryGenerator::new(8).generate_plan(&criteria);
+
+        assert_eq!(
+            text(&plan.primary),
+            vec![
+                "Example Show S01E03",
+                "Example Show S1E3",
+                "Example Show 03",
+                "Original Title S01E03",
+                "Original Title S1E3",
+                "Original Title 03",
+            ]
+        );
+        assert_eq!(text(&plan.fallback), vec!["Example Show", "Original Title"]);
+        assert_eq!(plan.primary.len() + plan.fallback.len(), 8);
+    }
+
+    #[test]
+    fn episode_plan_honors_small_budgets_and_deduplicates_fallback_titles() {
+        let criteria = SearchCriteria::Episode {
+            titles: vec![
+                " Example   Show ".into(),
+                "example show".into(),
+                "Original Title".into(),
+            ],
+            season: 1,
+            episode: 3,
+        };
+        let plan = QueryGenerator::new(2).generate_plan(&criteria);
+
+        assert_eq!(text(&plan.primary), vec!["Example Show S01E03"]);
+        assert_eq!(text(&plan.fallback), vec!["Example Show"]);
+        assert_eq!(plan.primary.len() + plan.fallback.len(), 2);
+
+        let one_query = QueryGenerator::new(1).generate_plan(&criteria);
+        assert_eq!(text(&one_query.primary), vec!["Example Show S01E03"]);
+        assert!(one_query.fallback.is_empty());
+    }
+
+    #[test]
+    fn movies_do_not_gain_an_episode_fallback_stage() {
+        let criteria = SearchCriteria::Movie {
+            titles: vec!["Dune Part Two".into()],
+            year: Some(2024),
+        };
+        let plan = QueryGenerator::default().generate_plan(&criteria);
+
+        assert_eq!(text(&plan.primary), vec!["Dune Part Two 2024"]);
+        assert!(plan.fallback.is_empty());
     }
 }

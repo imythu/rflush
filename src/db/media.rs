@@ -31,7 +31,7 @@ impl Database {
                         tmdb_token: row.get(0)?,
                         tmdb_language: row.get(1)?,
                         scan_interval_mins: row.get::<_, i64>(2)?.max(1) as u64,
-                        max_search_queries: row.get::<_, i64>(3)?.max(1) as usize,
+                        max_search_queries: row.get::<_, i64>(3)?.max(2) as usize,
                         search_concurrency: row.get::<_, i64>(4)?.max(1) as usize,
                         updated_at: row.get(5)?,
                     })
@@ -55,7 +55,7 @@ impl Database {
             settings.tmdb_language = "zh-CN".to_string();
         }
         settings.scan_interval_mins = settings.scan_interval_mins.max(1);
-        settings.max_search_queries = settings.max_search_queries.clamp(1, 32);
+        settings.max_search_queries = settings.max_search_queries.clamp(2, 32);
         settings.search_concurrency = settings.search_concurrency.clamp(1, 16);
         settings.updated_at = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {

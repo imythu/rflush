@@ -12,7 +12,7 @@ pub use decision::{
 #[allow(unused_imports)]
 pub use quality::{QualityAssessment, QualityProfile, QualityProfileError, QualityRejection};
 #[allow(unused_imports)]
-pub use query::{QueryGenerator, SearchCriteria, SearchQuery};
+pub use query::{QueryGenerator, SearchCriteria, SearchQuery, SearchQueryPlan};
 pub use rank::{SortKey, stable_release_key};
 #[allow(unused_imports)]
 pub use release::{ReleaseInfo, ReleaseParseError, ReleaseParser};
