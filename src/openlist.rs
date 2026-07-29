@@ -1328,6 +1328,21 @@ mod tests {
                 "data": null
             }))
             .into_response(),
+            Some("wrong-code-missing-task") => Json(json!({
+                "code": 500,
+                "message": "task not found",
+                "data": null
+            }))
+            .into_response(),
+            Some("localized-missing-task") => Json(json!({
+                "code": 404,
+                "message": "任务不存在",
+                "data": null
+            }))
+            .into_response(),
+            Some("unauthorized-task") => {
+                (AxumStatusCode::UNAUTHORIZED, "task not found").into_response()
+            }
             Some("http-404") => {
                 (AxumStatusCode::NOT_FOUND, "reverse proxy task not found").into_response()
             }
@@ -1504,6 +1519,24 @@ mod tests {
         assert!(
             client
                 .task_info_if_exists("uppercase-missing-task")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .task_info_if_exists("wrong-code-missing-task")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .task_info_if_exists("localized-missing-task")
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .task_info_if_exists("unauthorized-task")
                 .await
                 .is_err()
         );

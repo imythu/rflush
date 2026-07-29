@@ -919,7 +919,7 @@ export function TorrentTransferPage() {
         title="安全停止手动迁移任务"
         description={pendingSafetyJob?.stage === "planning_manual_review"
           ? "手动迁移任务尚未提交 OpenList 操作，可以直接停止。"
-          : "仅在你已确认且服务端能证明 OpenList 远端任务停止后释放目标锁；状态未知时会保留锁。"}
+          : "仅在你已确认，且服务端确认远端任务已终止或已从 OpenList 任务列表移除后释放目标锁；状态未知时会保留锁。"}
         panelClassName="max-w-lg"
       >
         <div className="flex flex-col gap-5 p-5 sm:p-6">

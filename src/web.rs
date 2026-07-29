@@ -1074,7 +1074,10 @@ fn summarize_openlist_cancel_observations(
         match result {
             Ok(Some(task)) if task.succeeded() || task.terminal_failure() => {}
             Ok(Some(_)) => active.push(task_id),
-            Ok(None) => unknown.push(format!("{task_id}: 任务不存在")),
+            Ok(None) => {
+                // This confirmed manual-cancel path accepts only the client's exact
+                // OpenList task-not-found response; every ambiguous lookup remains Err.
+            }
             Err(error) => unknown.push(format!("{task_id}: {error}")),
         }
     }
@@ -4923,10 +4926,6 @@ mod media_api_tests {
             "an earlier unknown result must not hide a later active task"
         );
 
-        assert!(matches!(
-            summarize_openlist_cancel_observations(vec![("task-a".to_string(), Ok(None))]),
-            OpenListCancelVerification::Unknown(_)
-        ));
         assert!(
             require_safe_openlist_cancel(OpenListCancelVerification::Unknown(vec![
                 "task-a: request timed out".to_string(),
@@ -4963,6 +4962,52 @@ mod media_api_tests {
         assert_eq!(
             summarize_openlist_cancel_observations(vec![("task-a".to_string(), Ok(Some(task)),)]),
             OpenListCancelVerification::ProvenSafe
+        );
+    }
+
+    #[test]
+    fn openlist_cancel_verification_accepts_tasks_proven_missing() {
+        let mut terminal_task = OpenListTask {
+            id: "task-terminal".to_string(),
+            name: String::new(),
+            state: 2,
+            status: String::new(),
+            progress: 0.0,
+            total_bytes: 0,
+            error: String::new(),
+        };
+
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![("task-missing".to_string(), Ok(None))]),
+            OpenListCancelVerification::ProvenSafe
+        );
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![
+                ("task-missing".to_string(), Ok(None)),
+                ("task-terminal".to_string(), Ok(Some(terminal_task.clone())),),
+            ]),
+            OpenListCancelVerification::ProvenSafe
+        );
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![
+                ("task-missing".to_string(), Ok(None)),
+                (
+                    "task-unknown".to_string(),
+                    Err("request timed out".to_string())
+                ),
+            ]),
+            OpenListCancelVerification::Unknown(vec![
+                "task-unknown: request timed out".to_string()
+            ])
+        );
+
+        terminal_task.state = 0;
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![
+                ("task-missing".to_string(), Ok(None)),
+                ("task-active".to_string(), Ok(Some(terminal_task))),
+            ]),
+            OpenListCancelVerification::Active(vec!["task-active".to_string()])
         );
     }
 
@@ -5014,6 +5059,92 @@ mod media_api_tests {
                 relocation_scheduler,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn confirmed_cancel_releases_lock_when_openlist_task_is_proven_missing() {
+        let app = Router::new().route(
+            "/api/task/copy/info",
+            post(|| async {
+                Json(serde_json::json!({
+                    "code": 404,
+                    "message": "task not found",
+                    "data": null
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (temp, state) = test_media_state().await;
+        let db = state.service.database();
+        let mut config = db.get_openlist_config().await.unwrap();
+        config.base_url = format!("http://{address}");
+        config.api_key = "test-key".to_string();
+        db.update_openlist_config(&config).await.unwrap();
+
+        let conn = rusqlite::Connection::open(temp.path().join("rflush.db")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let checkpoint = r#"{"path":"episode.mkv","size":10,"operation":"copy_file","phase":"uncertain","submitted_at":"2026-01-01T00:00:00Z"}"#;
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (infohash, source_qb_path, source_openlist_path, target_openlist_path,
+              target_qb_path, torrent_name, stage, openlist_task_id,
+              copy_checkpoint_json, copy_lock_acquired, manifest_cursor, last_error,
+              stage_started_at, created_at, updated_at)
+             VALUES ('0123456789abcdef0123456789abcdef01234567', '/source', '/source',
+                     '/target', '/target', 'missing task', 'copy_manual_review',
+                     'missing-task', ?, 1, 4, 'ambiguous response', ?, ?, ?)",
+            rusqlite::params![checkpoint, now, now, now],
+        )
+        .unwrap();
+        let job_id = conn.last_insert_rowid();
+        drop(conn);
+
+        let current = db.get_media_relocation_job(job_id).await.unwrap().unwrap();
+        let unconfirmed = resolve_openlist_copy(
+            State(state.clone()),
+            Path(job_id),
+            Json(ResolveOpenListCopyRequest {
+                resolution: "cancel".to_string(),
+                expected_version: current.version,
+                confirm_task_terminated: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unconfirmed.status, StatusCode::BAD_REQUEST);
+        let unchanged = db.get_media_relocation_job(job_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.version, current.version);
+        assert!(unchanged.copy_lock_acquired);
+        assert_eq!(unchanged.openlist_task_id.as_deref(), Some("missing-task"));
+        assert_eq!(unchanged.copy_checkpoint_json.as_deref(), Some(checkpoint));
+
+        let Json(response) = resolve_openlist_copy(
+            State(state.clone()),
+            Path(job_id),
+            Json(ResolveOpenListCopyRequest {
+                resolution: "cancel".to_string(),
+                expected_version: unchanged.version,
+                confirm_task_terminated: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.stage, "cancelled");
+        assert!(!response.copy_lock_acquired);
+        assert!(response.openlist_task_ids.is_empty());
+        assert!(response.copy_checkpoint.is_none());
+
+        let cancelled = db.get_media_relocation_job(job_id).await.unwrap().unwrap();
+        assert_eq!(cancelled.stage, "cancelled");
+        assert_eq!(cancelled.openlist_task_id, None);
+        assert_eq!(cancelled.copy_checkpoint_json, None);
+        assert!(!cancelled.copy_lock_acquired);
+        assert_eq!(cancelled.manifest_cursor, 0);
+        assert_eq!(cancelled.last_error, None);
+        server.abort();
     }
 
     #[tokio::test]
