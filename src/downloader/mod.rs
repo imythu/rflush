@@ -63,6 +63,8 @@ pub struct TorrentInfo {
     pub size: i64,
     pub uploaded: i64,
     pub downloaded: i64,
+    #[serde(default)]
+    pub progress: f64,
     pub upload_speed: i64,
     pub download_speed: i64,
     pub ratio: f64,
@@ -80,10 +82,14 @@ pub struct TorrentInfo {
     pub last_activity: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TorrentFileInfo {
     pub path: String,
     pub size: i64,
+    #[serde(default)]
+    pub progress: f64,
+    #[serde(default)]
+    pub is_seed: bool,
 }
 
 /// 下载器测试结果
@@ -211,6 +217,13 @@ pub trait DownloaderClient: Send + Sync {
         _hash: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async { Err("当前下载器不支持启动种子".to_string()) })
+    }
+
+    fn recheck_torrent(
+        &self,
+        _hash: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Err("当前下载器不支持重新校验种子".to_string()) })
     }
 
     fn get_torrent_files(

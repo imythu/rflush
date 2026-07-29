@@ -35,19 +35,23 @@ use crate::history::RunSummary;
 use crate::indexer::IndexerError;
 use crate::media::domain::{MediaTarget, ReleaseInfo, ReleaseParser};
 use crate::media::models::{
-    MediaDownloadRecord, MediaSettings, QualityProfileRecord, QualityProfileRequest,
-    SubscriptionRecord, UpdateSubscription,
+    MediaDownloadDeletion, MediaDownloadRecord, MediaSettings, QualityProfileRecord,
+    QualityProfileRequest, SubscriptionRecord, UpdateSubscription,
 };
 use crate::media::scheduler::MediaScheduler;
 use crate::media::service::{
-    CreateSubscriptionRequest, MediaService, MediaServiceError, QueueDownloadRequest,
-    ResourceSearchRequest, ResourceSearchResponse, SubscriptionRunResult, SubscriptionRunSnapshot,
+    CreateSubscriptionRequest, FailedDownloadReconciliation, MediaService, MediaServiceError,
+    QueueDownloadRequest, ResourceSearchRequest, ResourceSearchResponse, SubscriptionRunResult,
+    SubscriptionRunSnapshot,
 };
 use crate::media::tmdb::{TmdbDetails, TmdbError, TmdbMedia, TmdbMediaType, TmdbSeason};
 use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
-use crate::openlist::{OpenListClient, OpenListTask};
-use crate::relocation::RelocationScheduler;
+use crate::openlist::{OpenListClient, OpenListTask, openlist_identity_key};
+use crate::relocation::{
+    RelocationScheduler, is_path_prefix, normalize_path, torrent_is_complete,
+    validate_torrent_files_complete,
+};
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
 use crate::site::{SiteAuth, SiteStatsRecord, SiteType, SiteWithStats};
@@ -68,6 +72,7 @@ pub struct AppState {
     media_scheduler: Arc<MediaScheduler>,
     monitor: Arc<SystemMonitor>,
     tag_rule_scheduler: Arc<TagRuleScheduler>,
+    relocation_scheduler: Arc<RelocationScheduler>,
     self_use: bool,
 }
 
@@ -172,6 +177,7 @@ impl AppState {
         media_scheduler: Arc<MediaScheduler>,
         monitor: Arc<SystemMonitor>,
         tag_rule_scheduler: Arc<TagRuleScheduler>,
+        relocation_scheduler: Arc<RelocationScheduler>,
         self_use: bool,
     ) -> Self {
         Self {
@@ -187,6 +193,7 @@ impl AppState {
             media_scheduler,
             monitor,
             tag_rule_scheduler,
+            relocation_scheduler,
             self_use,
         }
     }
@@ -354,6 +361,7 @@ pub async fn serve(
         media_scheduler,
         monitor,
         tag_rule_scheduler,
+        Arc::clone(&relocation_scheduler),
         self_use,
     );
     let app = app_router(state, relocation_scheduler);
@@ -449,7 +457,10 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
             "/api/downloaders/{id}/default-path",
             get(get_downloader_default_path),
         )
-        .route("/api/downloaders/{id}/torrents", get(list_downloader_torrents))
+        .route(
+            "/api/downloaders/{id}/torrents",
+            get(list_downloader_torrents),
+        )
         .route(
             "/api/downloaders/{id}/openlist-transfer",
             post(create_openlist_transfer),
@@ -589,7 +600,14 @@ fn media_router(
             "/downloads",
             get(list_media_downloads).post(queue_media_download),
         )
-        .route("/downloads/{id}", get(get_media_download))
+        .route(
+            "/downloads/{id}",
+            get(get_media_download).delete(delete_media_download),
+        )
+        .route(
+            "/downloads/{id}/reconcile-failed",
+            post(reconcile_failed_media_download),
+        )
         .route("/downloads/{id}/redeliver", post(redeliver_media_download));
     let router = if self_use {
         router
@@ -602,6 +620,10 @@ fn media_router(
             .route(
                 "/openlist/jobs/{id}/resolve-copy",
                 post(resolve_openlist_copy),
+            )
+            .route(
+                "/openlist/jobs/{id}/resolve-migration",
+                post(resolve_openlist_migration),
             )
             .route("/openlist/scan", post(scan_openlist_jobs))
     } else {
@@ -636,6 +658,7 @@ struct OpenListJobResponse {
     infohash: String,
     torrent_name: String,
     stage: String,
+    workflow: &'static str,
     version: i64,
     source_qb_path: String,
     source_openlist_path: String,
@@ -645,12 +668,15 @@ struct OpenListJobResponse {
     openlist_task_ids: Vec<String>,
     copy_checkpoint: Option<OpenListCheckpointSummary>,
     manual_resolution_allowed: bool,
+    copy_resolution_actions: Vec<&'static str>,
+    migration_resolution_allowed: bool,
     copy_lock_acquired: bool,
     manifest_cursor: usize,
     next_attempt_at: Option<String>,
     last_error: Option<String>,
     created_at: String,
     updated_at: String,
+    stage_started_at: String,
     completed_at: Option<String>,
 }
 
@@ -658,8 +684,16 @@ struct OpenListJobResponse {
 struct OpenListCheckpointSummary {
     path: String,
     size: i64,
+    #[serde(default = "default_copy_checkpoint_operation")]
+    operation: String,
     phase: String,
     submitted_at: Option<String>,
+    #[serde(default)]
+    terminal_failure_verified: bool,
+}
+
+fn default_copy_checkpoint_operation() -> String {
+    "copy_file".to_string()
 }
 
 impl From<MediaRelocationJob> for OpenListJobResponse {
@@ -669,8 +703,18 @@ impl From<MediaRelocationJob> for OpenListJobResponse {
             .copy_checkpoint_json
             .as_deref()
             .and_then(|value| serde_json::from_str(value).ok());
-        let manual_resolution_allowed = job.stage == "copy_manual_review"
-            || (job.stage == "copying" && job.copy_checkpoint_json.is_none());
+        let copy_resolution_actions = copy_resolution_actions(&job);
+        let manual_resolution_allowed = !copy_resolution_actions.is_empty();
+        let workflow = if job.media_download_id.is_none() {
+            "qb_migration"
+        } else {
+            "auto_copy"
+        };
+        let migration_resolution_allowed = workflow == "qb_migration"
+            && matches!(
+                job.stage.as_str(),
+                "qb_manual_review" | "source_remove_manual_review"
+            );
         Self {
             id: job.id,
             media_download_id: job.media_download_id,
@@ -678,6 +722,7 @@ impl From<MediaRelocationJob> for OpenListJobResponse {
             infohash: job.infohash,
             torrent_name: job.torrent_name,
             stage: job.stage,
+            workflow,
             version: job.version,
             source_qb_path: job.source_qb_path,
             source_openlist_path: job.source_openlist_path,
@@ -687,27 +732,72 @@ impl From<MediaRelocationJob> for OpenListJobResponse {
             openlist_task_ids,
             copy_checkpoint,
             manual_resolution_allowed,
+            copy_resolution_actions,
+            migration_resolution_allowed,
             copy_lock_acquired: job.copy_lock_acquired,
             manifest_cursor: job.manifest_cursor,
             next_attempt_at: job.next_attempt_at,
             last_error: job.last_error,
             created_at: job.created_at,
             updated_at: job.updated_at,
+            stage_started_at: job.stage_started_at,
             completed_at: job.completed_at,
         }
     }
 }
 
+fn copy_resolution_actions(job: &MediaRelocationJob) -> Vec<&'static str> {
+    match job.stage.as_str() {
+        "planning_manual_review"
+            if job.media_download_id.is_some()
+                && job.openlist_task_id.is_none()
+                && job.copy_checkpoint_json.is_none()
+                && !job.copy_lock_acquired =>
+        {
+            vec!["recheck", "cancel"]
+        }
+        "copy_manual_review" => vec!["recheck", "cancel"],
+        "copying" if job.copy_checkpoint_json.is_none() => {
+            vec!["recheck", "cancel"]
+        }
+        "manifest_required" if job.media_download_id.is_none() => vec!["recheck", "cancel"],
+        "manifest_required" | "auto_copy_paused" => vec!["cancel"],
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenListJobsQuery {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenListJobsResponse {
+    page: usize,
+    page_size: usize,
+    total: usize,
+    records: Vec<OpenListJobResponse>,
+}
+
 async fn list_openlist_jobs(
     State(state): State<MediaApiState>,
-) -> Result<Json<Vec<OpenListJobResponse>>, ApiError> {
-    let jobs = state
+    Query(query): Query<OpenListJobsQuery>,
+) -> Result<Json<OpenListJobsResponse>, ApiError> {
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let (records, total) = state
         .service
         .database()
-        .list_media_relocation_jobs(200)
+        .list_automatic_media_relocation_jobs(page, page_size)
         .await
         .map_err(media_app_error)?;
-    Ok(Json(jobs.into_iter().map(Into::into).collect()))
+    Ok(Json(OpenListJobsResponse {
+        page,
+        page_size,
+        total,
+        records: records.into_iter().map(Into::into).collect(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -758,14 +848,9 @@ async fn resolve_openlist_copy(
     Json(payload): Json<ResolveOpenListCopyRequest>,
 ) -> Result<Json<OpenListJobResponse>, ApiError> {
     let resolution = payload.resolution.trim();
-    if !matches!(resolution, "force_retry" | "recheck" | "cancel") {
+    if !matches!(resolution, "recheck" | "cancel") {
         return Err(ApiError::bad_request(
-            "resolution must be force_retry, recheck, or cancel",
-        ));
-    }
-    if matches!(resolution, "force_retry" | "cancel") && !payload.confirm_task_terminated {
-        return Err(ApiError::bad_request(
-            "force_retry and cancel require confirm_task_terminated=true",
+            "resolution must be recheck or cancel",
         ));
     }
     let db = state.service.database();
@@ -779,27 +864,34 @@ async fn resolve_openlist_copy(
             "OpenList relocation job version changed; reload before resolving",
         ));
     }
-    if current.stage != "copy_manual_review"
-        && !(current.stage == "copying" && current.copy_checkpoint_json.is_none())
-        && !(current.stage == "manifest_required" && resolution == "cancel")
-    {
+    if !copy_resolution_actions(&current).contains(&resolution) {
         return Err(ApiError::conflict(
             "OpenList relocation job is not awaiting this manual resolution",
         ));
     }
-    if matches!(resolution, "force_retry" | "cancel") {
-        reject_running_openlist_tasks(db, &current).await?;
+    let planning_resolution = current.stage == "planning_manual_review";
+    if resolution == "cancel" && !planning_resolution && !payload.confirm_task_terminated {
+        return Err(ApiError::bad_request(
+            "copy-stage cancel requires confirm_task_terminated=true",
+        ));
     }
-    if !db
-        .resolve_media_relocation_copy(
+    if resolution == "cancel" && !planning_resolution {
+        require_safe_openlist_cancel(verify_openlist_tasks_for_cancel(db, &current).await?)?;
+    }
+    let changed = if current.stage == "manifest_required" && resolution == "recheck" {
+        db.recheck_media_relocation_manifest(id, payload.expected_version)
+            .await
+    } else {
+        db.resolve_media_relocation_copy(
             id,
             resolution,
             payload.expected_version,
             payload.confirm_task_terminated,
         )
         .await
-        .map_err(media_app_error)?
-    {
+    }
+    .map_err(media_app_error)?;
+    if !changed {
         return Err(ApiError::conflict(
             "OpenList relocation job changed or cannot apply this resolution",
         ));
@@ -810,6 +902,63 @@ async fn resolve_openlist_copy(
         .await
         .map_err(media_app_error)?
         .ok_or_else(|| ApiError::not_found("OpenList relocation job not found"))?;
+    Ok(Json(updated.into()))
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveOpenListMigrationRequest {
+    expected_version: i64,
+    resolution: String,
+}
+
+async fn resolve_openlist_migration(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<ResolveOpenListMigrationRequest>,
+) -> Result<Json<OpenListJobResponse>, ApiError> {
+    let db = state.service.database();
+    let current = db
+        .get_media_relocation_job(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("OpenList migration job not found"))?;
+    if current.version != payload.expected_version {
+        return Err(ApiError::conflict(
+            "OpenList migration job version changed; reload before retrying",
+        ));
+    }
+    if !matches!(
+        current.stage.as_str(),
+        "qb_manual_review" | "source_remove_manual_review"
+    ) || current.media_download_id.is_some()
+    {
+        return Err(ApiError::conflict(
+            "OpenList migration job is not awaiting a migration retry",
+        ));
+    }
+    let changed = match payload.resolution.as_str() {
+        "retry" => {
+            db.retry_media_relocation_migration(id, payload.expected_version)
+                .await
+        }
+        "abandon" => {
+            db.abandon_media_relocation_migration(id, payload.expected_version)
+                .await
+        }
+        _ => return Err(ApiError::bad_request("resolution must be retry or abandon")),
+    }
+    .map_err(media_app_error)?;
+    if !changed {
+        return Err(ApiError::conflict(
+            "OpenList migration job changed or cannot be retried",
+        ));
+    }
+    state.relocation_scheduler.request_scan();
+    let updated = db
+        .get_media_relocation_job(id)
+        .await
+        .map_err(media_app_error)?
+        .ok_or_else(|| ApiError::not_found("OpenList migration job not found"))?;
     Ok(Json(updated.into()))
 }
 
@@ -824,20 +973,74 @@ fn decode_openlist_job_task_ids(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-async fn reject_running_openlist_tasks(
+#[derive(Debug, PartialEq, Eq)]
+enum OpenListCancelVerification {
+    ProvenSafe,
+    Active(Vec<String>),
+    Unknown(Vec<String>),
+}
+
+fn require_safe_openlist_cancel(verification: OpenListCancelVerification) -> Result<(), ApiError> {
+    match verification {
+        OpenListCancelVerification::ProvenSafe => Ok(()),
+        OpenListCancelVerification::Active(task_ids) => Err(ApiError::conflict(format!(
+            "OpenList 任务仍在运行，不能释放复制锁；请先在 OpenList 停止任务后重新检查: {}",
+            task_ids.join(", ")
+        ))),
+        OpenListCancelVerification::Unknown(reasons) => Err(ApiError::conflict(format!(
+            "OpenList 任务状态无法证明已经终止，已保留复制锁；请恢复 OpenList 连接并重新检查: {}",
+            reasons.join("; ")
+        ))),
+    }
+}
+
+async fn verify_openlist_tasks_for_cancel(
     db: &Database,
     job: &MediaRelocationJob,
-) -> Result<(), ApiError> {
+) -> Result<OpenListCancelVerification, ApiError> {
     let task_ids = decode_openlist_job_task_ids(job.openlist_task_id.as_deref());
     if task_ids.is_empty() {
-        return Ok(());
+        if job.stage == "auto_copy_paused"
+            || (job.stage == "manifest_required" && job.copy_checkpoint_json.is_none())
+        {
+            return Ok(OpenListCancelVerification::ProvenSafe);
+        }
+        let checkpoint = job
+            .copy_checkpoint_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .map(|value| {
+                let phase = value
+                    .get("phase")
+                    .and_then(|phase| phase.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let operation = value
+                    .get("operation")
+                    .and_then(|operation| operation.as_str())
+                    .unwrap_or("copy_file")
+                    .to_string();
+                (phase, operation)
+            });
+        let safe_without_task = checkpoint
+            .is_some_and(|(phase, operation)| phase == "prepared" && operation != "remove_file");
+        return if safe_without_task {
+            Ok(OpenListCancelVerification::ProvenSafe)
+        } else {
+            Ok(OpenListCancelVerification::Unknown(vec![
+                "任务 ID 缺失或提交结果不确定".to_string(),
+            ]))
+        };
     }
     let config = db.get_openlist_config().await.map_err(media_app_error)?;
-    let client = manual_resolution_openlist_client(&config.base_url, &config.api_key).inspect_err(
-        |error| {
+    let client = match manual_resolution_openlist_client(&config.base_url, &config.api_key) {
+        Ok(client) => client,
+        Err(error) => {
             warn!(job_id = job.id, message = %error.message, "could not construct OpenList client before manual resolution");
-        },
-    )?;
+            return Ok(OpenListCancelVerification::Unknown(vec![error.message]));
+        }
+    };
+    let mut observations = Vec::with_capacity(task_ids.len());
     for task_id in task_ids {
         let result = client.task_info_if_exists(&task_id).await;
         if let Err(error) = &result {
@@ -848,9 +1051,9 @@ async fn reject_running_openlist_tasks(
                 "OpenList task state is uncertain during confirmed manual resolution"
             );
         }
-        require_terminal_or_missing_openlist_task(&task_id, result)?;
+        observations.push((task_id, result));
     }
-    Ok(())
+    Ok(summarize_openlist_cancel_observations(observations))
 }
 
 fn manual_resolution_openlist_client(
@@ -862,19 +1065,25 @@ fn manual_resolution_openlist_client(
     })
 }
 
-fn require_terminal_or_missing_openlist_task(
-    task_id: &str,
-    result: Result<Option<OpenListTask>, String>,
-) -> Result<(), ApiError> {
-    match result {
-        Ok(None) => Ok(()),
-        Ok(Some(task)) if task.succeeded() || task.terminal_failure() => Ok(()),
-        Ok(Some(_)) => Err(ApiError::conflict(format!(
-            "OpenList task {task_id} is still active; manual resolution was rejected"
-        ))),
-        Err(_) => Err(ApiError::conflict(format!(
-            "OpenList task {task_id} state could not be verified; manual resolution was rejected"
-        ))),
+fn summarize_openlist_cancel_observations(
+    observations: Vec<(String, Result<Option<OpenListTask>, String>)>,
+) -> OpenListCancelVerification {
+    let mut active = Vec::new();
+    let mut unknown = Vec::new();
+    for (task_id, result) in observations {
+        match result {
+            Ok(Some(task)) if task.succeeded() || task.terminal_failure() => {}
+            Ok(Some(_)) => active.push(task_id),
+            Ok(None) => unknown.push(format!("{task_id}: 任务不存在")),
+            Err(error) => unknown.push(format!("{task_id}: {error}")),
+        }
+    }
+    if !active.is_empty() {
+        OpenListCancelVerification::Active(active)
+    } else if !unknown.is_empty() {
+        OpenListCancelVerification::Unknown(unknown)
+    } else {
+        OpenListCancelVerification::ProvenSafe
     }
 }
 
@@ -891,12 +1100,10 @@ async fn scan_openlist_jobs(
     let db = state.service.database();
     let config = db.get_openlist_config().await.map_err(media_app_error)?;
     let discovered = db
-        .enqueue_submitted_media_relocation_jobs()
+        .enqueue_submitted_media_relocation_jobs(config.enabled)
         .await
         .map_err(media_app_error)?;
-    if config.enabled {
-        state.relocation_scheduler.request_scan();
-    }
+    state.relocation_scheduler.request_scan();
     Ok(Json(OpenListScanResponse {
         accepted: true,
         discovered,
@@ -925,6 +1132,7 @@ impl From<OpenListConfig> for OpenListConfigResponse {
 struct UpdateOpenListConfigRequest {
     address: String,
     api_key: Option<String>,
+    updated_at: String,
     #[serde(default)]
     clear_api_key: bool,
     enabled: bool,
@@ -977,6 +1185,7 @@ async fn update_openlist_config(
         ));
     }
     let current = db.get_openlist_config().await.map_err(media_app_error)?;
+    require_current_openlist_config_version(&payload.updated_at, &current.updated_at)?;
     if payload.clear_api_key
         && payload
             .api_key
@@ -995,14 +1204,25 @@ async fn update_openlist_config(
     let api_key = if payload.clear_api_key {
         String::new()
     } else {
-        supplied_key.unwrap_or(current.api_key)
+        supplied_key.unwrap_or_else(|| current.api_key.clone())
     };
-    if payload.enabled && api_key.is_empty() {
-        return Err(ApiError::bad_request("api_key is required when enabled"));
-    }
     if payload.enabled && api_key.is_empty() {
         return Err(ApiError::bad_request(
             "api_key is required when OpenList automation is enabled",
+        ));
+    }
+    if openlist_connection_change_requires_idle(
+        &current.base_url,
+        &current.api_key,
+        &payload.address,
+        &api_key,
+    ) && db
+        .has_in_flight_openlist_operations()
+        .await
+        .map_err(media_app_error)?
+    {
+        return Err(ApiError::conflict(
+            "OpenList address and API key cannot change while relocation jobs are active",
         ));
     }
     let updated = db
@@ -1019,7 +1239,29 @@ async fn update_openlist_config(
         })
         .await
         .map_err(media_app_error)?;
+    state.relocation_scheduler.request_scan();
     Ok(Json(updated.into()))
+}
+
+fn require_current_openlist_config_version(
+    expected_updated_at: &str,
+    current_updated_at: &str,
+) -> Result<(), ApiError> {
+    if expected_updated_at != current_updated_at {
+        return Err(ApiError::conflict(
+            "OpenList settings changed; reload before saving",
+        ));
+    }
+    Ok(())
+}
+
+fn openlist_connection_change_requires_idle(
+    current_address: &str,
+    current_api_key: &str,
+    next_address: &str,
+    next_api_key: &str,
+) -> bool {
+    current_address != next_address || current_api_key != next_api_key
 }
 
 fn normalize_and_validate_openlist_config(
@@ -1078,7 +1320,7 @@ fn normalize_and_validate_openlist_config(
     validate_non_overlapping_target_paths(&payload.target_directories)?;
     for mapping in &payload.source_mappings {
         for target in &payload.target_directories {
-            if paths_overlap(&mapping.openlist_path, &target.openlist_path) {
+            if openlist_paths_overlap(&mapping.openlist_path, &target.openlist_path) {
                 return Err(ApiError::bad_request(
                     "OpenList source mappings and target directories must not overlap",
                 ));
@@ -1160,6 +1402,10 @@ fn paths_overlap(left: &str, right: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn openlist_paths_overlap(left: &str, right: &str) -> bool {
+    paths_overlap(&openlist_identity_key(left), &openlist_identity_key(right))
+}
+
 fn validate_non_overlapping_mapping_paths(
     mappings: &[OpenListPathMapping],
 ) -> Result<(), ApiError> {
@@ -1167,7 +1413,7 @@ fn validate_non_overlapping_mapping_paths(
         for right in &mappings[index + 1..] {
             if (left.downloader_id == right.downloader_id
                 && paths_overlap(&left.qb_path, &right.qb_path))
-                || paths_overlap(&left.openlist_path, &right.openlist_path)
+                || openlist_paths_overlap(&left.openlist_path, &right.openlist_path)
             {
                 return Err(ApiError::bad_request(
                     "path mappings for one downloader must not overlap",
@@ -1190,7 +1436,7 @@ fn validate_non_overlapping_target_paths(
             }
             if (left.downloader_id == right.downloader_id
                 && paths_overlap(&left.qb_path, &right.qb_path))
-                || paths_overlap(&left.openlist_path, &right.openlist_path)
+                || openlist_paths_overlap(&left.openlist_path, &right.openlist_path)
             {
                 return Err(ApiError::bad_request(
                     "target directories for one downloader must not overlap",
@@ -1266,6 +1512,7 @@ struct MediaDownloadsQuery {
     status: Option<String>,
     page: Option<usize>,
     page_size: Option<usize>,
+    before_id: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1273,6 +1520,12 @@ struct SubscriptionDownloadsQuery {
     status: Option<String>,
     page: Option<usize>,
     page_size: Option<usize>,
+    before_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteMediaDownloadQuery {
+    version: i64,
 }
 
 async fn get_media_settings(
@@ -1586,7 +1839,7 @@ async fn delete_media_subscription(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::conflict(
-            "subscription changed or is currently being scanned",
+            "subscription changed, has active download or relocation work, or has an unresolved qB submission",
         ))
     }
 }
@@ -1713,20 +1966,21 @@ async fn list_media_downloads(
 ) -> Result<Json<Vec<MediaDownloadResponse>>, ApiError> {
     let (status, limit, offset) =
         validate_download_query(query.status.as_deref(), query.page, query.page_size)?;
+    let before_id = validate_download_cursor(query.before_id, query.page)?;
     if let Some(subscription_id) = query.subscription_id {
         load_media_subscription(&state, subscription_id).await?;
     }
-    let downloads = state
-        .service
-        .database()
-        .list_media_downloads(query.subscription_id, status.as_deref(), limit, offset)
-        .await
-        .map_err(media_app_error)?;
+    let db = state.service.database();
+    let downloads = if let Some(before_id) = before_id {
+        db.list_media_downloads_before(query.subscription_id, status.as_deref(), limit, before_id)
+            .await
+    } else {
+        db.list_media_downloads(query.subscription_id, status.as_deref(), limit, offset)
+            .await
+    }
+    .map_err(media_app_error)?;
     Ok(Json(
-        downloads
-            .into_iter()
-            .map(MediaDownloadResponse::from)
-            .collect(),
+        media_download_responses(state.service.database(), downloads).await?,
     ))
 }
 
@@ -1738,17 +1992,18 @@ async fn list_subscription_downloads(
     load_media_subscription(&state, id).await?;
     let (status, limit, offset) =
         validate_download_query(query.status.as_deref(), query.page, query.page_size)?;
-    let downloads = state
-        .service
-        .database()
-        .list_media_downloads(Some(id), status.as_deref(), limit, offset)
-        .await
-        .map_err(media_app_error)?;
+    let before_id = validate_download_cursor(query.before_id, query.page)?;
+    let db = state.service.database();
+    let downloads = if let Some(before_id) = before_id {
+        db.list_media_downloads_before(Some(id), status.as_deref(), limit, before_id)
+            .await
+    } else {
+        db.list_media_downloads(Some(id), status.as_deref(), limit, offset)
+            .await
+    }
+    .map_err(media_app_error)?;
     Ok(Json(
-        downloads
-            .into_iter()
-            .map(MediaDownloadResponse::from)
-            .collect(),
+        media_download_responses(state.service.database(), downloads).await?,
     ))
 }
 
@@ -1764,7 +2019,77 @@ async fn get_media_download(
         .await
         .map_err(media_app_error)?
         .ok_or_else(|| ApiError::not_found("media download not found"))?;
-    Ok(Json(MediaDownloadResponse::from(download)))
+    Ok(Json(
+        MediaDownloadResponse::from_database(state.service.database(), download).await?,
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteMediaDownloadResponse {
+    #[serde(flatten)]
+    deletion: MediaDownloadDeletion,
+    qb_torrent_deleted: bool,
+    openlist_data_deleted: bool,
+}
+
+async fn delete_media_download(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    Query(query): Query<DeleteMediaDownloadQuery>,
+) -> Result<Json<DeleteMediaDownloadResponse>, ApiError> {
+    validate_positive_id(id, "download id")?;
+    if query.version < 0 {
+        return Err(ApiError::bad_request(
+            "download version must be greater than or equal to zero",
+        ));
+    }
+    let deletion = state
+        .service
+        .delete_download_record(id, query.version)
+        .await
+        .map_err(ApiError::from)?;
+    state.scheduler.wake();
+    Ok(Json(DeleteMediaDownloadResponse {
+        deletion,
+        qb_torrent_deleted: false,
+        openlist_data_deleted: false,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct ReconcileFailedMediaDownloadResponse {
+    resolution: String,
+    #[serde(flatten)]
+    download: MediaDownloadResponse,
+}
+
+impl From<FailedDownloadReconciliation> for ReconcileFailedMediaDownloadResponse {
+    fn from(value: FailedDownloadReconciliation) -> Self {
+        Self {
+            resolution: value.resolution,
+            download: MediaDownloadResponse::from(value.download),
+        }
+    }
+}
+
+async fn reconcile_failed_media_download(
+    State(state): State<MediaApiState>,
+    Path(id): Path<i64>,
+    Query(query): Query<DeleteMediaDownloadQuery>,
+) -> Result<Json<ReconcileFailedMediaDownloadResponse>, ApiError> {
+    validate_positive_id(id, "download id")?;
+    if query.version < 0 {
+        return Err(ApiError::bad_request(
+            "download version must be greater than or equal to zero",
+        ));
+    }
+    let result = state
+        .service
+        .reconcile_failed_download(id, query.version)
+        .await
+        .map_err(ApiError::from)?;
+    state.scheduler.wake();
+    Ok(Json(ReconcileFailedMediaDownloadResponse::from(result)))
 }
 
 async fn redeliver_media_download(
@@ -1785,6 +2110,7 @@ struct MediaDownloadResponse {
     #[serde(flatten)]
     download: MediaDownloadRecord,
     parsed_release: Option<ReleaseInfo>,
+    failed_reconciliation_allowed: bool,
 }
 
 impl From<MediaDownloadRecord> for MediaDownloadResponse {
@@ -1793,8 +2119,38 @@ impl From<MediaDownloadRecord> for MediaDownloadResponse {
         Self {
             download,
             parsed_release,
+            failed_reconciliation_allowed: false,
         }
     }
+}
+
+impl MediaDownloadResponse {
+    async fn from_database(db: &Database, download: MediaDownloadRecord) -> Result<Self, ApiError> {
+        let failed_reconciliation_allowed = if download.status == "failed"
+            && download.subscription_id.is_some()
+            && download.infohash.is_some()
+        {
+            db.media_download_failed_reconciliation_allowed(download.id, download.version)
+                .await
+                .map_err(media_app_error)?
+        } else {
+            false
+        };
+        let mut response = Self::from(download);
+        response.failed_reconciliation_allowed = failed_reconciliation_allowed;
+        Ok(response)
+    }
+}
+
+async fn media_download_responses(
+    db: &Database,
+    downloads: Vec<MediaDownloadRecord>,
+) -> Result<Vec<MediaDownloadResponse>, ApiError> {
+    let mut responses = Vec::with_capacity(downloads.len());
+    for download in downloads {
+        responses.push(MediaDownloadResponse::from_database(db, download).await?);
+    }
+    Ok(responses)
 }
 
 async fn load_media_subscription(
@@ -2234,6 +2590,21 @@ fn validate_download_query(
         return Err(ApiError::bad_request("invalid download status"));
     }
     Ok((status, page_size, offset))
+}
+
+fn validate_download_cursor(
+    before_id: Option<i64>,
+    page: Option<usize>,
+) -> Result<Option<i64>, ApiError> {
+    if before_id.is_some() && page.is_some() {
+        return Err(ApiError::bad_request(
+            "before_id cannot be combined with page",
+        ));
+    }
+    if before_id.is_some_and(|value| value <= 0) {
+        return Err(ApiError::bad_request("before_id must be greater than zero"));
+    }
+    Ok(before_id)
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<GlobalConfig>, ApiError> {
@@ -3249,6 +3620,23 @@ fn resolve_downloader_password(
         .unwrap_or_else(|| existing.to_string()))
 }
 
+fn downloader_connection_identity_changed(
+    current_type: &str,
+    current_url: &str,
+    next_type: &str,
+    next_url: &str,
+) -> bool {
+    let current_is_qb = current_type.trim().eq_ignore_ascii_case("qb")
+        || current_type.trim().eq_ignore_ascii_case("qbittorrent");
+    let next_is_qb = next_type.trim().eq_ignore_ascii_case("qb")
+        || next_type.trim().eq_ignore_ascii_case("qbittorrent");
+    let same_type =
+        (current_is_qb && next_is_qb) || current_type.trim().eq_ignore_ascii_case(next_type.trim());
+    let same_url =
+        current_url.trim().trim_end_matches('/') == next_url.trim().trim_end_matches('/');
+    !same_type || !same_url
+}
+
 async fn list_downloaders(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<DownloaderResponse>>, ApiError> {
@@ -3296,8 +3684,36 @@ async fn update_downloader(
         .get_downloader(id)
         .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
+    let username = body
+        .username
+        .as_deref()
+        .unwrap_or(&existing.username)
+        .to_string();
     let password =
         resolve_downloader_password(&existing.password, body.password, body.clear_password)?;
+    if state
+        .db
+        .has_active_relocation_for_downloader(id)
+        .await
+        .map_err(media_app_error)?
+    {
+        if downloader_connection_identity_changed(
+            &existing.downloader_type,
+            &existing.url,
+            &body.downloader_type,
+            &body.url,
+        ) {
+            return Err(ApiError::conflict(
+                "活动迁移任务引用此下载器，不能修改下载器类型或 URL",
+            ));
+        }
+        let credentials_changed = existing.username != username || existing.password != password;
+        if credentials_changed && (username.trim().is_empty() || password.is_empty()) {
+            return Err(ApiError::conflict(
+                "活动迁移任务引用此下载器，只允许轮换为非空凭据",
+            ));
+        }
+    }
     state
         .db
         .update_downloader(
@@ -3305,10 +3721,11 @@ async fn update_downloader(
             &body.name,
             &body.downloader_type,
             &body.url,
-            body.username.as_deref().unwrap_or(""),
+            &username,
             &password,
         )
-        .await?;
+        .await
+        .map_err(media_app_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3316,7 +3733,19 @@ async fn delete_downloader(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.db.delete_downloader(id).await?;
+    if state
+        .db
+        .has_active_relocation_for_downloader(id)
+        .await
+        .map_err(media_app_error)?
+    {
+        return Err(ApiError::conflict("活动迁移任务引用此下载器，不能删除"));
+    }
+    state
+        .db
+        .delete_downloader(id)
+        .await
+        .map_err(media_app_error)?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3409,7 +3838,11 @@ async fn list_downloader_torrents(
     if !matches!(downloader.downloader_type.as_str(), "qbittorrent" | "qb") {
         return Err(ApiError::bad_request("仅支持 qBittorrent 下载器"));
     }
-    let client = state.pool.get(&downloader).await.map_err(ApiError::bad_request)?;
+    let client = state
+        .pool
+        .get(&downloader)
+        .await
+        .map_err(ApiError::bad_request)?;
     let keyword = query.keyword.unwrap_or_default().trim().to_lowercase();
     let mut torrents = client
         .list_torrents(None)
@@ -3417,13 +3850,13 @@ async fn list_downloader_torrents(
         .map_err(ApiError::bad_gateway)?
         .into_iter()
         .filter(|torrent| {
-            torrent.completion_on > 0
-                || (torrent.size > 0 && torrent.downloaded >= torrent.size)
-                || matches!(
-                    torrent.state.to_ascii_lowercase().as_str(),
-                    "uploading" | "stalledup" | "queuedup" | "forcedup" | "pausedup"
-                        | "stoppedup" | "checkingup"
-                )
+            torrent_is_complete(
+                torrent.completion_on,
+                torrent.downloaded,
+                torrent.size,
+                torrent.progress,
+                &torrent.state,
+            )
         })
         .filter(|torrent| {
             keyword.is_empty()
@@ -3447,6 +3880,8 @@ async fn list_downloader_torrents(
 #[derive(Debug, Deserialize)]
 struct CreateOpenListTransferRequest {
     hashes: Vec<String>,
+    target_directory_id: i64,
+    expected_config_updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -3474,12 +3909,45 @@ async fn create_openlist_transfer(
     if !matches!(downloader.downloader_type.as_str(), "qbittorrent" | "qb") {
         return Err(ApiError::bad_request("仅支持 qBittorrent 下载器"));
     }
-    let config = state.db.get_openlist_config().await.map_err(media_app_error)?;
-    if !config.enabled || config.target_directory_id.is_none() {
-        return Err(ApiError::bad_request("请先启用 OpenList 自动归档并选择目标目录"));
+    let config = state
+        .db
+        .get_openlist_config()
+        .await
+        .map_err(media_app_error)?;
+    if payload.expected_config_updated_at != config.updated_at {
+        return Err(ApiError::conflict(
+            "OpenList settings changed; reload migration targets before creating tasks",
+        ));
     }
-    if !config.path_mappings.iter().any(|mapping| mapping.downloader_id == id) {
-        return Err(ApiError::bad_request("该下载器尚未配置 OpenList 来源路径映射"));
+    if config.base_url.trim().is_empty() || config.api_key.trim().is_empty() {
+        return Err(ApiError::bad_request("请先配置 OpenList 地址和 API Key"));
+    }
+    if !config
+        .path_mappings
+        .iter()
+        .any(|mapping| mapping.downloader_id == id)
+    {
+        return Err(ApiError::bad_request(
+            "该下载器尚未配置 OpenList 来源路径映射",
+        ));
+    }
+    let target = config
+        .target_directories
+        .iter()
+        .find(|target| target.id == Some(payload.target_directory_id))
+        .ok_or_else(|| ApiError::bad_request("所选迁移目标目录不存在，请刷新后重试"))?;
+    let target_downloader = state
+        .db
+        .get_downloader(target.downloader_id)
+        .await?
+        .ok_or_else(|| ApiError::conflict("目标下载器已不存在，请刷新后重试"))?;
+    if !matches!(
+        target_downloader.downloader_type.as_str(),
+        "qbittorrent" | "qb"
+    ) {
+        return Err(ApiError::conflict(
+            "目标下载器已不再是 qBittorrent，请刷新后重试",
+        ));
     }
 
     let mut hashes = payload
@@ -3489,32 +3957,69 @@ async fn create_openlist_transfer(
         .collect::<Vec<_>>();
     hashes.sort();
     hashes.dedup();
-    if hashes.iter().any(|hash| hash.len() != 40 || !hash.bytes().all(|c| c.is_ascii_hexdigit())) {
+    if hashes
+        .iter()
+        .any(|hash| !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|c| c.is_ascii_hexdigit()))
+    {
         return Err(ApiError::bad_request("种子 hash 格式无效"));
     }
-    let client = state.pool.get(&downloader).await.map_err(ApiError::bad_request)?;
+    let client = state
+        .pool
+        .get(&downloader)
+        .await
+        .map_err(ApiError::bad_request)?;
     let torrents = client
         .list_torrents_by_hashes(&hashes)
         .await
         .map_err(ApiError::bad_gateway)?;
-    if torrents.len() != hashes.len() {
+    let expected_hashes = hashes
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let returned_hashes = torrents
+        .iter()
+        .map(|torrent| torrent.hash.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    if torrents.len() != expected_hashes.len() || returned_hashes != expected_hashes {
         return Err(ApiError::bad_request("部分种子已不存在，请刷新后重试"));
     }
     if torrents.iter().any(|torrent| {
-        torrent.completion_on <= 0
-            && (torrent.size <= 0 || torrent.downloaded < torrent.size)
-            && !matches!(
-                torrent.state.to_ascii_lowercase().as_str(),
-                "uploading"
-                    | "stalledup"
-                    | "queuedup"
-                    | "forcedup"
-                    | "pausedup"
-                    | "stoppedup"
-                    | "checkingup"
-            )
+        !torrent_is_complete(
+            torrent.completion_on,
+            torrent.downloaded,
+            torrent.size,
+            torrent.progress,
+            &torrent.state,
+        )
     }) {
         return Err(ApiError::bad_request("只能转移已下载完成的种子"));
+    }
+    for torrent in &torrents {
+        let save_path = normalize_path(&torrent.save_path).map_err(ApiError::bad_request)?;
+        let mapped = config
+            .path_mappings
+            .iter()
+            .filter(|mapping| mapping.downloader_id == id)
+            .any(|mapping| {
+                normalize_path(&mapping.qb_path)
+                    .is_ok_and(|mapping_root| is_path_prefix(&mapping_root, &save_path))
+            });
+        if !mapped {
+            return Err(ApiError::bad_request(format!(
+                "种子 {} 的保存路径 {} 没有 OpenList 来源映射",
+                torrent.name, save_path
+            )));
+        }
+        let files = client
+            .get_torrent_files(&torrent.hash)
+            .await
+            .map_err(ApiError::bad_gateway)?;
+        validate_torrent_files_complete(&files).map_err(|error| {
+            ApiError::bad_request(format!(
+                "种子 {:?} 包含未完整下载或已跳过的文件: {error}",
+                torrent.name
+            ))
+        })?;
     }
     let selected = torrents
         .into_iter()
@@ -3522,9 +4027,19 @@ async fn create_openlist_transfer(
         .collect::<Vec<_>>();
     let (created, skipped) = state
         .db
-        .enqueue_manual_media_relocation_jobs(id, &selected)
+        .enqueue_manual_media_relocation_jobs_if_config_current(
+            id,
+            target.downloader_id,
+            &target.openlist_path,
+            &target.qb_path,
+            &selected,
+            &payload.expected_config_updated_at,
+            &downloader.updated_at,
+            &target_downloader.updated_at,
+        )
         .await
         .map_err(media_app_error)?;
+    state.relocation_scheduler.request_scan();
     Ok(Json(CreateOpenListTransferResponse { created, skipped }))
 }
 
@@ -4223,6 +4738,14 @@ impl From<MediaServiceError> for ApiError {
 
 fn media_app_error(error: AppError) -> ApiError {
     match error {
+        AppError::InvalidConfig { message }
+            if message.contains("changed; reload")
+                || message.contains("while relocation jobs are active")
+                || message.contains("while download work is active")
+                || message.contains("reset_download_history") =>
+        {
+            ApiError::conflict(message)
+        }
         AppError::InvalidConfig { message } => ApiError::bad_request(message),
         AppError::Database { message } if message.contains("UNIQUE constraint failed") => {
             ApiError::conflict("resource already exists")
@@ -4273,16 +4796,114 @@ mod media_api_tests {
     }
 
     #[test]
-    fn openlist_manual_resolution_fails_closed_when_task_state_is_uncertain() {
-        assert!(manual_resolution_openlist_client("", "").is_err());
+    fn openlist_connection_guard_requires_idle_for_any_credential_change() {
+        assert!(!openlist_connection_change_requires_idle(
+            "https://openlist.example",
+            "old-key",
+            "https://openlist.example",
+            "old-key",
+        ));
+        assert!(openlist_connection_change_requires_idle(
+            "https://openlist.example",
+            "old-key",
+            "https://openlist.example",
+            "new-key",
+        ));
+        assert!(openlist_connection_change_requires_idle(
+            "https://openlist.example",
+            "old-key",
+            "https://openlist.example",
+            "",
+        ));
+        assert!(openlist_connection_change_requires_idle(
+            "https://openlist.example",
+            "old-key",
+            "https://other.example",
+            "old-key",
+        ));
+    }
+
+    #[test]
+    fn openlist_config_rejects_case_only_remote_path_overlap() {
+        let mut payload = UpdateOpenListConfigRequest {
+            address: "https://openlist.example".to_string(),
+            api_key: Some("test-key".to_string()),
+            updated_at: String::new(),
+            clear_api_key: false,
+            enabled: true,
+            target_directory_id: None,
+            selected_target_index: Some(0),
+            scan_interval_mins: 1,
+            source_mappings: vec![OpenListPathMapping {
+                id: None,
+                downloader_id: 1,
+                qb_path: "/downloads/source".to_string(),
+                openlist_path: "/Media".to_string(),
+            }],
+            target_directories: vec![OpenListTargetDirectory {
+                id: None,
+                name: "archive".to_string(),
+                downloader_id: 1,
+                openlist_path: "/media/archive".to_string(),
+                qb_path: "/downloads/archive".to_string(),
+            }],
+        };
+
+        assert!(normalize_and_validate_openlist_config(&mut payload).is_err());
+        assert!(openlist_paths_overlap("/Archive", "/archive/show"));
+        assert!(openlist_paths_overlap("/Ärchive", "/ärchive/show"));
+        assert!(openlist_paths_overlap("/Café", "/Cafe\u{301}/show"));
         assert!(
-            require_terminal_or_missing_openlist_task(
-                "task-a",
-                Err("request timed out".to_string())
-            )
-            .is_err()
+            !paths_overlap("/Downloads/Archive", "/downloads/archive"),
+            "qB paths keep their existing case-sensitive semantics"
         );
-        assert!(require_terminal_or_missing_openlist_task("task-a", Ok(None)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn openlist_settings_reject_a_stale_or_missing_client_version() {
+        let (_temp, state) = test_media_state().await;
+        let current = state
+            .service
+            .database()
+            .get_openlist_config()
+            .await
+            .unwrap();
+        let request = |updated_at: String, scan_interval_mins| UpdateOpenListConfigRequest {
+            address: String::new(),
+            api_key: None,
+            updated_at,
+            clear_api_key: false,
+            enabled: false,
+            target_directory_id: None,
+            selected_target_index: None,
+            scan_interval_mins,
+            source_mappings: Vec::new(),
+            target_directories: Vec::new(),
+        };
+        let first = update_openlist_config(
+            State(state.clone()),
+            Json(request(current.updated_at.clone(), 2)),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_ne!(first.updated_at, current.updated_at);
+
+        let stale =
+            update_openlist_config(State(state.clone()), Json(request(current.updated_at, 3)))
+                .await
+                .unwrap_err();
+        assert_eq!(stale.status, StatusCode::CONFLICT);
+
+        let missing = update_openlist_config(State(state), Json(request(String::new(), 4)))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn openlist_cancel_verification_prioritizes_any_proven_active_task() {
+        assert!(manual_resolution_openlist_client("", "").is_err());
 
         let mut task = OpenListTask {
             id: "task-a".to_string(),
@@ -4293,15 +4914,56 @@ mod media_api_tests {
             total_bytes: 0,
             error: String::new(),
         };
-        assert!(
-            require_terminal_or_missing_openlist_task("task-a", Ok(Some(task.clone()))).is_err()
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![
+                ("task-a".to_string(), Err("request timed out".to_string()),),
+                ("task-b".to_string(), Ok(Some(task.clone()))),
+            ]),
+            OpenListCancelVerification::Active(vec!["task-b".to_string()]),
+            "an earlier unknown result must not hide a later active task"
         );
-        task.state = 2;
+
+        assert!(matches!(
+            summarize_openlist_cancel_observations(vec![("task-a".to_string(), Ok(None))]),
+            OpenListCancelVerification::Unknown(_)
+        ));
         assert!(
-            require_terminal_or_missing_openlist_task("task-a", Ok(Some(task.clone()))).is_ok()
+            require_safe_openlist_cancel(OpenListCancelVerification::Unknown(vec![
+                "task-a: request timed out".to_string(),
+            ]))
+            .is_err(),
+            "explicit confirmation must never release a lock while task state is unknown"
+        );
+        assert!(
+            require_safe_openlist_cancel(OpenListCancelVerification::Active(vec![
+                "task-a".to_string(),
+            ]))
+            .is_err()
+        );
+        assert!(require_safe_openlist_cancel(OpenListCancelVerification::ProvenSafe).is_ok());
+
+        task.state = 2;
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![(
+                "task-a".to_string(),
+                Ok(Some(task.clone())),
+            )]),
+            OpenListCancelVerification::ProvenSafe
+        );
+        task.state = 5;
+        task.error = "temporary failure before retry".to_string();
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![(
+                "task-a".to_string(),
+                Ok(Some(task.clone())),
+            )]),
+            OpenListCancelVerification::Active(vec!["task-a".to_string()])
         );
         task.state = 7;
-        assert!(require_terminal_or_missing_openlist_task("task-a", Ok(Some(task))).is_ok());
+        assert_eq!(
+            summarize_openlist_cancel_observations(vec![("task-a".to_string(), Ok(Some(task)),)]),
+            OpenListCancelVerification::ProvenSafe
+        );
     }
 
     fn subscription_with_status(status: Option<&str>) -> SubscriptionRecord {
@@ -4352,6 +5014,57 @@ mod media_api_tests {
                 relocation_scheduler,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn automatic_openlist_jobs_handler_reaches_records_past_legacy_200_limit() {
+        let (temp, state) = test_media_state().await;
+        let conn = rusqlite::Connection::open(temp.path().join("rflush.db")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut oldest_review_id = 0;
+        for media_download_id in 1..=205_i64 {
+            conn.execute(
+                "INSERT INTO media_relocation_jobs
+                 (media_download_id, infohash, source_qb_path, source_openlist_path,
+                  target_openlist_path, target_qb_path, torrent_name, stage,
+                  stage_started_at, created_at, updated_at)
+                 VALUES (?, ?, '', '', '', '', ?, 'copy_manual_review', ?, ?, ?)",
+                rusqlite::params![
+                    media_download_id,
+                    format!("{media_download_id:040x}"),
+                    format!("automatic-review-{media_download_id}"),
+                    now,
+                    now,
+                    now,
+                ],
+            )
+            .unwrap();
+            if media_download_id == 1 {
+                oldest_review_id = conn.last_insert_rowid();
+            }
+        }
+        drop(conn);
+
+        let Json(response) = list_openlist_jobs(
+            State(state),
+            Query(OpenListJobsQuery {
+                page: Some(3),
+                page_size: Some(100),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.page, 3);
+        assert_eq!(response.page_size, 100);
+        assert_eq!(response.total, 205);
+        assert_eq!(response.records.len(), 5);
+        assert!(
+            response
+                .records
+                .iter()
+                .any(|record| record.id == oldest_review_id)
+        );
     }
 
     #[tokio::test]
@@ -4442,6 +5155,116 @@ mod media_api_tests {
         assert!(validate_download_query(None, Some(0), Some(10)).is_err());
         assert!(validate_download_query(None, Some(1), Some(201)).is_err());
         assert!(validate_download_query(None, Some(usize::MAX), Some(200)).is_err());
+        assert_eq!(validate_download_cursor(Some(42), None).unwrap(), Some(42));
+        assert!(validate_download_cursor(Some(0), None).is_err());
+        assert!(validate_download_cursor(Some(42), Some(1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn download_delete_endpoint_is_versioned_and_reports_the_external_data_boundary() {
+        let (_temp, state) = test_media_state().await;
+        let queued = state
+            .service
+            .database()
+            .enqueue_media_download(&crate::media::models::NewMediaDownload {
+                subscription_id: None,
+                target_key: "manual:test:delete".to_string(),
+                dedupe_key: "web-delete-history".to_string(),
+                site_id: None,
+                downloader_id: None,
+                source_site: "test".to_string(),
+                downloader_name: "removed downloader".to_string(),
+                torrent_id: "delete-history".to_string(),
+                title: "Delete.History.Test.1080p.WEB-DL".to_string(),
+                size: 1,
+                release_json: "{}".to_string(),
+                decision_json: "{}".to_string(),
+                profile_snapshot_json: "{}".to_string(),
+            })
+            .await
+            .unwrap();
+        let claimed = state
+            .service
+            .database()
+            .claim_due_media_downloads("web-delete-worker", 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(claimed.id, queued.id);
+        assert!(
+            state
+                .service
+                .database()
+                .transition_media_download(
+                    claimed.id,
+                    claimed.version,
+                    "web-delete-worker",
+                    "fetching",
+                    "cancelled",
+                    None,
+                    Some("cancelled for test"),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+        let cancelled = state
+            .service
+            .database()
+            .get_media_download(queued.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stale = delete_media_download(
+            State(state.clone()),
+            Path(cancelled.id),
+            Query(DeleteMediaDownloadQuery {
+                version: cancelled.version - 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.status, StatusCode::CONFLICT);
+
+        let Json(response) = delete_media_download(
+            State(state.clone()),
+            Path(cancelled.id),
+            Query(DeleteMediaDownloadQuery {
+                version: cancelled.version,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.deletion.deleted_id, cancelled.id);
+        assert!(!response.deletion.target_reopened);
+        assert!(!response.qb_torrent_deleted);
+        assert!(!response.openlist_data_deleted);
+        assert!(
+            state
+                .service
+                .database()
+                .get_media_download(cancelled.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_download_reconciliation_rejects_an_invalid_version_before_qb_access() {
+        let (_temp, state) = test_media_state().await;
+
+        let error = reconcile_failed_media_download(
+            State(state),
+            Path(1),
+            Query(DeleteMediaDownloadQuery { version: -1 }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -4647,6 +5470,90 @@ mod security_boundary_tests {
                 .password
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn manual_review_responses_expose_only_safe_resolution_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(temp.path()).await.unwrap();
+        let downloader_id = db
+            .create_downloader("qB", "qbittorrent", "http://127.0.0.1:8080", "", "")
+            .await
+            .unwrap();
+        db.enqueue_manual_media_relocation_jobs(
+            downloader_id,
+            downloader_id,
+            "/archive",
+            "/archive",
+            &[(
+                "0123456789012345678901234567890123456789".to_string(),
+                "planning review".to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+        let (mut jobs, _) = db.list_manual_media_relocation_jobs(1, 10).await.unwrap();
+        let mut job = jobs.pop().unwrap();
+        job.stage = "planning_manual_review".to_string();
+        job.media_download_id = Some(1);
+        job.manual_requested_at = None;
+        let response = OpenListJobResponse::from(job.clone());
+
+        assert!(response.manual_resolution_allowed);
+        assert_eq!(response.copy_resolution_actions, ["recheck", "cancel"]);
+        assert!(!response.copy_resolution_actions.contains(&"force_retry"));
+
+        job.stage = "copy_manual_review".to_string();
+        job.copy_checkpoint_json = Some(
+            r#"{"path":"episode.mkv","size":10,"operation":"copy_file","phase":"uncertain","submitted_at":"2026-01-01T00:00:00Z","terminal_failure_verified":true}"#
+                .to_string(),
+        );
+        job.openlist_task_id = Some("task-failed".to_string());
+        assert_eq!(copy_resolution_actions(&job), ["recheck", "cancel"]);
+
+        job.stage = "manifest_required".to_string();
+        job.media_download_id = None;
+        job.copy_checkpoint_json = None;
+        job.openlist_task_id = None;
+        assert_eq!(copy_resolution_actions(&job), ["recheck", "cancel"]);
+        assert_eq!(
+            verify_openlist_tasks_for_cancel(&db, &job).await.unwrap(),
+            OpenListCancelVerification::ProvenSafe
+        );
+
+        job.copy_checkpoint_json = Some(
+            r#"{"path":"episode.mkv","size":10,"operation":"remove_file","phase":"uncertain","submitted_at":"2026-01-01T00:00:00Z"}"#
+                .to_string(),
+        );
+        assert!(matches!(
+            verify_openlist_tasks_for_cancel(&db, &job).await.unwrap(),
+            OpenListCancelVerification::Unknown(_)
+        ));
+
+        job.media_download_id = Some(1);
+        assert_eq!(copy_resolution_actions(&job), ["cancel"]);
+    }
+
+    #[test]
+    fn downloader_identity_guard_treats_qb_alias_and_trailing_slash_as_same_endpoint() {
+        assert!(!downloader_connection_identity_changed(
+            "qbittorrent",
+            "http://127.0.0.1:8080",
+            "qb",
+            "http://127.0.0.1:8080/",
+        ));
+        assert!(downloader_connection_identity_changed(
+            "qbittorrent",
+            "http://127.0.0.1:8080",
+            "qbittorrent",
+            "http://127.0.0.1:9090",
+        ));
+        assert!(downloader_connection_identity_changed(
+            "qbittorrent",
+            "http://127.0.0.1:8080",
+            "other-client",
+            "http://127.0.0.1:8080",
+        ));
     }
 
     #[test]

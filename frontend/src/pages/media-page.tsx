@@ -111,6 +111,7 @@ type Subscription = {
 
 type MediaDownload = {
   id: number;
+  version: number;
   subscription_id: number | null;
   target_key: string;
   site_id: number | null;
@@ -129,6 +130,19 @@ type MediaDownload = {
   updated_at: string;
   submitted_at: string | null;
   parsed_release: ReleaseInfo | null;
+  failed_reconciliation_allowed: boolean;
+};
+
+type DeleteMediaDownloadResponse = {
+  deleted_id: number;
+  subscription_id: number | null;
+  target_reopened: boolean;
+  qb_torrent_deleted: false;
+  openlist_data_deleted: false;
+};
+
+type ReconcileFailedMediaDownloadResponse = MediaDownload & {
+  resolution: "submitted" | "retry_ready";
 };
 
 type SubscriptionRunResult = {
@@ -369,6 +383,7 @@ const DEFAULT_OPENLIST_SETTINGS: OpenListAutomationSettings = {
   source_mappings: [],
   target_directories: [],
   target_directory_id: null,
+  updated_at: "",
   clear_api_key: false,
 };
 
@@ -400,6 +415,7 @@ const EMPTY_RESOURCE_FORM: ResourceForm = {
 };
 
 const RESOURCE_SITE_IDS_STORAGE_KEY = "rflush.media.resource-site-ids";
+const DOWNLOAD_PAGE_SIZE = 20;
 
 function storedResourceSiteIds(): number[] | null {
   if (typeof window === "undefined") return null;
@@ -1013,6 +1029,9 @@ export function MediaPage() {
   const [profiles, setProfiles] = useState<QualityProfile[]>([]);
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [downloads, setDownloads] = useState<MediaDownload[]>([]);
+  const [downloadCursor, setDownloadCursor] = useState<number | null>(null);
+  const [downloadsHaveMore, setDownloadsHaveMore] = useState(false);
+  const [downloadsLoadingMore, setDownloadsLoadingMore] = useState(false);
   const [sites, setSites] = useState<Site[]>([]);
   const [downloaders, setDownloaders] = useState<Downloader[]>([]);
   const [openListSettings, setOpenListSettings] = useState<OpenListAutomationSettings | null>(null);
@@ -1038,10 +1057,16 @@ export function MediaPage() {
   const [editingDetailsError, setEditingDetailsError] = useState("");
   const [editSeasonMetadata, setEditSeasonMetadata] = useState<SeasonMetadataState>(EMPTY_SEASON_METADATA);
   const [editSubscriptionForm, setEditSubscriptionForm] = useState<SubscriptionForm>(EMPTY_SUBSCRIPTION_FORM);
+  const [editSubscriptionError, setEditSubscriptionError] = useState("");
+  const [resetDownloadHistory, setResetDownloadHistory] = useState(false);
+  const [resetHistoryConfirmOpen, setResetHistoryConfirmOpen] = useState(false);
   const createDetailsGeneration = useRef(0);
   const createSeasonGeneration = useRef(0);
   const editDetailsGeneration = useRef(0);
   const editSeasonGeneration = useRef(0);
+  const downloadListGeneration = useRef(0);
+  const downloadListReloading = useRef(false);
+  const downloadLoadMoreController = useRef<AbortController | null>(null);
 
   const rememberedResourceSiteIds = useRef<number[] | null>(null);
   const [resourceForm, setResourceForm] = useState<ResourceForm>(() => {
@@ -1070,19 +1095,27 @@ export function MediaPage() {
   const [resetQualityConfirmOpen, setResetQualityConfirmOpen] = useState(false);
   const [resetQualityError, setResetQualityError] = useState("");
   const [deleteSubscription, setDeleteSubscription] = useState<Subscription | null>(null);
+  const [deleteSubscriptionError, setDeleteSubscriptionError] = useState("");
+  const [deleteDownload, setDeleteDownload] = useState<MediaDownload | null>(null);
+  const [deleteDownloadError, setDeleteDownloadError] = useState("");
   const [runDetailsSubscription, setRunDetailsSubscription] = useState<Subscription | null>(null);
   const [runDetails, setRunDetails] = useState<SubscriptionRunSnapshot | null>(null);
   const [runDetailsLoading, setRunDetailsLoading] = useState(false);
   const [runDetailsError, setRunDetailsError] = useState("");
 
   const loadData = useCallback(async () => {
+    const downloadGeneration = ++downloadListGeneration.current;
+    downloadListReloading.current = true;
+    downloadLoadMoreController.current?.abort();
+    downloadLoadMoreController.current = null;
+    setDownloadsLoadingMore(false);
     setInitialLoading(true);
     setLoadError("");
     const results = await Promise.allSettled([
       api<unknown>("/api/media/settings"),
       api<unknown>("/api/media/quality-profiles"),
       api<unknown>("/api/media/subscriptions"),
-      api<unknown>("/api/media/downloads"),
+      api<unknown>(`/api/media/downloads?page=1&page_size=${DOWNLOAD_PAGE_SIZE}`),
       api<unknown>("/api/sites"),
       api<unknown>("/api/downloaders"),
     ]);
@@ -1104,9 +1137,15 @@ export function MediaPage() {
     if (results[2].status === "fulfilled") setSubscriptions(subscriptionRows);
     else errors.push(`订阅：${describeUnknown(results[2].reason)}`);
 
-    if (results[3].status === "fulfilled") {
-      setDownloads(readArray<MediaDownload>(results[3].value, ["downloads", "items", "records", "data"]));
-    } else errors.push(`下载任务：${describeUnknown(results[3].reason)}`);
+    if (downloadGeneration === downloadListGeneration.current) {
+      if (results[3].status === "fulfilled") {
+        const rows = readArray<MediaDownload>(results[3].value, ["downloads", "items", "records", "data"]);
+        setDownloads(rows);
+        setDownloadCursor(rows[rows.length - 1]?.id ?? null);
+        setDownloadsHaveMore(rows.length === DOWNLOAD_PAGE_SIZE);
+      } else errors.push(`下载任务：${describeUnknown(results[3].reason)}`);
+      downloadListReloading.current = false;
+    }
 
     const siteRows = results[4].status === "fulfilled"
       ? readArray<Site>(results[4].value, ["sites", "items", "data"])
@@ -1145,9 +1184,58 @@ export function MediaPage() {
   }, []);
 
   const reloadDownloads = useCallback(async () => {
-    const payload = await api<unknown>("/api/media/downloads");
-    setDownloads(readArray<MediaDownload>(payload, ["downloads", "items", "records", "data"]));
+    const generation = ++downloadListGeneration.current;
+    downloadListReloading.current = true;
+    downloadLoadMoreController.current?.abort();
+    downloadLoadMoreController.current = null;
+    setDownloadsLoadingMore(false);
+    try {
+      const payload = await api<unknown>(`/api/media/downloads?page=1&page_size=${DOWNLOAD_PAGE_SIZE}`);
+      if (generation !== downloadListGeneration.current) return;
+      const rows = readArray<MediaDownload>(payload, ["downloads", "items", "records", "data"]);
+      setDownloads(rows);
+      setDownloadCursor(rows[rows.length - 1]?.id ?? null);
+      setDownloadsHaveMore(rows.length === DOWNLOAD_PAGE_SIZE);
+    } finally {
+      if (generation === downloadListGeneration.current) downloadListReloading.current = false;
+    }
   }, []);
+
+  async function loadMoreDownloads() {
+    if (
+      downloadsLoadingMore
+      || downloadListReloading.current
+      || !downloadsHaveMore
+      || downloadCursor == null
+    ) return;
+    const generation = downloadListGeneration.current;
+    const controller = new AbortController();
+    downloadLoadMoreController.current?.abort();
+    downloadLoadMoreController.current = controller;
+    setDownloadsLoadingMore(true);
+    try {
+      const payload = await api<unknown>(
+        `/api/media/downloads?before_id=${downloadCursor}&page_size=${DOWNLOAD_PAGE_SIZE}`,
+        { signal: controller.signal },
+      );
+      if (controller.signal.aborted || generation !== downloadListGeneration.current) return;
+      const rows = readArray<MediaDownload>(payload, ["downloads", "items", "records", "data"]);
+      setDownloads((current) => {
+        const existingIds = new Set(current.map((download) => download.id));
+        return [...current, ...rows.filter((download) => !existingIds.has(download.id))];
+      });
+      if (rows.length > 0) setDownloadCursor(rows[rows.length - 1].id);
+      setDownloadsHaveMore(rows.length === DOWNLOAD_PAGE_SIZE);
+    } catch (error) {
+      if (controller.signal.aborted || (error as Error).name === "AbortError") return;
+      setNotice({ tone: "error", text: describeUnknown(error) });
+    } finally {
+      if (downloadLoadMoreController.current === controller) {
+        downloadLoadMoreController.current = null;
+        setDownloadsLoadingMore(false);
+      }
+    }
+  }
 
   const reloadProfiles = useCallback(async () => {
     const payload = await api<unknown>("/api/media/quality-profiles");
@@ -1348,6 +1436,9 @@ export function MediaPage() {
   function closeSubscriptionEditor() {
     editDetailsGeneration.current += 1;
     editSeasonGeneration.current += 1;
+    setResetHistoryConfirmOpen(false);
+    setResetDownloadHistory(false);
+    setEditSubscriptionError("");
     setEditingSubscription(null);
     setEditingDetails(null);
     setEditingDetailsLoading(false);
@@ -1363,6 +1454,9 @@ export function MediaPage() {
     setEditingDetailsLoading(false);
     setEditingDetailsError("");
     setEditSeasonMetadata(EMPTY_SEASON_METADATA);
+    setResetHistoryConfirmOpen(false);
+    setResetDownloadHistory(false);
+    setEditSubscriptionError("");
     setEditSubscriptionForm({
       numberingMode: subscription.absolute_episode == null ? "season" : "absolute",
       season: subscription.season ?? 1,
@@ -1379,10 +1473,10 @@ export function MediaPage() {
     }
   }
 
-  async function saveSubscriptionRules() {
+  async function saveSubscriptionRules(resetConfirmed = false) {
     if (!editingSubscription) return;
     if (!editTargetMetadataValid) {
-      setNotice({ tone: "error", text: "请等待季集元数据加载完成，并选择有效的季与集" });
+      setEditSubscriptionError("请等待季集元数据加载完成，并选择有效的季与集");
       return;
     }
     if (
@@ -1390,9 +1484,16 @@ export function MediaPage() {
       !editSubscriptionForm.downloaderId ||
       editSubscriptionForm.siteIds.length === 0
     ) {
-      setNotice({ tone: "error", text: "请选择质量配置、站点和下载器" });
+      setEditSubscriptionError("请选择质量配置、站点和下载器");
       return;
     }
+    if (resetDownloadHistory && !resetConfirmed) {
+      setResetHistoryConfirmOpen(true);
+      return;
+    }
+    const clearingHistory = resetDownloadHistory;
+    setResetHistoryConfirmOpen(false);
+    setEditSubscriptionError("");
     setBusyKey(`edit-subscription:${editingSubscription.id}`);
     try {
       await api(`/api/media/subscriptions/${editingSubscription.id}`, {
@@ -1410,13 +1511,34 @@ export function MediaPage() {
           site_ids: editSubscriptionForm.siteIds,
           save_path: editSubscriptionForm.savePath.trim() || null,
           enabled: editingSubscription.enabled,
+          reset_download_history: clearingHistory,
         }),
       });
       closeSubscriptionEditor();
-      await reloadSubscriptions();
-      setNotice({ tone: "success", text: "订阅规则已更新" });
+      const refreshResults = await Promise.allSettled([reloadSubscriptions(), reloadDownloads()]);
+      if (refreshResults.some((result) => result.status === "rejected")) {
+        setNotice({
+          tone: "error",
+          text: clearingHistory
+            ? "订阅已回到所选剧集，本地历史也已清理，但页面刷新失败。qB 种子和 OpenList 文件未被删除，请手动刷新页面。"
+            : "订阅规则已保存，但页面刷新失败，请手动刷新页面。",
+        });
+        return;
+      }
+      setNotice({
+        tone: "success",
+        text: clearingHistory
+          ? "订阅已回到所选剧集，本地下载历史已清理；qB 种子和 OpenList 文件未被删除"
+          : "订阅规则已更新",
+      });
     } catch (error) {
-      setNotice({ tone: "error", text: describeUnknown(error) });
+      setEditSubscriptionError(
+        error instanceof ApiError && error.status === 409
+          ? clearingHistory
+            ? "仍有下载、订阅扫描、OpenList 复制、qB 迁移任务或未确认的 qB 提交结果。请先核验/补交或在 qB 中处理异常任务，再重新清理。"
+            : "所选剧集已有提交记录或关联任务仍在运行。如需重新抓取，请勾选“从所选集开始重新抓取”；否则请等待当前任务结束。"
+          : describeUnknown(error),
+      );
     } finally {
       setBusyKey("");
     }
@@ -1470,6 +1592,88 @@ export function MediaPage() {
     }
   }
 
+  async function reconcileFailedDownload(download: MediaDownload) {
+    const key = `reconcile-failed:${download.id}`;
+    setBusyKey(key);
+    setNotice(null);
+    try {
+      const result = await api<ReconcileFailedMediaDownloadResponse>(
+        `/api/media/downloads/${download.id}/reconcile-failed?version=${download.version}`,
+        { method: "POST" },
+      );
+      const successText = result.resolution === "submitted"
+        ? "qB 已确认种子存在，订阅已推进到下一集"
+        : "qB 已确认种子不存在，当前剧集已恢复扫描";
+      const refreshResults = await Promise.allSettled([reloadSubscriptions(), reloadDownloads()]);
+      if (refreshResults.some((refresh) => refresh.status === "rejected")) {
+        setNotice({
+          tone: "error",
+          text: `${successText}，但页面刷新失败，请手动刷新后再操作。`,
+        });
+        return;
+      }
+      setNotice({ tone: "success", text: successText });
+    } catch (error) {
+      setNotice({
+        tone: "error",
+        text: error instanceof ApiError && error.status === 409
+          ? "记录、订阅或迁移状态已变化，核验结果未写入。请刷新后重试。"
+          : describeUnknown(error),
+      });
+    } finally {
+      setBusyKey("");
+    }
+  }
+
+  async function confirmDeleteDownload() {
+    if (!deleteDownload) return;
+    const key = `delete-download:${deleteDownload.id}`;
+    setBusyKey(key);
+    setDeleteDownloadError("");
+    setNotice(null);
+    try {
+      const result = await api<DeleteMediaDownloadResponse>(
+        `/api/media/downloads/${deleteDownload.id}?version=${deleteDownload.version}`,
+        { method: "DELETE" },
+      );
+      setDeleteDownload(null);
+      setDeleteDownloadError("");
+      const refreshResults = await Promise.allSettled([reloadSubscriptions(), reloadDownloads()]);
+      if (refreshResults.some((result) => result.status === "rejected")) {
+        setNotice({
+          tone: "error",
+          text: "本地记录已删除，但页面刷新失败。qB 种子和 OpenList 文件未被删除，请手动刷新页面。",
+        });
+        return;
+      }
+      setNotice({
+        tone: "success",
+        text: result.target_reopened
+          ? "本地记录已删除，订阅已回到该集；qB 种子和 OpenList 文件未被删除"
+          : "本地记录已删除；qB 种子和 OpenList 文件未被删除",
+      });
+    } catch (error) {
+      setDeleteDownloadError(
+        error instanceof ApiError && error.status === 409
+          ? "记录已变化，或 qB 提交结果、关联复制及迁移任务仍未确认。请先核验/补交或在 qB 中核实处理，再刷新重试。"
+          : describeUnknown(error),
+      );
+    } finally {
+      setBusyKey("");
+    }
+  }
+
+  function openDeleteDownload(download: MediaDownload) {
+    setDeleteDownloadError("");
+    setDeleteDownload(download);
+  }
+
+  function closeDeleteDownload() {
+    if (busyKey.startsWith("delete-download:")) return;
+    setDeleteDownloadError("");
+    setDeleteDownload(null);
+  }
+
   async function openRunDetails(subscription: Subscription) {
     setRunDetailsSubscription(subscription);
     setRunDetails(null);
@@ -1499,6 +1703,7 @@ export function MediaPage() {
 
   async function confirmDeleteSubscription() {
     if (!deleteSubscription) return;
+    setDeleteSubscriptionError("");
     setBusyKey(`delete-subscription:${deleteSubscription.id}`);
     try {
       await api(`/api/media/subscriptions/${deleteSubscription.id}`, { method: "DELETE" });
@@ -1506,10 +1711,25 @@ export function MediaPage() {
       await reloadSubscriptions();
       setNotice({ tone: "success", text: "订阅已删除" });
     } catch (error) {
-      setNotice({ tone: "error", text: describeUnknown(error) });
+      setDeleteSubscriptionError(
+        error instanceof ApiError && error.status === 409
+          ? "订阅仍有扫描、下载、复制或迁移任务，或 qB 提交结果尚未确认。请先完成或核验相关任务，再刷新重试。"
+          : describeUnknown(error),
+      );
     } finally {
       setBusyKey("");
     }
+  }
+
+  function openDeleteSubscription(subscription: Subscription) {
+    setDeleteSubscriptionError("");
+    setDeleteSubscription(subscription);
+  }
+
+  function closeDeleteSubscription() {
+    if (busyKey.startsWith("delete-subscription:")) return;
+    setDeleteSubscriptionError("");
+    setDeleteSubscription(null);
   }
 
   async function searchTmdb(event: FormEvent) {
@@ -1725,6 +1945,12 @@ export function MediaPage() {
 
   async function saveOpenListSettings() {
     if (!openListSettings) return;
+    const selectedTargetIndex = openListSettings.target_directories.findIndex(
+      (target) => target.id === openListSettings.target_directory_id,
+    );
+    const selectedTarget = selectedTargetIndex >= 0
+      ? openListSettings.target_directories[selectedTargetIndex]
+      : null;
     setBusyKey("save-openlist");
     try {
       const saved = await api<unknown>("/api/media/openlist/settings", {
@@ -1733,12 +1959,10 @@ export function MediaPage() {
           ...openListSettings,
           address: openListSettings.address.trim(),
           api_key: openListSettings.api_key?.trim() || null,
-          selected_target_index: (() => {
-            const index = openListSettings.target_directories.findIndex(
-              (target) => target.id === openListSettings.target_directory_id,
-            );
-            return index >= 0 ? index : null;
-          })(),
+          target_directory_id: selectedTarget?.id != null && selectedTarget.id > 0
+            ? selectedTarget.id
+            : null,
+          selected_target_index: selectedTargetIndex >= 0 ? selectedTargetIndex : null,
           target_directories: openListSettings.target_directories.map((target) => ({
             ...target,
             id: target.id != null && target.id > 0 ? target.id : undefined,
@@ -1854,7 +2078,7 @@ export function MediaPage() {
         <div>
           <h2 className="text-xl font-semibold">自动追剧</h2>
           <p className="mt-1 text-sm text-muted">
-            {subscriptions.length} 个订阅 · {downloads.filter((item) => !["submitted", "failed", "cancelled"].includes(item.status)).length} 个处理中任务
+            {subscriptions.length} 个订阅 · 已加载 {downloads.length} 条下载记录
           </p>
         </div>
         <Button variant="outline" disabled={initialLoading} onClick={() => void loadData()}>
@@ -1904,12 +2128,17 @@ export function MediaPage() {
           siteNames={siteNames}
           downloaderNames={downloaderNames}
           busyKey={busyKey}
+          downloadsHaveMore={downloadsHaveMore}
+          downloadsLoadingMore={downloadsLoadingMore}
           onAdd={() => setMode("tmdb")}
           onAction={(subscription, action) => void runSubscriptionAction(subscription, action)}
           onViewRun={(subscription) => void openRunDetails(subscription)}
           onEdit={openSubscriptionEditor}
-          onDelete={setDeleteSubscription}
+          onDelete={openDeleteSubscription}
           onRedeliver={(download) => void redeliverDownload(download)}
+          onReconcileFailed={(download) => void reconcileFailedDownload(download)}
+          onDeleteDownload={openDeleteDownload}
+          onLoadMoreDownloads={() => void loadMoreDownloads()}
         />
       ) : mode === "tmdb" ? (
         <TmdbPanel
@@ -2090,6 +2319,11 @@ export function MediaPage() {
       >
         {editingSubscription ? (
           <div className="flex flex-col gap-5 p-4 sm:p-6">
+            {editSubscriptionError ? (
+              <div role="alert" aria-live="assertive" className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+                {editSubscriptionError}
+              </div>
+            ) : null}
             {editingSubscription.media_type === "tv" ? (
               <TvTargetFields
                 idPrefix="edit-subscription"
@@ -2154,9 +2388,27 @@ export function MediaPage() {
               />
             </div>
 
+            {editingSubscription.media_type === "tv" ? (
+              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-border bg-surface-container/35 px-4 py-3 text-sm transition-colors hover:bg-accent">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 size-4 shrink-0 accent-primary"
+                  checked={resetDownloadHistory}
+                  onChange={(event) => setResetDownloadHistory(event.target.checked)}
+                />
+                <span className="min-w-0">
+                  <span className="block font-medium">从所选集开始重新抓取</span>
+                  <span className="mt-1 block text-xs leading-5 text-muted">
+                    清理该集及后续剧集的 rflush 下载记录和已结束的自动复制记录，不会删除 qB 种子或 OpenList 文件。
+                  </span>
+                </span>
+              </label>
+            ) : null}
+
             <div className="flex flex-wrap justify-end gap-2 border-t border-border pt-4">
               <Button variant="outline" onClick={closeSubscriptionEditor}>取消</Button>
               <Button
+                variant={resetDownloadHistory ? "destructive" : "default"}
                 disabled={
                   busyKey === `edit-subscription:${editingSubscription.id}` || !editTargetMetadataValid
                 }
@@ -2165,11 +2417,49 @@ export function MediaPage() {
                 {busyKey === `edit-subscription:${editingSubscription.id}` ? (
                   <LoaderCircle className="animate-spin" data-icon="inline-start" />
                 ) : null}
-                {busyKey === `edit-subscription:${editingSubscription.id}` ? "保存中" : "保存"}
+                {busyKey === `edit-subscription:${editingSubscription.id}`
+                  ? "保存中"
+                  : resetDownloadHistory
+                    ? "清理记录并保存"
+                    : "保存"}
               </Button>
             </div>
           </div>
         ) : null}
+      </Dialog>
+
+      <Dialog
+        open={resetHistoryConfirmOpen}
+        onClose={() => setResetHistoryConfirmOpen(false)}
+        title="确认重新抓取"
+        description={editingSubscription
+          ? `将从${editSubscriptionForm.season === 0 ? "特别篇" : `第 ${editSubscriptionForm.season} 季`}第 ${editSubscriptionForm.startEpisode} 集开始清理本地历史。`
+          : "确认清理本地下载历史。"}
+        panelClassName="max-w-xl"
+      >
+        <div className="flex flex-col gap-4 p-4 sm:p-6">
+          <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm">
+            <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden="true" />
+            <p className="leading-6 text-muted">
+              rflush 会删除所选范围内的本地下载历史和已结束的自动复制记录，并允许这些剧集再次入队。qB 种子和 OpenList 文件不会被删除；仍在运行的任务会阻止本次操作。
+            </p>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setResetHistoryConfirmOpen(false)}>取消</Button>
+            <Button
+              variant="destructive"
+              disabled={editingSubscription == null || busyKey.startsWith("edit-subscription:")}
+              onClick={() => void saveSubscriptionRules(true)}
+            >
+              {busyKey.startsWith("edit-subscription:") ? (
+                <LoaderCircle className="animate-spin" data-icon="inline-start" />
+              ) : (
+                <RotateCcw data-icon="inline-start" />
+              )}
+              {busyKey.startsWith("edit-subscription:") ? "处理中" : "确认清理并保存"}
+            </Button>
+          </div>
+        </div>
       </Dialog>
 
       <Dialog
@@ -2249,15 +2539,60 @@ export function MediaPage() {
 
       <Dialog
         open={deleteSubscription !== null}
-        onClose={() => setDeleteSubscription(null)}
+        onClose={closeDeleteSubscription}
         title="删除订阅"
         description={`确定删除「${deleteSubscription?.title ?? ""}」？已提交的下载记录会保留。`}
       >
-        <div className="flex justify-end gap-2 p-4 sm:p-6">
-          <Button variant="outline" onClick={() => setDeleteSubscription(null)}>取消</Button>
-          <Button variant="destructive" disabled={busyKey.startsWith("delete-subscription:")} onClick={() => void confirmDeleteSubscription()}>
-            {busyKey.startsWith("delete-subscription:") ? "删除中" : "确认删除"}
-          </Button>
+        <div className="flex flex-col gap-4 p-4 sm:p-6">
+          {deleteSubscriptionError ? (
+            <div role="alert" aria-live="assertive" className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              {deleteSubscriptionError}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" disabled={busyKey.startsWith("delete-subscription:")} onClick={closeDeleteSubscription}>取消</Button>
+            <Button variant="destructive" disabled={busyKey.startsWith("delete-subscription:")} onClick={() => void confirmDeleteSubscription()}>
+              {busyKey.startsWith("delete-subscription:") ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Trash2 data-icon="inline-start" />}
+              {busyKey.startsWith("delete-subscription:") ? "删除中" : "确认删除"}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={deleteDownload !== null}
+        onClose={closeDeleteDownload}
+        title="删除本地下载记录"
+        description={deleteDownload ? `${targetKeyLabel(deleteDownload.target_key)} · ${deleteDownload.title}` : undefined}
+        panelClassName="max-w-xl"
+      >
+        <div className="flex flex-col gap-4 p-4 sm:p-6">
+          <div className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm">
+            <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" aria-hidden="true" />
+            <p className="leading-6 text-muted">
+              仅删除 rflush 本地记录和关联的已结束自动复制记录，不会删除 qB 中的种子、下载文件或 OpenList 数据。若这是该集当前的提交记录，关联订阅会回到该集以便重新扫描。
+            </p>
+          </div>
+          {deleteDownloadError ? (
+            <div role="alert" aria-live="assertive" className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+              {deleteDownloadError}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" disabled={busyKey.startsWith("delete-download:")} onClick={closeDeleteDownload}>取消</Button>
+            <Button
+              variant="destructive"
+              disabled={deleteDownload == null || busyKey.startsWith("delete-download:")}
+              onClick={() => void confirmDeleteDownload()}
+            >
+              {busyKey.startsWith("delete-download:") ? (
+                <LoaderCircle className="animate-spin" data-icon="inline-start" />
+              ) : (
+                <Trash2 data-icon="inline-start" />
+              )}
+              {busyKey.startsWith("delete-download:") ? "删除中" : "确认删除本地记录"}
+            </Button>
+          </div>
         </div>
       </Dialog>
 
@@ -2851,12 +3186,17 @@ function SubscriptionsPanel({
   siteNames,
   downloaderNames,
   busyKey,
+  downloadsHaveMore,
+  downloadsLoadingMore,
   onAdd,
   onAction,
   onViewRun,
   onEdit,
   onDelete,
   onRedeliver,
+  onReconcileFailed,
+  onDeleteDownload,
+  onLoadMoreDownloads,
 }: {
   subscriptions: Subscription[];
   downloads: MediaDownload[];
@@ -2867,12 +3207,17 @@ function SubscriptionsPanel({
   siteNames: Map<number, string>;
   downloaderNames: Map<number, string>;
   busyKey: string;
+  downloadsHaveMore: boolean;
+  downloadsLoadingMore: boolean;
   onAdd: () => void;
   onAction: (subscription: Subscription, action: "run" | "pause" | "resume") => void;
   onViewRun: (subscription: Subscription) => void;
   onEdit: (subscription: Subscription) => void;
   onDelete: (subscription: Subscription) => void;
   onRedeliver: (download: MediaDownload) => void;
+  onReconcileFailed: (download: MediaDownload) => void;
+  onDeleteDownload: (download: MediaDownload) => void;
+  onLoadMoreDownloads: () => void;
 }) {
   const activeCount = subscriptions.filter((item) => item.enabled && !subscriptionIsCompleted(item)).length;
   const pausedCount = subscriptions.filter((item) => !item.enabled && !subscriptionIsCompleted(item)).length;
@@ -2888,7 +3233,7 @@ function SubscriptionsPanel({
           ["运行中", activeCount],
           ["已暂停", pausedCount],
           ["需处理", attentionCount],
-          ["下载队列", queuedCount],
+          ["已加载记录", downloads.length],
         ].map(([label, value]) => (
           <div key={label} className="bg-card px-4 py-4 sm:px-5">
             <dt className="text-xs font-medium text-muted">{label}</dt>
@@ -3092,8 +3437,8 @@ function SubscriptionsPanel({
       <Card>
         <CardHeader className="flex-row items-start justify-between gap-4">
           <div>
-            <CardTitle>最近下载</CardTitle>
-            <CardDescription>显示的是任务提交状态；“已提交下载器”不代表文件已经下载完成。</CardDescription>
+            <CardTitle>下载记录</CardTitle>
+            <CardDescription>显示的是任务提交状态；“已提交下载器”不代表文件已经下载完成。状态统计仅针对已加载记录。</CardDescription>
           </div>
           <div className="hidden shrink-0 flex-wrap justify-end gap-2 sm:flex">
             <StatusPill label={`${submittedDownloadCount} 已提交`} tone="positive" />
@@ -3106,10 +3451,12 @@ function SubscriptionsPanel({
             <EmptyState icon={HardDriveDownload} title="暂无下载任务" />
           ) : (
             <div className="grid gap-2">
-              {downloads.slice(0, 8).map((download) => {
+              {downloads.map((download) => {
                 const targetLabel = targetKeyLabel(download.target_key);
                 const qualityFields = releaseQualityFields(download.parsed_release).filter((field) => field !== targetLabel);
                 const notice = downloadNotice(download);
+                const canReconcileFailed = download.failed_reconciliation_allowed;
+                const reconcilingFailed = busyKey === `reconcile-failed:${download.id}`;
                 return (
                   <div key={download.id} className="grid gap-3 rounded-2xl border border-border bg-surface-container/40 px-4 py-3 lg:grid-cols-[minmax(0,1fr)_minmax(220px,auto)] lg:items-center">
                     <div className="min-w-0">
@@ -3152,10 +3499,62 @@ function SubscriptionsPanel({
                           {busyKey === `redeliver:${download.id}` ? "核验中" : "核验/补交"}
                         </Button>
                       ) : null}
+                      {canReconcileFailed ? (
+                        <Button
+                          variant="outline"
+                          className="h-8 px-3"
+                          disabled={reconcilingFailed}
+                          onClick={() => onReconcileFailed(download)}
+                        >
+                          {reconcilingFailed ? (
+                            <LoaderCircle className="animate-spin" data-icon="inline-start" />
+                          ) : (
+                            <ShieldCheck data-icon="inline-start" />
+                          )}
+                          {reconcilingFailed ? "核验中" : "核验 qB"}
+                        </Button>
+                      ) : null}
+                      {["submitted", "failed", "cancelled"].includes(download.status) ? (
+                        <Button
+                          variant="destructive"
+                          className="size-8 p-0"
+                          title="删除本地下载记录"
+                          aria-label={`删除${download.title}的本地下载记录`}
+                          disabled={
+                            busyKey === `delete-download:${download.id}`
+                            || busyKey === `reconcile-failed:${download.id}`
+                          }
+                          onClick={() => onDeleteDownload(download)}
+                        >
+                          {busyKey === `delete-download:${download.id}` ? (
+                            <LoaderCircle className="animate-spin" />
+                          ) : (
+                            <Trash2 />
+                          )}
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
                 );
               })}
+              <div className="flex flex-wrap items-center justify-between gap-3 px-1 pt-2 text-xs text-muted">
+                <span>{downloadsHaveMore ? `已显示 ${downloads.length} 条` : `已显示全部 ${downloads.length} 条`}</span>
+                {downloadsHaveMore ? (
+                  <Button
+                    variant="outline"
+                    className="h-8 px-3"
+                    disabled={downloadsLoadingMore}
+                    onClick={onLoadMoreDownloads}
+                  >
+                    {downloadsLoadingMore ? (
+                      <LoaderCircle className="animate-spin" data-icon="inline-start" />
+                    ) : (
+                      <ChevronDown data-icon="inline-start" />
+                    )}
+                    {downloadsLoadingMore ? "加载中" : "加载更多"}
+                  </Button>
+                ) : null}
+              </div>
             </div>
           )}
         </CardContent>

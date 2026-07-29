@@ -137,6 +137,8 @@ pub struct UpdateSubscription {
     pub site_ids: Vec<i64>,
     pub save_path: Option<String>,
     pub enabled: bool,
+    #[serde(default)]
+    pub reset_download_history: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +199,26 @@ pub struct MediaDownloadRecord {
     pub created_at: String,
     pub updated_at: String,
     pub submitted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaDownloadDeletion {
+    pub deleted_id: i64,
+    pub subscription_id: Option<i64>,
+    pub target_reopened: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum MediaDownloadDeleteOutcome {
+    Deleted {
+        download: MediaDownloadRecord,
+        target_reopened: bool,
+    },
+    NotFound,
+    VersionChanged,
+    DownloadActive,
+    SubscriptionActive,
+    RelocationActive,
 }
 
 pub fn target_key(

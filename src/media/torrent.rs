@@ -1,4 +1,5 @@
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 
 const MAX_BENCODE_DEPTH: usize = 128;
 type BencodeEntries<'a> = Vec<(&'a [u8], &'a [u8])>;
@@ -23,6 +24,10 @@ pub enum TorrentMetadataError {
     InvalidFiles,
     #[error("torrent file path is not valid UTF-8")]
     InvalidUtf8,
+    #[error("torrent infohash must be a 40 or 64 character hexadecimal string")]
+    InvalidInfoHash,
+    #[error("torrent metadata version is unsupported")]
+    UnsupportedMetaVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +37,47 @@ pub struct TorrentManifestFile {
 }
 
 pub fn torrent_infohash(data: &[u8]) -> Result<String, TorrentMetadataError> {
-    Ok(sha1_hex(info_dictionary(data)?))
+    let info = info_dictionary(data)?;
+    match info_meta_version(info)? {
+        Some(2) => Ok(sha256_torrent_id_hex(info)),
+        Some(_) => Err(TorrentMetadataError::UnsupportedMetaVersion),
+        None => Ok(sha1_hex(info)),
+    }
+}
+
+pub fn torrent_infohash_for(
+    data: &[u8],
+    expected_infohash: &str,
+) -> Result<String, TorrentMetadataError> {
+    if !expected_infohash
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(TorrentMetadataError::InvalidInfoHash);
+    }
+    let info = info_dictionary(data)?;
+    let meta_version = info_meta_version(info)?;
+    match expected_infohash.len() {
+        40 => match meta_version {
+            Some(2) => Ok(sha256_torrent_id_hex(info)),
+            Some(_) => Err(TorrentMetadataError::UnsupportedMetaVersion),
+            None => Ok(sha1_hex(info)),
+        },
+        64 => {
+            if meta_version != Some(2) {
+                return Err(TorrentMetadataError::UnsupportedMetaVersion);
+            }
+            Ok(sha256_hex(info))
+        }
+        _ => Err(TorrentMetadataError::InvalidInfoHash),
+    }
+}
+
+fn info_meta_version(info: &[u8]) -> Result<Option<i64>, TorrentMetadataError> {
+    let entries = dictionary_entries(info)?;
+    dictionary_value(&entries, b"meta version")?
+        .map(parse_nonnegative_integer)
+        .transpose()
 }
 
 pub fn torrent_file_manifest(
@@ -48,16 +93,38 @@ pub fn torrent_file_manifest(
         return Err(TorrentMetadataError::MissingName);
     }
 
-    if let Some(files) = dictionary_value(&entries, b"files")? {
-        return parse_multi_file_manifest(name, files);
+    let meta_version = dictionary_value(&entries, b"meta version")?
+        .map(parse_nonnegative_integer)
+        .transpose()?;
+    if meta_version.is_some_and(|version| version != 2) {
+        return Err(TorrentMetadataError::UnsupportedMetaVersion);
     }
-    let length = dictionary_value(&entries, b"length")?
-        .ok_or(TorrentMetadataError::InvalidFiles)
-        .and_then(parse_nonnegative_integer)?;
-    Ok(vec![TorrentManifestFile {
-        path: name.to_string(),
-        size: length,
-    }])
+
+    let v1_manifest = if let Some(files) = dictionary_value(&entries, b"files")? {
+        Some(parse_multi_file_manifest(name, files)?)
+    } else {
+        dictionary_value(&entries, b"length")?
+            .map(parse_nonnegative_integer)
+            .transpose()?
+            .map(|length| {
+                vec![TorrentManifestFile {
+                    path: name.to_string(),
+                    size: length,
+                }]
+            })
+    };
+    if meta_version == Some(2) {
+        let file_tree =
+            dictionary_value(&entries, b"file tree")?.ok_or(TorrentMetadataError::InvalidFiles)?;
+        let v2_manifest = parse_v2_file_tree(name, file_tree)?;
+        if let Some(v1_manifest) = v1_manifest
+            && v1_manifest != v2_manifest
+        {
+            return Err(TorrentMetadataError::InvalidFiles);
+        }
+        return Ok(v2_manifest);
+    }
+    v1_manifest.ok_or(TorrentMetadataError::InvalidFiles)
 }
 
 fn info_dictionary(data: &[u8]) -> Result<&[u8], TorrentMetadataError> {
@@ -128,6 +195,78 @@ fn dictionary_bytes<'a>(
         .transpose()
 }
 
+fn parse_v2_file_tree(
+    root_name: &str,
+    file_tree: &[u8],
+) -> Result<Vec<TorrentManifestFile>, TorrentMetadataError> {
+    let mut relative_manifest = Vec::new();
+    walk_v2_file_tree(file_tree, &mut Vec::new(), &mut relative_manifest, 1)?;
+    if relative_manifest.is_empty() {
+        return Err(TorrentMetadataError::InvalidFiles);
+    }
+
+    let single_file_at_root =
+        relative_manifest.len() == 1 && relative_manifest[0].path == root_name;
+    if !single_file_at_root {
+        for file in &mut relative_manifest {
+            file.path = format!("{root_name}/{}", file.path);
+        }
+    }
+    Ok(relative_manifest)
+}
+
+fn walk_v2_file_tree(
+    tree: &[u8],
+    components: &mut Vec<String>,
+    manifest: &mut Vec<TorrentManifestFile>,
+    depth: usize,
+) -> Result<(), TorrentMetadataError> {
+    if depth > MAX_BENCODE_DEPTH {
+        return Err(TorrentMetadataError::NestingTooDeep);
+    }
+    let entries = dictionary_entries(tree)?;
+    if entries.is_empty() {
+        return Err(TorrentMetadataError::InvalidFiles);
+    }
+    let mut previous_key: Option<&[u8]> = None;
+    for (key, _) in &entries {
+        if previous_key.is_some_and(|previous| previous >= *key) {
+            return Err(TorrentMetadataError::InvalidFiles);
+        }
+        previous_key = Some(key);
+    }
+
+    if let Some(properties) = dictionary_value(&entries, b"")? {
+        if components.is_empty() || entries.len() != 1 {
+            return Err(TorrentMetadataError::InvalidFiles);
+        }
+        let properties = dictionary_entries(properties)?;
+        let length = dictionary_value(&properties, b"length")?
+            .ok_or(TorrentMetadataError::InvalidFiles)
+            .and_then(parse_nonnegative_integer)?;
+        manifest.push(TorrentManifestFile {
+            path: components.join("/"),
+            size: length,
+        });
+        return Ok(());
+    }
+
+    for (raw_component, child) in entries {
+        let component =
+            std::str::from_utf8(raw_component).map_err(|_| TorrentMetadataError::InvalidUtf8)?;
+        if component.is_empty()
+            || matches!(component, "." | "..")
+            || component.contains(['/', '\\', '\0'])
+        {
+            return Err(TorrentMetadataError::InvalidFiles);
+        }
+        components.push(component.to_string());
+        walk_v2_file_tree(child, components, manifest, depth + 1)?;
+        components.pop();
+    }
+    Ok(())
+}
+
 fn parse_multi_file_manifest(
     root_name: &str,
     files: &[u8],
@@ -147,13 +286,17 @@ fn parse_multi_file_manifest(
             .or(dictionary_value(&entries, b"path")?)
             .ok_or(TorrentMetadataError::InvalidFiles)?;
         let components = parse_path_components(path)?;
-        manifest.push(TorrentManifestFile {
-            path: std::iter::once(root_name)
-                .chain(components.iter().copied())
-                .collect::<Vec<_>>()
-                .join("/"),
-            size,
-        });
+        let is_padding = dictionary_bytes(&entries, b"attr")?
+            .is_some_and(|attributes| attributes.contains(&b'p'));
+        if !is_padding {
+            manifest.push(TorrentManifestFile {
+                path: std::iter::once(root_name)
+                    .chain(components.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                size,
+            });
+        }
         cursor = end;
     }
     if cursor + 1 != files.len() || manifest.is_empty() {
@@ -277,9 +420,123 @@ fn sha1_hex(data: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_torrent_id_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    digest[..20]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bencoded_bytes(value: &[u8]) -> Vec<u8> {
+        let mut encoded = format!("{}:", value.len()).into_bytes();
+        encoded.extend_from_slice(value);
+        encoded
+    }
+
+    fn bencoded_integer(value: i64) -> Vec<u8> {
+        format!("i{value}e").into_bytes()
+    }
+
+    fn bencoded_dictionary(entries: Vec<(&[u8], Vec<u8>)>) -> Vec<u8> {
+        let mut encoded = vec![b'd'];
+        for (key, value) in entries {
+            encoded.extend(bencoded_bytes(key));
+            encoded.extend(value);
+        }
+        encoded.push(b'e');
+        encoded
+    }
+
+    fn bencoded_list(values: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut encoded = vec![b'l'];
+        for value in values {
+            encoded.extend(value);
+        }
+        encoded.push(b'e');
+        encoded
+    }
+
+    fn v2_single_torrent() -> Vec<u8> {
+        let properties = bencoded_dictionary(vec![(b"length", bencoded_integer(12))]);
+        let file = bencoded_dictionary(vec![(b"".as_slice(), properties)]);
+        let tree = bencoded_dictionary(vec![(b"file.bin", file)]);
+        let info = bencoded_dictionary(vec![
+            (b"file tree", tree),
+            (b"meta version", bencoded_integer(2)),
+            (b"name", bencoded_bytes(b"file.bin")),
+        ]);
+        bencoded_dictionary(vec![(b"info", info)])
+    }
+
+    fn v2_multi_torrent() -> Vec<u8> {
+        let file = |size| {
+            bencoded_dictionary(vec![(
+                b"".as_slice(),
+                bencoded_dictionary(vec![(b"length", bencoded_integer(size))]),
+            )])
+        };
+        let directory = bencoded_dictionary(vec![(b"a.mkv", file(10)), (b"b.mkv", file(20))]);
+        let tree = bencoded_dictionary(vec![(b"dir", directory)]);
+        let info = bencoded_dictionary(vec![
+            (b"file tree", tree),
+            (b"meta version", bencoded_integer(2)),
+            (b"name", bencoded_bytes(b"Show")),
+        ]);
+        bencoded_dictionary(vec![(b"info", info)])
+    }
+
+    fn hybrid_torrent_with_padding_file() -> Vec<u8> {
+        let path = |components: &[&[u8]]| {
+            bencoded_list(
+                components
+                    .iter()
+                    .map(|component| bencoded_bytes(component))
+                    .collect(),
+            )
+        };
+        let regular_file = |size, components: &[&[u8]]| {
+            bencoded_dictionary(vec![
+                (b"length", bencoded_integer(size)),
+                (b"path", path(components)),
+            ])
+        };
+        let padding_file = bencoded_dictionary(vec![
+            (b"attr", bencoded_bytes(b"p")),
+            (b"length", bencoded_integer(6)),
+            (b"path", path(&[b".pad", b"6"])),
+        ]);
+        let files = bencoded_list(vec![
+            regular_file(10, &[b"dir", b"a.mkv"]),
+            padding_file,
+            regular_file(20, &[b"dir", b"b.mkv"]),
+        ]);
+
+        let v2_file = |size| {
+            bencoded_dictionary(vec![(
+                b"".as_slice(),
+                bencoded_dictionary(vec![(b"length", bencoded_integer(size))]),
+            )])
+        };
+        let directory = bencoded_dictionary(vec![(b"a.mkv", v2_file(10)), (b"b.mkv", v2_file(20))]);
+        let tree = bencoded_dictionary(vec![(b"dir", directory)]);
+        let info = bencoded_dictionary(vec![
+            (b"file tree", tree),
+            (b"files", files),
+            (b"meta version", bencoded_integer(2)),
+            (b"name", bencoded_bytes(b"Show")),
+        ]);
+        bencoded_dictionary(vec![(b"info", info)])
+    }
 
     #[test]
     fn hashes_the_raw_info_dictionary() {
@@ -291,6 +548,40 @@ mod tests {
     #[test]
     fn sha1_matches_the_standard_vector() {
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn sha256_matches_the_standard_vector() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_torrent_id_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a3"
+        );
+    }
+
+    #[test]
+    fn hashes_v2_info_dictionary_with_sha256() {
+        let data = v2_single_torrent();
+        let info = info_dictionary(&data).unwrap();
+        assert_eq!(
+            torrent_infohash_for(&data, &"0".repeat(64)).unwrap(),
+            sha256_hex(info)
+        );
+        assert_eq!(
+            torrent_infohash_for(&data, &"0".repeat(40)).unwrap(),
+            sha256_torrent_id_hex(info)
+        );
+        assert_eq!(
+            torrent_infohash(&data).unwrap(),
+            sha256_torrent_id_hex(info)
+        );
+        assert_eq!(
+            torrent_infohash_for(&data, "not-a-hash"),
+            Err(TorrentMetadataError::InvalidInfoHash)
+        );
     }
 
     #[test]
@@ -327,6 +618,89 @@ mod tests {
                 path: "Show/Season/E01.mkv".to_string(),
                 size: 10,
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_v2_single_and_multi_file_manifests() {
+        assert_eq!(
+            torrent_file_manifest(&v2_single_torrent()).unwrap(),
+            vec![TorrentManifestFile {
+                path: "file.bin".to_string(),
+                size: 12,
+            }]
+        );
+
+        assert_eq!(
+            torrent_file_manifest(&v2_multi_torrent()).unwrap(),
+            vec![
+                TorrentManifestFile {
+                    path: "Show/dir/a.mkv".to_string(),
+                    size: 10,
+                },
+                TorrentManifestFile {
+                    path: "Show/dir/b.mkv".to_string(),
+                    size: 20,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn hybrid_manifest_ignores_bep47_padding_files() {
+        let torrent = hybrid_torrent_with_padding_file();
+        assert_eq!(
+            torrent_file_manifest(&torrent).unwrap(),
+            vec![
+                TorrentManifestFile {
+                    path: "Show/dir/a.mkv".to_string(),
+                    size: 10,
+                },
+                TorrentManifestFile {
+                    path: "Show/dir/b.mkv".to_string(),
+                    size: 20,
+                },
+            ]
+        );
+        let torrent_id = torrent_infohash(&torrent).unwrap();
+        assert_eq!(torrent_id.len(), 40);
+        assert_eq!(
+            torrent_infohash_for(&torrent, &torrent_id).unwrap(),
+            torrent_id
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_v2_file_tree_shapes() {
+        let properties = bencoded_dictionary(vec![(b"length", bencoded_integer(12))]);
+        let root_tree = bencoded_dictionary(vec![(b"".as_slice(), properties.clone())]);
+        let root_info = bencoded_dictionary(vec![
+            (b"file tree", root_tree),
+            (b"meta version", bencoded_integer(2)),
+            (b"name", bencoded_bytes(b"file.bin")),
+        ]);
+        let root_file = bencoded_dictionary(vec![(b"info", root_info)]);
+        assert_eq!(
+            torrent_file_manifest(&root_file),
+            Err(TorrentMetadataError::InvalidFiles)
+        );
+
+        let nested_file = bencoded_dictionary(vec![(
+            b"".as_slice(),
+            bencoded_dictionary(vec![(b"length", bencoded_integer(1))]),
+        )]);
+        let invalid_node =
+            bencoded_dictionary(vec![(b"".as_slice(), properties), (b"x", nested_file)]);
+        let sibling_tree = bencoded_dictionary(vec![(b"file.bin", invalid_node)]);
+        let sibling_info = bencoded_dictionary(vec![
+            (b"file tree", sibling_tree),
+            (b"meta version", bencoded_integer(2)),
+            (b"name", bencoded_bytes(b"file.bin")),
+        ]);
+        let sibling_leaf = bencoded_dictionary(vec![(b"info", sibling_info)]);
+        assert_eq!(
+            torrent_file_manifest(&sibling_leaf),
+            Err(TorrentMetadataError::InvalidFiles)
         );
     }
 }

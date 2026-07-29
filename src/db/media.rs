@@ -7,9 +7,10 @@ use super::{Database, join_error, open_connection, sql_error};
 use crate::error::AppError;
 use crate::media::domain::QualityProfile;
 use crate::media::models::{
-    MEDIA_DOWNLOAD_MAX_ATTEMPTS, MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS, MediaDownloadRecord,
-    MediaSettings, NewMediaDownload, NewSubscription, QualityProfileRecord, QualityProfileRequest,
-    SubscriptionRecord, SubscriptionTargetRecord, UpdateSubscription, target_key,
+    MEDIA_DOWNLOAD_MAX_ATTEMPTS, MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS,
+    MediaDownloadDeleteOutcome, MediaDownloadRecord, MediaSettings, NewMediaDownload,
+    NewSubscription, QualityProfileRecord, QualityProfileRequest, SubscriptionRecord,
+    SubscriptionTargetRecord, UpdateSubscription, target_key,
 };
 use crate::media::progression::{
     SubscriptionTargetSeed, SubscriptionTargetSeedStatus, TargetSyncResult, air_date_eligible_at,
@@ -252,29 +253,59 @@ impl Database {
                 .map_err(sql_error)?;
             for preset in [
                 (
-                    "电视剧 · 4K", "[\"2160p\",\"1080p\"]", "[\"2160p\",\"1080p\"]",
-                    "[\"720p\",\"480p\"]", "[\"WEB-DL\",\"BluRay\",\"WEBRip\"]",
-                    "[\"WEB-DL\",\"BluRay\",\"WEBRip\"]", "[\"H265\",\"AV1\",\"H264\"]", 0, 65,
+                    "电视剧 · 4K",
+                    "[\"2160p\",\"1080p\"]",
+                    "[\"2160p\",\"1080p\"]",
+                    "[\"720p\",\"480p\"]",
+                    "[\"WEB-DL\",\"BluRay\",\"WEBRip\"]",
+                    "[\"WEB-DL\",\"BluRay\",\"WEBRip\"]",
+                    "[\"H265\",\"AV1\",\"H264\"]",
+                    0,
+                    65,
                 ),
                 (
-                    "电影 · 收藏", "[\"2160p\",\"1080p\"]", "[\"2160p\",\"1080p\"]",
-                    "[\"720p\",\"480p\"]", "[\"REMUX\",\"BluRay\",\"WEB-DL\"]",
-                    "[\"REMUX\",\"BluRay\",\"WEB-DL\"]", "[\"H265\",\"AV1\",\"H264\"]", 0, 70,
+                    "电影 · 收藏",
+                    "[\"2160p\",\"1080p\"]",
+                    "[\"2160p\",\"1080p\"]",
+                    "[\"720p\",\"480p\"]",
+                    "[\"REMUX\",\"BluRay\",\"WEB-DL\"]",
+                    "[\"REMUX\",\"BluRay\",\"WEB-DL\"]",
+                    "[\"H265\",\"AV1\",\"H264\"]",
+                    0,
+                    70,
                 ),
                 (
-                    "电影 · 均衡", "[\"1080p\",\"2160p\",\"720p\"]", "[\"2160p\",\"1080p\",\"720p\"]",
-                    "[\"480p\"]", "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
-                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]", "[\"H265\",\"H264\",\"AV1\"]", 0, 65,
+                    "电影 · 均衡",
+                    "[\"1080p\",\"2160p\",\"720p\"]",
+                    "[\"2160p\",\"1080p\",\"720p\"]",
+                    "[\"480p\"]",
+                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
+                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
+                    "[\"H265\",\"H264\",\"AV1\"]",
+                    0,
+                    65,
                 ),
                 (
-                    "动漫 · 日常", "[\"2160p\",\"1080p\",\"720p\"]", "[\"2160p\",\"1080p\",\"720p\"]",
-                    "[\"480p\"]", "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
-                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]", "[\"H265\",\"H264\",\"AV1\"]", 1, 60,
+                    "动漫 · 日常",
+                    "[\"2160p\",\"1080p\",\"720p\"]",
+                    "[\"2160p\",\"1080p\",\"720p\"]",
+                    "[\"480p\"]",
+                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
+                    "[\"BluRay\",\"WEB-DL\",\"WEBRip\"]",
+                    "[\"H265\",\"H264\",\"AV1\"]",
+                    1,
+                    60,
                 ),
                 (
-                    "动漫 · 省空间", "[\"1080p\",\"720p\"]", "[\"1080p\",\"720p\"]",
-                    "[\"2160p\",\"480p\"]", "[\"WEB-DL\",\"WEBRip\",\"BluRay\"]",
-                    "[\"WEB-DL\",\"WEBRip\",\"BluRay\"]", "[\"H265\",\"AV1\",\"H264\"]", 1, 55,
+                    "动漫 · 省空间",
+                    "[\"1080p\",\"720p\"]",
+                    "[\"1080p\",\"720p\"]",
+                    "[\"2160p\",\"480p\"]",
+                    "[\"WEB-DL\",\"WEBRip\",\"BluRay\"]",
+                    "[\"WEB-DL\",\"WEBRip\",\"BluRay\"]",
+                    "[\"H265\",\"AV1\",\"H264\"]",
+                    1,
+                    55,
                 ),
             ] {
                 tx.execute(
@@ -283,7 +314,10 @@ impl Database {
                       source_order, allowed_sources, codec_order, blocked_codecs,
                       allow_unknown_quality, minimum_score, min_seeders, created_at, updated_at)
                      VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, 1, ?, ?)",
-                    params![preset.0, preset.1, preset.2, preset.3, preset.4, preset.5, preset.6, preset.7, preset.8, now, now],
+                    params![
+                        preset.0, preset.1, preset.2, preset.3, preset.4, preset.5, preset.6,
+                        preset.7, preset.8, now, now
+                    ],
                 )
                 .map_err(sql_error)?;
             }
@@ -531,6 +565,11 @@ impl Database {
                     "a completed movie subscription cannot be reopened by editing rules",
                 ));
             }
+            if current.media_type != "tv" && request.reset_download_history {
+                return Err(invalid(
+                    "download history can only be reset while editing a TV subscription",
+                ));
+            }
             let key = target_key(
                 &current.media_type,
                 current.tmdb_id,
@@ -576,16 +615,18 @@ impl Database {
                         "cannot move a subscription cursor while the source or destination target is active",
                     ));
                 }
-                if existing_target_status.as_deref() == Some("submitted") {
-                    let dedupe_key = format!("subscription:{id}:{key}");
-                    tx.execute(
-                        "UPDATE media_downloads
-                         SET dedupe_key = dedupe_key || ':history:' || id,
-                             updated_at = ?
-                         WHERE subscription_id = ? AND target_key = ? AND dedupe_key = ?",
-                        params![now, id, key, dedupe_key],
-                    )
-                    .map_err(sql_error)?;
+                if request.reset_download_history {
+                    reset_subscription_download_history(
+                        &tx,
+                        id,
+                        request.season,
+                        request.next_episode,
+                        &now,
+                    )?;
+                } else if existing_target_status.as_deref() == Some("submitted") {
+                    return Err(invalid(
+                        "the selected episode was already submitted; set reset_download_history to reopen it",
+                    ));
                 }
             }
             let new_start_episode = if current.media_type == "tv" {
@@ -683,8 +724,40 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.execute(
                 "DELETE FROM subscriptions
-                 WHERE id = ? AND version = ?
-                   AND (lease_until IS NULL OR lease_until < ?)",
+                 WHERE id = ?1 AND version = ?2
+                   AND (lease_until IS NULL OR lease_until < ?3)
+                   AND NOT EXISTS(
+                       SELECT 1
+                       FROM media_downloads AS download
+                       WHERE download.subscription_id = subscriptions.id
+                         AND (
+                             download.status NOT IN ('submitted', 'failed', 'cancelled')
+                             OR (download.lease_until IS NOT NULL
+                                 AND download.lease_until >= ?3)
+                             OR EXISTS(
+                                 SELECT 1 FROM subscription_targets AS target
+                                 WHERE target.subscription_id = download.subscription_id
+                                   AND target.target_key = download.target_key
+                                   AND target.status = 'queued'
+                             )
+                             OR EXISTS(
+                                 SELECT 1 FROM media_relocation_jobs AS relocation
+                                 WHERE (
+                                     relocation.media_download_id = download.id
+                                     OR (
+                                         download.downloader_id IS NOT NULL
+                                         AND length(trim(download.infohash)) > 0
+                                         AND (relocation.downloader_id = download.downloader_id
+                                              OR relocation.target_downloader_id = download.downloader_id)
+                                         AND lower(relocation.infohash) = lower(download.infohash)
+                                     )
+                                 )
+                                   AND (relocation.stage NOT IN ('completed', 'cancelled')
+                                        OR (relocation.lease_until IS NOT NULL
+                                            AND relocation.lease_until >= ?3))
+                             )
+                         )
+                   )",
                 params![id, expected_version, Utc::now().to_rfc3339()],
             )
             .map(|changed| changed > 0)
@@ -1596,6 +1669,217 @@ impl Database {
         .map_err(join_error)?
     }
 
+    pub async fn media_download_failed_reconciliation_allowed(
+        &self,
+        id: i64,
+        expected_version: i64,
+    ) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let Some(download) = load_media_download(&conn, id)? else {
+                return Ok(false);
+            };
+            if download.version != expected_version {
+                return Ok(false);
+            }
+            failed_reconciliation_allowed_row(&conn, &download, Utc::now())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn media_download_identity_has_active_relocation(
+        &self,
+        id: i64,
+        downloader_id: i64,
+        infohash: &str,
+    ) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        let infohash = infohash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            media_download_identity_has_active_relocation_row(
+                &conn,
+                id,
+                Some(downloader_id),
+                Some(&infohash),
+                &Utc::now().to_rfc3339(),
+            )
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn reserve_media_download_redelivery(
+        &self,
+        id: i64,
+        expected_version: i64,
+        downloader_id: i64,
+        infohash: &str,
+        owner: &str,
+        lease_seconds: i64,
+    ) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        let infohash = infohash.to_ascii_lowercase();
+        let owner = owner.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now();
+            let now_text = now.to_rfc3339();
+            let lease_until = (now + Duration::seconds(lease_seconds.max(10))).to_rfc3339();
+            let Some(download) = load_media_download(&tx, id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            };
+            if download.version != expected_version
+                || download.status != "submitted"
+                || download.downloader_id != Some(downloader_id)
+                || !download
+                    .infohash
+                    .as_deref()
+                    .is_some_and(|stored| stored.eq_ignore_ascii_case(&infohash))
+                || lease_is_active(download.lease_until.as_deref(), now)
+                || media_download_identity_has_active_relocation_row(
+                    &tx,
+                    download.id,
+                    download.downloader_id,
+                    Some(&infohash),
+                    &now_text,
+                )?
+            {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE media_downloads
+                     SET lease_owner = ?, lease_until = ?
+                     WHERE id = ? AND version = ? AND status = 'submitted'
+                       AND downloader_id = ? AND lower(infohash) = lower(?)
+                       AND (lease_until IS NULL OR lease_until < ?)",
+                    params![
+                        owner,
+                        lease_until,
+                        id,
+                        expected_version,
+                        downloader_id,
+                        infohash,
+                        now_text,
+                    ],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(true)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn release_media_download_redelivery(
+        &self,
+        id: i64,
+        expected_version: i64,
+        owner: &str,
+    ) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        let owner = owner.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            conn.execute(
+                "UPDATE media_downloads
+                 SET lease_owner = NULL, lease_until = NULL
+                 WHERE id = ? AND version = ? AND status = 'submitted'
+                   AND lease_owner = ?",
+                params![id, expected_version, owner],
+            )
+            .map(|changed| changed == 1)
+            .map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn renew_media_download_redelivery(
+        &self,
+        id: i64,
+        expected_version: i64,
+        downloader_id: i64,
+        infohash: &str,
+        owner: &str,
+        lease_seconds: i64,
+    ) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        let infohash = infohash.to_ascii_lowercase();
+        let owner = owner.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now();
+            let now_text = now.to_rfc3339();
+            let lease_until = (now + Duration::seconds(lease_seconds.max(10))).to_rfc3339();
+            let Some(download) = load_media_download(&tx, id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            };
+            if download.version != expected_version
+                || download.status != "submitted"
+                || download.downloader_id != Some(downloader_id)
+                || download.lease_owner.as_deref() != Some(owner.as_str())
+                || !lease_is_active(download.lease_until.as_deref(), now)
+                || !download
+                    .infohash
+                    .as_deref()
+                    .is_some_and(|stored| stored.eq_ignore_ascii_case(&infohash))
+                || media_download_identity_has_active_relocation_row(
+                    &tx,
+                    download.id,
+                    download.downloader_id,
+                    Some(&infohash),
+                    &now_text,
+                )?
+            {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE media_downloads SET lease_until = ?
+                     WHERE id = ? AND version = ? AND status = 'submitted'
+                       AND downloader_id = ? AND lower(infohash) = lower(?)
+                       AND lease_owner = ? AND lease_until IS NOT NULL
+                       AND lease_until >= ?",
+                    params![
+                        lease_until,
+                        id,
+                        expected_version,
+                        downloader_id,
+                        infohash,
+                        owner,
+                        now_text,
+                    ],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(true)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
     pub async fn get_media_download_by_infohash(
         &self,
         downloader_id: i64,
@@ -1647,6 +1931,385 @@ impl Database {
                 )
                 .map_err(sql_error)?;
             rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn list_media_downloads_before(
+        &self,
+        subscription_id: Option<i64>,
+        status: Option<&str>,
+        limit: usize,
+        before_id: i64,
+    ) -> Result<Vec<MediaDownloadRecord>, AppError> {
+        let path = self.path.clone();
+        let status = status.map(str::to_string);
+        let limit = i64::try_from(limit).map_err(|_| invalid("download limit is too large"))?;
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let sql = format!(
+                "{} WHERE (?1 IS NULL OR subscription_id = ?1)
+                    AND (?2 IS NULL OR status = ?2)
+                    AND id < ?3
+                 ORDER BY id DESC LIMIT ?4",
+                MEDIA_DOWNLOAD_SELECT
+            );
+            let mut stmt = conn.prepare(&sql).map_err(sql_error)?;
+            let rows = stmt
+                .query_map(
+                    params![subscription_id, status, before_id, limit],
+                    map_media_download,
+                )
+                .map_err(sql_error)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(sql_error)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn delete_media_download_record(
+        &self,
+        id: i64,
+        expected_version: i64,
+    ) -> Result<MediaDownloadDeleteOutcome, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now();
+            let now_text = now.to_rfc3339();
+            let Some(download) = load_media_download(&tx, id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(MediaDownloadDeleteOutcome::NotFound);
+            };
+            if download.version != expected_version {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(MediaDownloadDeleteOutcome::VersionChanged);
+            }
+            if !matches!(download.status.as_str(), "submitted" | "failed" | "cancelled")
+                || lease_is_active(download.lease_until.as_deref(), now)
+            {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(MediaDownloadDeleteOutcome::DownloadActive);
+            }
+
+            let relocation_active =
+                media_download_has_active_relocation_row(&tx, &download, &now_text)?;
+            if relocation_active {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(MediaDownloadDeleteOutcome::RelocationActive);
+            }
+
+            let mut target_reopened = false;
+            let mut reopen = None;
+            if let Some(subscription_id) = download.subscription_id {
+                let canonical_key = format!("subscription:{subscription_id}:{}", download.target_key);
+                if let Some(target) =
+                    load_subscription_target(&tx, subscription_id, &download.target_key)?
+                {
+                    if target.status == "queued" {
+                        tx.rollback().map_err(sql_error)?;
+                        return Ok(MediaDownloadDeleteOutcome::DownloadActive);
+                    }
+                    if download.dedupe_key == canonical_key && target.status == "submitted" {
+                            let target_relocation_active = tx
+                                .query_row(
+                                    "SELECT EXISTS(
+                                         SELECT 1
+                                         FROM media_downloads AS history
+                                         WHERE history.subscription_id = ?1
+                                           AND history.target_key = ?2
+                                           AND EXISTS(
+                                               SELECT 1
+                                               FROM media_relocation_jobs AS relocation
+                                               WHERE (
+                                                   relocation.media_download_id = history.id
+                                                   OR (
+                                                       history.downloader_id IS NOT NULL
+                                                       AND length(trim(history.infohash)) > 0
+                                                       AND (relocation.downloader_id = history.downloader_id
+                                                            OR relocation.target_downloader_id = history.downloader_id)
+                                                       AND lower(relocation.infohash) = lower(history.infohash)
+                                                   )
+                                               )
+                                                 AND (relocation.stage NOT IN ('completed', 'cancelled')
+                                                      OR (relocation.lease_until IS NOT NULL
+                                                          AND relocation.lease_until >= ?3))
+                                           )
+                                     )",
+                                    params![subscription_id, download.target_key, now_text],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .map_err(sql_error)?;
+                            if target_relocation_active {
+                                tx.rollback().map_err(sql_error)?;
+                                return Ok(MediaDownloadDeleteOutcome::RelocationActive);
+                            }
+                            let Some(subscription) = load_subscription(&tx, subscription_id)? else {
+                                tx.rollback().map_err(sql_error)?;
+                                return Ok(MediaDownloadDeleteOutcome::VersionChanged);
+                            };
+                            let other_work_active = tx
+                                .query_row(
+                                    "SELECT EXISTS(
+                                         SELECT 1 FROM media_downloads
+                                         WHERE subscription_id = ? AND id != ?
+                                           AND (status NOT IN ('submitted', 'failed', 'cancelled')
+                                                OR (lease_until IS NOT NULL AND lease_until >= ?))
+                                     )",
+                                    params![subscription_id, id, now_text],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .map_err(sql_error)?;
+                            if lease_is_active(subscription.lease_until.as_deref(), now)
+                                || other_work_active
+                            {
+                                tx.rollback().map_err(sql_error)?;
+                                return Ok(MediaDownloadDeleteOutcome::SubscriptionActive);
+                            }
+                            reopen = Some((subscription, target));
+                    }
+                }
+            }
+
+            let deleted = tx
+                .execute(
+                    "DELETE FROM media_downloads
+                     WHERE id = ? AND version = ?
+                       AND status IN ('submitted', 'failed', 'cancelled')
+                       AND (lease_until IS NULL OR lease_until < ?)",
+                    params![id, expected_version, now_text],
+                )
+                .map_err(sql_error)?;
+            if deleted != 1 {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(MediaDownloadDeleteOutcome::VersionChanged);
+            }
+
+            if let Some((subscription, target)) = reopen {
+                let target_status = if subscription.media_type == "tv" {
+                    "metadata_pending"
+                } else {
+                    "pending"
+                };
+                let target_changed = tx
+                    .execute(
+                        "UPDATE subscription_targets
+                         SET status = ?, air_date = CASE WHEN ? = 'tv' THEN NULL ELSE air_date END,
+                             updated_at = ?
+                         WHERE subscription_id = ? AND target_key = ? AND status = 'submitted'",
+                        params![
+                            target_status,
+                            subscription.media_type,
+                            now_text,
+                            subscription.id,
+                            target.target_key,
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                let subscription_changed = tx
+                    .execute(
+                        "UPDATE subscriptions
+                         SET season = ?, next_episode = ?,
+                             start_episode = CASE WHEN media_type = 'tv' THEN ? ELSE start_episode END,
+                             absolute_episode = ?, next_run_at = ?,
+                             lease_owner = NULL, lease_until = NULL,
+                             last_status = ?, last_error = NULL, last_run_info = NULL,
+                             version = version + 1, updated_at = ?
+                         WHERE id = ? AND version = ?
+                           AND (lease_until IS NULL OR lease_until < ?)",
+                        params![
+                            target.season,
+                            target.episode,
+                            target.episode,
+                            target.absolute_episode,
+                            now_text,
+                            if subscription.media_type == "tv" {
+                                "awaiting_metadata"
+                            } else {
+                                "waiting"
+                            },
+                            now_text,
+                            subscription.id,
+                            subscription.version,
+                            now_text,
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                if target_changed != 1 || subscription_changed != 1 {
+                    tx.rollback().map_err(sql_error)?;
+                    return Ok(MediaDownloadDeleteOutcome::VersionChanged);
+                }
+                target_reopened = true;
+            }
+
+            tx.commit().map_err(sql_error)?;
+            Ok(MediaDownloadDeleteOutcome::Deleted {
+                download,
+                target_reopened,
+            })
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn resolve_verified_failed_media_download(
+        &self,
+        id: i64,
+        expected_version: i64,
+        expected_downloader_id: i64,
+        expected_downloader_updated_at: &str,
+        torrent_present: bool,
+    ) -> Result<Option<MediaDownloadRecord>, AppError> {
+        let path = self.path.clone();
+        let expected_downloader_updated_at = expected_downloader_updated_at.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now();
+            let now_text = now.to_rfc3339();
+            let Some(download) = load_media_download(&tx, id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            };
+            let Some(subscription_id) = download.subscription_id else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            };
+            if download.version != expected_version
+                || download.status != "failed"
+                || download.infohash.is_none()
+                || download.downloader_id != Some(expected_downloader_id)
+                || lease_is_active(download.lease_until.as_deref(), now)
+            {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            }
+            let downloader_unchanged = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM downloaders
+                         WHERE id = ? AND updated_at = ?
+                     )",
+                    params![expected_downloader_id, expected_downloader_updated_at],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?;
+            if !downloader_unchanged {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            }
+            let Some(target) =
+                load_subscription_target(&tx, subscription_id, &download.target_key)?
+            else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            };
+            let Some(subscription) = load_subscription(&tx, subscription_id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            };
+            let current_key = target_key(
+                &subscription.media_type,
+                subscription.tmdb_id,
+                subscription.season,
+                subscription.next_episode,
+                subscription.absolute_episode,
+            );
+            let other_work_active = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM media_downloads
+                         WHERE subscription_id = ? AND id != ?
+                           AND (status NOT IN ('submitted', 'failed', 'cancelled')
+                                OR (lease_until IS NOT NULL AND lease_until >= ?))
+                     )",
+                    params![subscription_id, id, now_text],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?;
+            let relocation_active =
+                media_download_has_active_relocation_row(&tx, &download, &now_text)?;
+            if target.status != "queued"
+                || current_key != download.target_key
+                || lease_is_active(subscription.lease_until.as_deref(), now)
+                || other_work_active
+                || relocation_active
+            {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            }
+
+            let message = if torrent_present {
+                "qB verification confirmed the torrent is present"
+            } else {
+                "qB verification confirmed the torrent is absent; ready to retry"
+            };
+            let changed = tx
+                .execute(
+                    "UPDATE media_downloads
+                     SET status = CASE WHEN ? THEN 'submitted' ELSE status END,
+                         next_attempt_at = NULL, lease_owner = NULL, lease_until = NULL,
+                         last_error = ?, submitted_at = CASE WHEN ? THEN ? ELSE submitted_at END,
+                         version = version + 1, updated_at = ?
+                     WHERE id = ? AND version = ? AND status = 'failed'
+                       AND (lease_until IS NULL OR lease_until < ?)",
+                    params![
+                        torrent_present,
+                        message,
+                        torrent_present,
+                        now_text,
+                        now_text,
+                        id,
+                        expected_version,
+                        now_text,
+                    ],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(None);
+            }
+
+            if torrent_present {
+                let target_changed = tx
+                    .execute(
+                        "UPDATE subscription_targets SET status = 'submitted', updated_at = ?
+                         WHERE subscription_id = ? AND target_key = ? AND status = 'queued'",
+                        params![now_text, subscription_id, download.target_key],
+                    )
+                    .map_err(sql_error)?;
+                if target_changed != 1 {
+                    tx.rollback().map_err(sql_error)?;
+                    return Ok(None);
+                }
+                advance_subscription_after_submit(
+                    &tx,
+                    subscription_id,
+                    &download.target_key,
+                    &now_text,
+                )?;
+            } else {
+                reset_subscription_after_failed_download(&tx, &download, message, &now_text)?;
+                if subscription_target_has_status(
+                    &tx,
+                    subscription_id,
+                    &download.target_key,
+                    "queued",
+                )? {
+                    tx.rollback().map_err(sql_error)?;
+                    return Ok(None);
+                }
+            }
+
+            let resolved = load_media_download(&tx, id)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(resolved)
         })
         .await
         .map_err(join_error)?
@@ -1894,26 +2557,48 @@ impl Database {
         let owner = owner.to_string();
         let infohash = infohash.to_ascii_lowercase();
         tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
             let now = Utc::now();
+            let now_text = now.to_rfc3339();
             let lease_until = (now + Duration::seconds(lease_seconds.max(10))).to_rfc3339();
-            conn.execute(
-                "UPDATE media_downloads
+            let Some(download) = load_media_download(&tx, id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            };
+            if download.version != expected_version
+                || download.status != "fetching"
+                || download.lease_owner.as_deref() != Some(owner.as_str())
+                || download.downloader_id.is_none()
+                || media_download_identity_has_active_relocation_row(
+                    &tx,
+                    download.id,
+                    download.downloader_id,
+                    Some(&infohash),
+                    &now_text,
+                )?
+            {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE media_downloads
                  SET status = 'submitting', infohash = ?, lease_until = ?,
                      version = version + 1, updated_at = ?
                  WHERE id = ? AND version = ? AND status = 'fetching'
                    AND lease_owner = ?",
-                params![
-                    infohash,
-                    lease_until,
-                    now.to_rfc3339(),
-                    id,
-                    expected_version,
-                    owner,
-                ],
-            )
-            .map(|changed| changed > 0)
-            .map_err(sql_error)
+                    params![infohash, lease_until, now_text, id, expected_version, owner,],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(true)
         })
         .await
         .map_err(join_error)?
@@ -1941,6 +2626,13 @@ impl Database {
             if download.version != expected_version
                 || !matches!(download.status.as_str(), "submitting" | "reconciling")
                 || download.lease_owner.as_deref() != Some(owner.as_str())
+                || media_download_identity_has_active_relocation_row(
+                    &tx,
+                    download.id,
+                    download.downloader_id,
+                    Some(&infohash),
+                    &now,
+                )?
             {
                 tx.rollback().map_err(sql_error)?;
                 return Ok(false);
@@ -2029,7 +2721,18 @@ impl Database {
             if existing.status != "submitted"
                 || existing.downloader_id.is_none()
                 || existing.downloader_id != download.downloader_id
+                || existing.infohash.is_none()
             {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            if media_download_identity_has_active_relocation_row(
+                &tx,
+                download.id,
+                download.downloader_id,
+                existing.infohash.as_deref(),
+                &now,
+            )? {
                 tx.rollback().map_err(sql_error)?;
                 return Ok(false);
             }
@@ -2410,6 +3113,234 @@ fn subscription_target_is_ready(
         )
         .map_err(sql_error)?;
     Ok(skipped_frontier && !metadata_frontier)
+}
+
+fn media_download_has_active_relocation_row(
+    conn: &Connection,
+    download: &MediaDownloadRecord,
+    now: &str,
+) -> Result<bool, AppError> {
+    media_download_identity_has_active_relocation_row(
+        conn,
+        download.id,
+        download.downloader_id,
+        download.infohash.as_deref(),
+        now,
+    )
+}
+
+fn failed_reconciliation_allowed_row(
+    conn: &Connection,
+    download: &MediaDownloadRecord,
+    now: chrono::DateTime<Utc>,
+) -> Result<bool, AppError> {
+    let Some(subscription_id) = download.subscription_id else {
+        return Ok(false);
+    };
+    let Some(downloader_id) = download.downloader_id else {
+        return Ok(false);
+    };
+    let Some(infohash) = download.infohash.as_deref() else {
+        return Ok(false);
+    };
+    if download.status != "failed"
+        || !matches!(infohash.len(), 40 | 64)
+        || !infohash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || lease_is_active(download.lease_until.as_deref(), now)
+    {
+        return Ok(false);
+    }
+    let Some(subscription) = load_subscription(conn, subscription_id)? else {
+        return Ok(false);
+    };
+    let Some(target) = load_subscription_target(conn, subscription_id, &download.target_key)?
+    else {
+        return Ok(false);
+    };
+    let current_key = target_key(
+        &subscription.media_type,
+        subscription.tmdb_id,
+        subscription.season,
+        subscription.next_episode,
+        subscription.absolute_episode,
+    );
+    if target.status != "queued"
+        || current_key != download.target_key
+        || lease_is_active(subscription.lease_until.as_deref(), now)
+    {
+        return Ok(false);
+    }
+    let now_text = now.to_rfc3339();
+    let downloader_exists = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM downloaders WHERE id = ?)",
+            [downloader_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    let other_work_active = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM media_downloads
+                 WHERE subscription_id = ? AND id != ?
+                   AND (status NOT IN ('submitted', 'failed', 'cancelled')
+                        OR (lease_until IS NOT NULL AND lease_until >= ?))
+             )",
+            params![subscription_id, download.id, now_text],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    Ok(downloader_exists
+        && !other_work_active
+        && !media_download_has_active_relocation_row(conn, download, &now_text)?)
+}
+
+fn media_download_identity_has_active_relocation_row(
+    conn: &Connection,
+    download_id: i64,
+    downloader_id: Option<i64>,
+    infohash: Option<&str>,
+    now: &str,
+) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM media_relocation_jobs AS relocation
+             WHERE (
+                 relocation.media_download_id = ?1
+                 OR (
+                     ?2 IS NOT NULL
+                     AND length(trim(?3)) > 0
+                     AND (relocation.downloader_id = ?2
+                          OR relocation.target_downloader_id = ?2)
+                     AND lower(relocation.infohash) = lower(?3)
+                 )
+             )
+               AND (relocation.stage NOT IN ('completed', 'cancelled')
+                    OR (relocation.lease_until IS NOT NULL AND relocation.lease_until >= ?4))
+         )",
+        params![download_id, downloader_id, infohash, now],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(sql_error)
+}
+
+fn reset_subscription_download_history(
+    conn: &Connection,
+    subscription_id: i64,
+    season: Option<u32>,
+    start_episode: Option<u32>,
+    now: &str,
+) -> Result<(), AppError> {
+    let (Some(season), Some(start_episode)) = (season, start_episode) else {
+        return Err(invalid(
+            "season and next episode are required to reset TV download history",
+        ));
+    };
+    let unresolved_target = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM subscription_targets
+                 WHERE subscription_id = ? AND season IS ? AND episode >= ?
+                   AND status = 'queued'
+             )",
+            params![subscription_id, season, start_episode],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    if unresolved_target {
+        return Err(invalid(
+            "cannot reset download history while download work is active or a target submission is unresolved",
+        ));
+    }
+    let active_download = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM media_downloads AS download
+                 JOIN subscription_targets AS target
+                   ON target.subscription_id = download.subscription_id
+                  AND target.target_key = download.target_key
+                 WHERE download.subscription_id = ?
+                   AND target.season IS ? AND target.episode >= ?
+                   AND (download.status NOT IN ('submitted', 'failed', 'cancelled')
+                        OR (download.lease_until IS NOT NULL AND download.lease_until >= ?))
+             )",
+            params![subscription_id, season, start_episode, now],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    if active_download {
+        return Err(invalid(
+            "cannot reset download history while download work is active",
+        ));
+    }
+
+    let active_relocation = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM media_downloads AS download
+                 JOIN subscription_targets AS target
+                   ON target.subscription_id = download.subscription_id
+                  AND target.target_key = download.target_key
+                 WHERE download.subscription_id = ?1
+                   AND target.season IS ?2 AND target.episode >= ?3
+                   AND EXISTS(
+                       SELECT 1
+                       FROM media_relocation_jobs AS relocation
+                       WHERE (
+                           relocation.media_download_id = download.id
+                           OR (
+                               download.downloader_id IS NOT NULL
+                               AND length(trim(download.infohash)) > 0
+                               AND (relocation.downloader_id = download.downloader_id
+                                    OR relocation.target_downloader_id = download.downloader_id)
+                               AND lower(relocation.infohash) = lower(download.infohash)
+                           )
+                       )
+                         AND (relocation.stage NOT IN ('completed', 'cancelled')
+                              OR (relocation.lease_until IS NOT NULL
+                                  AND relocation.lease_until >= ?4))
+                   )
+             )",
+            params![subscription_id, season, start_episode, now],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
+    if active_relocation {
+        return Err(invalid(
+            "cannot reset download history while relocation jobs are active",
+        ));
+    }
+
+    conn.execute(
+        "DELETE FROM media_downloads
+         WHERE subscription_id = ?
+           AND target_key IN (
+               SELECT target_key FROM subscription_targets
+               WHERE subscription_id = ? AND season IS ? AND episode >= ?
+           )",
+        params![subscription_id, subscription_id, season, start_episode],
+    )
+    .map_err(sql_error)?;
+    conn.execute(
+        "UPDATE subscription_targets
+         SET status = CASE WHEN air_date IS NULL THEN 'metadata_pending' ELSE 'pending' END,
+             updated_at = ?
+         WHERE subscription_id = ? AND season IS ? AND episode >= ?
+           AND status = 'submitted'",
+        params![now, subscription_id, season, start_episode],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+fn lease_is_active(lease_until: Option<&str>, now: chrono::DateTime<Utc>) -> bool {
+    lease_until.is_some_and(|lease_until| {
+        chrono::DateTime::parse_from_rfc3339(lease_until)
+            .map(|lease_until| lease_until >= now)
+            .unwrap_or(true)
+    })
 }
 
 fn enqueue_media_download_row(
@@ -2910,7 +3841,10 @@ mod tests {
         let db = Database::open(dir.path()).await.unwrap();
 
         let profiles = db.reset_quality_profiles().await.unwrap();
-        let names: Vec<&str> = profiles.iter().map(|profile| profile.name.as_str()).collect();
+        let names: Vec<&str> = profiles
+            .iter()
+            .map(|profile| profile.name.as_str())
+            .collect();
 
         assert_eq!(
             names,
@@ -3875,6 +4809,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -3956,6 +4891,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -4352,6 +5288,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: Some("/new/movie/path".to_string()),
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -4440,6 +5377,7 @@ mod tests {
             site_ids: vec![site_id],
             save_path: None,
             enabled: true,
+            reset_download_history: false,
         };
         assert!(
             db.update_subscription(created.id, renewed_version, &update)
@@ -4512,6 +5450,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -4523,7 +5462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submitted_destination_can_be_selected_again() {
+    async fn submitted_destination_requires_an_explicit_history_reset() {
         let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
         let created = db
             .create_subscription(&test_tv_subscription_request(
@@ -4545,7 +5484,65 @@ mod tests {
             params![created.id, destination_key, now, now],
         )
         .unwrap();
+        let dedupe_key = format!("subscription:{}:{destination_key}", created.id);
+        let infohash = "1234567890abcdef1234567890abcdef12345678";
+        conn.execute(
+            "INSERT INTO media_downloads
+             (subscription_id, target_key, dedupe_key, site_id, downloader_id,
+              source_site, downloader_name, torrent_id, title, size, release_json,
+              decision_json, profile_snapshot_json, infohash, status,
+              created_at, updated_at, submitted_at)
+             VALUES (?, ?, ?, ?, ?, 'site', 'qB', 'torrent-9', 'Example Show E09', 1024,
+                     '{}', '{}', '{}', ?, 'submitted', ?, ?, ?)",
+            params![
+                created.id,
+                destination_key,
+                dedupe_key,
+                site_id,
+                downloader_id,
+                infohash,
+                now,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+        let download_id = conn.last_insert_rowid();
         drop(conn);
+
+        let error = db
+            .update_subscription(
+                created.id,
+                created.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(9),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                    reset_download_history: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reset_download_history"));
+        let unchanged = db.get_subscription(created.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.next_episode, Some(10));
+        assert_eq!(unchanged.version, created.version);
+        assert_eq!(
+            db.get_subscription_target(created.id, &destination_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "submitted"
+        );
+        let unchanged_download = db.get_media_download(download_id).await.unwrap().unwrap();
+        assert_eq!(unchanged_download.dedupe_key, dedupe_key);
+        assert_eq!(unchanged_download.infohash.as_deref(), Some(infohash));
 
         let moved = db
             .update_subscription(
@@ -4560,13 +5557,14 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: true,
                 },
             )
             .await
             .unwrap()
             .unwrap();
-
         assert_eq!(moved.next_episode, Some(9));
+        assert!(db.get_media_download(download_id).await.unwrap().is_none());
         assert_eq!(
             db.get_subscription_target(created.id, &destination_key)
                 .await
@@ -4575,6 +5573,973 @@ mod tests {
                 .status,
             "metadata_pending"
         );
+    }
+
+    #[tokio::test]
+    async fn resetting_download_history_releases_keys_and_restores_episode_progression() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let targets = (1..=5)
+            .map(|episode| {
+                test_target_seed(
+                    207,
+                    1,
+                    episode,
+                    Some("2020-01-01"),
+                    SubscriptionTargetSeedStatus::Pending,
+                )
+            })
+            .collect::<Vec<_>>();
+        let created = db
+            .create_subscription_with_targets(
+                &test_tv_subscription_request(207, 1, 1, site_id, downloader_id),
+                &targets,
+                None,
+                Some("waiting"),
+            )
+            .await
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let first_hash = format!("{:040x}", 1);
+        let mut conn = open_connection(&db.path).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "UPDATE subscriptions
+             SET next_episode = 5, start_episode = 1, last_status = 'submitted'
+             WHERE id = ?",
+            [created.id],
+        )
+        .unwrap();
+        let mut first_download_id = None;
+        for episode in 1..=4 {
+            let key = target_key("tv", 207, Some(1), Some(episode), None);
+            tx.execute(
+                "UPDATE subscription_targets SET status = 'submitted'
+                 WHERE subscription_id = ? AND target_key = ?",
+                params![created.id, key],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO media_downloads
+                 (subscription_id, target_key, dedupe_key, site_id, downloader_id,
+                  source_site, downloader_name, torrent_id, title, size, release_json,
+                  decision_json, profile_snapshot_json, infohash, status,
+                  created_at, updated_at, submitted_at)
+                 VALUES (?, ?, ?, ?, ?, 'site', 'qB', ?, ?, 1024, '{}', '{}', '{}', ?,
+                         'submitted', ?, ?, ?)",
+                params![
+                    created.id,
+                    key,
+                    format!("subscription:{}:{key}", created.id),
+                    site_id,
+                    downloader_id,
+                    format!("torrent-{episode}"),
+                    format!("Example.Show.S01E{episode:02}.1080p.WEB-DL"),
+                    format!("{episode:040x}"),
+                    now,
+                    now,
+                    now,
+                ],
+            )
+            .unwrap();
+            if episode == 1 {
+                first_download_id = Some(tx.last_insert_rowid());
+            }
+        }
+        tx.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              torrent_name, stage, created_at, updated_at)
+             VALUES (?, ?, ?, '/downloads', '/downloads', '/media', '/media',
+                     'Example Show', 'completed', ?, ?)",
+            params![
+                first_download_id.unwrap(),
+                downloader_id,
+                first_hash,
+                now,
+                now
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let current = db.get_subscription(created.id).await.unwrap().unwrap();
+        let rewound = db
+            .update_subscription(
+                created.id,
+                current.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(1),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                    reset_download_history: true,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            db.list_media_downloads(Some(created.id), None, 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let conn = open_connection(&db.path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM media_relocation_jobs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        for (episode, expected) in [
+            (1, "metadata_pending"),
+            (2, "pending"),
+            (3, "pending"),
+            (4, "pending"),
+            (5, "pending"),
+        ] {
+            let key = target_key("tv", 207, Some(1), Some(episode), None);
+            assert_eq!(
+                db.get_subscription_target(created.id, &key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                expected
+            );
+        }
+
+        let first_key = target_key("tv", 207, Some(1), Some(1), None);
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE subscription_targets SET status = 'pending', air_date = '2020-01-01'
+             WHERE subscription_id = ? AND target_key = ?",
+            params![created.id, first_key],
+        )
+        .unwrap();
+        drop(conn);
+        let request = NewMediaDownload {
+            subscription_id: Some(created.id),
+            target_key: first_key.clone(),
+            dedupe_key: format!("subscription:{}:{first_key}", created.id),
+            site_id: Some(site_id),
+            downloader_id: Some(downloader_id),
+            source_site: "site".to_string(),
+            downloader_name: "qB".to_string(),
+            torrent_id: "torrent-1-redownload".to_string(),
+            title: "Example.Show.S01E01.1080p.WEB-DL".to_string(),
+            size: 1_024,
+            release_json: "{}".to_string(),
+            decision_json: "{}".to_string(),
+            profile_snapshot_json: "{}".to_string(),
+        };
+        let queued = db
+            .enqueue_subscription_media_download(rewound.version, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed = db
+            .claim_due_media_downloads("history-reset-worker", 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(claimed.id, queued.id);
+        assert!(
+            db.mark_media_download_submitting(
+                claimed.id,
+                claimed.version,
+                "history-reset-worker",
+                &first_hash,
+                60,
+            )
+            .await
+            .unwrap()
+        );
+        let submitting = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert!(
+            db.mark_media_download_submitted(
+                submitting.id,
+                submitting.version,
+                "history-reset-worker",
+                &first_hash,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_subscription(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .next_episode,
+            Some(2),
+            "cleared submitted targets must no longer be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_submitted_record_waits_for_relocation_and_reopens_its_target() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let mut request = new_download(&created, site_id, downloader_id);
+        request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        submit_test_download(&db, &request, "single-delete-worker", infohash).await;
+        let submitted = db
+            .list_media_downloads(Some(created.id), Some("submitted"), 10, 0)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        let future = (Utc::now() + Duration::minutes(10)).to_rfc3339();
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              torrent_name, stage, created_at, updated_at)
+             VALUES (?, ?, ?, '/downloads', '/downloads', '/media', '/media',
+                     'Example Show', 'copying', ?, ?)",
+            params![submitted.id, downloader_id, infohash, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(matches!(
+            db.delete_media_download_record(submitted.id, submitted.version)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::RelocationActive
+        ));
+        assert!(db.get_media_download(submitted.id).await.unwrap().is_some());
+
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE media_relocation_jobs
+             SET stage = 'completed', lease_owner = 'stale-worker', lease_until = ?
+             WHERE media_download_id = ?",
+            params![future, submitted.id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            db.delete_media_download_record(submitted.id, submitted.version)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::RelocationActive
+        ));
+
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE media_relocation_jobs SET lease_owner = NULL, lease_until = NULL
+             WHERE media_download_id = ?",
+            [submitted.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_downloads
+             (subscription_id, target_key, dedupe_key, site_id, downloader_id,
+              source_site, downloader_name, torrent_id, title, size, release_json,
+              decision_json, profile_snapshot_json, status, created_at, updated_at, submitted_at)
+             VALUES (?, ?, ?, ?, ?, 'site', 'qB', 'historical-torrent', 'Historical E03',
+                     1024, '{}', '{}', '{}', 'submitted', ?, ?, ?)",
+            params![
+                created.id,
+                request.target_key,
+                format!("{}:history:test", request.dedupe_key),
+                site_id,
+                downloader_id,
+                now,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+        let history_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              torrent_name, stage, created_at, updated_at)
+             VALUES (?, ?, 'fedcba9876543210fedcba9876543210fedcba98', '/downloads',
+                     '/downloads', '/media', '/media', 'Historical E03', 'copying', ?, ?)",
+            params![history_id, downloader_id, now, now],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            db.delete_media_download_record(submitted.id, submitted.version)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::RelocationActive
+        ));
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE media_relocation_jobs SET stage = 'cancelled'
+             WHERE media_download_id = ?",
+            [history_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            db.delete_media_download_record(history_id, 0)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::Deleted {
+                target_reopened: false,
+                ..
+            }
+        ));
+        let deleted = db
+            .delete_media_download_record(submitted.id, submitted.version)
+            .await
+            .unwrap();
+        assert!(matches!(
+            deleted,
+            MediaDownloadDeleteOutcome::Deleted {
+                target_reopened: true,
+                ..
+            }
+        ));
+        assert!(db.get_media_download(submitted.id).await.unwrap().is_none());
+        let conn = open_connection(&db.path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM media_relocation_jobs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        let reopened = db.get_subscription(created.id).await.unwrap().unwrap();
+        assert_eq!(reopened.next_episode, Some(3));
+        assert_eq!(reopened.last_status.as_deref(), Some("awaiting_metadata"));
+        assert!(reopened.enabled);
+        assert_eq!(
+            db.get_subscription_target(created.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "metadata_pending"
+        );
+
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE subscription_targets SET status = 'pending', air_date = '2020-01-01'
+             WHERE subscription_id = ? AND target_key = ?",
+            params![created.id, request.target_key],
+        )
+        .unwrap();
+        drop(conn);
+        let requeued = db
+            .enqueue_subscription_media_download(reopened.version, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requeued.target_key, request.target_key);
+        assert_eq!(requeued.status, "queued");
+    }
+
+    #[tokio::test]
+    async fn target_side_manual_relocation_blocks_download_history_deletion() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let mut request = new_download(&created, site_id, downloader_id);
+        request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
+        let infohash = "3456789abcdef0123456789abcdef0123456789a";
+        submit_test_download(&db, &request, "manual-delete-guard", infohash).await;
+        let submitted = db
+            .list_media_downloads(Some(created.id), Some("submitted"), 10, 0)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let source_id = db
+            .create_downloader(
+                "manual-source",
+                "qbittorrent",
+                "http://127.0.0.1:9090",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                source_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash.to_string(), "target-side migration".to_string())],
+            )
+            .await
+            .unwrap(),
+            (1, 0)
+        );
+
+        assert!(matches!(
+            db.delete_media_download_record(submitted.id, submitted.version)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::RelocationActive
+        ));
+        assert!(db.get_media_download(submitted.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn redelivery_reservation_blocks_manual_migration_until_released() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let mut request = new_download(&created, site_id, downloader_id);
+        request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
+        let infohash = "6789abcdef0123456789abcdef0123456789abcd";
+        submit_test_download(&db, &request, "redelivery-reservation", infohash).await;
+        let submitted = db
+            .list_media_downloads(Some(created.id), Some("submitted"), 10, 0)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let source_id = db
+            .create_downloader(
+                "reservation-source",
+                "qbittorrent",
+                "http://127.0.0.1:9092",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        let owner = "redelivery-reservation-test";
+        assert!(
+            db.reserve_media_download_redelivery(
+                submitted.id,
+                submitted.version,
+                downloader_id,
+                infohash,
+                owner,
+                60,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.renew_media_download_redelivery(
+                submitted.id,
+                submitted.version,
+                downloader_id,
+                infohash,
+                owner,
+                60,
+            )
+            .await
+            .unwrap()
+        );
+
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                source_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash.to_string(), "reserved torrent".to_string())],
+            )
+            .await
+            .unwrap(),
+            (0, 1)
+        );
+        assert!(
+            db.release_media_download_redelivery(submitted.id, submitted.version, owner)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                source_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash.to_string(), "reserved torrent".to_string())],
+            )
+            .await
+            .unwrap(),
+            (1, 0)
+        );
+        let released = db.get_media_download(submitted.id).await.unwrap().unwrap();
+        assert_eq!(released.version, submitted.version);
+        assert_eq!(released.lease_owner, None);
+        assert_eq!(released.lease_until, None);
+    }
+
+    #[tokio::test]
+    async fn expired_redelivery_reservation_cannot_revive_after_subscription_deletion() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let mut request = new_download(&created, site_id, downloader_id);
+        request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
+        let infohash = "789abcdef0123456789abcdef0123456789abcde";
+        submit_test_download(&db, &request, "expired-redelivery", infohash).await;
+        let submitted = db
+            .list_media_downloads(Some(created.id), Some("submitted"), 10, 0)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let owner = "expired-redelivery-reservation";
+        assert!(
+            db.reserve_media_download_redelivery(
+                submitted.id,
+                submitted.version,
+                downloader_id,
+                infohash,
+                owner,
+                60,
+            )
+            .await
+            .unwrap()
+        );
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE media_downloads SET lease_until = ? WHERE id = ?",
+            params![
+                (Utc::now() - Duration::minutes(1)).to_rfc3339(),
+                submitted.id
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let current_subscription = db.get_subscription(created.id).await.unwrap().unwrap();
+        assert!(
+            db.delete_subscription(created.id, current_subscription.version)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.renew_media_download_redelivery(
+                submitted.id,
+                submitted.version,
+                downloader_id,
+                infohash,
+                owner,
+                60,
+            )
+            .await
+            .unwrap(),
+            "an expired side-effect reservation must never be revived after its subscription is deleted"
+        );
+        let orphaned_audit = db.get_media_download(submitted.id).await.unwrap().unwrap();
+        assert_eq!(orphaned_audit.subscription_id, None);
+        assert_eq!(orphaned_audit.lease_owner.as_deref(), Some(owner));
+    }
+
+    #[tokio::test]
+    async fn target_side_manual_relocation_rolls_back_history_reset() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = db
+            .create_subscription(&test_tv_subscription_request(
+                209,
+                1,
+                3,
+                site_id,
+                downloader_id,
+            ))
+            .await
+            .unwrap();
+        let key = target_key("tv", 209, Some(1), Some(3), None);
+        set_test_target_status(&db, created.id, &key, "submitted");
+        let infohash = "456789abcdef0123456789abcdef0123456789ab";
+        let now = Utc::now().to_rfc3339();
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "INSERT INTO media_downloads
+             (subscription_id, target_key, dedupe_key, site_id, downloader_id,
+              source_site, downloader_name, torrent_id, title, size, release_json,
+              decision_json, profile_snapshot_json, infohash, status,
+              created_at, updated_at, submitted_at)
+             VALUES (?, ?, ?, ?, ?, 'site', 'qB', 'torrent-3', 'Example Show', 1024,
+                     '{}', '{}', '{}', ?, 'submitted', ?, ?, ?)",
+            params![
+                created.id,
+                key,
+                format!("subscription:{}:{key}", created.id),
+                site_id,
+                downloader_id,
+                infohash,
+                now,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+        let download_id = conn.last_insert_rowid();
+        drop(conn);
+        let source_id = db
+            .create_downloader(
+                "manual-reset-source",
+                "qbittorrent",
+                "http://127.0.0.1:9091",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                source_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash.to_string(), "target-side reset guard".to_string())],
+            )
+            .await
+            .unwrap(),
+            (1, 0)
+        );
+
+        let error = db
+            .update_subscription(
+                created.id,
+                created.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(3),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                    reset_download_history: true,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("relocation jobs are active"));
+        assert!(db.get_media_download(download_id).await.unwrap().is_some());
+        assert_eq!(
+            db.get_subscription_target(created.id, &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "submitted"
+        );
+        assert_eq!(
+            db.get_subscription(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            created.version
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_failed_download_freezes_downloader_identity_and_reconcile_snapshot() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let mut request = new_download(&created, site_id, downloader_id);
+        request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
+        let queued = enqueue_linked_download(&db, &request).await;
+        let infohash = "56789abcdef0123456789abcdef0123456789abc";
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE media_downloads
+             SET status='failed', infohash=?, next_attempt_at=NULL,
+                 lease_owner=NULL, lease_until=NULL, version=version+1,
+                 last_error='submission outcome is unknown'
+             WHERE id=?",
+            params![infohash, queued.id],
+        )
+        .unwrap();
+        drop(conn);
+        let failed = db.get_media_download(queued.id).await.unwrap().unwrap();
+        let downloader_snapshot = db.get_downloader(downloader_id).await.unwrap().unwrap();
+        let source_id = db
+            .create_downloader(
+                "unresolved-source",
+                "qbittorrent",
+                "http://127.0.0.1:9093",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                source_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash.to_string(), "unresolved torrent".to_string())],
+            )
+            .await
+            .unwrap(),
+            (0, 1),
+            "unknown qB submissions must freeze both migration endpoints"
+        );
+
+        let update_error = db
+            .update_downloader(
+                downloader_id,
+                &downloader_snapshot.name,
+                &downloader_snapshot.downloader_type,
+                "http://127.0.0.1:9999",
+                &downloader_snapshot.username,
+                &downloader_snapshot.password,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            update_error
+                .to_string()
+                .contains("downloads are being processed")
+        );
+        let delete_error = db.delete_downloader(downloader_id).await.unwrap_err();
+        assert!(
+            delete_error
+                .to_string()
+                .contains("downloads are being processed")
+        );
+
+        db.update_downloader(
+            downloader_id,
+            "renamed while awaiting verification",
+            &downloader_snapshot.downloader_type,
+            &downloader_snapshot.url,
+            &downloader_snapshot.username,
+            &downloader_snapshot.password,
+        )
+        .await
+        .unwrap();
+        let current_downloader = db.get_downloader(downloader_id).await.unwrap().unwrap();
+        assert_ne!(
+            current_downloader.updated_at,
+            downloader_snapshot.updated_at
+        );
+        assert!(
+            db.resolve_verified_failed_media_download(
+                failed.id,
+                failed.version,
+                downloader_id,
+                &downloader_snapshot.updated_at,
+                false,
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let unchanged = db.get_media_download(failed.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "failed");
+        assert_eq!(unchanged.version, failed.version);
+        assert_eq!(
+            db.get_subscription_target(created.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_reset_rolls_back_when_a_target_has_active_relocation() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = db
+            .create_subscription(&test_tv_subscription_request(
+                208,
+                1,
+                3,
+                site_id,
+                downloader_id,
+            ))
+            .await
+            .unwrap();
+        let key = target_key("tv", 208, Some(1), Some(3), None);
+        set_test_target_status(&db, created.id, &key, "submitted");
+        let now = Utc::now().to_rfc3339();
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "INSERT INTO media_downloads
+             (subscription_id, target_key, dedupe_key, site_id, downloader_id,
+              source_site, downloader_name, torrent_id, title, size, release_json,
+              decision_json, profile_snapshot_json, infohash, status,
+              created_at, updated_at, submitted_at)
+             VALUES (?, ?, ?, ?, ?, 'site', 'qB', 'torrent-3', 'Example Show', 1024,
+                     '{}', '{}', '{}', 'abcdef0123456789abcdef0123456789abcdef01',
+                     'submitted', ?, ?, ?)",
+            params![
+                created.id,
+                key,
+                format!("subscription:{}:{key}", created.id),
+                site_id,
+                downloader_id,
+                now,
+                now,
+                now,
+            ],
+        )
+        .unwrap();
+        let download_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              torrent_name, stage, created_at, updated_at)
+             VALUES (?, ?, 'abcdef0123456789abcdef0123456789abcdef01', '/downloads',
+                     '/downloads', '/media', '/media', 'Example Show', 'copying', ?, ?)",
+            params![download_id, downloader_id, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(
+            !db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap(),
+            "an active relocation must retain its subscription and target identity"
+        );
+
+        let error = db
+            .update_subscription(
+                created.id,
+                created.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: Some(3),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                    reset_download_history: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("relocation jobs are active"));
+        assert!(db.get_media_download(download_id).await.unwrap().is_some());
+        assert_eq!(
+            db.get_subscription_target(created.id, &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "submitted"
+        );
+        assert_eq!(
+            db.get_subscription(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            created.version
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_queued_target_preserves_failed_download_evidence() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let mut request = new_download(&created, site_id, downloader_id);
+        request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
+        let queued = enqueue_linked_download(&db, &request).await;
+        assert!(
+            !db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap(),
+            "a queued download must keep its subscription identity"
+        );
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "UPDATE media_downloads
+             SET status = 'failed', next_attempt_at = NULL, lease_owner = NULL,
+                 lease_until = NULL, version = version + 1,
+                 last_error = 'submission outcome is unknown'
+             WHERE id = ?",
+            [queued.id],
+        )
+        .unwrap();
+        drop(conn);
+        let failed = db.get_media_download(queued.id).await.unwrap().unwrap();
+
+        assert!(
+            !db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap(),
+            "an unknown qB submission must retain its reconciliation context"
+        );
+
+        assert!(matches!(
+            db.delete_media_download_record(failed.id, failed.version)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::DownloadActive
+        ));
+        let reset_error = db
+            .update_subscription(
+                created.id,
+                created.version,
+                &UpdateSubscription {
+                    season: Some(1),
+                    next_episode: created.next_episode,
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                    reset_download_history: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(reset_error.to_string().contains("submission is unresolved"));
+        assert!(db.get_media_download(failed.id).await.unwrap().is_some());
+        assert_eq!(
+            db.get_subscription_target(created.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+        assert_eq!(
+            db.get_subscription(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            created.version
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_subscription_can_be_deleted_without_orphaning_work() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+
+        assert!(
+            db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap()
+        );
+        assert!(db.get_subscription(created.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -4623,6 +6588,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -4652,6 +6618,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -4679,6 +6646,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: Some("/new/path".to_string()),
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -4707,6 +6675,7 @@ mod tests {
                     site_ids: vec![site_id],
                     save_path: None,
                     enabled: true,
+                    reset_download_history: false,
                 },
             )
             .await
@@ -5041,6 +7010,28 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(deep_cancelled_page.len(), 10);
+
+        let first_cursor_page = db
+            .list_media_downloads(Some(subscription.id), Some("cancelled"), 20, 0)
+            .await
+            .unwrap();
+        let cursor = first_cursor_page.last().unwrap().id;
+        let removed = first_cursor_page.first().unwrap();
+        assert!(matches!(
+            db.delete_media_download_record(removed.id, removed.version)
+                .await
+                .unwrap(),
+            MediaDownloadDeleteOutcome::Deleted { .. }
+        ));
+        let second_cursor_page = db
+            .list_media_downloads_before(Some(subscription.id), Some("cancelled"), 20, cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_cursor_page.first().map(|download| download.id),
+            cancelled_ids.iter().rev().nth(20).copied(),
+            "keyset pagination must not skip a boundary row after a concurrent deletion"
+        );
     }
 
     #[tokio::test]

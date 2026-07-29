@@ -384,6 +384,11 @@ mod tests {
             size,
             uploaded: 0,
             downloaded,
+            progress: if size > 0 {
+                downloaded as f64 / size as f64
+            } else {
+                0.0
+            },
             upload_speed: 0,
             download_speed: 0,
             ratio: 0.0,

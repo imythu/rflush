@@ -546,6 +546,7 @@ paths:
         - {$ref: '#/components/parameters/IdPath'}
         - {$ref: '#/components/parameters/MediaDownloadStatus'}
         - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/BeforeId'}
         - {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 200, default: 100}}
       responses:
         '200':
@@ -580,6 +581,7 @@ paths:
         - {name: subscription_id, in: query, required: false, schema: {type: integer, format: int64}}
         - {$ref: '#/components/parameters/MediaDownloadStatus'}
         - {$ref: '#/components/parameters/Page'}
+        - {$ref: '#/components/parameters/BeforeId'}
         - {name: page_size, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 200, default: 100}}
       responses:
         '200':
@@ -613,6 +615,24 @@ paths:
       responses:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/MediaDownload'}}}}
         default: {$ref: '#/components/responses/Error'}
+    delete:
+      summary: Delete a terminal media download record from rflush
+      description: >-
+        Deletes local rflush history only. It never deletes a qB torrent, downloaded files, or
+        OpenList data. Submitted subscription targets are reopened atomically when this is their
+        current canonical record. Active downloads, subscription work, relocation jobs, and stale
+        client versions return 409.
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {name: version, in: query, required: true, schema: {type: integer, format: int64, minimum: 0}}
+      responses:
+        '200': {description: Local record deleted, content: {application/json: {schema: {$ref: '#/components/schemas/DeleteMediaDownloadResponse'}}}}
+        '409':
+          description: Record changed or related work is still active
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        default: {$ref: '#/components/responses/Error'}
 
   /api/media/downloads/{id}/redeliver:
     post:
@@ -624,6 +644,32 @@ paths:
       parameters: [{$ref: '#/components/parameters/IdPath'}]
       responses:
         '200': {description: Verified in downloader, content: {application/json: {schema: {$ref: '#/components/schemas/MediaDownload'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/media/downloads/{id}/reconcile-failed:
+    post:
+      summary: Resolve an unknown qB submission for a failed subscription download
+      description: >-
+        Queries qB by the stored infohash without adding or deleting anything. If qB confirms the
+        torrent exists, the download and subscription target become submitted and progression
+        advances atomically. If qB confirms it is absent, the failed audit record is retained and
+        the target becomes pending so a later scan can retry. qB errors, stale versions, changed
+        downloader identity, active relocation work, or subscription races leave all state unchanged.
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {name: version, in: query, required: true, schema: {type: integer, format: int64, minimum: 0}}
+      responses:
+        '200': {description: Unknown submission resolved, content: {application/json: {schema: {$ref: '#/components/schemas/ReconcileFailedMediaDownloadResponse'}}}}
+        '409':
+          description: Download, downloader, subscription, target, or relocation state changed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '502':
+          description: qB verification failed; no state was changed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
         default: {$ref: '#/components/responses/Error'}
 
 components:
@@ -643,6 +689,12 @@ components:
       in: query
       required: false
       schema: {type: integer, minimum: 1}
+    BeforeId:
+      name: before_id
+      in: query
+      required: false
+      description: Stable keyset cursor for older records; cannot be combined with page.
+      schema: {type: integer, format: int64, minimum: 1}
     PageSize:
       name: page_size
       in: query
@@ -1172,6 +1224,13 @@ components:
         site_ids: {type: array, minItems: 1, maxItems: 100, uniqueItems: true, items: {type: integer, format: int64, minimum: 1}}
         save_path: {type: string, maxLength: 1024, nullable: true}
         enabled: {type: boolean}
+        reset_download_history:
+          type: boolean
+          default: false
+          description: >-
+            For TV only, delete terminal rflush download and relocation history from the selected
+            episode onward and reopen submitted targets. Does not delete qB or OpenList data and
+            fails with 409 while related work is active.
 
     MediaSubscription:
       type: object
@@ -1477,6 +1536,8 @@ components:
         - created_at
         - updated_at
         - submitted_at
+        - parsed_release
+        - failed_reconciliation_allowed
       properties:
         id: {type: integer, format: int64}
         subscription_id: {type: integer, format: int64, nullable: true}
@@ -1494,7 +1555,7 @@ components:
         profile_snapshot_json: {type: string}
         infohash:
           type: string
-          pattern: '^[0-9A-Fa-f]{40}$'
+          pattern: '^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$'
           nullable: true
           description: >-
             Case-insensitively unique together with downloader_id. The same torrent may be
@@ -1509,6 +1570,38 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         submitted_at: {type: string, format: date-time, nullable: true}
+        parsed_release:
+          type: object
+          allOf: [{$ref: '#/components/schemas/ReleaseInfo'}]
+          nullable: true
+        failed_reconciliation_allowed:
+          type: boolean
+          description: >-
+            True only while a failed subscription download has a valid infohash, its current
+            target remains queued, and no download or relocation work prevents a read-only qB check.
+
+    DeleteMediaDownloadResponse:
+      type: object
+      required:
+        - deleted_id
+        - subscription_id
+        - target_reopened
+        - qb_torrent_deleted
+        - openlist_data_deleted
+      properties:
+        deleted_id: {type: integer, format: int64}
+        subscription_id: {type: integer, format: int64, nullable: true}
+        target_reopened: {type: boolean}
+        qb_torrent_deleted: {type: boolean, enum: [false]}
+        openlist_data_deleted: {type: boolean, enum: [false]}
+
+    ReconcileFailedMediaDownloadResponse:
+      allOf:
+        - {$ref: '#/components/schemas/MediaDownload'}
+        - type: object
+          required: [resolution]
+          properties:
+            resolution: {type: string, enum: [submitted, retry_ready]}
 
     SubscriptionRunResult:
       type: object

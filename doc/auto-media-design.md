@@ -457,11 +457,14 @@ Dune Part Two 2024
 - `POST /api/media/resources/search`
 - `POST /api/media/downloads`
 - `GET /api/media/downloads/{id}`
+- `DELETE /api/media/downloads/{id}?version=...`
 - `GET /api/media/downloads?subscription_id=...&status=...`
 
 搜索响应包含：归一化站点结果、`ReleaseInfo`、`MatchDecision`、稳定排序位置和逐站错误。任何响应都不得返回站点凭据。
 
 手动下载也进入同一 outbox。用户覆盖硬拒绝时必须显式提交 `override_reason`，并写入审计信息。
+
+删除下载记录只清理 rflush 本地的终态 outbox/自动复制历史，不调用 qB 或 OpenList。关联下载、订阅扫描或迁移仍在运行时必须拒绝删除；TV 订阅可在编辑时显式清理所选集及之后的终态历史，把对应 `submitted` target 恢复为可搜索状态。
 
 ## 9. 调用流程
 

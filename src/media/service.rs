@@ -20,9 +20,9 @@ use super::domain::{
 };
 use super::lease::process_owner_id;
 use super::models::{
-    MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS, MediaDownloadRecord, NewMediaDownload,
-    NewSubscription, QualityProfileRecord, SubscriptionRecord, SubscriptionTargetRecord,
-    media_download_category,
+    MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS, MediaDownloadDeleteOutcome, MediaDownloadDeletion,
+    MediaDownloadRecord, NewMediaDownload, NewSubscription, QualityProfileRecord,
+    SubscriptionRecord, SubscriptionTargetRecord, media_download_category,
 };
 use super::progression::{
     ProgressionError, SubscriptionTargetSeedStatus, TargetReadiness, air_date_eligible_at,
@@ -142,6 +142,12 @@ pub struct SubscriptionRunSnapshot {
     pub successful_sites: usize,
     pub best_candidate_id: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedDownloadReconciliation {
+    pub resolution: String,
+    pub download: MediaDownloadRecord,
 }
 
 #[derive(Clone)]
@@ -1420,6 +1426,188 @@ impl MediaService {
         let downloader_id = download.downloader_id.ok_or_else(|| {
             MediaServiceError::NotFound("download client was deleted".to_string())
         })?;
+        let lease_owner = format!("redelivery:{}:{}", download.id, new_candidate_id()?);
+        if !self
+            .db
+            .reserve_media_download_redelivery(
+                download.id,
+                download.version,
+                downloader_id,
+                &infohash,
+                &lease_owner,
+                DOWNLOAD_LEASE_SECONDS,
+            )
+            .await?
+        {
+            self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+                .await?;
+            return Err(MediaServiceError::Conflict(
+                "download changed or is already being verified; reload and try again".to_string(),
+            ));
+        }
+
+        let result = async {
+            let downloader = self
+                .db
+                .get_downloader(downloader_id)
+                .await?
+                .ok_or_else(|| {
+                    MediaServiceError::NotFound(format!("downloader {downloader_id}"))
+                })?;
+            let client = self
+                .downloaders
+                .get(&downloader)
+                .await
+                .map_err(MediaServiceError::Downloader)?;
+            if torrent_is_present(client.as_ref(), &infohash)
+                .await
+                .map_err(MediaServiceError::Downloader)?
+            {
+                return Ok(download.clone());
+            }
+
+            let (search_result, torrent) = self.fetch_torrent_for_download(&download).await?;
+            let fetched_infohash = torrent_infohash(&torrent)?;
+            if !fetched_infohash.eq_ignore_ascii_case(&infohash) {
+                return Err(MediaServiceError::Conflict(
+                    "the stored torrent locator now returns different torrent content".to_string(),
+                ));
+            }
+            let options = self.add_torrent_options(&download).await?;
+            let filename = media_download_filename(&search_result);
+            if !self
+                .db
+                .renew_media_download_redelivery(
+                    download.id,
+                    download.version,
+                    downloader_id,
+                    &infohash,
+                    &lease_owner,
+                    DOWNLOAD_LEASE_SECONDS,
+                )
+                .await?
+            {
+                return Err(MediaServiceError::Conflict(
+                    "redelivery reservation expired or a migration started; qBittorrent submission was not attempted"
+                        .to_string(),
+                ));
+            }
+            match add_torrent_and_confirm(client.as_ref(), torrent, &filename, &options, &infohash)
+                .await
+            {
+                Ok(()) => Ok(download.clone()),
+                Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
+                    Err(MediaServiceError::Downloader(message))
+                }
+                Err(TorrentSubmissionError::Unknown(message)) => Err(
+                    MediaServiceError::Downloader(format!("submission result is unknown: {message}")),
+                ),
+            }
+        }
+        .await;
+        if !self
+            .db
+            .release_media_download_redelivery(download.id, download.version, &lease_owner)
+            .await?
+        {
+            return Err(MediaServiceError::Conflict(
+                "download changed while releasing the redelivery reservation".to_string(),
+            ));
+        }
+        result
+    }
+
+    pub async fn delete_download_record(
+        &self,
+        download_id: i64,
+        expected_version: i64,
+    ) -> Result<MediaDownloadDeletion, MediaServiceError> {
+        match self
+            .db
+            .delete_media_download_record(download_id, expected_version)
+            .await?
+        {
+            MediaDownloadDeleteOutcome::Deleted {
+                download,
+                target_reopened,
+            } => Ok(MediaDownloadDeletion {
+                deleted_id: download.id,
+                subscription_id: download.subscription_id,
+                target_reopened,
+            }),
+            MediaDownloadDeleteOutcome::NotFound => Err(MediaServiceError::NotFound(format!(
+                "download {download_id}"
+            ))),
+            MediaDownloadDeleteOutcome::VersionChanged => Err(MediaServiceError::Conflict(
+                "download record changed; reload and try again".to_string(),
+            )),
+            MediaDownloadDeleteOutcome::DownloadActive => Err(MediaServiceError::Conflict(
+                "download record is still being processed and cannot be deleted".to_string(),
+            )),
+            MediaDownloadDeleteOutcome::SubscriptionActive => Err(MediaServiceError::Conflict(
+                "subscription has active scan or download work; retry after it finishes"
+                    .to_string(),
+            )),
+            MediaDownloadDeleteOutcome::RelocationActive => Err(MediaServiceError::Conflict(
+                "the related OpenList copy or qB migration is still active; resolve it before deleting the record"
+                    .to_string(),
+            )),
+        }
+    }
+
+    pub async fn reconcile_failed_download(
+        &self,
+        download_id: i64,
+        expected_version: i64,
+    ) -> Result<FailedDownloadReconciliation, MediaServiceError> {
+        let download = self
+            .db
+            .get_media_download(download_id)
+            .await?
+            .ok_or_else(|| MediaServiceError::NotFound(format!("download {download_id}")))?;
+        if download.version != expected_version {
+            return Err(MediaServiceError::Conflict(
+                "download record changed; reload and try again".to_string(),
+            ));
+        }
+        if download.status != "failed" {
+            return Err(MediaServiceError::Conflict(
+                "only failed downloads with an unresolved qB submission can be reconciled"
+                    .to_string(),
+            ));
+        }
+        let subscription_id = download.subscription_id.ok_or_else(|| {
+            MediaServiceError::Conflict(
+                "only subscription downloads can release an unresolved target".to_string(),
+            )
+        })?;
+        let target = self
+            .db
+            .get_subscription_target(subscription_id, &download.target_key)
+            .await?
+            .ok_or_else(|| {
+                MediaServiceError::Conflict("subscription target no longer exists".to_string())
+            })?;
+        if target.status != "queued" {
+            return Err(MediaServiceError::Conflict(
+                "subscription target is not awaiting qB reconciliation".to_string(),
+            ));
+        }
+        let infohash = download.infohash.clone().ok_or_else(|| {
+            MediaServiceError::Conflict(
+                "failed download has no infohash to verify in qB".to_string(),
+            )
+        })?;
+        if !is_valid_infohash(&infohash) {
+            return Err(MediaServiceError::Conflict(
+                "failed download has an invalid infohash".to_string(),
+            ));
+        }
+        let downloader_id = download.downloader_id.ok_or_else(|| {
+            MediaServiceError::NotFound("download client was deleted".to_string())
+        })?;
+        self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+            .await?;
         let downloader = self
             .db
             .get_downloader(downloader_id)
@@ -1430,33 +1618,34 @@ impl MediaService {
             .get(&downloader)
             .await
             .map_err(MediaServiceError::Downloader)?;
-        if torrent_is_present(client.as_ref(), &infohash)
+        let torrent_present = !client
+            .list_torrents_by_hashes(&[infohash])
             .await
             .map_err(MediaServiceError::Downloader)?
-        {
-            return Ok(download);
-        }
-
-        let (result, torrent) = self.fetch_torrent_for_download(&download).await?;
-        let fetched_infohash = torrent_infohash(&torrent)?;
-        if !fetched_infohash.eq_ignore_ascii_case(&infohash) {
-            return Err(MediaServiceError::Conflict(
-                "the stored torrent locator now returns different torrent content".to_string(),
-            ));
-        }
-        let options = self.add_torrent_options(&download).await?;
-        let filename = media_download_filename(&result);
-        match add_torrent_and_confirm(client.as_ref(), torrent, &filename, &options, &infohash)
-            .await
-        {
-            Ok(()) => Ok(download),
-            Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
-                Err(MediaServiceError::Downloader(message))
-            }
-            Err(TorrentSubmissionError::Unknown(message)) => Err(MediaServiceError::Downloader(
-                format!("submission result is unknown: {message}"),
-            )),
-        }
+            .is_empty();
+        let resolved = self
+            .db
+            .resolve_verified_failed_media_download(
+                download.id,
+                download.version,
+                downloader_id,
+                &downloader.updated_at,
+                torrent_present,
+            )
+            .await?
+            .ok_or_else(|| {
+                MediaServiceError::Conflict(
+                    "download or subscription changed during qB reconciliation".to_string(),
+                )
+            })?;
+        Ok(FailedDownloadReconciliation {
+            resolution: if torrent_present {
+                "submitted".to_string()
+            } else {
+                "retry_ready".to_string()
+            },
+            download: resolved,
+        })
     }
 
     async fn fetch_torrent_for_download(
@@ -1505,6 +1694,25 @@ impl MediaService {
         })
     }
 
+    async fn ensure_download_identity_not_relocating(
+        &self,
+        download_id: i64,
+        downloader_id: i64,
+        infohash: &str,
+    ) -> Result<(), MediaServiceError> {
+        if self
+            .db
+            .media_download_identity_has_active_relocation(download_id, downloader_id, infohash)
+            .await?
+        {
+            return Err(MediaServiceError::Conflict(
+                "the torrent is being copied or migrated; qBittorrent submission is blocked"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn process_download(
         &self,
         download: MediaDownloadRecord,
@@ -1544,6 +1752,8 @@ impl MediaService {
             .await?
             .ok_or_else(|| MediaServiceError::NotFound(format!("downloader {downloader_id}")))?;
         let infohash = torrent_infohash(&torrent)?;
+        self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+            .await?;
         let client = self
             .downloaders
             .get(&downloader)
@@ -1555,12 +1765,20 @@ impl MediaService {
             .await?
         {
             if existing.id != download.id && existing.status == "submitted" {
+                self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+                    .await?;
                 if !torrent_is_present(client.as_ref(), &infohash)
                     .await
                     .map_err(MediaServiceError::Downloader)?
                 {
                     let options = self.add_torrent_options(&download).await?;
                     let filename = media_download_filename(&result);
+                    self.ensure_download_identity_not_relocating(
+                        download.id,
+                        downloader_id,
+                        &infohash,
+                    )
+                    .await?;
                     match add_torrent_and_confirm(
                         client.as_ref(),
                         torrent,
@@ -1609,6 +1827,8 @@ impl MediaService {
             )
             .await?
         {
+            self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+                .await?;
             return Err(MediaServiceError::Conflict(
                 "download lease changed before qBittorrent submission".to_string(),
             ));
@@ -1686,6 +1906,8 @@ impl MediaService {
         let downloader_id = download.downloader_id.ok_or_else(|| {
             MediaServiceError::NotFound("download client was deleted".to_string())
         })?;
+        self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+            .await?;
         let downloader = self
             .db
             .get_downloader(downloader_id)
@@ -1837,7 +2059,7 @@ fn media_download_filename(result: &SearchResult) -> String {
 }
 
 fn is_valid_infohash(infohash: &str) -> bool {
-    infohash.len() == 40 && infohash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    matches!(infohash.len(), 40 | 64) && infohash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 async fn torrent_is_present(client: &dyn DownloaderClient, infohash: &str) -> Result<bool, String> {
@@ -2443,6 +2665,7 @@ mod tests {
             size: 1,
             uploaded: 0,
             downloaded: 0,
+            progress: 0.0,
             upload_speed: 0,
             download_speed: 0,
             ratio: 0.0,
@@ -2503,6 +2726,94 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    async fn enqueue_failed_linked_download(
+        db: &Database,
+        site_id: i64,
+        downloader_id: i64,
+        tmdb_id: i64,
+        infohash: &str,
+    ) -> (SubscriptionRecord, MediaDownloadRecord, NewMediaDownload) {
+        let target_key = crate::media::models::target_key("tv", tmdb_id, Some(1), Some(3), None);
+        let subscription = db
+            .create_subscription_with_targets(
+                &NewSubscription {
+                    tmdb_id,
+                    media_type: "tv".to_string(),
+                    tmdb_is_animation: false,
+                    tmdb_genres: Vec::new(),
+                    title: format!("Example Show {tmdb_id}"),
+                    original_title: None,
+                    aliases: Vec::new(),
+                    year: Some(2026),
+                    poster_path: None,
+                    season: Some(1),
+                    start_episode: Some(3),
+                    absolute_episode: None,
+                    quality_profile_id: 1,
+                    downloader_id,
+                    site_ids: vec![site_id],
+                    save_path: None,
+                    enabled: true,
+                },
+                &[crate::media::progression::SubscriptionTargetSeed {
+                    target_key: target_key.clone(),
+                    season: 1,
+                    episode: 3,
+                    absolute_episode: None,
+                    air_date: Some("2020-01-01".to_string()),
+                    status: SubscriptionTargetSeedStatus::Pending,
+                }],
+                None,
+                Some("waiting"),
+            )
+            .await
+            .unwrap();
+        let request = NewMediaDownload {
+            subscription_id: Some(subscription.id),
+            target_key: target_key.clone(),
+            dedupe_key: format!("subscription:{}:{target_key}", subscription.id),
+            site_id: Some(site_id),
+            downloader_id: Some(downloader_id),
+            source_site: "service-site-a".to_string(),
+            downloader_name: "service-downloader".to_string(),
+            torrent_id: format!("failed-{tmdb_id}"),
+            title: format!("Example.Show.{tmdb_id}.S01E03.1080p.WEB-DL"),
+            size: 1_024,
+            release_json: "{}".to_string(),
+            decision_json: "{}".to_string(),
+            profile_snapshot_json: "{}".to_string(),
+        };
+        let queued = db
+            .enqueue_subscription_media_download(subscription.version, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = format!("failed-reconcile-{tmdb_id}");
+        let fetching = db
+            .claim_due_media_downloads(&owner, 60, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|download| download.id == queued.id)
+            .unwrap();
+        assert!(
+            db.transition_media_download(
+                fetching.id,
+                fetching.version,
+                &owner,
+                "fetching",
+                "failed",
+                Some(infohash),
+                Some("submission outcome is unknown"),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+        let failed = db.get_media_download(queued.id).await.unwrap().unwrap();
+        (subscription, failed, request)
     }
 
     async fn install_download_dependencies(
@@ -2706,6 +3017,321 @@ mod tests {
         let error = service.redeliver_download(queued.id).await.unwrap_err();
 
         assert!(matches!(error, MediaServiceError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn redelivery_is_blocked_by_target_side_manual_migration_before_qb_access() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("redelivery-migration-guard");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "guarded-redelivery").await;
+        let submitted =
+            mark_test_download_submitted(&db, &queued, "guarded-redelivery-worker", &infohash)
+                .await;
+        let source_downloader_id = db
+            .create_downloader(
+                "migration-source",
+                "qbittorrent",
+                "http://127.0.0.1:9090",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                source_downloader_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash.clone(), "guarded torrent".to_string())],
+            )
+            .await
+            .unwrap(),
+            (1, 0)
+        );
+        let client = Arc::new(ScriptedDownloader::new(Vec::new(), Ok(Vec::new()), Ok(())));
+        let fetch_count = install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+
+        let error = service.redeliver_download(submitted.id).await.unwrap_err();
+
+        assert!(matches!(error, MediaServiceError::Conflict(_)));
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_download_does_not_add_when_manual_migration_owns_the_identity() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("process-migration-guard");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs(
+                downloader_id,
+                downloader_id,
+                "/archive",
+                "/archive",
+                &[(infohash, "guarded process torrent".to_string())],
+            )
+            .await
+            .unwrap(),
+            (1, 0)
+        );
+        let client = Arc::new(ScriptedDownloader::new(Vec::new(), Ok(Vec::new()), Ok(())));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "guarded-process").await;
+        let owner = "guarded-process-worker";
+        let fetching = db
+            .claim_due_media_downloads(owner, 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let error = service.process_download(fetching, owner).await.unwrap_err();
+
+        assert!(matches!(error, MediaServiceError::Conflict(_)));
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.get_media_download(queued.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "retry_wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reconciliation_confirms_present_torrent_without_adding() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let infohash = "0123456789abcdef0123456789abcdef01234567";
+        let (subscription, failed, request) =
+            enqueue_failed_linked_download(&db, site_id, downloader_id, 301, infohash).await;
+        let client = Arc::new(ScriptedDownloader::new(
+            Vec::new(),
+            Ok(vec![test_torrent_info(infohash)]),
+            Ok(()),
+        ));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            test_torrent("unused-present-reconcile"),
+            Arc::clone(&client),
+        )
+        .await;
+        assert!(
+            db.media_download_failed_reconciliation_allowed(failed.id, failed.version)
+                .await
+                .unwrap()
+        );
+
+        let resolved = service
+            .reconcile_failed_download(failed.id, failed.version)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.resolution, "submitted");
+        assert_eq!(resolved.download.status, "submitted");
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.get_subscription_target(subscription.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "submitted"
+        );
+        let advanced = db.get_subscription(subscription.id).await.unwrap().unwrap();
+        assert_eq!(advanced.next_episode, Some(4));
+        assert_eq!(advanced.last_status.as_deref(), Some("submitted"));
+        assert!(
+            !db.media_download_failed_reconciliation_allowed(failed.id, resolved.download.version)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reconciliation_confirms_absence_and_allows_requeue() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let infohash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let (subscription, failed, request) =
+            enqueue_failed_linked_download(&db, site_id, downloader_id, 302, infohash).await;
+        let client = Arc::new(ScriptedDownloader::new(Vec::new(), Ok(Vec::new()), Ok(())));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            test_torrent("unused-absent-reconcile"),
+            Arc::clone(&client),
+        )
+        .await;
+        assert!(
+            db.media_download_failed_reconciliation_allowed(failed.id, failed.version)
+                .await
+                .unwrap()
+        );
+
+        let resolved = service
+            .reconcile_failed_download(failed.id, failed.version)
+            .await
+            .unwrap();
+
+        assert_eq!(resolved.resolution, "retry_ready");
+        assert_eq!(resolved.download.status, "failed");
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.get_subscription_target(subscription.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        assert!(
+            !db.media_download_failed_reconciliation_allowed(failed.id, resolved.download.version)
+                .await
+                .unwrap()
+        );
+        let retry_subscription = db.get_subscription(subscription.id).await.unwrap().unwrap();
+        let requeued = db
+            .enqueue_subscription_media_download(retry_subscription.version, &request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(requeued.id, failed.id);
+        assert_eq!(requeued.status, "queued");
+        assert!(
+            !db.media_download_failed_reconciliation_allowed(failed.id, requeued.version)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reconciliation_qb_error_leaves_all_state_unchanged() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let infohash = "23456789abcdef0123456789abcdef0123456789";
+        let (subscription, failed, request) =
+            enqueue_failed_linked_download(&db, site_id, downloader_id, 303, infohash).await;
+        let client = Arc::new(ScriptedDownloader::new(
+            Vec::new(),
+            Err("qB lookup unavailable".to_string()),
+            Ok(()),
+        ));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            test_torrent("unused-error-reconcile"),
+            Arc::clone(&client),
+        )
+        .await;
+        assert!(
+            db.media_download_failed_reconciliation_allowed(failed.id, failed.version)
+                .await
+                .unwrap()
+        );
+        let before_download = serde_json::to_value(&failed).unwrap();
+        let before_target = serde_json::to_value(
+            db.get_subscription_target(subscription.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let before_subscription =
+            serde_json::to_value(db.get_subscription(subscription.id).await.unwrap().unwrap())
+                .unwrap();
+
+        let error = service
+            .reconcile_failed_download(failed.id, failed.version)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, MediaServiceError::Downloader(_)));
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(db.get_media_download(failed.id).await.unwrap().unwrap()).unwrap(),
+            before_download
+        );
+        assert_eq!(
+            serde_json::to_value(
+                db.get_subscription_target(subscription.id, &request.target_key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            before_target
+        );
+        assert_eq!(
+            serde_json::to_value(db.get_subscription(subscription.id).await.unwrap().unwrap())
+                .unwrap(),
+            before_subscription
+        );
+        assert!(
+            db.media_download_failed_reconciliation_allowed(failed.id, failed.version)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_download_history_is_versioned_and_does_not_contact_the_downloader() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "delete-history").await;
+        let active = service
+            .delete_download_record(queued.id, queued.version)
+            .await
+            .unwrap_err();
+        assert!(matches!(active, MediaServiceError::Conflict(_)));
+        let submitted = mark_test_download_submitted(
+            &db,
+            &queued,
+            "delete-history-worker",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .await;
+
+        let stale = service
+            .delete_download_record(submitted.id, submitted.version - 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(stale, MediaServiceError::Conflict(_)));
+        assert!(db.get_media_download(submitted.id).await.unwrap().is_some());
+
+        // No downloader client is installed in the pool. A successful deletion therefore also
+        // proves this operation is local database cleanup rather than a qB mutation.
+        let deleted = service
+            .delete_download_record(submitted.id, submitted.version)
+            .await
+            .unwrap();
+        assert_eq!(deleted.deleted_id, submitted.id);
+        assert_eq!(deleted.subscription_id, None);
+        assert!(!deleted.target_reopened);
+        assert!(db.get_media_download(submitted.id).await.unwrap().is_none());
     }
 
     #[test]

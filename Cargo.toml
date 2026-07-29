@@ -23,11 +23,14 @@ scraper = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+unicode-normalization = "0.1"
+icu_casemap = "2.2"
 sysinfo = "0.34"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 urlencoding = "2"

@@ -1174,13 +1174,66 @@ impl Database {
             password.to_string(),
         );
         tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current = tx
+                .query_row(
+                    "SELECT downloader_type, url, username, password
+                     FROM downloaders WHERE id = ?",
+                    [id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some((current_type, current_url, current_username, current_password)) = current {
+                let active = downloader_has_active_qb_work(&tx, id, &now)?;
+                if active
+                    && (!same_downloader_type(&current_type, &dtype)
+                        || !same_downloader_url(&current_url, &url))
+                {
+                    return Err(AppError::InvalidConfig {
+                        message: "downloader URL or type cannot change while relocation jobs are active or downloads are being processed"
+                            .to_string(),
+                    });
+                }
+                let credentials_changed =
+                    current_username != username || current_password != password;
+                if active
+                    && credentials_changed
+                    && (username.trim().is_empty() || password.is_empty())
+                {
+                    return Err(AppError::InvalidConfig {
+                        message: "downloader credentials cannot be cleared while relocation jobs are active or downloads are being processed"
+                            .to_string(),
+                    });
+                }
+            }
+            tx.execute(
                 "UPDATE downloaders SET name = ?, downloader_type = ?, url = ?, username = ?, password = ?, updated_at = ? WHERE id = ?",
                 params![name, dtype, url, username, password, now, id],
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
             Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn has_active_relocation_for_downloader(&self, id: i64) -> Result<bool, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            downloader_has_active_relocation(&conn, id, &Utc::now().to_rfc3339())
         })
         .await
         .map_err(join_error)?
@@ -1189,9 +1242,19 @@ impl Database {
     pub async fn delete_downloader(&self, id: i64) -> Result<(), AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute("DELETE FROM downloaders WHERE id = ?", params![id])
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            if downloader_has_active_qb_work(&tx, id, &Utc::now().to_rfc3339())? {
+                return Err(AppError::InvalidConfig {
+                    message: "downloader cannot be deleted while relocation jobs are active or downloads are being processed"
+                        .to_string(),
+                });
+            }
+            tx.execute("DELETE FROM downloaders WHERE id = ?", params![id])
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
             Ok(())
         })
         .await
@@ -3019,6 +3082,7 @@ impl Database {
                     manifest_cursor INTEGER NOT NULL DEFAULT 0,
                     target_root_folder INTEGER,
                     manual_requested_at TEXT,
+                    stage_started_at TEXT NOT NULL DEFAULT '',
                     torrent_name TEXT NOT NULL,
                     stage TEXT NOT NULL DEFAULT 'waiting_download',
                     openlist_task_id TEXT,
@@ -3106,7 +3170,44 @@ impl Database {
                 "manual_requested_at",
                 "ALTER TABLE media_relocation_jobs ADD COLUMN manual_requested_at TEXT",
             )?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "stage_started_at",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN stage_started_at TEXT NOT NULL DEFAULT ''",
+            )?;
+            conn.execute(
+                "UPDATE media_relocation_jobs
+                 SET stage_started_at=COALESCE(NULLIF(updated_at, ''), created_at)
+                 WHERE stage_started_at=''",
+                [],
+            )
+            .map_err(sql_error)?;
             migrate_media_relocation_jobs_for_manual_transfers(&conn)?;
+            let legacy_auto_boundary_at = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE media_relocation_jobs
+                 SET stage='completed', openlist_task_id=NULL,
+                     copy_checkpoint_json=NULL, copy_lock_acquired=0,
+                     lease_owner=NULL, lease_until=NULL, attempts=0, next_attempt_at=NULL,
+                     manual_requested_at=NULL,
+                     last_error='历史自动复制任务的 qB 后续已停止；自动追剧不会继续接管 qB 或清理源文件。旧流程可能已移除源 qB 任务，若存在 torrent_data 已保留供人工恢复',
+                     completed_at=COALESCE(completed_at, ?), stage_started_at=?, updated_at=?,
+                     version=version+1
+                 WHERE media_download_id IS NOT NULL
+                   AND stage IN ('copy_verified', 'qb_reconcile', 'torrent_exported',
+                                 'source_qb_removed', 'target_qb_submitted',
+                                 'target_qb_check_requested', 'target_qb_checking',
+                                 'target_qb_starting', 'qb_manual_review',
+                                 'source_removing', 'source_remove_manual_review',
+                                 'source_removed')",
+                params![
+                    legacy_auto_boundary_at,
+                    legacy_auto_boundary_at,
+                    legacy_auto_boundary_at
+                ],
+            )
+            .map_err(sql_error)?;
 
             migrate_media_download_infohash_uniqueness(&conn)?;
 
@@ -3564,20 +3665,83 @@ fn row_to_tag_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::tag_rule:
     })
 }
 
+fn downloader_has_active_relocation(
+    conn: &Connection,
+    id: i64,
+    now: &str,
+) -> Result<bool, AppError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM media_relocation_jobs
+             WHERE (downloader_id = ?1 OR target_downloader_id = ?1)
+               AND (stage NOT IN ('completed', 'cancelled')
+                    OR (lease_until IS NOT NULL AND lease_until >= ?2))
+         )",
+        params![id, now],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn downloader_has_active_qb_work(conn: &Connection, id: i64, now: &str) -> Result<bool, AppError> {
+    if downloader_has_active_relocation(conn, id, now)? {
+        return Ok(true);
+    }
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM media_downloads AS download
+             WHERE download.downloader_id = ?1
+               AND (
+                   download.status NOT IN ('submitted', 'failed', 'cancelled')
+                   OR (download.lease_until IS NOT NULL AND download.lease_until >= ?2)
+                   OR (
+                       download.status = 'failed'
+                       AND length(trim(download.infohash)) > 0
+                       AND download.subscription_id IS NOT NULL
+                       AND EXISTS(
+                           SELECT 1 FROM subscription_targets AS target
+                           WHERE target.subscription_id = download.subscription_id
+                             AND target.target_key = download.target_key
+                             AND target.status = 'queued'
+                       )
+                   )
+               )
+         )",
+        params![id, now],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn same_downloader_type(current: &str, next: &str) -> bool {
+    let current = current.trim();
+    let next = next.trim();
+    let current_is_qb =
+        current.eq_ignore_ascii_case("qb") || current.eq_ignore_ascii_case("qbittorrent");
+    let next_is_qb = next.eq_ignore_ascii_case("qb") || next.eq_ignore_ascii_case("qbittorrent");
+    (current_is_qb && next_is_qb) || current.eq_ignore_ascii_case(next)
+}
+
+fn same_downloader_url(current: &str, next: &str) -> bool {
+    current.trim().trim_end_matches('/') == next.trim().trim_end_matches('/')
+}
+
 fn open_connection(path: &Path) -> Result<Connection, AppError> {
     let conn = Connection::open(path).map_err(sql_error)?;
     // 这些 PRAGMA 是按连接生效的。由于每个操作都新开连接，必须在此逐一设置，
     // 否则 foreign_keys 会静默关闭、并发写入会立刻返回 SQLITE_BUSY。
     // - busy_timeout: 写锁争用时等待而非立即失败（高频采集 + Web 请求并发写）。
     // - foreign_keys: 启用外键级联（ON DELETE CASCADE / SET NULL）。
-    // - journal_mode=WAL + synchronous=NORMAL: 读写并发，且仍有合理的持久性。
+    // - journal_mode=WAL + synchronous=FULL: 保持读写并发，并确保每次提交在返回前
+    //   同步 WAL。OpenList/qB 副作用前的 checkpoint 必须能承受主机断电，而不只是进程崩溃。
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(sql_error)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(sql_error)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(sql_error)?;
-    conn.pragma_update(None, "synchronous", "NORMAL")
+    conn.pragma_update(None, "synchronous", "FULL")
         .map_err(sql_error)?;
     Ok(conn)
 }
@@ -3654,7 +3818,7 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             source_manifest_json TEXT NOT NULL DEFAULT '[]',
             copy_checkpoint_json TEXT, copy_lock_acquired INTEGER NOT NULL DEFAULT 0,
             manifest_cursor INTEGER NOT NULL DEFAULT 0, target_root_folder INTEGER,
-            manual_requested_at TEXT,
+            manual_requested_at TEXT, stage_started_at TEXT NOT NULL DEFAULT '',
             torrent_name TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'waiting_download',
             openlist_task_id TEXT, torrent_data BLOB, attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT, lease_owner TEXT, lease_until TEXT,
@@ -3667,7 +3831,7 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             target_qb_path, target_content_qb_path, target_downloader_id,
             copy_items_json, source_files_json, source_manifest_json,
             copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
-            manual_requested_at,
+            manual_requested_at, stage_started_at,
             torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
             lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at)
          SELECT id, media_download_id, downloader_id, infohash, source_qb_path,
@@ -3675,7 +3839,7 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             target_qb_path, target_content_qb_path, target_downloader_id,
             copy_items_json, source_files_json, source_manifest_json,
             copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
-            manual_requested_at,
+            manual_requested_at, updated_at,
             torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
             lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at
          FROM media_relocation_jobs_legacy;
@@ -3799,6 +3963,138 @@ fn final_status_name(status: FinalStatus) -> &'static str {
 mod migration_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn every_database_connection_uses_power_loss_durable_wal_commits() {
+        let dir = tempdir().unwrap();
+        let conn = open_connection(&dir.path().join("durability.db")).unwrap();
+
+        let journal_mode = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        let synchronous = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(
+            synchronous, 2,
+            "SQLite FULL synchronous must remain enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_automatic_qb_followups_are_stopped_at_database_boundary() {
+        let dir = tempdir().unwrap();
+        Database::open(dir.path()).await.unwrap();
+        let db_path = dir.path().join("rflush.db");
+        let conn = open_connection(&db_path).unwrap();
+        let stages = [
+            "copy_verified",
+            "qb_reconcile",
+            "torrent_exported",
+            "source_qb_removed",
+            "target_qb_submitted",
+            "target_qb_check_requested",
+            "target_qb_checking",
+            "target_qb_starting",
+            "qb_manual_review",
+            "source_removing",
+            "source_remove_manual_review",
+            "source_removed",
+        ];
+        for (index, stage) in stages.iter().enumerate() {
+            let now = format!("2026-01-01T00:00:{index:02}Z");
+            let hash = format!("{index:040x}");
+            conn.execute(
+                "INSERT INTO media_downloads
+                 (target_key, dedupe_key, source_site, downloader_name, torrent_id,
+                  title, release_json, decision_json, profile_snapshot_json, infohash,
+                  status, created_at, updated_at)
+                 VALUES (?, ?, 'legacy', 'legacy-qb', ?, ?, '{}', '{}', '{}', ?,
+                         'submitted', ?, ?)",
+                params![
+                    format!("tv:{index}"),
+                    format!("legacy-auto-{index}"),
+                    format!("torrent-{index}"),
+                    format!("Legacy Auto {index}"),
+                    hash,
+                    now,
+                    now
+                ],
+            )
+            .unwrap();
+            let media_download_id = conn.last_insert_rowid();
+            conn.execute(
+                r#"INSERT INTO media_relocation_jobs
+                 (media_download_id, infohash, source_qb_path, source_openlist_path,
+                  target_openlist_path, target_qb_path, torrent_name, stage,
+                  openlist_task_id, torrent_data, attempts, next_attempt_at,
+                  lease_owner, lease_until, last_error, copy_checkpoint_json,
+                  copy_lock_acquired, manual_requested_at, stage_started_at,
+                  created_at, updated_at)
+                 VALUES (?, ?, '/source-qb', '/source', '/target', '/target-qb', ?, ?,
+                         'legacy-task', X'0102', 3, ?, 'legacy-worker', ?, 'legacy error',
+                         '{"phase":"uncertain"}', 1, ?, ?, ?, ?)"#,
+                params![
+                    media_download_id,
+                    hash,
+                    format!("Legacy Auto {index}"),
+                    stage,
+                    now,
+                    "2099-01-01T00:00:00Z",
+                    now,
+                    now,
+                    now,
+                    now
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        Database::open(dir.path()).await.unwrap();
+        let conn = open_connection(&db_path).unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT stage, openlist_task_id, torrent_data, copy_checkpoint_json,
+                        copy_lock_acquired, lease_owner, next_attempt_at,
+                        manual_requested_at, completed_at, last_error
+                 FROM media_relocation_jobs ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), stages.len());
+        for row in rows {
+            assert_eq!(row.0, "completed");
+            assert_eq!(row.1, None);
+            assert_eq!(row.2.as_deref(), Some([1_u8, 2_u8].as_slice()));
+            assert_eq!(row.3, None);
+            assert!(!row.4);
+            assert_eq!(row.5, None);
+            assert_eq!(row.6, None);
+            assert_eq!(row.7, None);
+            assert!(row.8.is_some());
+            assert!(row.9.as_deref().is_some_and(|error| error.contains("qB")));
+        }
+    }
 
     #[tokio::test]
     async fn creates_brush_task() {
