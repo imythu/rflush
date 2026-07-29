@@ -1827,11 +1827,6 @@ async fn delete_media_subscription(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
     let current = load_media_subscription(&state, id).await?;
-    if subscription_is_leased(&current) {
-        return Err(ApiError::conflict(
-            "subscription is currently being scanned",
-        ));
-    }
     if state
         .service
         .database()
@@ -1842,7 +1837,7 @@ async fn delete_media_subscription(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::conflict(
-            "subscription changed, has active download or relocation work, or has an unresolved qB submission",
+            "subscription changed while being deleted",
         ))
     }
 }

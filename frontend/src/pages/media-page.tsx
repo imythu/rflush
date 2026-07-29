@@ -1713,7 +1713,7 @@ export function MediaPage() {
     } catch (error) {
       setDeleteSubscriptionError(
         error instanceof ApiError && error.status === 409
-          ? "订阅仍有扫描、下载、复制或迁移任务，或 qB 提交结果尚未确认。请先完成或核验相关任务，再刷新重试。"
+          ? "订阅状态已发生变化，请刷新后重试。"
           : describeUnknown(error),
       );
     } finally {
@@ -2541,7 +2541,7 @@ export function MediaPage() {
         open={deleteSubscription !== null}
         onClose={closeDeleteSubscription}
         title="删除订阅"
-        description={`确定删除「${deleteSubscription?.title ?? ""}」？已提交的下载记录会保留。`}
+        description={`确定删除「${deleteSubscription?.title ?? ""}」？rflush 中的相关下载记录及其自动复制、迁移任务将一并删除；qB 中的种子和文件会保留，已提交到 OpenList 的远端任务无法撤回。`}
       >
         <div className="flex flex-col gap-4 p-4 sm:p-6">
           {deleteSubscriptionError ? (

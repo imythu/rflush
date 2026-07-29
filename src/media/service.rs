@@ -1792,65 +1792,66 @@ impl MediaService {
             .await?
             .ok_or_else(|| MediaServiceError::NotFound(format!("downloader {downloader_id}")))?;
         let infohash = torrent_infohash(&torrent)?;
-        self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
-            .await?;
         let client = self
             .downloaders
             .get(&downloader)
             .await
             .map_err(MediaServiceError::Downloader)?;
+        if torrent_is_present(client.as_ref(), &infohash)
+            .await
+            .map_err(MediaServiceError::Downloader)?
+        {
+            if !self
+                .db
+                .mark_media_download_qb_present(download.id, download.version, owner, &infohash)
+                .await?
+            {
+                return Err(MediaServiceError::Conflict(
+                    "download lease changed while recording an existing qBittorrent torrent"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+            .await?;
         if let Some(existing) = self
             .db
             .get_media_download_by_infohash(downloader_id, &infohash)
             .await?
         {
             if existing.id != download.id && existing.status == "submitted" {
+                let options = self.add_torrent_options(&download).await?;
+                let filename = media_download_filename(&result);
                 self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
                     .await?;
-                if !torrent_is_present(client.as_ref(), &infohash)
-                    .await
-                    .map_err(MediaServiceError::Downloader)?
+                match add_torrent_and_confirm(
+                    client.as_ref(),
+                    torrent,
+                    &filename,
+                    &options,
+                    &infohash,
+                )
+                .await
                 {
-                    let options = self.add_torrent_options(&download).await?;
-                    let filename = media_download_filename(&result);
-                    self.ensure_download_identity_not_relocating(
-                        download.id,
-                        downloader_id,
-                        &infohash,
-                    )
-                    .await?;
-                    match add_torrent_and_confirm(
-                        client.as_ref(),
-                        torrent,
-                        &filename,
-                        &options,
-                        &infohash,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
-                            return Err(MediaServiceError::Downloader(message));
-                        }
-                        Err(TorrentSubmissionError::Unknown(message)) => {
-                            return Err(MediaServiceError::Downloader(format!(
-                                "submission result is unknown: {message}"
-                            )));
-                        }
+                    Ok(()) => {}
+                    Err(TorrentSubmissionError::ConfirmedAbsent(message)) => {
+                        return Err(MediaServiceError::Downloader(message));
+                    }
+                    Err(TorrentSubmissionError::Unknown(message)) => {
+                        return Err(MediaServiceError::Downloader(format!(
+                            "submission result is unknown: {message}"
+                        )));
                     }
                 }
                 if !self
                     .db
-                    .mark_media_download_duplicate_submitted(
-                        download.id,
-                        download.version,
-                        owner,
-                        existing.id,
-                    )
+                    .mark_media_download_qb_present(download.id, download.version, owner, &infohash)
                     .await?
                 {
                     return Err(MediaServiceError::Conflict(
-                        "download lease changed while marking a duplicate".to_string(),
+                        "download lease changed while recording a restored qBittorrent torrent"
+                            .to_string(),
                     ));
                 }
                 return Ok(());
@@ -1962,7 +1963,7 @@ impl MediaService {
             Ok(true) => {
                 if !self
                     .db
-                    .mark_media_download_submitted(download.id, download.version, owner, &infohash)
+                    .mark_media_download_qb_present(download.id, download.version, owner, &infohash)
                     .await?
                 {
                     return Err(MediaServiceError::Conflict(
@@ -1972,6 +1973,8 @@ impl MediaService {
                 Ok(())
             }
             Ok(false) => {
+                self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
+                    .await?;
                 self.db
                     .release_media_download_after_error(
                         download.id,
@@ -3095,6 +3098,107 @@ mod tests {
         assert_eq!(stored.infohash.as_deref(), Some(infohash.as_str()));
         assert!(stored.submitted_at.is_some());
         assert_eq!(client.add_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn qb_present_torrent_is_submitted_without_adding_it_again() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("externally-present");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        let present = vec![test_torrent_info(&infohash)];
+        let client = Arc::new(ScriptedDownloader::new(
+            Vec::new(),
+            Ok(present),
+            Err("duplicate torrent".to_string()),
+        ));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+        let queued = enqueue_test_download(&db, site_id, downloader_id, "externally-present").await;
+        let owner = "externally-present-worker";
+        let fetching = db
+            .claim_due_media_downloads(owner, 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        service.process_download(fetching, owner).await.unwrap();
+
+        let stored = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "submitted");
+        assert_eq!(stored.infohash.as_deref(), Some(infohash.as_str()));
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn qb_present_duplicate_bypasses_active_relocation_without_duplicate_add() {
+        let (_dir, service, db, site_id, _other_site, downloader_id) = test_service().await;
+        let torrent = test_torrent("relocating-present");
+        let infohash = torrent_infohash(&torrent).unwrap();
+        let original =
+            enqueue_test_download(&db, site_id, downloader_id, "relocating-original").await;
+        let original =
+            mark_test_download_submitted(&db, &original, "relocating-original-worker", &infohash)
+                .await;
+        assert_eq!(
+            db.enqueue_submitted_media_relocation_jobs(true)
+                .await
+                .unwrap(),
+            1
+        );
+        let client = Arc::new(ScriptedDownloader::new(
+            Vec::new(),
+            Ok(vec![test_torrent_info(&infohash)]),
+            Err("duplicate torrent".to_string()),
+        ));
+        install_download_dependencies(
+            &service,
+            &db,
+            site_id,
+            downloader_id,
+            torrent,
+            Arc::clone(&client),
+        )
+        .await;
+        let duplicate =
+            enqueue_test_download(&db, site_id, downloader_id, "relocating-duplicate").await;
+        let owner = "relocating-duplicate-worker";
+        let fetching = db
+            .claim_due_media_downloads(owner, 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(fetching.id, duplicate.id);
+
+        service.process_download(fetching, owner).await.unwrap();
+
+        let stored = db.get_media_download(duplicate.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, "submitted");
+        assert_eq!(stored.infohash, None);
+        assert!(
+            stored
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains(&original.id.to_string()))
+        );
+        assert_eq!(client.add_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            db.enqueue_submitted_media_relocation_jobs(true)
+                .await
+                .unwrap(),
+            0
+        );
+        let jobs = db.list_media_relocation_jobs(10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].media_download_id, Some(original.id));
     }
 
     #[tokio::test]

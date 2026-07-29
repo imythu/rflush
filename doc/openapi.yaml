@@ -498,6 +498,10 @@ paths:
         default: {$ref: '#/components/responses/Error'}
     delete:
       summary: Delete a media subscription
+      description: >-
+        Deletes the subscription and all related rflush download records and automatic
+        copy or relocation jobs. It does not delete qBittorrent torrents or files, and
+        an OpenList task that has already been submitted remotely cannot be recalled.
       parameters: [{$ref: '#/components/parameters/IdPath'}]
       responses:
         '204': {description: Deleted}

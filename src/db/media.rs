@@ -721,47 +721,46 @@ impl Database {
     ) -> Result<bool, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "DELETE FROM subscriptions
-                 WHERE id = ?1 AND version = ?2
-                   AND (lease_until IS NULL OR lease_until < ?3)
-                   AND NOT EXISTS(
-                       SELECT 1
-                       FROM media_downloads AS download
-                       WHERE download.subscription_id = subscriptions.id
-                         AND (
-                             download.status NOT IN ('submitted', 'failed', 'cancelled')
-                             OR (download.lease_until IS NOT NULL
-                                 AND download.lease_until >= ?3)
-                             OR EXISTS(
-                                 SELECT 1 FROM subscription_targets AS target
-                                 WHERE target.subscription_id = download.subscription_id
-                                   AND target.target_key = download.target_key
-                                   AND target.status = 'queued'
-                             )
-                             OR EXISTS(
-                                 SELECT 1 FROM media_relocation_jobs AS relocation
-                                 WHERE (
-                                     relocation.media_download_id = download.id
-                                     OR (
-                                         download.downloader_id IS NOT NULL
-                                         AND length(trim(download.infohash)) > 0
-                                         AND (relocation.downloader_id = download.downloader_id
-                                              OR relocation.target_downloader_id = download.downloader_id)
-                                         AND lower(relocation.infohash) = lower(download.infohash)
-                                     )
-                                 )
-                                   AND (relocation.stage NOT IN ('completed', 'cancelled')
-                                        OR (relocation.lease_until IS NOT NULL
-                                            AND relocation.lease_until >= ?3))
-                             )
-                         )
-                   )",
-                params![id, expected_version, Utc::now().to_rfc3339()],
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let Some(current) = load_subscription(&tx, id)? else {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            };
+            if current.version != expected_version {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+
+            // Removing the database work does not contact qBittorrent, so submitted
+            // torrents and their files remain available there.
+            tx.execute(
+                "DELETE FROM media_relocation_jobs
+                 WHERE media_download_id IN (
+                     SELECT id FROM media_downloads WHERE subscription_id = ?
+                 )",
+                [id],
             )
-            .map(|changed| changed > 0)
-            .map_err(sql_error)
+            .map_err(sql_error)?;
+            tx.execute(
+                "DELETE FROM media_downloads WHERE subscription_id = ?",
+                [id],
+            )
+            .map_err(sql_error)?;
+            let changed = tx
+                .execute(
+                    "DELETE FROM subscriptions WHERE id = ? AND version = ?",
+                    params![id, expected_version],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                tx.rollback().map_err(sql_error)?;
+                return Ok(false);
+            }
+            tx.commit().map_err(sql_error)?;
+            Ok(true)
         })
         .await
         .map_err(join_error)?
@@ -2689,15 +2688,16 @@ impl Database {
         .map_err(join_error)?
     }
 
-    pub async fn mark_media_download_duplicate_submitted(
+    pub async fn mark_media_download_qb_present(
         &self,
         id: i64,
         expected_version: i64,
         owner: &str,
-        existing_download_id: i64,
+        infohash: &str,
     ) -> Result<bool, AppError> {
         let path = self.path.clone();
         let owner = owner.to_string();
+        let infohash = infohash.to_ascii_lowercase();
         tokio::task::spawn_blocking(move || {
             let mut conn = open_connection(&path)?;
             let tx = conn
@@ -2708,34 +2708,26 @@ impl Database {
                 message: format!("media download {id} not found"),
             })?;
             if download.version != expected_version
-                || download.status != "fetching"
+                || !matches!(download.status.as_str(), "fetching" | "reconciling")
                 || download.lease_owner.as_deref() != Some(owner.as_str())
             {
                 tx.rollback().map_err(sql_error)?;
                 return Ok(false);
             }
-            let Some(existing) = load_media_download(&tx, existing_download_id)? else {
+            let Some(downloader_id) = download.downloader_id else {
                 tx.rollback().map_err(sql_error)?;
                 return Ok(false);
             };
-            if existing.status != "submitted"
-                || existing.downloader_id.is_none()
-                || existing.downloader_id != download.downloader_id
-                || existing.infohash.is_none()
-            {
-                tx.rollback().map_err(sql_error)?;
-                return Ok(false);
-            }
-            if media_download_identity_has_active_relocation_row(
-                &tx,
-                download.id,
-                download.downloader_id,
-                existing.infohash.as_deref(),
-                &now,
-            )? {
-                tx.rollback().map_err(sql_error)?;
-                return Ok(false);
-            }
+            let existing_download_id = tx
+                .query_row(
+                    "SELECT id FROM media_downloads
+                     WHERE id != ? AND downloader_id = ? AND lower(infohash) = lower(?)
+                     LIMIT 1",
+                    params![id, downloader_id, infohash],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
             if let Some(subscription_id) = download.subscription_id
                 && !subscription_target_has_status(
                     &tx,
@@ -2747,17 +2739,21 @@ impl Database {
                 tx.rollback().map_err(sql_error)?;
                 return Ok(false);
             }
+            let stored_infohash = existing_download_id.is_none().then_some(infohash.as_str());
+            let submission_note = existing_download_id.map(|existing_id| {
+                format!("torrent already submitted by media download {existing_id}")
+            });
             let changed = tx
                 .execute(
                     "UPDATE media_downloads
-                     SET status = 'submitted', lease_owner = NULL, lease_until = NULL,
-                         version = version + 1, last_error = ?, updated_at = ?, submitted_at = ?
-                     WHERE id = ? AND version = ? AND status = 'fetching'
-                       AND lease_owner = ?",
+                     SET status = 'submitted', infohash = ?, lease_owner = NULL,
+                         lease_until = NULL, version = version + 1, last_error = ?,
+                         updated_at = ?, submitted_at = ?
+                     WHERE id = ? AND version = ? AND lease_owner = ?
+                       AND status IN ('fetching', 'reconciling')",
                     params![
-                        format!(
-                            "torrent already submitted by media download {existing_download_id}"
-                        ),
+                        stored_infohash,
+                        submission_note,
                         now,
                         now,
                         id,
@@ -4593,6 +4589,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn qb_present_duplicate_advances_subscription_during_active_relocation() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let subscription = create_tv_subscription(&db, site_id, downloader_id).await;
+        let infohash = "abcdef0123456789abcdef0123456789abcdef01";
+        let now = Utc::now().to_rfc3339();
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "INSERT INTO media_downloads
+             (target_key, dedupe_key, site_id, downloader_id, source_site,
+              downloader_name, torrent_id, title, size, release_json,
+              decision_json, profile_snapshot_json, infohash, status,
+              created_at, updated_at, submitted_at)
+             VALUES ('manual:existing', 'existing-qb-torrent', ?, ?, 'site', 'qB',
+                     'existing', 'Existing season pack', 1024, '{}', '{}', '{}', ?,
+                     'submitted', ?, ?, ?)",
+            params![site_id, downloader_id, infohash, now, now, now],
+        )
+        .unwrap();
+        let existing_download_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              torrent_name, stage, created_at, updated_at)
+             VALUES (?, ?, ?, '/downloads', '/downloads', '/media', '/media',
+                     'Existing season pack', 'copying', ?, ?)",
+            params![existing_download_id, downloader_id, infohash, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let request = new_download(&subscription, site_id, downloader_id);
+        let queued = enqueue_linked_download(&db, &request).await;
+        let fetching = db
+            .claim_due_media_downloads("qb-present-worker", 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(fetching.id, queued.id);
+        assert!(
+            db.mark_media_download_qb_present(
+                fetching.id,
+                fetching.version,
+                "qb-present-worker",
+                infohash,
+            )
+            .await
+            .unwrap()
+        );
+
+        let submitted = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert_eq!(submitted.status, "submitted");
+        assert_eq!(submitted.infohash, None);
+        assert!(
+            submitted
+                .last_error
+                .as_deref()
+                .is_some_and(|message| message.contains(&existing_download_id.to_string()))
+        );
+        assert_eq!(
+            db.get_subscription_target(subscription.id, &request.target_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "submitted"
+        );
+        let advanced = db.get_subscription(subscription.id).await.unwrap().unwrap();
+        assert_eq!(advanced.next_episode, Some(4));
+        assert_eq!(advanced.last_status.as_deref(), Some("submitted"));
+        assert!(
+            db.media_download_identity_has_active_relocation(
+                submitted.id,
+                downloader_id,
+                infohash,
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn manual_linked_enqueue_checks_version_lease_and_materialized_readiness_atomically() {
         let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
         let future_targets = vec![
@@ -5391,11 +5470,6 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            !db.delete_subscription(created.id, renewed_version)
-                .await
-                .unwrap()
-        );
-        assert!(
             db.finish_subscription_scan(
                 created.id,
                 renewed_version,
@@ -6084,7 +6158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_redelivery_reservation_cannot_revive_after_subscription_deletion() {
+    async fn subscription_deletion_removes_expired_redelivery_reservation() {
         let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
         let created = create_tv_subscription(&db, site_id, downloader_id).await;
         let mut request = new_download(&created, site_id, downloader_id);
@@ -6140,9 +6214,7 @@ mod tests {
             .unwrap(),
             "an expired side-effect reservation must never be revived after its subscription is deleted"
         );
-        let orphaned_audit = db.get_media_download(submitted.id).await.unwrap().unwrap();
-        assert_eq!(orphaned_audit.subscription_id, None);
-        assert_eq!(orphaned_audit.lease_owner.as_deref(), Some(owner));
+        assert!(db.get_media_download(submitted.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -6357,7 +6429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_reset_rolls_back_when_a_target_has_active_relocation() {
+    async fn active_relocation_blocks_history_reset_but_is_removed_with_subscription() {
         let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
         let created = db
             .create_subscription(&test_tv_subscription_request(
@@ -6405,14 +6477,27 @@ mod tests {
             params![download_id, downloader_id, now, now],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (downloader_id, infohash, source_qb_path, source_openlist_path,
+              target_openlist_path, target_qb_path, torrent_name, stage,
+              created_at, updated_at)
+             VALUES (?, 'abcdef0123456789abcdef0123456789abcdef01', '/manual-source',
+                     '/manual-source', '/manual-target', '/manual-target',
+                     'Independent manual transfer', 'copying', ?, ?)",
+            params![downloader_id, now, now],
+        )
+        .unwrap();
+        let manual_job_id = conn.last_insert_rowid();
         drop(conn);
 
         assert!(
-            !db.delete_subscription(created.id, created.version)
+            !db.delete_subscription(created.id, created.version + 1)
                 .await
                 .unwrap(),
-            "an active relocation must retain its subscription and target identity"
+            "a stale delete must not remove related work"
         );
+        assert!(db.get_media_download(download_id).await.unwrap().is_some());
 
         let error = db
             .update_subscription(
@@ -6450,6 +6535,39 @@ mod tests {
                 .version,
             created.version
         );
+
+        assert!(
+            db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap(),
+            "deleting a subscription must discard its active relocation work"
+        );
+        assert!(db.get_subscription(created.id).await.unwrap().is_none());
+        assert!(db.get_media_download(download_id).await.unwrap().is_none());
+        assert!(
+            db.get_subscription_target(created.id, &key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let conn = open_connection(&db.path).unwrap();
+        let relocation_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_relocation_jobs WHERE media_download_id = ?",
+                [download_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relocation_count, 0);
+        let manual_job_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM media_relocation_jobs
+                 WHERE id = ? AND media_download_id IS NULL",
+                [manual_job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(manual_job_count, 1);
     }
 
     #[tokio::test]
@@ -6459,12 +6577,6 @@ mod tests {
         let mut request = new_download(&created, site_id, downloader_id);
         request.dedupe_key = format!("subscription:{}:{}", created.id, request.target_key);
         let queued = enqueue_linked_download(&db, &request).await;
-        assert!(
-            !db.delete_subscription(created.id, created.version)
-                .await
-                .unwrap(),
-            "a queued download must keep its subscription identity"
-        );
         let conn = open_connection(&db.path).unwrap();
         conn.execute(
             "UPDATE media_downloads
@@ -6477,13 +6589,6 @@ mod tests {
         .unwrap();
         drop(conn);
         let failed = db.get_media_download(queued.id).await.unwrap().unwrap();
-
-        assert!(
-            !db.delete_subscription(created.id, created.version)
-                .await
-                .unwrap(),
-            "an unknown qB submission must retain its reconciliation context"
-        );
 
         assert!(matches!(
             db.delete_media_download_record(failed.id, failed.version)
@@ -6527,6 +6632,15 @@ mod tests {
                 .version,
             created.version
         );
+
+        assert!(
+            db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap(),
+            "subscription deletion must discard unresolved download evidence"
+        );
+        assert!(db.get_subscription(created.id).await.unwrap().is_none());
+        assert!(db.get_media_download(failed.id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -6540,6 +6654,85 @@ mod tests {
                 .unwrap()
         );
         assert!(db.get_subscription(created.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn actively_scanned_subscription_can_be_deleted() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let claimed = db
+            .claim_subscription(created.id, "delete-test-worker", 60)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            db.delete_subscription(created.id, claimed.version)
+                .await
+                .unwrap()
+        );
+        assert!(db.get_subscription(created.id).await.unwrap().is_none());
+        let conn = open_connection(&db.path).unwrap();
+        let related_rows: (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM subscription_sites WHERE subscription_id = ?1),
+                    (SELECT COUNT(*) FROM subscription_targets WHERE subscription_id = ?1)",
+                [created.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(related_rows, (0, 0));
+        assert!(
+            !db.finish_subscription_scan(
+                created.id,
+                claimed.version,
+                "delete-test-worker",
+                &Utc::now().to_rfc3339(),
+                "waiting",
+                None,
+            )
+            .await
+            .unwrap(),
+            "a deleted scan must not recreate its subscription"
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_download_is_deleted_with_its_subscription() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let created = create_tv_subscription(&db, site_id, downloader_id).await;
+        let request = new_download(&created, site_id, downloader_id);
+        let queued = enqueue_linked_download(&db, &request).await;
+        let claimed = db
+            .claim_due_media_downloads("delete-download-worker", 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(claimed.id, queued.id);
+
+        assert!(
+            db.delete_subscription(created.id, created.version)
+                .await
+                .unwrap()
+        );
+        assert!(db.get_media_download(claimed.id).await.unwrap().is_none());
+        assert!(
+            !db.transition_media_download(
+                claimed.id,
+                claimed.version,
+                "delete-download-worker",
+                "fetching",
+                "cancelled",
+                None,
+                Some("late worker result"),
+                None,
+            )
+            .await
+            .unwrap(),
+            "a claimed download must not be recreated after deletion"
+        );
     }
 
     #[tokio::test]
