@@ -1797,6 +1797,74 @@ mod tests {
         assert_eq!(file.path, "Season/E01.mkv");
     }
 
+    #[tokio::test]
+    async fn directory_checkpoint_accepts_missing_ancestor_of_derived_target_root() {
+        let harness = RelocationTestHarness::new(BTreeMap::new()).await;
+        let checkpoint = copy_checkpoint(
+            "/cmcc/Download/media/云母/动漫",
+            0,
+            CopyCheckpointOperation::CreateDirectory,
+            CopyCheckpointPhase::Prepared,
+        );
+        let mut job = harness
+            .seed_job(
+                "copy_submitting",
+                Some(checkpoint.clone()),
+                None,
+                "Show/E01.mkv",
+                0,
+            )
+            .await;
+        job.target_openlist_path = "/cmcc/Download/media/云母/动漫/动画/2024".to_string();
+
+        let (index, file) = validate_copy_checkpoint(&checkpoint, &job).unwrap();
+
+        assert_eq!(index, 0);
+        assert_eq!(file.path, "Show/E01.mkv");
+    }
+
+    #[tokio::test]
+    async fn directory_checkpoint_rejects_paths_outside_current_target_parent_chain() {
+        let harness = RelocationTestHarness::new(BTreeMap::new()).await;
+        let initial_checkpoint = copy_checkpoint(
+            "/cmcc/Download/media/云母/动漫",
+            0,
+            CopyCheckpointOperation::CreateDirectory,
+            CopyCheckpointPhase::Prepared,
+        );
+        let mut job = harness
+            .seed_job(
+                "copy_submitting",
+                Some(initial_checkpoint),
+                None,
+                "Show/E01.mkv",
+                0,
+            )
+            .await;
+        job.target_openlist_path = "/cmcc/Download/media/云母/动漫/动画/2024".to_string();
+
+        for path in [
+            "/cmcc/Download/media/云母/电影",
+            "/cmcc/Download/media/云母/动漫2",
+            "/cmcc/Download/media/云母/动漫/动画/2024/Other",
+            "/cmcc/Download/media/云母/动漫/动画/2024/Show/E01.mkv",
+        ] {
+            let checkpoint = copy_checkpoint(
+                path,
+                0,
+                CopyCheckpointOperation::CreateDirectory,
+                CopyCheckpointPhase::Prepared,
+            );
+
+            let error = validate_copy_checkpoint(&checkpoint, &job).unwrap_err();
+
+            assert!(
+                error.contains("不在当前目标文件的父目录链中"),
+                "unexpected validation result for {path}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn qb_transfer_completion_rejects_stale_or_unstable_states() {
         assert!(!torrent_is_complete(1, 99, 100, 0.99, "downloading"));
@@ -5648,14 +5716,10 @@ fn validate_copy_checkpoint(
                 .rsplit_once('/')
                 .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
                 .ok_or("目录 checkpoint 对应的目标文件路径无效")?;
-            let target_root = normalize_path(&job.target_openlist_path)?;
             let directory = normalize_path(&checkpoint.path)?;
-            let target_root_identity = openlist_identity_key(&target_root);
             let directory_identity = openlist_identity_key(&directory);
             let target_parent_identity = openlist_identity_key(target_parent);
-            if !is_path_prefix(&target_root_identity, &directory_identity)
-                || !is_path_prefix(&directory_identity, &target_parent_identity)
-            {
+            if !is_path_prefix(&directory_identity, &target_parent_identity) {
                 return Err(format!(
                     "目录 checkpoint 不在当前目标文件的父目录链中: {directory}"
                 ));

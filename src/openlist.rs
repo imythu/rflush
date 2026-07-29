@@ -192,7 +192,7 @@ impl ManifestInspectError {
 
 #[derive(Debug, Deserialize)]
 struct CopyResult {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     tasks: Vec<OpenListTask>,
 }
 
@@ -228,10 +228,18 @@ struct ListRequest<'a> {
 
 #[derive(Deserialize)]
 struct ListResult {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     content: Vec<OpenListObject>,
     #[serde(default)]
     total: usize,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Serialize)]
@@ -1067,9 +1075,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ManifestFileState, ManifestInspectError, OpenListClient, OpenListObject,
-        OpenListRequestError, OpenListTask, openlist_identity_key, valid_child_name,
-        validate_manifest_file,
+        CopyResult, ListResult, ManifestFileState, ManifestInspectError, OpenListClient,
+        OpenListObject, OpenListRequestError, OpenListTask, openlist_identity_key,
+        valid_child_name, validate_manifest_file,
     };
 
     #[test]
@@ -1082,6 +1090,19 @@ mod tests {
             openlist_identity_key("/Media/Straße.mkv"),
             openlist_identity_key("/media/STRASSE.MKV")
         );
+    }
+
+    #[test]
+    fn openlist_collection_results_accept_missing_or_null_fields() {
+        for raw in [r#"{"total":0}"#, r#"{"content":null,"total":0}"#] {
+            let result: ListResult = serde_json::from_str(raw).unwrap();
+            assert!(result.content.is_empty(), "response: {raw}");
+        }
+
+        for raw in [r#"{}"#, r#"{"tasks":null}"#] {
+            let result: CopyResult = serde_json::from_str(raw).unwrap();
+            assert!(result.tasks.is_empty(), "response: {raw}");
+        }
     }
 
     #[derive(Default)]
