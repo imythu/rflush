@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use reqwest::header::{ACCEPT, AUTHORIZATION, COOKIE, HeaderMap, HeaderValue};
@@ -9,10 +10,12 @@ use tokio::sync::Mutex;
 
 use crate::site::SiteAuth;
 
+use super::access::OriginAccessGate;
 use super::{
     IndexerAdapter, IndexerCapabilities, IndexerError, IndexerFuture, SearchRequest, SearchResult,
-    endpoint_url, ensure_result_site, http_error, normalize_base_url, rate_limit_error,
-    read_torrent_response, resolve_same_origin_url, response_is_authentication_page, same_origin,
+    endpoint_url, ensure_result_site, http_error, normalize_base_url, parse_json_or_rate_limit,
+    rate_limit_error_from_body, rate_limit_error_from_json, read_torrent_response,
+    resolve_same_origin_url, response_is_authentication_page, same_origin,
 };
 
 enum NexusMode {
@@ -31,17 +34,19 @@ pub struct NexusPhpIndexer {
     base_url: Url,
     mode: NexusMode,
     client: Client,
+    access_gate: Arc<OriginAccessGate>,
     // Signed links are deliberately transient and never enter SearchResult or persistence.
     api_download_urls: Mutex<HashMap<String, Url>>,
 }
 
 impl NexusPhpIndexer {
-    pub fn new(
+    pub(crate) fn new(
         site_id: i64,
         site_name: String,
         base_url: &str,
         auth: SiteAuth,
         client: Client,
+        access_gate: Arc<OriginAccessGate>,
     ) -> Result<Self, IndexerError> {
         let base_url = normalize_base_url(base_url)?;
         let mode = match auth {
@@ -109,6 +114,7 @@ impl NexusPhpIndexer {
             base_url,
             mode,
             client,
+            access_gate,
             api_download_urls: Mutex::new(HashMap::new()),
         })
     }
@@ -132,25 +138,30 @@ impl NexusPhpIndexer {
 
     async fn search_api(&self, request: &SearchRequest) -> Result<Vec<SearchResult>, IndexerError> {
         let url = endpoint_url(&self.base_url, "/api/v1/torrents")?;
+        let request = self.client.get(url).headers(self.headers()).query(&[
+            ("page", request.page.to_string()),
+            ("per_page", request.page_size.to_string()),
+            (
+                "include_fields[torrent]",
+                "download_url,active_status".to_string(),
+            ),
+            ("filter[title]", request.query.clone()),
+        ]);
         let response = self
-            .client
-            .get(url)
-            .headers(self.headers())
-            .query(&[
-                ("page", request.page.to_string()),
-                ("per_page", request.page_size.to_string()),
-                (
-                    "include_fields[torrent]",
-                    "download_url,active_status".to_string(),
-                ),
-                ("filter[title]", request.query.clone()),
-            ])
-            .send()
-            .await
-            .map_err(http_error)?;
+            .access_gate
+            .send_with_same_origin_redirects(&self.client, request, &self.base_url)
+            .await?;
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(rate_limit_error(&response));
+        let final_url = response.url().clone();
+        if !same_origin(&self.base_url, &final_url) {
+            return Err(IndexerError::UnsafeUrl(
+                "NexusPHP API redirected to another origin".to_string(),
+            ));
+        }
+
+        let body = response.text().await.map_err(http_error)?;
+        if let Some(error) = rate_limit_error_from_body(&body) {
+            return Err(error);
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(IndexerError::AuthenticationExpired(format!(
@@ -162,15 +173,12 @@ impl NexusPhpIndexer {
                 "NexusPHP API returned HTTP {status}"
             )));
         }
-        if !same_origin(&self.base_url, response.url()) {
-            return Err(IndexerError::UnsafeUrl(
-                "NexusPHP API redirected to another origin".to_string(),
+        if response_is_authentication_page(&final_url, &body) {
+            return Err(IndexerError::AuthenticationExpired(
+                "NexusPHP API credentials are invalid or expired".to_string(),
             ));
         }
-
-        let body = response.text().await.map_err(http_error)?;
-        let json: Value = serde_json::from_str(&body)
-            .map_err(|_| IndexerError::Parse("NexusPHP API returned invalid JSON".to_string()))?;
+        let json = parse_json_or_rate_limit(&body, "NexusPHP API returned invalid JSON")?;
         ensure_nexus_success(&json)?;
         let parsed = parse_api_results(&json, self.site_id, &self.site_name, &self.base_url)?;
 
@@ -193,21 +201,25 @@ impl NexusPhpIndexer {
         request: &SearchRequest,
     ) -> Result<Vec<SearchResult>, IndexerError> {
         let url = endpoint_url(&self.base_url, "/torrents.php")?;
+        let request = self.client.get(url).headers(self.headers()).query(&[
+            ("search", request.query.clone()),
+            ("notnewword", "1".to_string()),
+            ("page", request.page.saturating_sub(1).to_string()),
+        ]);
         let response = self
-            .client
-            .get(url)
-            .headers(self.headers())
-            .query(&[
-                ("search", request.query.clone()),
-                ("notnewword", "1".to_string()),
-                ("page", request.page.saturating_sub(1).to_string()),
-            ])
-            .send()
-            .await
-            .map_err(http_error)?;
+            .access_gate
+            .send_with_same_origin_redirects(&self.client, request, &self.base_url)
+            .await?;
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(rate_limit_error(&response));
+        let final_url = response.url().clone();
+        if !same_origin(&self.base_url, &final_url) {
+            return Err(IndexerError::UnsafeUrl(
+                "NexusPHP search redirected to another origin".to_string(),
+            ));
+        }
+        let body = response.text().await.map_err(http_error)?;
+        if let Some(error) = rate_limit_error_from_body(&body) {
+            return Err(error);
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(IndexerError::AuthenticationExpired(format!(
@@ -219,13 +231,6 @@ impl NexusPhpIndexer {
                 "NexusPHP returned HTTP {status}"
             )));
         }
-        let final_url = response.url().clone();
-        if !same_origin(&self.base_url, &final_url) {
-            return Err(IndexerError::UnsafeUrl(
-                "NexusPHP search redirected to another origin".to_string(),
-            ));
-        }
-        let body = response.text().await.map_err(http_error)?;
         if response_is_authentication_page(&final_url, &body) {
             return Err(IndexerError::AuthenticationExpired(
                 "NexusPHP cookie is invalid or expired".to_string(),
@@ -247,21 +252,25 @@ impl NexusPhpIndexer {
 
         // Resolve a fresh signed URL from the API so persisted ID-only locators survive restarts.
         let url = endpoint_url(&self.base_url, "/api/v1/torrents")?;
+        let request = self.client.get(url).headers(self.headers()).query(&[
+            ("per_page", "1"),
+            ("include_fields[torrent]", "download_url"),
+            ("filter[id]", torrent_id),
+        ]);
         let response = self
-            .client
-            .get(url)
-            .headers(self.headers())
-            .query(&[
-                ("per_page", "1"),
-                ("include_fields[torrent]", "download_url"),
-                ("filter[id]", torrent_id),
-            ])
-            .send()
-            .await
-            .map_err(http_error)?;
+            .access_gate
+            .send_with_same_origin_redirects(&self.client, request, &self.base_url)
+            .await?;
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(rate_limit_error(&response));
+        let final_url = response.url().clone();
+        if !same_origin(&self.base_url, &final_url) {
+            return Err(IndexerError::UnsafeUrl(
+                "NexusPHP API redirected to another origin".to_string(),
+            ));
+        }
+        let body = response.text().await.map_err(http_error)?;
+        if let Some(error) = rate_limit_error_from_body(&body) {
+            return Err(error);
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(IndexerError::AuthenticationExpired(format!(
@@ -273,14 +282,12 @@ impl NexusPhpIndexer {
                 "NexusPHP API returned HTTP {status}"
             )));
         }
-        if !same_origin(&self.base_url, response.url()) {
-            return Err(IndexerError::UnsafeUrl(
-                "NexusPHP API redirected to another origin".to_string(),
+        if response_is_authentication_page(&final_url, &body) {
+            return Err(IndexerError::AuthenticationExpired(
+                "NexusPHP API credentials are invalid or expired".to_string(),
             ));
         }
-        let body = response.text().await.map_err(http_error)?;
-        let json: Value = serde_json::from_str(&body)
-            .map_err(|_| IndexerError::Parse("NexusPHP API returned invalid JSON".to_string()))?;
+        let json = parse_json_or_rate_limit(&body, "NexusPHP API returned invalid JSON")?;
         ensure_nexus_success(&json)?;
 
         if let Some(raw_url) = api_items(&json)?
@@ -305,13 +312,11 @@ impl NexusPhpIndexer {
 
     async fn download_url(&self, url: Url) -> Result<Vec<u8>, IndexerError> {
         let url = resolve_same_origin_url(&self.base_url, url.as_str())?;
+        let request = self.client.get(url).headers(self.headers());
         let response = self
-            .client
-            .get(url)
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(http_error)?;
+            .access_gate
+            .send_with_same_origin_redirects(&self.client, request, &self.base_url)
+            .await?;
         read_torrent_response(response, &self.base_url).await
     }
 
@@ -385,6 +390,9 @@ impl IndexerAdapter for NexusPhpIndexer {
 }
 
 fn ensure_nexus_success(json: &Value) -> Result<(), IndexerError> {
+    if let Some(error) = rate_limit_error_from_json(json) {
+        return Err(error);
+    }
     let Some(ret) = json.get("ret") else {
         return Err(IndexerError::Parse(
             "NexusPHP API response is missing ret".to_string(),
@@ -737,6 +745,8 @@ fn parse_datetime(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use reqwest::Url;
 
+    use crate::indexer::IndexerError;
+
     use super::{ensure_nexus_success, parse_api_results, parse_html_results};
 
     #[test]
@@ -823,5 +833,44 @@ mod tests {
 
         let missing_list = serde_json::json!({ "ret": 0, "data": { "meta": {} } });
         assert!(parse_api_results(&missing_list, 1, "Tracker", &base).is_err());
+    }
+
+    #[test]
+    fn recognizes_only_explicit_nexus_rate_limit_messages() {
+        for message in [
+            "Too Many Requests",
+            "request rate limit exceeded",
+            "请求过于频繁，请稍后再试",
+            "請求過於頻繁，請稍後再試",
+        ] {
+            let json = serde_json::json!({ "ret": 1, "msg": message });
+            assert!(matches!(
+                ensure_nexus_success(&json),
+                Err(IndexerError::RateLimited(_))
+            ));
+        }
+        assert!(matches!(
+            ensure_nexus_success(&serde_json::json!({
+                "code": 1,
+                "message": "請求過於頻繁"
+            })),
+            Err(IndexerError::RateLimited(_))
+        ));
+        assert!(matches!(
+            ensure_nexus_success(&serde_json::json!({
+                "code": "429",
+                "message": "try later"
+            })),
+            Err(IndexerError::RateLimited(_))
+        ));
+
+        let unrelated = serde_json::json!({
+            "ret": 1,
+            "msg": "download is unavailable because the user's ratio is too low"
+        });
+        assert!(matches!(
+            ensure_nexus_success(&unrelated),
+            Err(IndexerError::Api(_))
+        ));
     }
 }

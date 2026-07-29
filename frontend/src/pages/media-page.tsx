@@ -4389,7 +4389,7 @@ function SettingsPanel({
             </div>
             <FormNumber id="media-scan-interval" label="扫描间隔（分钟）" min={1} value={settings.scan_interval_mins} onChange={(scan_interval_mins) => setSettings((current) => ({ ...current, scan_interval_mins }))} />
             <FormNumber id="media-max-queries" label="单次搜索查询上限" min={2} value={settings.max_search_queries} onChange={(max_search_queries) => setSettings((current) => ({ ...current, max_search_queries }))} />
-            <FormNumber id="media-search-concurrency" label="搜索并发" min={1} value={settings.search_concurrency} onChange={(search_concurrency) => setSettings((current) => ({ ...current, search_concurrency }))} />
+            <FormNumber id="media-search-concurrency" label="并发搜索站点数" min={1} value={settings.search_concurrency} onChange={(search_concurrency) => setSettings((current) => ({ ...current, search_concurrency }))} />
           </div>
           <div className="flex justify-end border-t border-border pt-4">
             <Button disabled={busyKey === "save-settings"} onClick={onSaveSettings}>

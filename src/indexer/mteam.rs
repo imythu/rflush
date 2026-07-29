@@ -1,14 +1,18 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, LOCATION};
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, Method, StatusCode, Url};
 use serde_json::{Value, json};
 
 use crate::site::SiteAuth;
 
+use super::access::OriginAccessGate;
 use super::{
     IndexerAdapter, IndexerCapabilities, IndexerError, IndexerFuture, SearchRequest, SearchResult,
-    endpoint_url, ensure_result_site, http_error, normalize_base_url, rate_limit_error,
-    read_torrent_response, resolve_same_origin_url, same_origin,
+    endpoint_url, ensure_result_site, http_error, normalize_base_url, parse_json_or_rate_limit,
+    rate_limit_error_from_body, rate_limit_error_from_json, read_torrent_response,
+    resolve_same_origin_url, same_origin,
 };
 
 const MTEAM_DEFAULT_API: &str = "https://api.m-team.cc";
@@ -20,15 +24,17 @@ pub struct MTeamIndexer {
     base_url: Url,
     api_key: HeaderValue,
     client: Client,
+    access_gate: Arc<OriginAccessGate>,
 }
 
 impl MTeamIndexer {
-    pub fn new(
+    pub(crate) fn new(
         site_id: i64,
         site_name: String,
         base_url: &str,
         auth: SiteAuth,
         client: Client,
+        access_gate: Arc<OriginAccessGate>,
     ) -> Result<Self, IndexerError> {
         let base_url = if base_url.trim().is_empty() {
             normalize_base_url(MTEAM_DEFAULT_API)?
@@ -59,6 +65,7 @@ impl MTeamIndexer {
             base_url,
             api_key,
             client,
+            access_gate,
         })
     }
 
@@ -71,33 +78,17 @@ impl MTeamIndexer {
 
     async fn search_api(&self, request: &SearchRequest) -> Result<Vec<SearchResult>, IndexerError> {
         let url = endpoint_url(&self.base_url, "/api/torrent/search")?;
+        let request = self.client.post(url).headers(self.headers()).json(&json!({
+            "visible": 1,
+            "pageNumber": request.page,
+            "pageSize": request.page_size,
+            "keyword": request.query,
+        }));
         let response = self
-            .client
-            .post(url)
-            .headers(self.headers())
-            .json(&json!({
-                "visible": 1,
-                "pageNumber": request.page,
-                "pageSize": request.page_size,
-                "keyword": request.query,
-            }))
-            .send()
-            .await
-            .map_err(http_error)?;
+            .access_gate
+            .send_with_same_origin_redirects(&self.client, request, &self.base_url)
+            .await?;
         let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(rate_limit_error(&response));
-        }
-        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-            return Err(IndexerError::AuthenticationExpired(format!(
-                "M-Team API returned HTTP {status}"
-            )));
-        }
-        if !status.is_success() {
-            return Err(IndexerError::Http(format!(
-                "M-Team API returned HTTP {status}"
-            )));
-        }
         if !same_origin(&self.base_url, response.url()) {
             return Err(IndexerError::UnsafeUrl(
                 "M-Team search redirected to another origin".to_string(),
@@ -105,26 +96,8 @@ impl MTeamIndexer {
         }
 
         let body = response.text().await.map_err(http_error)?;
-        let json: Value = serde_json::from_str(&body)
-            .map_err(|_| IndexerError::Parse("M-Team API returned invalid JSON".to_string()))?;
-        ensure_mteam_success(&json)?;
-        parse_search_results(&json, self.site_id, &self.site_name, &self.base_url)
-    }
-
-    async fn generate_download_url(&self, torrent_id: &str) -> Result<Url, IndexerError> {
-        let url = endpoint_url(&self.base_url, "/api/torrent/genDlToken")?;
-        let form = reqwest::multipart::Form::new().text("id", torrent_id.to_string());
-        let response = self
-            .client
-            .post(url)
-            .headers(self.headers())
-            .multipart(form)
-            .send()
-            .await
-            .map_err(http_error)?;
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(rate_limit_error(&response));
+        if let Some(error) = rate_limit_error_from_body(&body) {
+            return Err(error);
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(IndexerError::AuthenticationExpired(format!(
@@ -136,14 +109,60 @@ impl MTeamIndexer {
                 "M-Team API returned HTTP {status}"
             )));
         }
+        let json = parse_json_or_rate_limit(&body, "M-Team API returned invalid JSON")?;
+        ensure_mteam_success(&json)?;
+        parse_search_results(&json, self.site_id, &self.site_name, &self.base_url)
+    }
+
+    async fn generate_download_url(&self, torrent_id: &str) -> Result<Url, IndexerError> {
+        let url = endpoint_url(&self.base_url, "/api/torrent/genDlToken")?;
+        let form = reqwest::multipart::Form::new().text("id", torrent_id.to_string());
+        let request = self
+            .client
+            .post(url)
+            .headers(self.headers())
+            .multipart(form);
+        let response = self
+            .access_gate
+            .send_with_same_origin_redirects_rebuilding(
+                &self.client,
+                request,
+                &self.base_url,
+                |method, url| {
+                    if method != Method::POST {
+                        return None;
+                    }
+                    let form = reqwest::multipart::Form::new().text("id", torrent_id.to_string());
+                    Some(
+                        self.client
+                            .post(url.clone())
+                            .headers(self.headers())
+                            .multipart(form),
+                    )
+                },
+            )
+            .await?;
+        let status = response.status();
         if !same_origin(&self.base_url, response.url()) {
             return Err(IndexerError::UnsafeUrl(
                 "M-Team token endpoint redirected to another origin".to_string(),
             ));
         }
         let body = response.text().await.map_err(http_error)?;
-        let json: Value = serde_json::from_str(&body)
-            .map_err(|_| IndexerError::Parse("M-Team API returned invalid JSON".to_string()))?;
+        if let Some(error) = rate_limit_error_from_body(&body) {
+            return Err(error);
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(IndexerError::AuthenticationExpired(format!(
+                "M-Team API returned HTTP {status}"
+            )));
+        }
+        if !status.is_success() {
+            return Err(IndexerError::Http(format!(
+                "M-Team API returned HTTP {status}"
+            )));
+        }
+        let json = parse_json_or_rate_limit(&body, "M-Team API returned invalid JSON")?;
         ensure_mteam_success(&json)?;
         let raw_url = json
             .get("data")
@@ -172,12 +191,7 @@ impl MTeamIndexer {
                     "M-Team download URL uses an untrusted origin".to_string(),
                 ));
             }
-            let response = self
-                .client
-                .get(url.clone())
-                .send()
-                .await
-                .map_err(http_error)?;
+            let response = self.access_gate.send(self.client.get(url.clone())).await?;
             if !response.status().is_redirection() {
                 let final_url = response.url().clone();
                 return read_torrent_response(response, &final_url).await;
@@ -251,6 +265,9 @@ impl IndexerAdapter for MTeamIndexer {
 }
 
 fn ensure_mteam_success(json: &Value) -> Result<(), IndexerError> {
+    if let Some(error) = rate_limit_error_from_json(json) {
+        return Err(error);
+    }
     let code = json.get("code");
     let success = code.and_then(Value::as_i64) == Some(0)
         || code.and_then(Value::as_u64) == Some(0)
@@ -410,6 +427,8 @@ fn parse_datetime(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use reqwest::Url;
 
+    use crate::indexer::IndexerError;
+
     use super::{ensure_mteam_success, is_allowed_download_url, parse_search_results};
 
     #[test]
@@ -480,5 +499,28 @@ mod tests {
             "authentication_expired"
         );
         assert!(ensure_mteam_success(&serde_json::json!({ "data": {} })).is_err());
+    }
+
+    #[test]
+    fn recognizes_mteam_rate_limit_responses() {
+        for fixture in [
+            serde_json::json!({ "code": 429, "message": "try later" }),
+            serde_json::json!({ "code": "429", "message": "try later" }),
+            serde_json::json!({ "code": 1, "message": "請求過於頻繁，請稍後再試" }),
+            serde_json::json!({ "code": 1, "message": "Too Many Requests" }),
+        ] {
+            assert!(matches!(
+                ensure_mteam_success(&fixture),
+                Err(IndexerError::RateLimited(_))
+            ));
+        }
+
+        assert!(matches!(
+            ensure_mteam_success(&serde_json::json!({
+                "code": 1,
+                "message": "torrent is unavailable"
+            })),
+            Err(IndexerError::Api(_))
+        ));
     }
 }

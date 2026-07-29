@@ -1,14 +1,16 @@
+mod access;
 pub mod mteam;
 pub mod nexusphp;
 pub mod pool;
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use reqwest::header::RETRY_AFTER;
-use reqwest::{Client, Response, StatusCode, Url};
+use reqwest::{Response, StatusCode, Url};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
@@ -167,13 +169,37 @@ pub enum IndexerError {
     #[error("tracker API error: {0}")]
     Api(String),
     #[error("tracker rate limited the request{0}")]
-    RateLimited(String),
+    RateLimited(IndexerRateLimit),
     #[error("response parse error: {0}")]
     Parse(String),
     #[error("unsafe URL: {0}")]
     UnsafeUrl(String),
     #[error("invalid torrent response: {0}")]
     InvalidTorrent(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexerRateLimit {
+    retry_after_secs: Option<u64>,
+}
+
+impl IndexerRateLimit {
+    pub(crate) const fn new(retry_after_secs: Option<u64>) -> Self {
+        Self { retry_after_secs }
+    }
+
+    pub(crate) const fn retry_after_secs(self) -> Option<u64> {
+        self.retry_after_secs
+    }
+}
+
+impl fmt::Display for IndexerRateLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.retry_after_secs {
+            Some(seconds) => write!(formatter, "; retry after {seconds} seconds"),
+            None => Ok(()),
+        }
+    }
 }
 
 impl IndexerError {
@@ -199,16 +225,20 @@ pub trait IndexerAdapter: Send + Sync {
     #[allow(dead_code)]
     fn capabilities(&self) -> IndexerCapabilities;
 
+    fn access_key(&self) -> Option<&str> {
+        None
+    }
+
     fn search<'a>(&'a self, request: &'a SearchRequest) -> IndexerFuture<'a, Vec<SearchResult>>;
 
     fn fetch_torrent<'a>(&'a self, result: &'a SearchResult) -> IndexerFuture<'a, Vec<u8>>;
 }
 
-/// Construct an indexer with a caller-provided client. The pool is the preferred helper when
-/// site proxy settings need to be honored automatically.
-pub fn create_indexer(
+/// Construct the inner adapter used by `IndexerPool` with its shared origin gate.
+pub(crate) fn create_indexer(
     record: &SiteRecord,
-    client: Client,
+    client: reqwest::Client,
+    access_gate: Arc<access::OriginAccessGate>,
 ) -> Result<Arc<dyn IndexerAdapter>, IndexerError> {
     let site_type = SiteType::from_str(record.site_type.trim()).ok_or_else(|| {
         IndexerError::Configuration(format!("unsupported site type: {}", record.site_type))
@@ -224,6 +254,7 @@ pub fn create_indexer(
             &record.base_url,
             auth,
             client,
+            Arc::clone(&access_gate),
         )?)),
         SiteType::MTeam => Ok(Arc::new(mteam::MTeamIndexer::new(
             record.id,
@@ -231,6 +262,7 @@ pub fn create_indexer(
             &record.base_url,
             auth,
             client,
+            access_gate,
         )?)),
     }
 }
@@ -426,12 +458,105 @@ pub(crate) fn rate_limit_error(response: &Response) -> IndexerError {
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    IndexerError::RateLimited(
-        retry_after
-            .map(|seconds| format!("; retry after {seconds} seconds"))
-            .unwrap_or_default(),
-    )
+        .and_then(|value| parse_retry_after(value, Utc::now()));
+    IndexerError::RateLimited(IndexerRateLimit::new(retry_after))
+}
+
+pub(crate) fn rate_limit_error_from_json(json: &serde_json::Value) -> Option<IndexerError> {
+    let code_is_rate_limited = ["code", "ret", "status"]
+        .into_iter()
+        .filter_map(|key| json.get(key))
+        .chain(
+            ["/error/code", "/error/status", "/data/code", "/data/status"]
+                .into_iter()
+                .filter_map(|pointer| json.pointer(pointer)),
+        )
+        .any(json_value_is_rate_limit_code);
+    let message = json
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| json.get("msg").and_then(serde_json::Value::as_str))
+        .or_else(|| json.get("error").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            json.pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            json.pointer("/data/message")
+                .and_then(serde_json::Value::as_str)
+        });
+    if !code_is_rate_limited && !message.is_some_and(text_indicates_rate_limit) {
+        return None;
+    }
+
+    let retry_after_secs = ["retry_after", "retryAfter", "retry_after_secs"]
+        .into_iter()
+        .filter_map(|key| json.get(key))
+        .find_map(json_value_u64)
+        .or_else(|| json.pointer("/data/retry_after").and_then(json_value_u64))
+        .or_else(|| json.pointer("/data/retryAfter").and_then(json_value_u64));
+    Some(IndexerError::RateLimited(IndexerRateLimit::new(
+        retry_after_secs,
+    )))
+}
+
+pub(crate) fn text_indicates_rate_limit(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("too many requests")
+        || lower.contains("rate limit exceeded")
+        || lower.contains("request rate limit")
+        || lower.contains("requests are too frequent")
+        || lower.contains("request is too frequent")
+        || lower.contains("you are being rate limited")
+        || text.contains("请求过于频繁")
+        || text.contains("請求過於頻繁")
+        || text.contains("请求太频繁")
+        || text.contains("請求太頻繁")
+}
+
+pub(crate) fn rate_limit_error_from_body(body: &str) -> Option<IndexerError> {
+    match serde_json::from_str(body) {
+        Ok(json) => rate_limit_error_from_json(&json),
+        Err(_) => text_indicates_rate_limit(body)
+            .then(|| IndexerError::RateLimited(IndexerRateLimit::new(None))),
+    }
+}
+
+pub(crate) fn parse_json_or_rate_limit(
+    body: &str,
+    invalid_message: &'static str,
+) -> Result<serde_json::Value, IndexerError> {
+    serde_json::from_str(body).map_err(|_| {
+        rate_limit_error_from_body(body)
+            .unwrap_or_else(|| IndexerError::Parse(invalid_message.to_string()))
+    })
+}
+
+fn json_value_is_rate_limit_code(value: &serde_json::Value) -> bool {
+    value.as_u64() == Some(StatusCode::TOO_MANY_REQUESTS.as_u16().into())
+        || value.as_i64() == Some(StatusCode::TOO_MANY_REQUESTS.as_u16().into())
+        || value
+            .as_str()
+            .is_some_and(|value| value.trim().parse::<u16>().ok() == Some(429))
+}
+
+fn json_value_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+}
+
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<u64> {
+    value.parse::<u64>().ok().or_else(|| {
+        let retry_at = DateTime::parse_from_rfc2822(value)
+            .ok()?
+            .with_timezone(&Utc);
+        let milliseconds = retry_at
+            .signed_duration_since(now)
+            .num_milliseconds()
+            .max(0) as u64;
+        Some(milliseconds.saturating_add(999) / 1_000)
+    })
 }
 
 pub(crate) fn response_is_authentication_page(final_url: &Url, body: &str) -> bool {
@@ -455,21 +580,21 @@ pub(crate) async fn read_torrent_response(
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(rate_limit_error(&response));
     }
-    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-        return Err(IndexerError::AuthenticationExpired(format!(
-            "tracker returned HTTP {status}"
-        )));
-    }
-    if !status.is_success() {
-        return Err(IndexerError::Http(format!(
-            "tracker returned HTTP {status}"
-        )));
-    }
     resolve_same_origin_url(base_url, response.url().as_str())?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_TORRENT_BYTES as u64)
     {
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Err(IndexerError::AuthenticationExpired(format!(
+                "tracker returned HTTP {status}"
+            )));
+        }
+        if !status.is_success() {
+            return Err(IndexerError::Http(format!(
+                "tracker returned HTTP {status}"
+            )));
+        }
         return Err(IndexerError::InvalidTorrent(
             "torrent response is too large".to_string(),
         ));
@@ -486,15 +611,34 @@ pub(crate) async fn read_torrent_response(
     }
 
     let preview = String::from_utf8_lossy(&body[..body.len().min(16 * 1024)]);
+    let json = if body.first() != Some(&b'd') {
+        serde_json::from_slice::<serde_json::Value>(&body).ok()
+    } else {
+        None
+    };
+    if let Some(error) = json.as_ref().and_then(rate_limit_error_from_json) {
+        return Err(error);
+    }
+    if text_indicates_rate_limit(&preview) {
+        return Err(IndexerError::RateLimited(IndexerRateLimit::new(None)));
+    }
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return Err(IndexerError::AuthenticationExpired(format!(
+            "tracker returned HTTP {status}"
+        )));
+    }
+    if !status.is_success() {
+        return Err(IndexerError::Http(format!(
+            "tracker returned HTTP {status}"
+        )));
+    }
     if response_is_authentication_page(response.url(), &preview) {
         return Err(IndexerError::AuthenticationExpired(
             "tracker returned a login or verification page".to_string(),
         ));
     }
     if body.first() != Some(&b'd') {
-        if body.first() == Some(&b'{')
-            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
-        {
+        if let Some(json) = json {
             let message = json
                 .get("message")
                 .or_else(|| json.get("msg"))
@@ -527,8 +671,113 @@ pub(crate) fn ensure_result_site(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    use super::{SearchResult, normalize_base_url, validate_same_origin_url};
+    use super::{
+        IndexerError, IndexerRateLimit, SearchResult, normalize_base_url, parse_json_or_rate_limit,
+        parse_retry_after, rate_limit_error_from_body, rate_limit_error_from_json,
+        read_torrent_response, text_indicates_rate_limit, validate_same_origin_url,
+    };
+
+    #[test]
+    fn rate_limit_metadata_preserves_retry_after_without_exposing_other_headers() {
+        assert_eq!(IndexerRateLimit::new(None).to_string(), "");
+        assert_eq!(
+            IndexerRateLimit::new(Some(90)).to_string(),
+            "; retry after 90 seconds"
+        );
+        assert_eq!(IndexerRateLimit::new(Some(90)).retry_after_secs(), Some(90));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-29T10:00:00.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(parse_retry_after("90", now), Some(90));
+        assert_eq!(
+            parse_retry_after("Wed, 29 Jul 2026 10:01:30 GMT", now),
+            Some(90)
+        );
+        assert_eq!(
+            parse_retry_after("Wed, 29 Jul 2026 09:59:00 GMT", now),
+            Some(0)
+        );
+        assert_eq!(parse_retry_after("invalid", now), None);
+    }
+
+    #[test]
+    fn recognizes_structured_and_text_rate_limit_responses() {
+        for json in [
+            serde_json::json!({ "code": 429, "message": "try later" }),
+            serde_json::json!({ "ret": "429", "msg": "try later" }),
+            serde_json::json!({ "code": 1, "message": "請求過於頻繁" }),
+            serde_json::json!({ "status": 1, "error": { "message": "Too Many Requests" } }),
+            serde_json::json!({ "code": 1, "message": null, "msg": "Too Many Requests" }),
+            serde_json::json!({ "error": { "code": 429, "message": "try later" } }),
+        ] {
+            assert!(matches!(
+                rate_limit_error_from_json(&json),
+                Some(super::IndexerError::RateLimited(_))
+            ));
+        }
+        assert!(text_indicates_rate_limit(
+            "Error 1015: You are being rate limited"
+        ));
+        assert!(
+            rate_limit_error_from_json(&serde_json::json!({
+                "code": 1,
+                "message": "torrent is unavailable"
+            }))
+            .is_none()
+        );
+        assert!(matches!(
+            parse_json_or_rate_limit("Too Many Requests", "invalid JSON"),
+            Err(super::IndexerError::RateLimited(_))
+        ));
+        assert!(matches!(
+            rate_limit_error_from_body(r#"{"error":{"code":429}}"#),
+            Some(super::IndexerError::RateLimited(_))
+        ));
+        assert!(
+            rate_limit_error_from_body(r#"{"ret":0,"data":[{"name":"Too Many Requests"}]}"#)
+                .is_none()
+        );
+        assert!(matches!(
+            parse_json_or_rate_limit("<html>temporary failure</html>", "invalid JSON"),
+            Err(super::IndexerError::Parse(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn torrent_rate_limit_body_wins_over_forbidden_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = "Too Many Requests";
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let base_url = reqwest::Url::parse(&format!("http://{address}")).unwrap();
+        let response = reqwest::Client::new()
+            .get(base_url.clone())
+            .send()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            read_torrent_response(response, &base_url).await,
+            Err(IndexerError::RateLimited(_))
+        ));
+        server.await.unwrap();
+    }
 
     #[test]
     fn same_origin_validation_rejects_host_scheme_and_port_changes() {

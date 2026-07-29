@@ -121,8 +121,8 @@ SQLite
 - `IndexerAdapter`：`search`、`fetch_torrent`、能力描述。
 - `NexusPhpIndexer`：API Key 走 `/api/v1/torrents`；Cookie 走 NexusPHP HTML；登录页重定向或 HTML 登录特征统一报认证过期。
 - `MTeamIndexer`：`x-api-key` 搜索、生成下载 token、下载种子。
-- `IndexerPool`：按站点配置、代理和认证摘要缓存；配置变化自动重建。
-- `IndexerAggregator`：限制并发、单站错误隔离、跨查询去重，返回结果和逐站错误。
+- `IndexerPool`：按站点配置、代理和认证摘要缓存；按规范化 origin 共享访问 gate，配置变化重建 adapter 时不重置限速状态。搜索和取种操作共用单并发 gate，每次真实 HTTP 请求间隔至少 1 秒；收到 429 或明确的响应体频控错误后，按 `Retry-After` 或至少 60 秒冷却，冷却期间不访问远端。
+- `IndexerAggregator`：不同站点 origin 按设置并发、同一 origin 的查询严格串行；单站错误隔离、跨查询去重，返回结果和逐站错误。
 
 上层只接收统一模型：
 
@@ -175,7 +175,7 @@ struct SearchResult {
 | `tmdb_language` | TEXT NOT NULL | 默认 `zh-CN` |
 | `scan_interval_mins` | INTEGER NOT NULL | 默认 30 |
 | `max_search_queries` | INTEGER NOT NULL | 默认 8 |
-| `search_concurrency` | INTEGER NOT NULL | 默认 4 |
+| `search_concurrency` | INTEGER NOT NULL | 默认 4；表示并发搜索的不同站点 origin 数，同 origin 请求始终串行限速 |
 | `updated_at` | TEXT NOT NULL | 更新时间 |
 
 ### 5.2 `quality_profiles`
@@ -528,7 +528,7 @@ Worker CAS 认领 queued/retry_wait
 |---|---|
 | PT 页面结构差异 | API 优先；HTML 使用 Nexus 默认解析和 fixture；单站失败隔离 |
 | Cookie 过期 | 检测登录跳转/登录 HTML，返回稳定认证错误，不吞掉 |
-| M-Team 限流 | 复用连接池、全局并发限制、退避和逐站错误 |
+| 追剧 PT 搜索/取种限流 | 按 origin 共享单并发 gate、最小请求间隔、429/响应体频控冷却和逐站错误隔离 |
 | 查询爆炸 | query 上限、并发上限、结果去重和超时 |
 | 错剧误下 | Identity Gate 硬拒绝，评分不能覆盖 |
 | 动画/数字标题歧义 | 有序规则、置信来源、反例 fixture |
