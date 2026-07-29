@@ -20,9 +20,9 @@ use super::domain::{
 };
 use super::lease::process_owner_id;
 use super::models::{
-    MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS, MediaDownloadDeleteOutcome, MediaDownloadDeletion,
-    MediaDownloadRecord, NewMediaDownload, NewSubscription, QualityProfileRecord,
-    SubscriptionRecord, SubscriptionTargetRecord, media_download_category,
+    MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS, MediaDownloadCoverage, MediaDownloadDeleteOutcome,
+    MediaDownloadDeletion, MediaDownloadRecord, NewMediaDownload, NewSubscription,
+    QualityProfileRecord, SubscriptionRecord, SubscriptionTargetRecord, media_download_category,
 };
 use super::progression::{
     ProgressionError, SubscriptionTargetSeedStatus, TargetReadiness, air_date_eligible_at,
@@ -1782,6 +1782,7 @@ impl MediaService {
                 download.id, download.status
             )));
         }
+        let coverage = media_download_coverage(&download, &self.parser);
         let (result, torrent) = self.fetch_torrent_for_download(&download).await?;
         let downloader_id = download.downloader_id.ok_or_else(|| {
             MediaServiceError::NotFound("download client was deleted".to_string())
@@ -1803,7 +1804,13 @@ impl MediaService {
         {
             if !self
                 .db
-                .mark_media_download_qb_present(download.id, download.version, owner, &infohash)
+                .mark_media_download_qb_present(
+                    download.id,
+                    download.version,
+                    owner,
+                    &infohash,
+                    coverage.clone(),
+                )
                 .await?
             {
                 return Err(MediaServiceError::Conflict(
@@ -1846,7 +1853,13 @@ impl MediaService {
                 }
                 if !self
                     .db
-                    .mark_media_download_qb_present(download.id, download.version, owner, &infohash)
+                    .mark_media_download_qb_present(
+                        download.id,
+                        download.version,
+                        owner,
+                        &infohash,
+                        coverage.clone(),
+                    )
                     .await?
                 {
                     return Err(MediaServiceError::Conflict(
@@ -1892,6 +1905,7 @@ impl MediaService {
                         submitting.version,
                         owner,
                         &infohash,
+                        coverage,
                     )
                     .await?
                 {
@@ -1941,14 +1955,13 @@ impl MediaService {
         download: MediaDownloadRecord,
         owner: &str,
     ) -> Result<(), MediaServiceError> {
+        let coverage = media_download_coverage(&download, &self.parser);
         let infohash = download.infohash.clone().ok_or_else(|| {
             MediaServiceError::Invalid("reconciling download has no infohash".to_string())
         })?;
         let downloader_id = download.downloader_id.ok_or_else(|| {
             MediaServiceError::NotFound("download client was deleted".to_string())
         })?;
-        self.ensure_download_identity_not_relocating(download.id, downloader_id, &infohash)
-            .await?;
         let downloader = self
             .db
             .get_downloader(downloader_id)
@@ -1963,7 +1976,13 @@ impl MediaService {
             Ok(true) => {
                 if !self
                     .db
-                    .mark_media_download_qb_present(download.id, download.version, owner, &infohash)
+                    .mark_media_download_qb_present(
+                        download.id,
+                        download.version,
+                        owner,
+                        &infohash,
+                        coverage,
+                    )
                     .await?
                 {
                     return Err(MediaServiceError::Conflict(
@@ -2099,6 +2118,50 @@ fn media_download_filename(result: &SearchResult) -> String {
         "rflush-media-{}-{}.torrent",
         result.site_id, result.torrent_id
     )
+}
+
+fn media_download_coverage(
+    download: &MediaDownloadRecord,
+    parser: &ReleaseParser,
+) -> MediaDownloadCoverage {
+    if download.subscription_id.is_none() {
+        return MediaDownloadCoverage::default();
+    }
+    let accepted = serde_json::from_str::<serde_json::Value>(&download.decision_json)
+        .ok()
+        .and_then(|decision| {
+            decision
+                .get("accepted")
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| {
+                    decision
+                        .get("decision")
+                        .and_then(|value| value.get("accepted"))
+                        .and_then(serde_json::Value::as_bool)
+                })
+        })
+        .unwrap_or(false);
+    if !accepted {
+        return MediaDownloadCoverage::default();
+    }
+    let Ok(release) = parser.parse(&download.title) else {
+        return MediaDownloadCoverage::default();
+    };
+    let episodes = if release.episodes.len() > 1 {
+        release.episodes
+    } else {
+        Vec::new()
+    };
+    let absolute_episodes = if release.absolute_episodes.len() > 1 {
+        release.absolute_episodes
+    } else {
+        Vec::new()
+    };
+    MediaDownloadCoverage {
+        season: release.season,
+        episodes,
+        absolute_episodes,
+    }
 }
 
 fn is_valid_infohash(infohash: &str) -> bool {
@@ -2418,6 +2481,106 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn coverage_test_download(
+        subscription_id: Option<i64>,
+        title: &str,
+        decision_json: &str,
+    ) -> MediaDownloadRecord {
+        MediaDownloadRecord {
+            id: 1,
+            subscription_id,
+            target_key: "tv:42:s01e03".to_string(),
+            dedupe_key: "coverage-test".to_string(),
+            site_id: Some(1),
+            downloader_id: Some(1),
+            source_site: "test-site".to_string(),
+            downloader_name: "test-downloader".to_string(),
+            torrent_id: "coverage-torrent".to_string(),
+            title: title.to_string(),
+            size: 1,
+            release_json: "{}".to_string(),
+            decision_json: decision_json.to_string(),
+            profile_snapshot_json: "{}".to_string(),
+            infohash: None,
+            status: "fetching".to_string(),
+            attempts: 1,
+            next_attempt_at: None,
+            lease_owner: None,
+            lease_until: None,
+            version: 1,
+            last_error: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            submitted_at: None,
+        }
+    }
+
+    #[test]
+    fn accepted_subscription_download_recovers_multi_episode_coverage() {
+        let parser = ReleaseParser::default();
+        let raw = coverage_test_download(
+            Some(42),
+            "Example.Show.S01E03-E05.1080p.WEB-DL",
+            r#"{"accepted":true}"#,
+        );
+        assert_eq!(
+            media_download_coverage(&raw, &parser),
+            MediaDownloadCoverage {
+                season: Some(1),
+                episodes: vec![3, 4, 5],
+                absolute_episodes: Vec::new(),
+            }
+        );
+
+        let envelope = coverage_test_download(
+            Some(42),
+            "Example.Show.S01E03E04E05.1080p.WEB-DL",
+            r#"{"decision":{"accepted":true}}"#,
+        );
+        assert_eq!(
+            media_download_coverage(&envelope, &parser).episodes,
+            vec![3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn unaccepted_manual_or_single_episode_download_has_no_multi_episode_coverage() {
+        let parser = ReleaseParser::default();
+        let rejected = coverage_test_download(
+            Some(42),
+            "Example.Show.S01E03-E05.1080p.WEB-DL",
+            r#"{"accepted":false}"#,
+        );
+        assert_eq!(
+            media_download_coverage(&rejected, &parser),
+            MediaDownloadCoverage::default()
+        );
+
+        let manual = coverage_test_download(
+            None,
+            "Example.Show.S01E03-E05.1080p.WEB-DL",
+            r#"{"accepted":true}"#,
+        );
+        assert_eq!(
+            media_download_coverage(&manual, &parser),
+            MediaDownloadCoverage::default()
+        );
+
+        let single = coverage_test_download(
+            Some(42),
+            "Example.Show.S01E03.1080p.WEB-DL",
+            r#"{"accepted":true}"#,
+        );
+        assert_eq!(
+            media_download_coverage(&single, &parser),
+            MediaDownloadCoverage {
+                season: Some(1),
+                episodes: Vec::new(),
+                absolute_episodes: Vec::new(),
+            }
+        );
+    }
 
     struct StaticIndexer {
         site_id: i64,
@@ -3023,9 +3186,15 @@ mod tests {
         );
         let submitting = db.get_media_download(queued.id).await.unwrap().unwrap();
         assert!(
-            db.mark_media_download_submitted(submitting.id, submitting.version, owner, infohash,)
-                .await
-                .unwrap()
+            db.mark_media_download_submitted(
+                submitting.id,
+                submitting.version,
+                owner,
+                infohash,
+                MediaDownloadCoverage::default(),
+            )
+            .await
+            .unwrap()
         );
         db.get_media_download(queued.id).await.unwrap().unwrap()
     }

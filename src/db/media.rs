@@ -8,9 +8,9 @@ use crate::error::AppError;
 use crate::media::domain::QualityProfile;
 use crate::media::models::{
     MEDIA_DOWNLOAD_MAX_ATTEMPTS, MEDIA_DOWNLOAD_RECONCILIATION_GRACE_SECONDS,
-    MediaDownloadDeleteOutcome, MediaDownloadRecord, MediaSettings, NewMediaDownload,
-    NewSubscription, QualityProfileRecord, QualityProfileRequest, SubscriptionRecord,
-    SubscriptionTargetRecord, UpdateSubscription, target_key,
+    MediaDownloadCoverage, MediaDownloadDeleteOutcome, MediaDownloadRecord, MediaSettings,
+    NewMediaDownload, NewSubscription, QualityProfileRecord, QualityProfileRequest,
+    SubscriptionRecord, SubscriptionTargetRecord, UpdateSubscription, target_key,
 };
 use crate::media::progression::{
     SubscriptionTargetSeed, SubscriptionTargetSeedStatus, TargetSyncResult, air_date_eligible_at,
@@ -2292,6 +2292,7 @@ impl Database {
                     subscription_id,
                     &download.target_key,
                     &now_text,
+                    &MediaDownloadCoverage::default(),
                 )?;
             } else {
                 reset_subscription_after_failed_download(&tx, &download, message, &now_text)?;
@@ -2609,6 +2610,7 @@ impl Database {
         expected_version: i64,
         owner: &str,
         infohash: &str,
+        coverage: MediaDownloadCoverage,
     ) -> Result<bool, AppError> {
         let path = self.path.clone();
         let owner = owner.to_string();
@@ -2679,6 +2681,7 @@ impl Database {
                     subscription_id,
                     &download.target_key,
                     &now,
+                    &coverage,
                 )?;
             }
             tx.commit().map_err(sql_error)?;
@@ -2694,6 +2697,7 @@ impl Database {
         expected_version: i64,
         owner: &str,
         infohash: &str,
+        coverage: MediaDownloadCoverage,
     ) -> Result<bool, AppError> {
         let path = self.path.clone();
         let owner = owner.to_string();
@@ -2783,6 +2787,7 @@ impl Database {
                     subscription_id,
                     &download.target_key,
                     &now,
+                    &coverage,
                 )?;
             }
             tx.commit().map_err(sql_error)?;
@@ -3506,11 +3511,166 @@ fn map_media_download(row: &Row<'_>) -> rusqlite::Result<MediaDownloadRecord> {
     })
 }
 
+fn contiguous_coverage_end(values: &[u32], start: u32) -> u32 {
+    let values: HashSet<_> = values.iter().copied().collect();
+    if !values.contains(&start) {
+        return start;
+    }
+    let mut end = start;
+    while let Some(next) = end.checked_add(1) {
+        if !values.contains(&next) {
+            break;
+        }
+        end = next;
+    }
+    end
+}
+
+fn materialize_covered_subscription_targets(
+    conn: &Connection,
+    subscription: &SubscriptionRecord,
+    submitted_target: &SubscriptionTargetRecord,
+    coverage: &MediaDownloadCoverage,
+    now: &str,
+) -> Result<(u32, Option<u32>), AppError> {
+    let start_episode = submitted_target
+        .episode
+        .or(subscription.next_episode)
+        .ok_or_else(|| invalid("TV subscription target has no episode"))?;
+    let start_absolute = submitted_target.absolute_episode;
+    let mut desired_episode = start_episode;
+
+    if let Some(start_absolute) = start_absolute {
+        let absolute_end = contiguous_coverage_end(&coverage.absolute_episodes, start_absolute);
+        if absolute_end > start_absolute {
+            let delta = absolute_end - start_absolute;
+            desired_episode = start_episode
+                .checked_add(delta)
+                .ok_or_else(|| invalid("covered episode range overflowed"))?;
+        } else if coverage.season == subscription.season {
+            let episode_end = contiguous_coverage_end(&coverage.episodes, start_episode);
+            if episode_end > start_episode {
+                desired_episode = episode_end;
+            }
+        }
+    } else if coverage.season == subscription.season {
+        desired_episode = contiguous_coverage_end(&coverage.episodes, start_episode);
+    }
+
+    let mut episode = start_episode;
+    let mut absolute_episode = start_absolute;
+    while episode < desired_episode {
+        let next_episode = episode
+            .checked_add(1)
+            .ok_or_else(|| invalid("covered episode range overflowed"))?;
+        let next_absolute = match absolute_episode {
+            Some(value) => Some(
+                value
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("covered absolute episode range overflowed"))?,
+            ),
+            None => None,
+        };
+        let existing_target = if let Some(next_absolute) = next_absolute {
+            conn.query_row(
+                "SELECT id, subscription_id, target_key, season, episode,
+                        absolute_episode, air_date, status, created_at, updated_at
+                 FROM subscription_targets
+                 WHERE subscription_id = ? AND season IS ? AND absolute_episode = ?
+                 LIMIT 1",
+                params![subscription.id, subscription.season, next_absolute],
+                map_subscription_target,
+            )
+            .optional()
+            .map_err(sql_error)?
+        } else {
+            let key = target_key(
+                &subscription.media_type,
+                subscription.tmdb_id,
+                subscription.season,
+                Some(next_episode),
+                None,
+            );
+            load_subscription_target(conn, subscription.id, &key)?
+        };
+        let (key, materialized_episode, materialized_absolute, status) =
+            if let Some(target) = existing_target {
+                (
+                    target.target_key,
+                    target.episode.unwrap_or(next_episode),
+                    target.absolute_episode.or(next_absolute),
+                    Some(target.status),
+                )
+            } else if next_absolute.is_none() {
+                (
+                    target_key(
+                        &subscription.media_type,
+                        subscription.tmdb_id,
+                        subscription.season,
+                        Some(next_episode),
+                        None,
+                    ),
+                    next_episode,
+                    None,
+                    None,
+                )
+            } else {
+                break;
+            };
+        if materialized_episode != next_episode {
+            break;
+        }
+        match status.as_deref() {
+            Some("submitted") => {}
+            Some("pending" | "metadata_pending") => {
+                let changed = conn
+                    .execute(
+                        "UPDATE subscription_targets SET status = 'submitted', updated_at = ?
+                         WHERE subscription_id = ? AND target_key = ?
+                           AND status IN ('pending', 'metadata_pending')",
+                        params![now, subscription.id, key],
+                    )
+                    .map_err(sql_error)?;
+                if changed != 1 {
+                    return Err(AppError::Database {
+                        message: format!(
+                            "subscription target {key} changed while applying multi-episode coverage"
+                        ),
+                    });
+                }
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO subscription_targets
+                     (subscription_id, target_key, season, episode, absolute_episode,
+                      status, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?)",
+                    params![
+                        subscription.id,
+                        key,
+                        subscription.season,
+                        materialized_episode,
+                        materialized_absolute,
+                        now,
+                        now,
+                    ],
+                )
+                .map_err(sql_error)?;
+            }
+            Some(_) => break,
+        }
+        episode = materialized_episode;
+        absolute_episode = materialized_absolute;
+    }
+    Ok((episode, absolute_episode))
+}
+
 fn advance_subscription_after_submit(
     conn: &Connection,
     subscription_id: i64,
     submitted_target_key: &str,
     now: &str,
+    coverage: &MediaDownloadCoverage,
 ) -> Result<(), AppError> {
     let subscription =
         load_subscription(conn, subscription_id)?.ok_or_else(|| AppError::Database {
@@ -3551,10 +3711,13 @@ fn advance_subscription_after_submit(
         .ok_or_else(|| AppError::Database {
         message: format!("subscription target {submitted_target_key} disappeared while advancing"),
     })?;
-    let current_episode = submitted_target
-        .episode
-        .or(subscription.next_episode)
-        .ok_or_else(|| invalid("TV subscription target has no episode"))?;
+    let (current_episode, current_absolute) = materialize_covered_subscription_targets(
+        conn,
+        &subscription,
+        &submitted_target,
+        coverage,
+        now,
+    )?;
     let next_target = conn
         .query_row(
             "SELECT id, subscription_id, target_key, season, episode,
@@ -3622,7 +3785,7 @@ fn advance_subscription_after_submit(
             let next_episode = current_episode
                 .checked_add(1)
                 .ok_or_else(|| invalid("TV episode cursor overflowed"))?;
-            let next_absolute = match submitted_target.absolute_episode {
+            let next_absolute = match current_absolute {
                 Some(value) => Some(value.checked_add(1).ok_or_else(|| {
                     invalid("absolute episode cursor overflowed; subscription was not advanced")
                 })?),
@@ -4565,6 +4728,7 @@ mod tests {
                 submitting.version,
                 "download-worker",
                 infohash,
+                MediaDownloadCoverage::default(),
             )
             .await
             .unwrap()
@@ -4635,6 +4799,11 @@ mod tests {
                 fetching.version,
                 "qb-present-worker",
                 infohash,
+                MediaDownloadCoverage {
+                    season: Some(1),
+                    episodes: vec![3, 4, 5],
+                    absolute_episodes: Vec::new(),
+                },
             )
             .await
             .unwrap()
@@ -4658,8 +4827,28 @@ mod tests {
             "submitted"
         );
         let advanced = db.get_subscription(subscription.id).await.unwrap().unwrap();
-        assert_eq!(advanced.next_episode, Some(4));
+        assert_eq!(advanced.next_episode, Some(6));
         assert_eq!(advanced.last_status.as_deref(), Some("submitted"));
+        for episode in 3..=5 {
+            let key = target_key("tv", advanced.tmdb_id, Some(1), Some(episode), None);
+            assert_eq!(
+                db.get_subscription_target(subscription.id, &key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "submitted"
+            );
+        }
+        let next_key = target_key("tv", advanced.tmdb_id, Some(1), Some(6), None);
+        assert_eq!(
+            db.get_subscription_target(subscription.id, &next_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "metadata_pending"
+        );
         assert!(
             db.media_download_identity_has_active_relocation(
                 submitted.id,
@@ -4668,6 +4857,78 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_episode_coverage_stops_before_another_queued_target() {
+        let (_dir, db, site_id, downloader_id) = database_with_media_references().await;
+        let subscription = create_tv_subscription(&db, site_id, downloader_id).await;
+        let request = new_download(&subscription, site_id, downloader_id);
+        let queued = enqueue_linked_download(&db, &request).await;
+        let next_key = target_key("tv", subscription.tmdb_id, Some(1), Some(4), None);
+        let now = Utc::now().to_rfc3339();
+        let conn = open_connection(&db.path).unwrap();
+        conn.execute(
+            "INSERT INTO subscription_targets
+             (subscription_id, target_key, season, episode, status, created_at, updated_at)
+             VALUES (?, ?, 1, 4, 'queued', ?, ?)",
+            params![subscription.id, next_key, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        let fetching = db
+            .claim_due_media_downloads("coverage-worker", 60, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let infohash = "123456789abcdef0123456789abcdef012345678";
+        assert!(
+            db.mark_media_download_submitting(
+                queued.id,
+                fetching.version,
+                "coverage-worker",
+                infohash,
+                60,
+            )
+            .await
+            .unwrap()
+        );
+        let submitting = db.get_media_download(queued.id).await.unwrap().unwrap();
+        assert!(
+            db.mark_media_download_submitted(
+                queued.id,
+                submitting.version,
+                "coverage-worker",
+                infohash,
+                MediaDownloadCoverage {
+                    season: Some(1),
+                    episodes: vec![3, 4, 5],
+                    absolute_episodes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap()
+        );
+
+        let advanced = db.get_subscription(subscription.id).await.unwrap().unwrap();
+        assert_eq!(advanced.next_episode, Some(4));
+        assert_eq!(
+            db.get_subscription_target(subscription.id, &next_key)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+        let episode_five_key = target_key("tv", subscription.tmdb_id, Some(1), Some(5), None);
+        assert!(
+            db.get_subscription_target(subscription.id, &episode_five_key)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -5018,6 +5279,7 @@ mod tests {
                 forced.version,
                 "forced-submitter",
                 "abababababababababababababababababababab",
+                MediaDownloadCoverage::default(),
             )
             .await
             .unwrap()
@@ -5412,9 +5674,15 @@ mod tests {
         );
         let submitting = db.get_media_download(queued.id).await.unwrap().unwrap();
         assert!(
-            db.mark_media_download_submitted(queued.id, submitting.version, owner, infohash)
-                .await
-                .unwrap()
+            db.mark_media_download_submitted(
+                queued.id,
+                submitting.version,
+                owner,
+                infohash,
+                MediaDownloadCoverage::default(),
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -5846,6 +6114,7 @@ mod tests {
                 submitting.version,
                 "history-reset-worker",
                 &first_hash,
+                MediaDownloadCoverage::default(),
             )
             .await
             .unwrap()
@@ -7043,6 +7312,7 @@ mod tests {
                 submitting.version,
                 "download-first",
                 infohash,
+                MediaDownloadCoverage::default(),
             )
             .await
             .unwrap()

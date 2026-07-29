@@ -155,6 +155,13 @@ pub struct SubscriptionTargetRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaDownloadCoverage {
+    pub season: Option<u32>,
+    pub episodes: Vec<u32>,
+    pub absolute_episodes: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewMediaDownload {
     pub subscription_id: Option<i64>,
