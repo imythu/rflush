@@ -3807,6 +3807,8 @@ async fn get_downloader_default_path(
 #[derive(Debug, Deserialize)]
 struct DownloaderTorrentQuery {
     keyword: Option<String>,
+    #[serde(default)]
+    include_incomplete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3818,6 +3820,8 @@ struct TransferableTorrentResponse {
     category: String,
     tags: String,
     added_on: i64,
+    progress: f64,
+    state: String,
 }
 
 async fn list_downloader_torrents(
@@ -3848,13 +3852,14 @@ async fn list_downloader_torrents(
         .map_err(ApiError::bad_gateway)?
         .into_iter()
         .filter(|torrent| {
-            torrent_is_complete(
-                torrent.completion_on,
-                torrent.downloaded,
-                torrent.size,
-                torrent.progress,
-                &torrent.state,
-            )
+            query.include_incomplete
+                || torrent_is_complete(
+                    torrent.completion_on,
+                    torrent.downloaded,
+                    torrent.size,
+                    torrent.progress,
+                    &torrent.state,
+                )
         })
         .filter(|torrent| {
             keyword.is_empty()
@@ -3869,6 +3874,8 @@ async fn list_downloader_torrents(
             category: torrent.category,
             tags: torrent.tags,
             added_on: torrent.added_on,
+            progress: torrent.progress,
+            state: torrent.state,
         })
         .collect::<Vec<_>>();
     torrents.sort_by(|left, right| right.added_on.cmp(&left.added_on));

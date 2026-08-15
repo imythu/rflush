@@ -247,6 +247,16 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/DownloaderSpaceStats'}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/downloaders/{id}/torrents:
+    get:
+      parameters:
+        - {$ref: '#/components/parameters/IdPath'}
+        - {name: keyword, in: query, required: false, schema: {type: string}}
+        - {name: include_incomplete, in: query, required: false, schema: {type: boolean, default: false}, description: Include incomplete torrents for storage analysis.}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/DownloaderTorrent'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
   /api/brush-tasks:
     get:
       responses:
@@ -1003,6 +1013,20 @@ components:
         effective_free_space: {type: integer, format: int64}
         torrent_count: {type: integer, format: int64}
         incomplete_count: {type: integer, format: int64}
+
+    DownloaderTorrent:
+      type: object
+      required: [hash, name, size, save_path, category, tags, added_on, progress, state]
+      properties:
+        hash: {type: string}
+        name: {type: string}
+        size: {type: integer, format: int64}
+        save_path: {type: string}
+        category: {type: string}
+        tags: {type: string}
+        added_on: {type: integer, format: int64}
+        progress: {type: number, format: double}
+        state: {type: string}
 
     BrushTaskRecord:
       type: object

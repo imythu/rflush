@@ -177,6 +177,8 @@ export type TransferableTorrent = {
   category: string;
   tags: string;
   added_on: number;
+  progress: number;
+  state: string;
 };
 
 export type BrushTaskRecord = {
