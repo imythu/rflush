@@ -1016,11 +1016,12 @@ components:
 
     DownloaderTorrent:
       type: object
-      required: [hash, name, size, save_path, category, tags, added_on, progress, state]
+      required: [hash, name, size, downloaded, save_path, category, tags, added_on, progress, state]
       properties:
         hash: {type: string}
         name: {type: string}
         size: {type: integer, format: int64}
+        downloaded: {type: integer, format: int64}
         save_path: {type: string}
         category: {type: string}
         tags: {type: string}

@@ -173,6 +173,7 @@ export type TransferableTorrent = {
   hash: string;
   name: string;
   size: number;
+  downloaded: number;
   save_path: string;
   category: string;
   tags: string;
