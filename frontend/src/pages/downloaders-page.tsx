@@ -4,6 +4,7 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
+  Copy,
   Edit,
   Eye,
   FolderTree,
@@ -130,6 +131,7 @@ export function DownloadersPage() {
 
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
+  const [copySource, setCopySource] = useState<DownloaderRecord | null>(null);
   const [form, setForm] = useState<FormData>(emptyForm);
   const [existingPasswordConfigured, setExistingPasswordConfigured] = useState(false);
   const [clearPassword, setClearPassword] = useState(false);
@@ -192,6 +194,7 @@ export function DownloadersPage() {
 
   function openAdd() {
     setEditingId(null);
+    setCopySource(null);
     setForm(emptyForm);
     setExistingPasswordConfigured(false);
     setClearPassword(false);
@@ -201,6 +204,7 @@ export function DownloadersPage() {
 
   function openEdit(d: DownloaderRecord) {
     setEditingId(d.id);
+    setCopySource(null);
     setForm({
       name: d.name,
       downloader_type: d.downloader_type,
@@ -209,6 +213,22 @@ export function DownloadersPage() {
       password: "",
     });
     setExistingPasswordConfigured(d.password_configured);
+    setClearPassword(false);
+    setSubmitError("");
+    setDialogOpen(true);
+  }
+
+  function openCopy(d: DownloaderRecord) {
+    setEditingId(null);
+    setCopySource(d);
+    setForm({
+      name: `${d.name} - 副本`,
+      downloader_type: d.downloader_type,
+      url: d.url,
+      username: d.username,
+      password: "",
+    });
+    setExistingPasswordConfigured(false);
     setClearPassword(false);
     setSubmitError("");
     setDialogOpen(true);
@@ -279,6 +299,7 @@ export function DownloadersPage() {
   function closeDialog() {
     setDialogOpen(false);
     setEditingId(null);
+    setCopySource(null);
     setForm(emptyForm);
     setExistingPasswordConfigured(false);
     setClearPassword(false);
@@ -290,7 +311,9 @@ export function DownloadersPage() {
     setSubmitError("");
     try {
       const body = JSON.stringify(
-        editingId !== null ? { ...form, clear_password: clearPassword } : form,
+        editingId !== null
+          ? { ...form, clear_password: clearPassword }
+          : { ...form, copy_from_id: copySource?.id },
       );
       if (editingId !== null) {
         await api(`/api/downloaders/${editingId}`, { method: "PUT", body });
@@ -401,6 +424,10 @@ export function DownloadersPage() {
             <Button variant="outline" onClick={() => openEdit(detailDownloader)}>
               <Edit className="mr-2 h-4 w-4" />
               编辑
+            </Button>
+            <Button variant="outline" onClick={() => openCopy(detailDownloader)}>
+              <Copy className="mr-2 h-4 w-4" />
+              复制
             </Button>
             <Button variant="destructive" onClick={() => setDeleteTarget(detailDownloader)}>
               <Trash2 className="mr-2 h-4 w-4" />
@@ -625,14 +652,26 @@ export function DownloadersPage() {
         <Dialog
           open={dialogOpen}
           onClose={closeDialog}
-          title={editingId !== null ? "编辑下载器" : "添加下载器"}
-          description={editingId !== null ? "修改下载器配置信息。" : "填写下载器连接信息。"}
+          title={editingId !== null ? "编辑下载器" : copySource ? "复制下载器" : "添加下载器"}
+          description={
+            editingId !== null
+              ? "修改下载器配置信息。"
+              : copySource
+                ? `基于「${copySource.name}」创建新下载器。`
+                : "填写下载器连接信息。"
+          }
           escMode="double"
         >
           <div className="space-y-4 p-4 sm:p-6">
             {submitError ? (
               <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
                 {submitError}
+              </div>
+            ) : null}
+
+            {copySource?.password_configured ? (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                已保存的密码会安全复制；如需更换，请在下方输入新密码。
               </div>
             ) : null}
 
@@ -663,7 +702,13 @@ export function DownloadersPage() {
                     setForm((prev) => ({ ...prev, password: e.target.value }));
                     if (e.target.value) setClearPassword(false);
                   }}
-                  placeholder={editingId !== null && existingPasswordConfigured ? "留空以保留已保存密码" : "可选"}
+                  placeholder={
+                    editingId !== null && existingPasswordConfigured
+                      ? "留空以保留已保存密码"
+                      : copySource?.password_configured
+                        ? "留空以复制已保存密码"
+                        : "可选"
+                  }
                   disabled={clearPassword}
                 />
               </div>
@@ -828,6 +873,10 @@ export function DownloadersPage() {
                               <Edit className="mr-1.5 h-3.5 w-3.5" />
                               编辑
                             </Button>
+                            <Button variant="outline" className="h-8 px-2.5 text-xs" onClick={() => openCopy(d)}>
+                              <Copy className="mr-1.5 h-3.5 w-3.5" />
+                              复制
+                            </Button>
                             <Button variant="destructive" className="h-8 px-2.5 text-xs" onClick={() => setDeleteTarget(d)}>
                               <Trash2 className="mr-1.5 h-3.5 w-3.5" />
                               删除
@@ -885,6 +934,10 @@ export function DownloadersPage() {
                       <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openEdit(d)}>
                         <Edit className="mr-1.5 h-3.5 w-3.5" />
                         编辑
+                      </Button>
+                      <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openCopy(d)}>
+                        <Copy className="mr-1.5 h-3.5 w-3.5" />
+                        复制
                       </Button>
                       <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteTarget(d)}>
                         <Trash2 className="mr-1.5 h-3.5 w-3.5" />

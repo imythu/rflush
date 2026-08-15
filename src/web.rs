@@ -3556,6 +3556,8 @@ struct CreateDownloaderRequest {
     url: String,
     username: Option<String>,
     password: Option<String>,
+    #[serde(default)]
+    copy_from_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3618,6 +3620,15 @@ fn resolve_downloader_password(
         .unwrap_or_else(|| existing.to_string()))
 }
 
+fn resolve_created_downloader_password(
+    copied_password: String,
+    incoming: Option<String>,
+) -> String {
+    incoming
+        .filter(|password| !password.is_empty())
+        .unwrap_or(copied_password)
+}
+
 fn downloader_connection_identity_changed(
     current_type: &str,
     current_url: &str,
@@ -3656,6 +3667,20 @@ async fn create_downloader(
     if body.name.is_empty() || body.url.is_empty() {
         return Err(ApiError::bad_request("名称和URL不能为空"));
     }
+    let copied_password = if let Some(source_id) = body.copy_from_id {
+        if source_id <= 0 {
+            return Err(ApiError::bad_request("copy_from_id must be positive"));
+        }
+        state
+            .db
+            .get_downloader(source_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("复制来源下载器不存在"))?
+            .password
+    } else {
+        String::new()
+    };
+    let password = resolve_created_downloader_password(copied_password, body.password);
     let id = state
         .db
         .create_downloader(
@@ -3663,7 +3688,7 @@ async fn create_downloader(
             &body.downloader_type,
             &body.url,
             body.username.as_deref().unwrap_or(""),
-            body.password.as_deref().unwrap_or(""),
+            &password,
         )
         .await?;
     Ok(Json(serde_json::json!({ "id": id })))
@@ -5551,6 +5576,25 @@ mod security_boundary_tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn downloader_copy_reuses_password_unless_a_replacement_is_supplied() {
+        assert_eq!(
+            resolve_created_downloader_password(
+                "dummy-downloader-secret".to_string(),
+                Some(String::new()),
+            ),
+            "dummy-downloader-secret"
+        );
+        assert_eq!(
+            resolve_created_downloader_password(
+                "dummy-downloader-secret".to_string(),
+                Some("dummy-new-secret".to_string()),
+            ),
+            "dummy-new-secret"
+        );
+        assert_eq!(resolve_created_downloader_password(String::new(), None), "");
     }
 
     #[tokio::test]

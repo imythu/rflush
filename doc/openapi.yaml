@@ -978,6 +978,12 @@ components:
         url: {type: string}
         username: {type: string, nullable: true}
         password: {type: string, nullable: true, writeOnly: true}
+        copy_from_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+          description: Source downloader whose saved password is reused when password is empty.
 
     UpdateDownloaderRequest:
       type: object
