@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Duration, Utc};
@@ -51,6 +52,17 @@ pub struct OpenListConfig {
     pub updated_at: String,
     pub path_mappings: Vec<OpenListPathMapping>,
     pub target_directories: Vec<OpenListTargetDirectory>,
+}
+
+/// A manual transfer target snapshot.  The relocation worker persists these
+/// paths before it starts copying so a later settings change cannot redirect
+/// an already-confirmed transfer.
+#[derive(Debug, Clone)]
+pub struct ManualMediaRelocationTarget {
+    pub infohash: String,
+    pub torrent_name: String,
+    pub target_openlist_path: String,
+    pub target_qb_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +202,7 @@ impl Database {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -211,6 +224,44 @@ impl Database {
             target_openlist_path,
             target_qb_path,
             torrents,
+            None,
+            Some(expected_openlist_config_updated_at),
+            Some(expected_source_downloader_updated_at),
+            Some(expected_target_downloader_updated_at),
+        )
+        .await
+    }
+
+    pub async fn enqueue_manual_media_relocation_jobs_with_targets_if_config_current(
+        &self,
+        downloader_id: i64,
+        target_downloader_id: i64,
+        targets: &[ManualMediaRelocationTarget],
+        expected_openlist_config_updated_at: &str,
+        expected_source_downloader_updated_at: &str,
+        expected_target_downloader_updated_at: &str,
+    ) -> Result<(usize, usize), AppError> {
+        self.enqueue_manual_media_relocation_jobs_inner(
+            downloader_id,
+            target_downloader_id,
+            "",
+            "",
+            &targets
+                .iter()
+                .map(|target| (target.infohash.clone(), target.torrent_name.clone()))
+                .collect::<Vec<_>>(),
+            Some(
+                targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            target.infohash.clone(),
+                            target.target_openlist_path.clone(),
+                            target.target_qb_path.clone(),
+                        )
+                    })
+                    .collect(),
+            ),
             Some(expected_openlist_config_updated_at),
             Some(expected_source_downloader_updated_at),
             Some(expected_target_downloader_updated_at),
@@ -225,6 +276,7 @@ impl Database {
         target_openlist_path: &str,
         target_qb_path: &str,
         torrents: &[(String, String)],
+        target_overrides: Option<Vec<(String, String, String)>>,
         expected_openlist_config_updated_at: Option<&str>,
         expected_source_downloader_updated_at: Option<&str>,
         expected_target_downloader_updated_at: Option<&str>,
@@ -233,6 +285,11 @@ impl Database {
         let target_openlist_path = target_openlist_path.to_string();
         let target_qb_path = target_qb_path.to_string();
         let torrents = torrents.to_vec();
+        let target_overrides = target_overrides
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(hash, openlist, qb)| (hash.to_ascii_lowercase(), (openlist, qb)))
+            .collect::<HashMap<_, _>>();
         let expected_openlist_config_updated_at =
             expected_openlist_config_updated_at.map(str::to_string);
         let expected_source_downloader_updated_at =
@@ -339,6 +396,12 @@ impl Database {
                     skipped += 1;
                     continue;
                 }
+                let (target_openlist_path, target_qb_path) = target_overrides
+                    .get(&infohash.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        (target_openlist_path.clone(), target_qb_path.clone())
+                    });
                 tx.execute(
                     "INSERT INTO media_relocation_jobs
                      (media_download_id, downloader_id, infohash, source_qb_path,
@@ -1386,7 +1449,10 @@ fn remote_paths_overlap(left: &str, right: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, OpenListPathMapping, OpenListTargetDirectory, remote_paths_overlap};
+    use super::{
+        Database, ManualMediaRelocationTarget, OpenListPathMapping, OpenListTargetDirectory,
+        remote_paths_overlap,
+    };
 
     #[test]
     fn remote_paths_overlap_is_unicode_case_insensitive_and_boundary_aware() {
@@ -2022,6 +2088,64 @@ mod tests {
             .unwrap();
         assert!(past_end.is_empty());
         assert_eq!(huge_total, 2);
+    }
+
+    #[tokio::test]
+    async fn manual_relocation_targets_are_snapshotted_per_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let source_id = db
+            .create_downloader("source", "qbittorrent", "http://127.0.0.1:8080", "", "")
+            .await
+            .unwrap();
+        let target_id = db
+            .create_downloader("target", "qbittorrent", "http://127.0.0.1:8081", "", "")
+            .await
+            .unwrap();
+        let source = db.get_downloader(source_id).await.unwrap().unwrap();
+        let target = db.get_downloader(target_id).await.unwrap().unwrap();
+        let config = db.get_openlist_config().await.unwrap();
+        let targets = vec![
+            ManualMediaRelocationTarget {
+                infohash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                torrent_name: "first".to_string(),
+                target_openlist_path: "/archive/云母/电影/剧情/2024".to_string(),
+                target_qb_path: "/data/archive/云母/电影/剧情/2024".to_string(),
+            },
+            ManualMediaRelocationTarget {
+                infohash: "1123456789abcdef0123456789abcdef01234567".to_string(),
+                torrent_name: "second".to_string(),
+                target_openlist_path: "/archive/云母/电视剧/科幻/2025".to_string(),
+                target_qb_path: "/data/archive/云母/电视剧/科幻/2025".to_string(),
+            },
+        ];
+        assert_eq!(
+            db.enqueue_manual_media_relocation_jobs_with_targets_if_config_current(
+                source_id,
+                target_id,
+                &targets,
+                &config.updated_at,
+                &source.updated_at,
+                &target.updated_at,
+            )
+            .await
+            .unwrap(),
+            (2, 0)
+        );
+        let (jobs, total) = db.list_manual_media_relocation_jobs(1, 10).await.unwrap();
+        assert_eq!(total, 2);
+        let first = jobs
+            .iter()
+            .find(|job| job.infohash.starts_with("01"))
+            .unwrap();
+        let second = jobs
+            .iter()
+            .find(|job| job.infohash.starts_with("11"))
+            .unwrap();
+        assert_eq!(first.target_openlist_path, targets[0].target_openlist_path);
+        assert_eq!(first.target_qb_path, targets[0].target_qb_path);
+        assert_eq!(second.target_openlist_path, targets[1].target_openlist_path);
+        assert_eq!(second.target_qb_path, targets[1].target_qb_path);
     }
 
     #[tokio::test]

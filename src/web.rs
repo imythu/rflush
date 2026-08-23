@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,11 +24,12 @@ use crate::brush::scheduler::BrushScheduler;
 use crate::collector::DownloaderSnapshotCollector;
 use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
 use crate::db::{
-    Database, DownloadHistoryRecord, DownloadRunRecord, MediaRelocationJob, OpenListConfig,
-    OpenListPathMapping, OpenListTargetDirectory, PaginatedRunRecords,
+    Database, DownloadHistoryRecord, DownloadRunRecord, ManualMediaRelocationTarget,
+    MediaRelocationJob, OpenListConfig, OpenListPathMapping, OpenListTargetDirectory,
+    PaginatedRunRecords,
 };
-use crate::downloader::DownloaderClientPool;
 use crate::downloader::DownloaderSpaceStats;
+use crate::downloader::{DownloaderClient, DownloaderClientPool};
 use crate::engine::DownloadEngine;
 use crate::error::AppError;
 use crate::history::RunSummary;
@@ -36,7 +37,7 @@ use crate::indexer::IndexerError;
 use crate::media::domain::{MediaTarget, ReleaseInfo, ReleaseParser};
 use crate::media::models::{
     MediaDownloadDeletion, MediaDownloadRecord, MediaSettings, QualityProfileRecord,
-    QualityProfileRequest, SubscriptionRecord, UpdateSubscription,
+    QualityProfileRequest, SubscriptionRecord, UpdateSubscription, media_download_category,
 };
 use crate::media::scheduler::MediaScheduler;
 use crate::media::service::{
@@ -49,8 +50,8 @@ use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
 use crate::openlist::{OpenListClient, OpenListTask, openlist_identity_key};
 use crate::relocation::{
-    RelocationScheduler, is_path_prefix, normalize_path, torrent_is_complete,
-    validate_torrent_files_complete,
+    RelocationScheduler, archive_relative_directory, is_path_prefix, join_path, normalize_path,
+    torrent_is_complete, validate_torrent_files_complete,
 };
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
@@ -464,6 +465,10 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         .route(
             "/api/downloaders/{id}/openlist-transfer",
             post(create_openlist_transfer),
+        )
+        .route(
+            "/api/downloaders/{id}/openlist-transfer/preview",
+            post(preview_openlist_transfer),
         )
         // 刷流任务
         .route(
@@ -3914,6 +3919,70 @@ struct CreateOpenListTransferRequest {
     hashes: Vec<String>,
     target_directory_id: i64,
     expected_config_updated_at: String,
+    #[serde(default)]
+    target_mode: Option<String>,
+    #[serde(default)]
+    target_downloader_id: Option<i64>,
+    #[serde(default)]
+    plan_confirmed: bool,
+    #[serde(default)]
+    planned_targets: Vec<OpenListTransferPlannedTarget>,
+    #[serde(default)]
+    expected_source_downloader_updated_at: Option<String>,
+    #[serde(default)]
+    expected_target_downloader_updated_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PreviewOpenListTransferRequest {
+    hashes: Vec<String>,
+    target_directory_id: i64,
+    expected_config_updated_at: String,
+    #[serde(default)]
+    target_downloader_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenListTransferPlannedTarget {
+    hash: String,
+    target_openlist_path: String,
+    target_qb_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenListTransferClassification {
+    tmdb_id: Option<i64>,
+    media_type: Option<String>,
+    title: String,
+    year: Option<u32>,
+    category: String,
+    genre: String,
+    matched: bool,
+    source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpenListTransferPlanItem {
+    hash: String,
+    torrent_name: String,
+    target_openlist_path: String,
+    target_qb_path: String,
+    classification: OpenListTransferClassification,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenListTransferPlanResponse {
+    mode: &'static str,
+    target_directory_id: i64,
+    target_downloader_id: i64,
+    openlist_root: String,
+    qb_root: String,
+    directories: Vec<String>,
+    items: Vec<OpenListTransferPlanItem>,
+    warnings: Vec<String>,
+    expected_config_updated_at: String,
+    source_downloader_updated_at: String,
+    target_downloader_updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -3930,12 +3999,259 @@ async fn create_openlist_transfer(
     if !state.self_use {
         return Err(ApiError::not_found("功能不可用"));
     }
-    if payload.hashes.is_empty() || payload.hashes.len() > 100 {
+    let mode = normalize_transfer_mode(payload.target_mode.as_deref())?;
+    let (config, downloader, target, target_downloader, client) = load_openlist_transfer_context(
+        &state,
+        id,
+        payload.target_directory_id,
+        payload.target_downloader_id,
+        &payload.expected_config_updated_at,
+    )
+    .await?;
+    if payload
+        .expected_source_downloader_updated_at
+        .as_deref()
+        .is_some_and(|expected| expected != downloader.updated_at)
+        || payload
+            .expected_target_downloader_updated_at
+            .as_deref()
+            .is_some_and(|expected| expected != target_downloader.updated_at)
+    {
+        return Err(ApiError::conflict(
+            "qBittorrent 配置已变化，请重新生成 TMDB 分类规划",
+        ));
+    }
+    let hashes = normalize_transfer_hashes(payload.hashes)?;
+    let torrents = load_transfer_torrents(&client, &config, id, &hashes).await?;
+    let selected = torrents
+        .iter()
+        .map(|torrent| (torrent.hash.to_ascii_lowercase(), torrent.name.clone()))
+        .collect::<Vec<_>>();
+
+    let (created, skipped) = if mode == "tmdb" {
+        if !payload.plan_confirmed {
+            return Err(ApiError::bad_request(
+                "TMDB 分类目录必须先生成规划并完成二次确认",
+            ));
+        }
+        let planned =
+            validate_planned_transfer_targets(&hashes, &payload.planned_targets, &target)?;
+        let openlist = OpenListClient::new(&config.base_url, &config.api_key)
+            .map_err(ApiError::bad_gateway)?;
+        let mut checked_directories = HashSet::new();
+        for (target_openlist_path, _) in planned.values() {
+            if !checked_directories.insert(target_openlist_path.clone()) {
+                continue;
+            }
+            match openlist
+                .stat_if_exists(target_openlist_path)
+                .await
+                .map_err(ApiError::bad_gateway)?
+            {
+                Some(object) if object.is_dir => {}
+                Some(_) => {
+                    return Err(ApiError::bad_request(format!(
+                        "TMDB 分类目录不是目录，无法确认: {target_openlist_path}"
+                    )));
+                }
+                None => {
+                    return Err(ApiError::conflict(
+                        "TMDB 分类目录已不存在，请重新生成目录后再确认",
+                    ));
+                }
+            }
+        }
+        let targets = torrents
+            .iter()
+            .map(|torrent| {
+                let hash = torrent.hash.to_ascii_lowercase();
+                let (target_openlist_path, target_qb_path) = planned
+                    .get(&hash)
+                    .cloned()
+                    .ok_or_else(|| ApiError::bad_request("TMDB 分类规划缺少种子目标路径"))?;
+                Ok(ManualMediaRelocationTarget {
+                    infohash: hash,
+                    torrent_name: torrent.name.clone(),
+                    target_openlist_path,
+                    target_qb_path,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        state
+            .db
+            .enqueue_manual_media_relocation_jobs_with_targets_if_config_current(
+                id,
+                target.downloader_id,
+                &targets,
+                &payload.expected_config_updated_at,
+                &downloader.updated_at,
+                &target_downloader.updated_at,
+            )
+            .await
+            .map_err(media_app_error)?
+    } else {
+        state
+            .db
+            .enqueue_manual_media_relocation_jobs_if_config_current(
+                id,
+                target.downloader_id,
+                &target.openlist_path,
+                &target.qb_path,
+                &selected,
+                &payload.expected_config_updated_at,
+                &downloader.updated_at,
+                &target_downloader.updated_at,
+            )
+            .await
+            .map_err(media_app_error)?
+    };
+    state.relocation_scheduler.request_scan();
+    Ok(Json(CreateOpenListTransferResponse { created, skipped }))
+}
+
+async fn preview_openlist_transfer(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<PreviewOpenListTransferRequest>,
+) -> Result<Json<OpenListTransferPlanResponse>, ApiError> {
+    if !state.self_use {
+        return Err(ApiError::not_found("功能不可用"));
+    }
+    let (config, downloader, target, target_downloader, client) = load_openlist_transfer_context(
+        &state,
+        id,
+        payload.target_directory_id,
+        payload.target_downloader_id,
+        &payload.expected_config_updated_at,
+    )
+    .await?;
+    let hashes = normalize_transfer_hashes(payload.hashes)?;
+    let torrents = load_transfer_torrents(&client, &config, id, &hashes).await?;
+    let target_openlist_root =
+        normalize_path(&target.openlist_path).map_err(ApiError::bad_request)?;
+    let target_qb_root = normalize_path(&target.qb_path).map_err(ApiError::bad_request)?;
+    let tmdb_configured = state
+        .db
+        .get_media_settings()
+        .await
+        .map_err(media_app_error)?
+        .tmdb_token
+        .is_some_and(|token| !token.trim().is_empty());
+    let mut tmdb_cache = HashMap::<String, Option<TmdbMedia>>::new();
+    let mut items = Vec::with_capacity(torrents.len());
+    let mut warnings = Vec::new();
+    let mut directories = HashSet::new();
+    for torrent in torrents {
+        let classification =
+            classify_transfer_torrent(&state, id, &torrent, tmdb_configured, &mut tmdb_cache)
+                .await?;
+        let relative = archive_relative_directory(
+            &classification.category,
+            &classification.genre,
+            classification.year,
+        );
+        let target_openlist_path =
+            join_path(&target_openlist_root, &relative).map_err(ApiError::bad_request)?;
+        let target_qb_path =
+            join_path(&target_qb_root, &relative).map_err(ApiError::bad_request)?;
+        if !classification.matched {
+            warnings.push(format!(
+                "{} 未匹配到 TMDB，已使用 {} / {} / {}",
+                torrent.name,
+                classification.category,
+                classification.genre,
+                classification
+                    .year
+                    .map(|year| year.to_string())
+                    .unwrap_or_else(|| "年份未知".to_string())
+            ));
+        }
+        directories.insert(target_openlist_path.clone());
+        items.push(OpenListTransferPlanItem {
+            hash: torrent.hash.to_ascii_lowercase(),
+            torrent_name: torrent.name,
+            target_openlist_path,
+            target_qb_path,
+            classification,
+        });
+    }
+
+    let openlist =
+        OpenListClient::new(&config.base_url, &config.api_key).map_err(ApiError::bad_gateway)?;
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort();
+    for directory in &directories {
+        openlist
+            .create_directory_tree_if_missing(directory)
+            .await
+            .map_err(ApiError::bad_gateway)?;
+    }
+    Ok(Json(OpenListTransferPlanResponse {
+        mode: "tmdb",
+        target_directory_id: payload.target_directory_id,
+        target_downloader_id: target.downloader_id,
+        openlist_root: target_openlist_root,
+        qb_root: target_qb_root,
+        directories,
+        items,
+        warnings,
+        expected_config_updated_at: config.updated_at,
+        source_downloader_updated_at: downloader.updated_at,
+        target_downloader_updated_at: target_downloader.updated_at,
+    }))
+}
+
+fn normalize_transfer_mode(value: Option<&str>) -> Result<&'static str, ApiError> {
+    match value
+        .unwrap_or("fixed")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fixed" | "directory" => Ok("fixed"),
+        "tmdb" | "auto" | "auto_tmdb" => Ok("tmdb"),
+        _ => Err(ApiError::bad_request("target_mode must be fixed or tmdb")),
+    }
+}
+
+fn normalize_transfer_hashes(hashes: Vec<String>) -> Result<Vec<String>, ApiError> {
+    if hashes.is_empty() || hashes.len() > 100 {
         return Err(ApiError::bad_request("请选择 1 到 100 个种子"));
     }
+    let mut hashes = hashes
+        .into_iter()
+        .map(|hash| hash.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    hashes.sort();
+    hashes.dedup();
+    if hashes
+        .iter()
+        .any(|hash| !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|c| c.is_ascii_hexdigit()))
+    {
+        return Err(ApiError::bad_request("种子 hash 格式无效"));
+    }
+    Ok(hashes)
+}
+
+async fn load_openlist_transfer_context(
+    state: &AppState,
+    source_id: i64,
+    target_directory_id: i64,
+    requested_target_downloader_id: Option<i64>,
+    expected_config_updated_at: &str,
+) -> Result<
+    (
+        OpenListConfig,
+        crate::downloader::DownloaderRecord,
+        OpenListTargetDirectory,
+        crate::downloader::DownloaderRecord,
+        std::sync::Arc<dyn DownloaderClient>,
+    ),
+    ApiError,
+> {
     let downloader = state
         .db
-        .get_downloader(id)
+        .get_downloader(source_id)
         .await?
         .ok_or_else(|| ApiError::not_found("下载器不存在"))?;
     if !matches!(downloader.downloader_type.as_str(), "qbittorrent" | "qb") {
@@ -3946,7 +4262,7 @@ async fn create_openlist_transfer(
         .get_openlist_config()
         .await
         .map_err(media_app_error)?;
-    if payload.expected_config_updated_at != config.updated_at {
+    if expected_config_updated_at != config.updated_at {
         return Err(ApiError::conflict(
             "OpenList settings changed; reload migration targets before creating tasks",
         ));
@@ -3957,7 +4273,7 @@ async fn create_openlist_transfer(
     if !config
         .path_mappings
         .iter()
-        .any(|mapping| mapping.downloader_id == id)
+        .any(|mapping| mapping.downloader_id == source_id)
     {
         return Err(ApiError::bad_request(
             "该下载器尚未配置 OpenList 来源路径映射",
@@ -3966,8 +4282,14 @@ async fn create_openlist_transfer(
     let target = config
         .target_directories
         .iter()
-        .find(|target| target.id == Some(payload.target_directory_id))
+        .find(|target| target.id == Some(target_directory_id))
+        .cloned()
         .ok_or_else(|| ApiError::bad_request("所选迁移目标目录不存在，请刷新后重试"))?;
+    if requested_target_downloader_id.is_some_and(|requested| requested != target.downloader_id) {
+        return Err(ApiError::conflict(
+            "目标下载器与所选目录不匹配，请刷新后重试",
+        ));
+    }
     let target_downloader = state
         .db
         .get_downloader(target.downloader_id)
@@ -3981,37 +4303,29 @@ async fn create_openlist_transfer(
             "目标下载器已不再是 qBittorrent，请刷新后重试",
         ));
     }
-
-    let mut hashes = payload
-        .hashes
-        .into_iter()
-        .map(|hash| hash.trim().to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    hashes.sort();
-    hashes.dedup();
-    if hashes
-        .iter()
-        .any(|hash| !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|c| c.is_ascii_hexdigit()))
-    {
-        return Err(ApiError::bad_request("种子 hash 格式无效"));
-    }
     let client = state
         .pool
         .get(&downloader)
         .await
         .map_err(ApiError::bad_request)?;
+    Ok((config, downloader, target, target_downloader, client))
+}
+
+async fn load_transfer_torrents(
+    client: &std::sync::Arc<dyn DownloaderClient>,
+    config: &OpenListConfig,
+    source_id: i64,
+    hashes: &[String],
+) -> Result<Vec<crate::downloader::TorrentInfo>, ApiError> {
     let torrents = client
-        .list_torrents_by_hashes(&hashes)
+        .list_torrents_by_hashes(hashes)
         .await
         .map_err(ApiError::bad_gateway)?;
-    let expected_hashes = hashes
-        .iter()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
+    let expected_hashes = hashes.iter().cloned().collect::<HashSet<_>>();
     let returned_hashes = torrents
         .iter()
         .map(|torrent| torrent.hash.to_ascii_lowercase())
-        .collect::<std::collections::HashSet<_>>();
+        .collect::<HashSet<_>>();
     if torrents.len() != expected_hashes.len() || returned_hashes != expected_hashes {
         return Err(ApiError::bad_request("部分种子已不存在，请刷新后重试"));
     }
@@ -4031,7 +4345,7 @@ async fn create_openlist_transfer(
         let mapped = config
             .path_mappings
             .iter()
-            .filter(|mapping| mapping.downloader_id == id)
+            .filter(|mapping| mapping.downloader_id == source_id)
             .any(|mapping| {
                 normalize_path(&mapping.qb_path)
                     .is_ok_and(|mapping_root| is_path_prefix(&mapping_root, &save_path))
@@ -4053,26 +4367,261 @@ async fn create_openlist_transfer(
             ))
         })?;
     }
-    let selected = torrents
-        .into_iter()
-        .map(|torrent| (torrent.hash.to_ascii_lowercase(), torrent.name))
-        .collect::<Vec<_>>();
-    let (created, skipped) = state
+    Ok(torrents)
+}
+
+async fn classify_transfer_torrent(
+    state: &AppState,
+    source_id: i64,
+    torrent: &crate::downloader::TorrentInfo,
+    tmdb_configured: bool,
+    tmdb_cache: &mut HashMap<String, Option<TmdbMedia>>,
+) -> Result<OpenListTransferClassification, ApiError> {
+    let parsed = ReleaseParser::default().parse(&torrent.name).ok();
+    let linked_download = state
         .db
-        .enqueue_manual_media_relocation_jobs_if_config_current(
-            id,
-            target.downloader_id,
-            &target.openlist_path,
-            &target.qb_path,
-            &selected,
-            &payload.expected_config_updated_at,
-            &downloader.updated_at,
-            &target_downloader.updated_at,
-        )
+        .get_media_download_by_infohash(source_id, &torrent.hash)
         .await
         .map_err(media_app_error)?;
-    state.relocation_scheduler.request_scan();
-    Ok(Json(CreateOpenListTransferResponse { created, skipped }))
+    if let Some(download) = linked_download {
+        let subscription = match download.subscription_id {
+            Some(id) => state
+                .db
+                .get_subscription(id)
+                .await
+                .map_err(media_app_error)?,
+            None => None,
+        };
+        let category = media_download_category(
+            &download.target_key,
+            subscription
+                .as_ref()
+                .is_some_and(|item| item.tmdb_is_animation),
+        );
+        let year = subscription
+            .as_ref()
+            .and_then(|item| item.year)
+            .or_else(|| release_year(&download.release_json))
+            .or_else(|| parsed.as_ref().and_then(|release| release.year));
+        let genre = subscription
+            .as_ref()
+            .and_then(|item| item.tmdb_genres.first())
+            .map(|genre| safe_transfer_component(&genre.name, "其他"))
+            .unwrap_or_else(|| "其他".to_string());
+        return Ok(OpenListTransferClassification {
+            tmdb_id: subscription.as_ref().map(|item| item.tmdb_id),
+            media_type: subscription.as_ref().map(|item| item.media_type.clone()),
+            title: subscription
+                .as_ref()
+                .map(|item| item.title.clone())
+                .unwrap_or_else(|| download.title.clone()),
+            year,
+            category: category.to_string(),
+            genre,
+            matched: subscription.is_some(),
+            source: if subscription.is_some() {
+                "subscription".to_string()
+            } else {
+                "download_record".to_string()
+            },
+        });
+    }
+
+    let query = parsed
+        .as_ref()
+        .map(|release| release.title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| torrent.name.trim().to_string());
+    let year = parsed.as_ref().and_then(|release| release.year);
+    let media_type_hint = parsed.as_ref().and_then(|release| {
+        if release.season.is_some() || release.full_season || !release.absolute_episodes.is_empty()
+        {
+            Some("tv")
+        } else if release.matched_rule == "movie" {
+            Some("movie")
+        } else {
+            None
+        }
+    });
+    if tmdb_configured {
+        let cache_key = format!(
+            "{}:{}",
+            media_type_hint.unwrap_or("multi"),
+            query.to_ascii_lowercase()
+        );
+        if !tmdb_cache.contains_key(&cache_key) {
+            let result = state
+                .media
+                .tmdb_search(&query, media_type_hint)
+                .await
+                .map_err(ApiError::from)?
+                .into_iter()
+                .next();
+            tmdb_cache.insert(cache_key.clone(), result);
+        }
+        if let Some(Some(media)) = tmdb_cache.get(&cache_key) {
+            let category = match media.media_type {
+                TmdbMediaType::Movie => "电影",
+                TmdbMediaType::Tv if media.is_animation => "动漫",
+                TmdbMediaType::Tv => "电视剧",
+            };
+            let genre = media
+                .genres
+                .first()
+                .map(|genre| safe_transfer_component(&genre.name, "其他"))
+                .unwrap_or_else(|| "其他".to_string());
+            return Ok(OpenListTransferClassification {
+                tmdb_id: Some(media.tmdb_id),
+                media_type: Some(media.media_type.as_str().to_string()),
+                title: media.title.clone(),
+                year: media.year.or(year),
+                category: category.to_string(),
+                genre,
+                matched: true,
+                source: "tmdb".to_string(),
+            });
+        }
+    }
+    Ok(OpenListTransferClassification {
+        tmdb_id: None,
+        media_type: None,
+        title: query,
+        year,
+        category: fallback_transfer_category(parsed.as_ref(), media_type_hint).to_string(),
+        genre: "其他".to_string(),
+        matched: false,
+        source: "fallback".to_string(),
+    })
+}
+
+fn fallback_transfer_category(
+    parsed: Option<&ReleaseInfo>,
+    media_type_hint: Option<&str>,
+) -> &'static str {
+    if media_type_hint == Some("movie") {
+        "电影"
+    } else if parsed.is_some_and(|release| !release.absolute_episodes.is_empty()) {
+        "动漫"
+    } else {
+        "电视剧"
+    }
+}
+
+fn release_year(value: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|value| value.get("year").and_then(serde_json::Value::as_u64))
+        .and_then(|year| u32::try_from(year).ok())
+}
+
+fn safe_transfer_component(value: &str, fallback: &str) -> String {
+    let value = value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .map(|character| {
+            if character == '/' || character == '\\' {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let value = value
+        .trim_matches(['.', ' '])
+        .chars()
+        .take(80)
+        .collect::<String>();
+    if value.is_empty() || value == "." || value == ".." {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
+
+fn validate_planned_transfer_targets(
+    hashes: &[String],
+    planned: &[OpenListTransferPlannedTarget],
+    target: &OpenListTargetDirectory,
+) -> Result<HashMap<String, (String, String)>, ApiError> {
+    if planned.len() != hashes.len() {
+        return Err(ApiError::bad_request(
+            "TMDB 分类规划与选中的种子数量不一致，请重新生成目录",
+        ));
+    }
+    let openlist_root = normalize_path(&target.openlist_path).map_err(ApiError::bad_request)?;
+    let qb_root = normalize_path(&target.qb_path).map_err(ApiError::bad_request)?;
+    let expected = hashes.iter().cloned().collect::<HashSet<_>>();
+    let mut result = HashMap::new();
+    for item in planned {
+        let hash = item.hash.trim().to_ascii_lowercase();
+        if !expected.contains(&hash) || result.contains_key(&hash) {
+            return Err(ApiError::bad_request("TMDB 分类规划包含未知或重复的种子"));
+        }
+        let openlist_path =
+            normalize_path(&item.target_openlist_path).map_err(ApiError::bad_request)?;
+        let qb_path = normalize_path(&item.target_qb_path).map_err(ApiError::bad_request)?;
+        if !is_path_prefix(&openlist_root, &openlist_path) || !is_path_prefix(&qb_root, &qb_path) {
+            return Err(ApiError::bad_request(
+                "TMDB 分类目标路径必须位于所选根目录下",
+            ));
+        }
+        let openlist_suffix = transfer_relative_suffix(&openlist_root, &openlist_path)?;
+        let qb_suffix = transfer_relative_suffix(&qb_root, &qb_path)?;
+        if openlist_suffix != qb_suffix || !is_generated_transfer_suffix(&openlist_suffix) {
+            return Err(ApiError::bad_request(
+                "TMDB 分类目标路径必须使用生成的 云母/类型/主类型/年份 目录",
+            ));
+        }
+        result.insert(hash, (openlist_path, qb_path));
+    }
+    if result.len() != expected.len() {
+        return Err(ApiError::bad_request("TMDB 分类规划缺少种子目标路径"));
+    }
+    Ok(result)
+}
+
+fn transfer_relative_suffix(root: &str, path: &str) -> Result<String, ApiError> {
+    if root == path {
+        return Ok(String::new());
+    }
+    if root == "/" {
+        return Ok(path.trim_start_matches('/').to_string());
+    }
+    path.strip_prefix(root)
+        .map(|suffix| suffix.trim_start_matches('/').to_string())
+        .ok_or_else(|| ApiError::bad_request("目标路径不在根目录下"))
+}
+
+fn is_generated_transfer_suffix(value: &str) -> bool {
+    let mut components = value.split('/');
+    let Some(prefix) = components.next() else {
+        return false;
+    };
+    let Some(category) = components.next() else {
+        return false;
+    };
+    let Some(genre) = components.next() else {
+        return false;
+    };
+    let Some(year) = components.next() else {
+        return false;
+    };
+    if components.next().is_some()
+        || prefix != "云母"
+        || !matches!(category, "电影" | "电视剧" | "动漫")
+        || genre.is_empty()
+        || genre == "."
+        || genre == ".."
+        || genre.chars().count() > 80
+        || genre.chars().any(|character| character.is_control())
+    {
+        return false;
+    }
+    year == "年份未知"
+        || (!year.is_empty()
+            && year.bytes().all(|byte| byte.is_ascii_digit())
+            && year.parse::<u32>().is_ok())
 }
 
 // ========== Brush Tasks API ==========
@@ -4814,6 +5363,71 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod media_api_tests {
     use super::*;
+
+    #[test]
+    fn tmdb_transfer_plans_require_matching_paths_under_the_selected_roots() {
+        let target = OpenListTargetDirectory {
+            id: Some(7),
+            name: "archive".to_string(),
+            downloader_id: 2,
+            openlist_path: "/media".to_string(),
+            qb_path: "/data/media".to_string(),
+        };
+        let hashes = vec!["0123456789abcdef0123456789abcdef01234567".to_string()];
+        let valid = vec![OpenListTransferPlannedTarget {
+            hash: hashes[0].clone(),
+            target_openlist_path: "/media/云母/电影/剧情/2024".to_string(),
+            target_qb_path: "/data/media/云母/电影/剧情/2024".to_string(),
+        }];
+        assert!(validate_planned_transfer_targets(&hashes, &valid, &target).is_ok());
+
+        let escaped = vec![OpenListTransferPlannedTarget {
+            hash: hashes[0].clone(),
+            target_openlist_path: "/other/云母/电影/剧情/2024".to_string(),
+            target_qb_path: "/data/media/云母/电影/剧情/2024".to_string(),
+        }];
+        assert!(validate_planned_transfer_targets(&hashes, &escaped, &target).is_err());
+
+        let mismatched = vec![OpenListTransferPlannedTarget {
+            hash: hashes[0].clone(),
+            target_openlist_path: "/media/云母/电影/剧情/2024".to_string(),
+            target_qb_path: "/data/media/other".to_string(),
+        }];
+        assert!(validate_planned_transfer_targets(&hashes, &mismatched, &target).is_err());
+    }
+
+    #[test]
+    fn tmdb_transfer_directory_components_are_safe_and_bounded() {
+        assert_eq!(
+            safe_transfer_component("  剧情/../动作  ", "其他"),
+            "剧情_.._动作"
+        );
+        assert_eq!(safe_transfer_component("...", "其他"), "其他");
+        assert!(
+            safe_transfer_component(&"a".repeat(100), "其他")
+                .chars()
+                .count()
+                <= 80
+        );
+        assert!(is_generated_transfer_suffix("云母/电影/剧情/2024"));
+        assert!(is_generated_transfer_suffix("云母/电视剧/其他/年份未知"));
+        assert!(!is_generated_transfer_suffix("云母/电影/剧情/2024/extra"));
+        assert!(!is_generated_transfer_suffix("云母/未知/剧情/2024"));
+        assert!(!is_generated_transfer_suffix(&format!(
+            "云母/电影/{}/2024",
+            "a".repeat(81)
+        )));
+        let movie = ReleaseParser::default()
+            .parse("Example.Movie.2024.1080p.WEB-DL")
+            .unwrap();
+        assert_eq!(
+            fallback_transfer_category(Some(&movie), Some("movie")),
+            "电影"
+        );
+        assert_eq!(normalize_transfer_mode(None).unwrap(), "fixed");
+        assert_eq!(normalize_transfer_mode(Some("auto_tmdb")).unwrap(), "tmdb");
+        assert!(normalize_transfer_mode(Some("unknown")).is_err());
+    }
 
     #[test]
     fn openlist_task_ids_accept_current_and_legacy_formats() {

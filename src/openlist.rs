@@ -386,6 +386,20 @@ impl OpenListClient {
         }
     }
 
+    /// Create every missing component of an absolute directory path in order.
+    /// OpenList's mkdir endpoint only accepts a path whose parent already
+    /// exists, so callers that prepare a generated archive tree must walk the
+    /// path one component at a time.
+    pub async fn create_directory_tree_if_missing(&self, path: &str) -> Result<(), String> {
+        let components = absolute_remote_directory_components(path)?;
+        let mut current = "/".to_string();
+        for component in components {
+            current = remote_child_path(&current, component)?;
+            self.create_directory_if_missing(&current).await?;
+        }
+        Ok(())
+    }
+
     async fn refreshed_object_if_exists(
         &self,
         path: &str,
@@ -2326,6 +2340,35 @@ mod tests {
         assert!(state.mkdirs.is_empty());
         assert!(state.copies.is_empty());
         drop(state);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn directory_tree_creation_walks_missing_components_idempotently() {
+        let state = Arc::new(Mutex::new(FakeOpenListState::default()));
+        let app = Router::new()
+            .route("/api/fs/list", post(fake_list))
+            .route("/api/fs/mkdir", post(fake_mkdir))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenListClient::new(&format!("http://{address}"), "test-key").unwrap();
+        let path = "/archive/云母/电影/剧情/2024";
+
+        client.create_directory_tree_if_missing(path).await.unwrap();
+        client.create_directory_tree_if_missing(path).await.unwrap();
+
+        assert_eq!(
+            state.lock().unwrap().mkdirs,
+            vec![
+                "/archive".to_string(),
+                "/archive/云母".to_string(),
+                "/archive/云母/电影".to_string(),
+                "/archive/云母/电影/剧情".to_string(),
+                path.to_string(),
+            ]
+        );
         server.abort();
     }
 

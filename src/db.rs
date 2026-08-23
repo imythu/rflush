@@ -17,7 +17,8 @@ mod media;
 mod openlist;
 
 pub use openlist::{
-    MediaRelocationJob, OpenListConfig, OpenListPathMapping, OpenListTargetDirectory,
+    ManualMediaRelocationTarget, MediaRelocationJob, OpenListConfig, OpenListPathMapping,
+    OpenListTargetDirectory,
 };
 
 #[derive(Clone)]

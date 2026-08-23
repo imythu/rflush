@@ -4541,7 +4541,7 @@ impl RelocationScheduler {
     }
 }
 
-fn archive_relative_directory(
+pub fn archive_relative_directory(
     primary_type: &str,
     primary_genre: &str,
     tmdb_year: Option<u32>,

@@ -4,6 +4,7 @@ import {
   ArrowRight,
   CheckCircle2,
   Clock3,
+  FolderTree,
   LoaderCircle,
   RefreshCw,
   RotateCcw,
@@ -41,6 +42,41 @@ type OpenListSettingsSummary = {
   target_directory_id: number | null;
   source_mappings: Array<{ downloader_id: number; qb_path: string }>;
   target_directories: OpenListTargetDirectory[];
+};
+
+type TransferMode = "fixed" | "tmdb";
+
+type TransferPlanClassification = {
+  tmdb_id: number | null;
+  media_type: string | null;
+  title: string;
+  year: number | null;
+  category: string;
+  genre: string;
+  matched: boolean;
+  source: string;
+};
+
+type TransferPlanItem = {
+  hash: string;
+  torrent_name: string;
+  target_openlist_path: string;
+  target_qb_path: string;
+  classification: TransferPlanClassification;
+};
+
+type TransferPlan = {
+  mode: "tmdb";
+  target_directory_id: number;
+  target_downloader_id: number;
+  openlist_root: string;
+  qb_root: string;
+  directories: string[];
+  items: TransferPlanItem[];
+  warnings: string[];
+  expected_config_updated_at: string;
+  source_downloader_updated_at: string;
+  target_downloader_updated_at: string;
 };
 
 type CopyCheckpoint = {
@@ -184,13 +220,17 @@ export function TorrentTransferPage() {
   const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
   const [settings, setSettings] = useState<OpenListSettingsSummary | null>(null);
   const [downloaderId, setDownloaderId] = useState("");
+  const [targetDownloaderId, setTargetDownloaderId] = useState("");
   const [targetDirectoryId, setTargetDirectoryId] = useState("");
+  const [targetMode, setTargetMode] = useState<TransferMode>("fixed");
   const [torrents, setTorrents] = useState<TransferableTorrent[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [keyword, setKeyword] = useState("");
   const [torrentPage, setTorrentPage] = useState(1);
   const [torrentLoading, setTorrentLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [planning, setPlanning] = useState(false);
+  const [tmdbPlan, setTmdbPlan] = useState<TransferPlan | null>(null);
   const [confirmTransferOpen, setConfirmTransferOpen] = useState(false);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -212,7 +252,13 @@ export function TorrentTransferPage() {
   const selectedTarget = settings?.target_directories.find(
     (target) => target.id != null && String(target.id) === targetDirectoryId,
   );
-  const selectedTargetDownloader = downloaders.find((item) => item.id === selectedTarget?.downloader_id);
+  const selectedTargetDownloader = downloaders.find((item) => String(item.id) === targetDownloaderId);
+  const targetDirectories = useMemo(
+    () => (settings?.target_directories ?? []).filter(
+      (target) => target.id != null && (!targetDownloaderId || String(target.downloader_id) === targetDownloaderId),
+    ),
+    [settings?.target_directories, targetDownloaderId],
+  );
   const sourceHasMapping = Boolean(
     selectedSource && settings?.source_mappings.some((mapping) => mapping.downloader_id === selectedSource.id),
   );
@@ -262,6 +308,7 @@ export function TorrentTransferPage() {
     selectedSource
       && selectedTarget
       && selectedTargetDownloader
+      && selectedTarget.downloader_id === selectedTargetDownloader.id
       && sourceHasMapping
       && openListConfigured
       && configVersionAvailable
@@ -294,6 +341,16 @@ export function TorrentTransferPage() {
         setDownloaders(qbDownloaders);
         setSettings(loadedSettings);
         if (qbDownloaders.length === 1) setDownloaderId(String(qbDownloaders[0].id));
+        const configuredTargets = loadedSettings.target_directories.filter((target) => target.id != null);
+        const preferredTarget = configuredTargets.find(
+          (target) => target.id === loadedSettings.target_directory_id,
+        ) ?? (configuredTargets.length === 1 ? configuredTargets[0] : undefined);
+        if (preferredTarget) {
+          setTargetDirectoryId(String(preferredTarget.id));
+          setTargetDownloaderId(String(preferredTarget.downloader_id));
+        } else if (qbDownloaders.length === 1) {
+          setTargetDownloaderId(String(qbDownloaders[0].id));
+        }
       })
       .catch((loadError: Error) => {
         if (active && loadError.name !== "AbortError") {
@@ -305,6 +362,38 @@ export function TorrentTransferPage() {
       controller.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (!targetDirectoryId) return;
+    const target = settings?.target_directories.find(
+      (item) => item.id != null && String(item.id) === targetDirectoryId,
+    );
+    if (!target || (targetDownloaderId && String(target.downloader_id) !== targetDownloaderId)) {
+      setTargetDirectoryId("");
+      setTmdbPlan(null);
+    }
+  }, [settings?.target_directories, targetDirectoryId, targetDownloaderId]);
+
+  useEffect(() => {
+    if (!tmdbPlan) return;
+    const planHashes = new Set(tmdbPlan.items.map((item) => item.hash));
+    const currentHashes = new Set(selected);
+    const sourceUpdatedAt = selectedSource?.updated_at;
+    const targetUpdatedAt = selectedTargetDownloader?.updated_at;
+    if (
+      planHashes.size !== currentHashes.size
+      || [...planHashes].some((hash) => !currentHashes.has(hash))
+      || targetMode !== "tmdb"
+      || tmdbPlan.expected_config_updated_at !== settings?.updated_at
+      || tmdbPlan.target_directory_id !== selectedTarget?.id
+      || tmdbPlan.target_downloader_id !== selectedTarget?.downloader_id
+      || (sourceUpdatedAt != null && tmdbPlan.source_downloader_updated_at !== sourceUpdatedAt)
+      || (targetUpdatedAt != null && tmdbPlan.target_downloader_updated_at !== targetUpdatedAt)
+    ) {
+      setTmdbPlan(null);
+    }
+  }, [selected, selectedSource?.updated_at, selectedTarget?.downloader_id, selectedTarget?.id,
+    selectedTargetDownloader?.updated_at, settings?.updated_at, targetMode, tmdbPlan]);
 
   useEffect(() => {
     const generation = ++jobPollGeneration.current;
@@ -412,6 +501,7 @@ export function TorrentTransferPage() {
       return;
     }
     setError("");
+    setTmdbPlan(null);
     setSelected((current) => {
       const next = new Set(current);
       if (next.has(hash)) next.delete(hash);
@@ -421,6 +511,7 @@ export function TorrentTransferPage() {
   }
 
   function togglePage() {
+    setTmdbPlan(null);
     setSelected((current) => {
       const next = new Set(current);
       const allPageSelected = selectablePageTorrents.length > 0
@@ -439,16 +530,50 @@ export function TorrentTransferPage() {
     });
   }
 
+  async function generateTmdbPlan() {
+    if (!canSubmit || !selectedSource || !selectedTarget?.id) return;
+    setPlanning(true);
+    setTmdbPlan(null);
+    setError("");
+    setNotice("");
+    setModalError("");
+    setConfirmTransferOpen(true);
+    try {
+      const plan = await api<TransferPlan>(
+        `/api/downloaders/${selectedSource.id}/openlist-transfer/preview`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            hashes: [...selected],
+            target_directory_id: selectedTarget.id,
+            target_downloader_id: selectedTarget.downloader_id,
+            expected_config_updated_at: settings?.updated_at ?? "",
+          }),
+        },
+      );
+      setTmdbPlan(plan);
+    } catch (planError) {
+      setModalError((planError as Error).message || "生成 TMDB 分类目录失败");
+    } finally {
+      setPlanning(false);
+    }
+  }
+
   function openTransferConfirmation() {
     if (!canSubmit) return;
     setError("");
     setNotice("");
     setModalError("");
-    setConfirmTransferOpen(true);
+    if (targetMode === "tmdb") {
+      void generateTmdbPlan();
+    } else {
+      setConfirmTransferOpen(true);
+    }
   }
 
   async function submit() {
     if (!canSubmit || !selectedSource || !selectedTarget?.id) return;
+    if (targetMode === "tmdb" && !tmdbPlan) return;
     setSubmitting(true);
     setError("");
     setNotice("");
@@ -461,11 +586,28 @@ export function TorrentTransferPage() {
           body: JSON.stringify({
             hashes: [...selected],
             target_directory_id: selectedTarget.id,
+            target_downloader_id: selectedTarget.downloader_id,
+            target_mode: targetMode,
+            plan_confirmed: targetMode === "tmdb",
+            planned_targets: targetMode === "tmdb"
+              ? tmdbPlan?.items.map((item) => ({
+                hash: item.hash,
+                target_openlist_path: item.target_openlist_path,
+                target_qb_path: item.target_qb_path,
+              })) ?? []
+              : [],
+            expected_source_downloader_updated_at: targetMode === "tmdb"
+              ? tmdbPlan?.source_downloader_updated_at
+              : undefined,
+            expected_target_downloader_updated_at: targetMode === "tmdb"
+              ? tmdbPlan?.target_downloader_updated_at
+              : undefined,
             expected_config_updated_at: settings?.updated_at ?? "",
           }),
         },
       );
       setSelected(new Set());
+      setTmdbPlan(null);
       setConfirmTransferOpen(false);
       refreshJobs(1);
       setNotice(
@@ -545,14 +687,13 @@ export function TorrentTransferPage() {
   }
 
   const targetOptions = [
-    { value: "", label: "请选择迁移目标" },
-    ...(settings?.target_directories ?? [])
+    { value: "", label: targetMode === "tmdb" ? "请选择分类根目录" : "请选择固定目录" },
+    ...targetDirectories
       .filter((target): target is OpenListTargetDirectory & { id: number } => target.id != null)
       .map((target) => {
-        const targetDownloader = downloaders.find((item) => item.id === target.downloader_id);
         return {
           value: String(target.id),
-          label: `${target.name || "未命名目标"} · ${targetDownloader?.name ?? "目标下载器不可用"}`,
+          label: `${target.name || "未命名目标"} · ${target.openlist_root || "未设置路径"}`,
         };
       }),
   ];
@@ -589,7 +730,7 @@ export function TorrentTransferPage() {
             </div>
           ) : null}
 
-          <div className="grid gap-3 lg:grid-cols-[minmax(0,18rem)_minmax(0,1fr)_minmax(16rem,20rem)] lg:items-end">
+          <div className="grid gap-3 lg:grid-cols-[minmax(0,16rem)_minmax(0,16rem)_minmax(0,18rem)_minmax(0,1fr)] lg:items-end">
             <div className="min-w-0">
               <Label htmlFor="torrent-transfer-source" className="mb-2 block">来源下载器</Label>
               <Select
@@ -611,12 +752,64 @@ export function TorrentTransferPage() {
               />
             </div>
             <div className="min-w-0">
-              <Label htmlFor="torrent-transfer-target" className="mb-2 block">迁移目标</Label>
+              <Label htmlFor="torrent-transfer-target-qb" className="mb-2 block">目标 qBittorrent</Label>
+              <Select
+                id="torrent-transfer-target-qb"
+                value={targetDownloaderId}
+                onChange={(value) => {
+                  setTargetDownloaderId(value);
+                  const target = selectedTarget;
+                  if (target && String(target.downloader_id) !== value) setTargetDirectoryId("");
+                  setTmdbPlan(null);
+                }}
+                disabled={downloaders.length === 0}
+                options={[
+                  { value: "", label: downloaders.length === 0 ? "没有可用的 qBittorrent" : "选择目标 qBittorrent" },
+                  ...downloaders.map((item) => ({ value: String(item.id), label: item.name })),
+                ]}
+              />
+            </div>
+            <div className="min-w-0">
+              <Label className="mb-2 block">目标方式</Label>
+              <div className="flex h-11 rounded-2xl border border-border bg-input p-1" role="group" aria-label="目标方式">
+                <button
+                  type="button"
+                  className={cn(
+                    "min-w-0 flex-1 rounded-xl px-2 text-xs font-semibold transition-colors",
+                    targetMode === "fixed" ? "bg-card text-foreground shadow-sm" : "text-muted hover:text-foreground",
+                  )}
+                  aria-pressed={targetMode === "fixed"}
+                  onClick={() => {
+                    setTargetMode("fixed");
+                    setTmdbPlan(null);
+                  }}
+                >固定目录</button>
+                <button
+                  type="button"
+                  className={cn(
+                    "min-w-0 flex-1 rounded-xl px-2 text-xs font-semibold transition-colors",
+                    targetMode === "tmdb" ? "bg-card text-foreground shadow-sm" : "text-muted hover:text-foreground",
+                  )}
+                  aria-pressed={targetMode === "tmdb"}
+                  onClick={() => {
+                    setTargetMode("tmdb");
+                    setTmdbPlan(null);
+                  }}
+                >根目录 + TMDB</button>
+              </div>
+            </div>
+            <div className="min-w-0">
+              <Label htmlFor="torrent-transfer-target" className="mb-2 block">
+                {targetMode === "tmdb" ? "分类根目录" : "固定目标目录"}
+              </Label>
               <Select
                 id="torrent-transfer-target"
                 value={targetDirectoryId}
-                onChange={setTargetDirectoryId}
-                disabled={!settings || targetOptions.length === 1}
+                onChange={(value) => {
+                  setTargetDirectoryId(value);
+                  setTmdbPlan(null);
+                }}
+                disabled={!settings || targetOptions.length === 1 || !targetDownloaderId}
                 options={targetOptions}
               />
             </div>
@@ -651,6 +844,12 @@ export function TorrentTransferPage() {
                 <div className="text-muted">qB 路径</div>
                 <div className="mt-1 truncate font-mono" title={selectedTarget.qb_root}>{selectedTarget.qb_root}</div>
               </div>
+              {targetMode === "tmdb" ? (
+                <div className="flex min-w-0 items-start gap-2 sm:col-span-2 lg:col-span-3">
+                  <FolderTree className="mt-0.5 size-4 shrink-0 text-primary" />
+                  <span className="text-muted">提交前会按 TMDB 类型、主类型和年份生成目录；目录生成后需要再次确认。</span>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -670,6 +869,12 @@ export function TorrentTransferPage() {
             <div className="flex items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm text-destructive" role="alert">
               <AlertCircle className="mt-0.5 size-4 shrink-0" />
               <span>未取得 OpenList 配置版本，请刷新页面后再创建迁移任务。</span>
+            </div>
+          ) : null}
+          {settings && targetDownloaderId && targetDirectories.length === 0 ? (
+            <div className="flex items-start gap-2 rounded-lg border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm text-destructive" role="alert">
+              <AlertCircle className="mt-0.5 size-4 shrink-0" />
+              <span>目标 qBittorrent 尚未配置可用的 OpenList 目标目录，请先在自动复制设置中添加根目录。</span>
             </div>
           ) : null}
 
@@ -757,9 +962,9 @@ export function TorrentTransferPage() {
                   onClick={() => setTorrentPage((page) => page + 1)}
                 >下一页</Button>
               </div>
-              <Button onClick={openTransferConfirmation} disabled={submitting || !canSubmit}>
-                <ArrowRight data-icon="inline-start" />
-                {`核对并转移 ${selected.size} 个`}
+              <Button onClick={openTransferConfirmation} disabled={submitting || planning || !canSubmit}>
+                {planning ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : targetMode === "tmdb" ? <FolderTree data-icon="inline-start" /> : <ArrowRight data-icon="inline-start" />}
+                {targetMode === "tmdb" ? `生成目录并核对 ${selected.size} 个` : `核对并转移 ${selected.size} 个`}
               </Button>
             </div>
           </div>
@@ -880,29 +1085,88 @@ export function TorrentTransferPage() {
       <Dialog
         open={confirmTransferOpen}
         onClose={() => {
-          if (!submitting) {
+          if (!submitting && !planning) {
             setConfirmTransferOpen(false);
             setModalError("");
           }
         }}
-        title="确认迁移目标"
-        description="任务创建后会先复制并核验，再迁移 qB 做种任务。"
-        panelClassName="max-w-xl"
+        title={targetMode === "tmdb" ? "确认 TMDB 分类目录" : "确认迁移目标"}
+        description={targetMode === "tmdb"
+          ? "目录已生成。请核对每条种子的分类路径，确认后才会创建迁移任务。"
+          : "任务创建后会先复制并核验，再迁移 qB 做种任务。"}
+        panelClassName={targetMode === "tmdb" ? "max-w-4xl" : "max-w-xl"}
       >
         <div className="flex flex-col gap-5 p-5 sm:p-6">
           <ModalError message={modalError} />
-          <dl className="flex min-w-0 flex-col gap-3 rounded-lg border border-border bg-surface-container/45 p-4 text-sm">
-            <SummaryRow label="来源下载器" value={selectedSource?.name ?? "未选择"} />
-            <SummaryRow label="目标下载器" value={selectedTargetDownloader?.name ?? "不可用"} />
-            <SummaryRow label="OpenList 路径" value={selectedTarget?.openlist_root ?? "未选择"} mono />
-            <SummaryRow label="qB 路径" value={selectedTarget?.qb_root ?? "未选择"} mono />
-            <SummaryRow label="种子" value={`${selected.size} 个 · ${formatBytes(selectedBytes)}`} />
-          </dl>
+          {planning ? (
+            <div className="flex min-h-40 items-center justify-center gap-2 rounded-lg border border-border bg-surface-container/45 text-sm text-muted">
+              <LoaderCircle className="size-4 animate-spin" />正在匹配 TMDB 并生成目录
+            </div>
+          ) : targetMode === "tmdb" && tmdbPlan ? (
+            <>
+              <dl className="grid min-w-0 gap-3 rounded-lg border border-border bg-surface-container/45 p-4 text-sm sm:grid-cols-2">
+                <SummaryRow label="来源下载器" value={selectedSource?.name ?? "未选择"} />
+                <SummaryRow label="目标下载器" value={selectedTargetDownloader?.name ?? "不可用"} />
+                <SummaryRow label="OpenList 根目录" value={tmdbPlan.openlist_root} mono />
+                <SummaryRow label="qB 根目录" value={tmdbPlan.qb_root} mono />
+                <SummaryRow label="已生成目录" value={`${tmdbPlan.directories.length} 个`} />
+                <SummaryRow label="种子" value={`${tmdbPlan.items.length} 个 · ${formatBytes(selectedBytes)}`} />
+              </dl>
+              {tmdbPlan.warnings.length > 0 ? (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-foreground">
+                  <div className="font-semibold">有 {tmdbPlan.warnings.length} 条需要留意的匹配</div>
+                  <ul className="mt-2 max-h-28 list-disc space-y-1 overflow-auto pl-5 text-xs text-muted">
+                    {tmdbPlan.warnings.map((warning, index) => <li className="break-words" key={`${index}-${warning}`}>{warning}</li>)}
+                  </ul>
+                </div>
+              ) : null}
+              <div className="max-h-[min(28rem,45dvh)] overflow-auto rounded-lg border border-border">
+                <Table className="min-w-[48rem]">
+                  <TableHeader className="sticky top-0 bg-card">
+                    <TableRow>
+                      <TableHead>种子</TableHead>
+                      <TableHead>TMDB 匹配</TableHead>
+                      <TableHead>生成目录</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {tmdbPlan.items.map((item) => (
+                      <TableRow key={item.hash}>
+                        <TableCell className="max-w-[18rem]">
+                          <div className="truncate font-medium" title={item.torrent_name}>{item.torrent_name}</div>
+                          <div className="mt-1 font-mono text-xs text-muted">{item.hash.slice(0, 12)}</div>
+                        </TableCell>
+                        <TableCell className="text-xs">
+                          <div className="font-medium">{item.classification.title}</div>
+                          <div className="mt-1 text-muted">
+                            {item.classification.category} · {item.classification.genre} · {item.classification.year ?? "年份未知"}
+                            {!item.classification.matched ? " · 未匹配" : null}
+                          </div>
+                        </TableCell>
+                        <TableCell className="max-w-[22rem] font-mono text-xs text-muted" title={item.target_openlist_path}>
+                          <div className="truncate">{item.target_openlist_path}</div>
+                          <div className="mt-1 truncate">{item.target_qb_path}</div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </>
+          ) : (
+            <dl className="flex min-w-0 flex-col gap-3 rounded-lg border border-border bg-surface-container/45 p-4 text-sm">
+              <SummaryRow label="来源下载器" value={selectedSource?.name ?? "未选择"} />
+              <SummaryRow label="目标下载器" value={selectedTargetDownloader?.name ?? "不可用"} />
+              <SummaryRow label="OpenList 路径" value={selectedTarget?.openlist_root ?? "未选择"} mono />
+              <SummaryRow label="qB 路径" value={selectedTarget?.qb_root ?? "未选择"} mono />
+              <SummaryRow label="种子" value={`${selected.size} 个 · ${formatBytes(selectedBytes)}`} />
+            </dl>
+          )}
           <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-            <Button variant="outline" disabled={submitting} onClick={() => setConfirmTransferOpen(false)}>返回修改</Button>
-            <Button disabled={submitting || !canSubmit} onClick={() => void submit()}>
-              {submitting ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <ArrowRight data-icon="inline-start" />}
-              {submitting ? "创建任务中" : "确认并创建迁移"}
+            <Button variant="outline" disabled={submitting || planning} onClick={() => setConfirmTransferOpen(false)}>返回修改</Button>
+            <Button disabled={submitting || planning || !canSubmit || (targetMode === "tmdb" && !tmdbPlan)} onClick={() => void submit()}>
+              {submitting ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : targetMode === "tmdb" ? <FolderTree data-icon="inline-start" /> : <ArrowRight data-icon="inline-start" />}
+              {submitting ? "创建任务中" : targetMode === "tmdb" ? "确认目录并创建迁移" : "确认并创建迁移"}
             </Button>
           </div>
         </div>
