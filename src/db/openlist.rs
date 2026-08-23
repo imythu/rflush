@@ -465,7 +465,8 @@ impl Database {
                     AND NOT EXISTS (SELECT 1 FROM media_relocation_jobs j
                                     WHERE j.media_download_id = m.id)
                     AND NOT EXISTS (SELECT 1 FROM media_relocation_jobs active
-                                      WHERE active.downloader_id = m.downloader_id
+                                      WHERE (active.downloader_id = m.downloader_id
+                                             OR active.target_downloader_id = m.downloader_id)
                                       AND lower(active.infohash) = lower(m.infohash)
                                       AND active.stage NOT IN ('completed', 'cancelled'))",
                     params![processing_enabled, now, now, now, now],
@@ -2562,6 +2563,64 @@ mod tests {
         assert_eq!(automatic.len(), 1);
         assert_eq!(automatic[0].stage, "waiting_download");
         assert_eq!(automatic[0].torrent_name, "independent automatic copy");
+    }
+
+    #[tokio::test]
+    async fn active_manual_target_downloader_blocks_duplicate_automatic_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let source_id = db
+            .create_downloader(
+                "manual-source",
+                "qbittorrent",
+                "http://127.0.0.1:8080",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        let target_id = db
+            .create_downloader(
+                "automatic-source",
+                "qbittorrent",
+                "http://127.0.0.1:8081",
+                "",
+                "",
+            )
+            .await
+            .unwrap();
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = super::open_connection(&dir.path().join("rflush.db")).unwrap();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, downloader_id, infohash, source_qb_path,
+              source_openlist_path, target_openlist_path, target_qb_path,
+              target_downloader_id, torrent_name, stage, created_at, updated_at)
+             VALUES (NULL, ?, ?, '/source', '/source', '/target', '/target',
+                     ?, 'manual copy', 'copying', ?, ?)",
+            rusqlite::params![source_id, hash, target_id, now, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_downloads
+             (target_key, dedupe_key, downloader_id, source_site, downloader_name,
+              torrent_id, title, release_json, decision_json, profile_snapshot_json,
+              infohash, status, created_at, updated_at)
+             VALUES ('target', 'automatic-copy', ?, 'site', 'qB', 'torrent',
+                     'automatic copy', '{}', '{}', '{}', ?, 'submitted', ?, ?)",
+            rusqlite::params![target_id, hash, now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            db.enqueue_submitted_media_relocation_jobs(true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(db.list_media_relocation_jobs(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

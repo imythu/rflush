@@ -278,8 +278,11 @@ impl OpenListClient {
             return Err("OpenList 复制名称必须是单个文件或目录名".to_string());
         }
         let names = [name];
-        let data: CopyResult = self
-            .post(
+        // OpenList returns `data: null` when the operation is completed
+        // synchronously (for example when no background task is needed).
+        // That is a successful copy, not a malformed response.
+        let data: Option<CopyResult> = self
+            .post_envelope_structured(
                 "/api/fs/copy",
                 &CopyRequest {
                     src_dir,
@@ -290,8 +293,9 @@ impl OpenListClient {
                     merge: false,
                 },
             )
-            .await?;
-        Ok(data.tasks)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(data.map(|result| result.tasks).unwrap_or_default())
     }
 
     #[allow(dead_code)]
@@ -1309,6 +1313,10 @@ mod tests {
         success(json!({"tasks": [{"id": id, "state": 0}]}))
     }
 
+    async fn fake_copy_without_task(Json(_body): Json<Value>) -> Json<Value> {
+        success(Value::Null)
+    }
+
     async fn fake_remove(
         State(state): State<SharedFakeState>,
         Json(body): Json<Value>,
@@ -1444,6 +1452,25 @@ mod tests {
                 "episode.mkv".to_string(),
             )]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn copy_accepts_a_successful_synchronous_null_data_response() {
+        let app = Router::new().route("/api/fs/copy", post(fake_copy_without_task));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenListClient::new(&format!("http://{address}"), "test-key").unwrap();
+
+        assert!(
+            client
+                .copy("/src", "/dst", "episode.mkv")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
         server.abort();
     }
 

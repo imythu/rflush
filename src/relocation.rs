@@ -1691,6 +1691,15 @@ mod tests {
     }
 
     #[test]
+    fn absolute_episode_downloads_use_the_anime_archive_category() {
+        let category = media_download_category("tv:33:abs0123", false);
+        assert_eq!(
+            archive_relative_directory(category, "动画", Some(2025)),
+            "云母/动漫/动画/2025"
+        );
+    }
+
+    #[test]
     fn tmdb_archive_uses_primary_genre_and_tmdb_year() {
         assert_eq!(
             archive_relative_directory("电视剧", "动画", Some(2025)),
@@ -3114,13 +3123,8 @@ impl RelocationScheduler {
                     }
                 };
                 let relative_dir = download.as_ref().map(|download| {
-                    let primary_type = if download.target_key.starts_with("movie:") {
-                        "电影"
-                    } else if tmdb_is_animation {
-                        "动漫"
-                    } else {
-                        "电视剧"
-                    };
+                    let primary_type =
+                        media_download_category(&download.target_key, tmdb_is_animation);
                     let tmdb_year = subscription.as_ref().and_then(|item| item.year);
                     let primary_genre = subscription
                         .as_ref()

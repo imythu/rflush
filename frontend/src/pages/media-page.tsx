@@ -4171,7 +4171,8 @@ function tmdbCategoryLabel(media: TmdbMedia): string {
 }
 
 function subscriptionCategoryLabel(subscription: Subscription): string {
-  return subscription.media_type === "movie" ? "电影" : "电视剧";
+  if (subscription.media_type === "movie") return "电影";
+  return subscription.tmdb_is_animation ? "动漫" : "电视剧";
 }
 
 function GenrePills({ genres }: { genres: TmdbGenre[] }) {
