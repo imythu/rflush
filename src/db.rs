@@ -3096,7 +3096,8 @@ impl Database {
                     last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    completed_at TEXT
+                    completed_at TEXT,
+                    cleared_at TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_media_relocation_jobs_due
@@ -3185,6 +3186,12 @@ impl Database {
             )
             .map_err(sql_error)?;
             migrate_media_relocation_jobs_for_manual_transfers(&conn)?;
+            ensure_column(
+                &conn,
+                "media_relocation_jobs",
+                "cleared_at",
+                "ALTER TABLE media_relocation_jobs ADD COLUMN cleared_at TEXT",
+            )?;
             let legacy_auto_boundary_at = Utc::now().to_rfc3339();
             conn.execute(
                 "UPDATE media_relocation_jobs
@@ -3824,7 +3831,8 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             openlist_task_id TEXT, torrent_data BLOB, attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT, lease_owner TEXT, lease_until TEXT,
             version INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT,
+            cleared_at TEXT
          );
          INSERT INTO media_relocation_jobs
            (id, media_download_id, downloader_id, infohash, source_qb_path,
@@ -3834,7 +3842,8 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
             manual_requested_at, stage_started_at,
             torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
-            lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at)
+            lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at,
+            cleared_at)
          SELECT id, media_download_id, downloader_id, infohash, source_qb_path,
             source_openlist_path, source_content_openlist_path, target_openlist_path,
             target_qb_path, target_content_qb_path, target_downloader_id,
@@ -3842,7 +3851,8 @@ fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Resu
             copy_checkpoint_json, copy_lock_acquired, manifest_cursor, target_root_folder,
             manual_requested_at, updated_at,
             torrent_name, stage, openlist_task_id, torrent_data, attempts, next_attempt_at,
-            lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at
+            lease_owner, lease_until, version, last_error, created_at, updated_at, completed_at,
+            NULL
          FROM media_relocation_jobs_legacy;
          DROP TABLE media_relocation_jobs_legacy;
          CREATE INDEX idx_media_relocation_jobs_due

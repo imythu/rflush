@@ -460,7 +460,8 @@ impl Database {
             let total = tx
                 .query_row(
                     "SELECT COUNT(*) FROM media_relocation_jobs
-                     WHERE media_download_id IS NOT NULL",
+                     WHERE media_download_id IS NOT NULL
+                       AND cleared_at IS NULL",
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -480,6 +481,7 @@ impl Database {
                             stage_started_at
                      FROM media_relocation_jobs
                      WHERE media_download_id IS NOT NULL
+                       AND cleared_at IS NULL
                      ORDER BY CASE
                          WHEN stage IN ('planning_manual_review', 'copy_manual_review',
                                         'manifest_required')
@@ -497,6 +499,61 @@ impl Database {
             };
             tx.commit().map_err(sql_error)?;
             Ok((records, total))
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Stop every automatic copy job and remove it from the active queue.
+    ///
+    /// The rows remain as local tombstones so a later scheduler scan cannot
+    /// recreate the same job from its submitted media download.  Any worker
+    /// that still holds a lease is invalidated by the version bump; an already
+    /// submitted remote OpenList operation cannot be recalled by this local
+    /// state change.
+    pub async fn stop_and_clear_automatic_media_relocation_jobs(&self) -> Result<usize, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open_connection(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let now = Utc::now().to_rfc3339();
+            let changed = tx
+                .execute(
+                    "UPDATE media_relocation_jobs
+                     SET stage=CASE
+                           WHEN stage IN ('completed', 'cancelled') THEN stage
+                           ELSE 'cancelled'
+                         END,
+                         openlist_task_id=NULL,
+                         copy_checkpoint_json=NULL,
+                         copy_lock_acquired=0,
+                         manifest_cursor=0,
+                         attempts=0,
+                         next_attempt_at=NULL,
+                         lease_owner=NULL,
+                         lease_until=NULL,
+                         manual_requested_at=NULL,
+                         last_error=CASE
+                           WHEN stage IN ('completed', 'cancelled') THEN last_error
+                           ELSE 'OpenList 自动复制任务已由用户批量停止'
+                         END,
+                         completed_at=CASE
+                           WHEN stage IN ('completed', 'cancelled') THEN completed_at
+                           ELSE COALESCE(completed_at, ?)
+                         END,
+                         stage_started_at=?,
+                         updated_at=?,
+                         cleared_at=?,
+                         version=version+1
+                     WHERE media_download_id IS NOT NULL
+                       AND cleared_at IS NULL",
+                    params![now, now, now, now],
+                )
+                .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+            Ok(changed)
         })
         .await
         .map_err(join_error)?
@@ -1497,6 +1554,7 @@ mod tests {
         assert!(columns.iter().any(|name| name == "manifest_cursor"));
         assert!(columns.iter().any(|name| name == "target_root_folder"));
         assert!(columns.iter().any(|name| name == "stage_started_at"));
+        assert!(columns.iter().any(|name| name == "cleared_at"));
         let media_download_not_null: i64 = conn
             .query_row(
                 "SELECT \"notnull\" FROM pragma_table_info('media_relocation_jobs')
@@ -1509,6 +1567,17 @@ mod tests {
 
         conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
         let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO media_downloads
+             (id, target_key, dedupe_key, downloader_id, source_site, downloader_name,
+              torrent_id, title, release_json, decision_json, profile_snapshot_json,
+              infohash, status, created_at, updated_at, submitted_at)
+             VALUES (101, 'episode', 'clear-test', 1, 'site', 'qB', 'torrent',
+                     'automatic copy', '{}', '{}', '{}',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'submitted', ?, ?, ?)",
+            rusqlite::params![now, now, now],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO media_relocation_jobs
              (media_download_id, infohash, source_qb_path, source_openlist_path,
@@ -1571,6 +1640,79 @@ mod tests {
             db.next_media_relocation_attempt_at(true).await.unwrap(),
             Some(next_attempt_at)
         );
+    }
+
+    #[tokio::test]
+    async fn batch_clear_stops_automatic_jobs_without_touching_manual_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let conn = super::open_connection(&dir.path().join("rflush.db")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, infohash, source_qb_path, source_openlist_path,
+              target_openlist_path, target_qb_path, torrent_name, stage,
+              openlist_task_id, copy_lock_acquired, created_at, updated_at)
+             VALUES (101, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '/src', '/src',
+                     '/target', '/target', 'automatic copy', 'copying', 'remote-task', 1, ?, ?)",
+            rusqlite::params![now, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO media_relocation_jobs
+             (media_download_id, infohash, source_qb_path, source_openlist_path,
+              target_openlist_path, target_qb_path, torrent_name, stage,
+              created_at, updated_at)
+             VALUES (NULL, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', '/src', '/src',
+                     '/target', '/target', 'manual transfer', 'copying', ?, ?)",
+            rusqlite::params![now, now],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            db.stop_and_clear_automatic_media_relocation_jobs()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.stop_and_clear_automatic_media_relocation_jobs()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.enqueue_submitted_media_relocation_jobs(true)
+                .await
+                .unwrap(),
+            0
+        );
+        let automatic = db
+            .list_automatic_media_relocation_jobs(1, 20)
+            .await
+            .unwrap();
+        assert_eq!(automatic.1, 0);
+        assert!(automatic.0.is_empty());
+        let manual = db.list_manual_media_relocation_jobs(1, 20).await.unwrap();
+        assert_eq!(manual.1, 1);
+        assert_eq!(manual.0[0].torrent_name, "manual transfer");
+        let cleared = db.get_media_relocation_job(1).await.unwrap().unwrap();
+        assert_eq!(cleared.stage, "cancelled");
+        assert_eq!(cleared.openlist_task_id, None);
+        assert!(!cleared.copy_lock_acquired);
+        assert!(!db.has_in_flight_openlist_operations().await.unwrap());
+
+        let conn = super::open_connection(&dir.path().join("rflush.db")).unwrap();
+        let cleared_at: Option<String> = conn
+            .query_row(
+                "SELECT cleared_at FROM media_relocation_jobs WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cleared_at.is_some());
     }
 
     #[tokio::test]

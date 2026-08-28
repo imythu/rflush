@@ -87,6 +87,10 @@ type OpenListJobsResponse = {
   records: OpenListJob[];
 };
 
+type ClearOpenListJobsResponse = {
+  cleared: number;
+};
+
 const JOB_STAGE_LABELS: Record<string, string> = {
   waiting_download: "等待下载完成",
   planning_manual_review: "自动复制规划需要处理",
@@ -207,6 +211,7 @@ export function OpenListAutomationPanel({
   const [jobTotal, setJobTotal] = useState(0);
   const [jobPollNonce, setJobPollNonce] = useState(0);
   const [scanBusy, setScanBusy] = useState(false);
+  const [clearBusy, setClearBusy] = useState(false);
   const [jobsError, setJobsError] = useState("");
   const [jobsNotice, setJobsNotice] = useState("");
   const [resolvingJobId, setResolvingJobId] = useState<number | null>(null);
@@ -220,10 +225,14 @@ export function OpenListAutomationPanel({
     ? null
     : jobs.find((job) => job.id === pendingResolutionJobId) ?? null;
 
-  function refreshJobs(page = jobPage) {
+  function stopJobPolling() {
     jobPollController.current?.abort();
     jobPollController.current = null;
     jobPollGeneration.current += 1;
+  }
+
+  function refreshJobs(page = jobPage) {
+    stopJobPolling();
     if (page !== jobPage) {
       setJobs([]);
       setJobsLoading(true);
@@ -313,14 +322,38 @@ export function OpenListAutomationPanel({
     }
   }
 
+  async function clearJobs() {
+    stopJobPolling();
+    setClearBusy(true);
+    setJobsError("");
+    setJobsNotice("");
+    setPendingResolutionJobId(null);
+    setResolutionError("");
+    setRemoteTaskStoppedConfirmed(false);
+    try {
+      const result = await api<ClearOpenListJobsResponse>("/api/media/openlist/jobs/clear-all", {
+        method: "POST",
+      });
+      setJobs([]);
+      setJobTotal(0);
+      setJobPage(1);
+      setJobsNotice(result.cleared > 0
+        ? `已停止并清空 ${result.cleared} 个自动复制任务；已提交的 OpenList 远端操作无法撤回`
+        : "暂无可清空的自动复制任务");
+    } catch (error) {
+      setJobsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setClearBusy(false);
+      refreshJobs(1);
+    }
+  }
+
   async function resolveCopy(
     job: OpenListJob,
     resolution: CopyResolution,
     confirmTaskTerminated = false,
   ) {
-    jobPollController.current?.abort();
-    jobPollController.current = null;
-    jobPollGeneration.current += 1;
+    stopJobPolling();
     setResolvingJobId(job.id);
     setJobsError("");
     setJobsNotice("");
@@ -487,12 +520,23 @@ export function OpenListAutomationPanel({
               <h3 id="openlist-jobs-title" className="font-semibold">自动复制任务</h3>
               <p className="mt-1 text-xs text-muted">这里只显示追剧触发的复制；手动 qB 迁移在“种子转移”中单独管理</p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={jobsLoading || clearBusy || jobTotal === 0}
+                onClick={() => void clearJobs()}
+                title="停止并清空所有自动复制任务"
+                aria-label="停止并清空所有自动复制任务"
+              >
+                {clearBusy ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Trash2 data-icon="inline-start" />}
+                {clearBusy ? "清空中" : "停止并清空"}
+              </Button>
               <Button type="button" variant="outline" disabled={jobsLoading} onClick={() => refreshJobs()} title="刷新任务列表">
                 {jobsLoading ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}
                 刷新
               </Button>
-              <Button type="button" disabled={scanBusy} onClick={() => void scanNow()} title="立即扫描并记录已提交的种子">
+              <Button type="button" disabled={scanBusy || clearBusy} onClick={() => void scanNow()} title="立即扫描并记录已提交的种子">
                 {scanBusy ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <ScanLine data-icon="inline-start" />}
                 {scanBusy ? "扫描中" : "立即扫描"}
               </Button>

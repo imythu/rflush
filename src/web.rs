@@ -623,6 +623,7 @@ fn media_router(
             )
             .route("/openlist/jobs", get(list_openlist_jobs))
             .route("/openlist/manual-jobs", get(list_manual_openlist_jobs))
+            .route("/openlist/jobs/clear-all", post(clear_openlist_jobs))
             .route(
                 "/openlist/jobs/{id}/resolve-copy",
                 post(resolve_openlist_copy),
@@ -786,6 +787,11 @@ struct OpenListJobsResponse {
     records: Vec<OpenListJobResponse>,
 }
 
+#[derive(Debug, Serialize)]
+struct ClearOpenListJobsResponse {
+    cleared: usize,
+}
+
 async fn list_openlist_jobs(
     State(state): State<MediaApiState>,
     Query(query): Query<OpenListJobsQuery>,
@@ -804,6 +810,19 @@ async fn list_openlist_jobs(
         total,
         records: records.into_iter().map(Into::into).collect(),
     }))
+}
+
+async fn clear_openlist_jobs(
+    State(state): State<MediaApiState>,
+) -> Result<Json<ClearOpenListJobsResponse>, ApiError> {
+    let cleared = state
+        .service
+        .database()
+        .stop_and_clear_automatic_media_relocation_jobs()
+        .await
+        .map_err(media_app_error)?;
+    state.relocation_scheduler.request_scan();
+    Ok(Json(ClearOpenListJobsResponse { cleared }))
 }
 
 #[derive(Debug, Deserialize)]
