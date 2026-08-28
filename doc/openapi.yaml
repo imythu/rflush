@@ -185,6 +185,21 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/OkResponse'}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/sites/{id}/credentials:
+    get:
+      summary: Retrieve stored credentials for one site on demand
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200':
+          description: OK
+          headers:
+            Cache-Control:
+              schema: {type: string, example: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SiteCredentialsResponse'}
+        default: {$ref: '#/components/responses/Error'}
+
   /api/sites/{id}/test:
     post:
       parameters: [{$ref: '#/components/parameters/IdPath'}]
@@ -851,7 +866,7 @@ components:
 
     SiteResponse:
       type: object
-      description: Site credentials are write-only and are never returned by the API.
+      description: Site list responses omit credentials; use the dedicated credentials endpoint to retrieve one site on demand.
       required:
         - id
         - name
@@ -878,6 +893,16 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         stats: {allOf: [{$ref: '#/components/schemas/SiteStatsRecord'}], nullable: true}
+
+    SiteCredentialsResponse:
+      type: object
+      description: Sensitive stored credentials for a single site. Responses must not be cached.
+      required: [auth_type, cookie, passkey, api_key]
+      properties:
+        auth_type: {type: string, enum: [cookie, passkey, cookie_passkey, api_key], readOnly: true}
+        cookie: {type: string, nullable: true, readOnly: true}
+        passkey: {type: string, nullable: true, readOnly: true}
+        api_key: {type: string, nullable: true, readOnly: true}
 
     SiteStatsRecord:
       type: object

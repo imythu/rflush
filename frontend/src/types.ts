@@ -111,6 +111,13 @@ export type SiteRecord = {
   stats: SiteStatsRecord | null;
 };
 
+export type SiteCredentialsRecord = {
+  auth_type: "cookie" | "passkey" | "cookie_passkey" | "api_key";
+  cookie: string | null;
+  passkey: string | null;
+  api_key: string | null;
+};
+
 export type SiteStatsRecord = {
   site_id: number;
   uid: string | null;

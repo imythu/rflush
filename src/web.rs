@@ -416,6 +416,7 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         .route("/api/sites", get(list_sites).post(create_site))
         .route("/api/sites/stats-overview", get(get_sites_stats_overview))
         .route("/api/sites/{id}", put(update_site).delete(delete_site))
+        .route("/api/sites/{id}/credentials", get(get_site_credentials))
         .route("/api/sites/{id}/test", post(test_site))
         .route("/api/sites/{id}/stats", get(get_site_stats))
         .route("/api/proxy/test", post(test_proxy))
@@ -3010,6 +3011,14 @@ struct SiteResponse {
     stats: Option<SiteStatsRecord>,
 }
 
+#[derive(Debug, Serialize)]
+struct SiteCredentialsResponse {
+    auth_type: &'static str,
+    cookie: Option<String>,
+    passkey: Option<String>,
+    api_key: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -3028,6 +3037,38 @@ impl From<SiteWithStats> for SiteResponse {
             created_at: site.created_at,
             updated_at: site.updated_at,
             stats: site.stats,
+        }
+    }
+}
+
+impl From<SiteAuth> for SiteCredentialsResponse {
+    fn from(auth: SiteAuth) -> Self {
+        let auth_type = site_auth_type(&auth);
+        match auth {
+            SiteAuth::Cookie { cookie } => Self {
+                auth_type,
+                cookie: Some(cookie),
+                passkey: None,
+                api_key: None,
+            },
+            SiteAuth::Passkey { passkey } => Self {
+                auth_type,
+                cookie: None,
+                passkey: Some(passkey),
+                api_key: None,
+            },
+            SiteAuth::CookiePasskey { cookie, passkey } => Self {
+                auth_type,
+                cookie: Some(cookie),
+                passkey: Some(passkey),
+                api_key: None,
+            },
+            SiteAuth::ApiKey { api_key } => Self {
+                auth_type,
+                cookie: None,
+                passkey: None,
+                api_key: Some(api_key),
+            },
         }
     }
 }
@@ -3216,6 +3257,25 @@ async fn list_sites(State(state): State<AppState>) -> Result<Json<Vec<SiteRespon
             .map(SiteResponse::from)
             .collect(),
     ))
+}
+
+async fn get_site_credentials(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let site = state
+        .db
+        .get_site(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("站点不存在"))?;
+    let auth = serde_json::from_str::<SiteAuth>(&site.auth_config)
+        .map_err(|_| ApiError::internal("现有认证配置无效"))?;
+
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(SiteCredentialsResponse::from(auth)),
+    )
+        .into_response())
 }
 
 async fn create_site(
@@ -6133,6 +6193,20 @@ mod security_boundary_tests {
                 .to_string()
                 .contains("dummy-downloader-secret")
         );
+    }
+
+    #[test]
+    fn site_credentials_response_only_includes_matching_auth_fields() {
+        let credentials = SiteCredentialsResponse::from(SiteAuth::CookiePasskey {
+            cookie: "dummy-cookie".to_string(),
+            passkey: "dummy-passkey".to_string(),
+        });
+        let json = serde_json::to_value(credentials).unwrap();
+
+        assert_eq!(json["auth_type"], "cookie_passkey");
+        assert_eq!(json["cookie"], "dummy-cookie");
+        assert_eq!(json["passkey"], "dummy-passkey");
+        assert!(json["api_key"].is_null());
     }
 
     #[test]

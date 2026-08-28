@@ -13,6 +13,10 @@ import {
   Gauge,
   ShieldCheck,
   Copy,
+  Check,
+  Eye,
+  EyeOff,
+  ExternalLink,
   Download as DownloadIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -36,8 +40,12 @@ import {
   TableCell,
 } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import { formatDate } from "@/lib/format";
-import type { SiteRecord, SiteStatsRecord, SiteTestResult } from "@/types";
+import type {
+  SiteCredentialsRecord,
+  SiteRecord,
+  SiteStatsRecord,
+  SiteTestResult,
+} from "@/types";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -52,6 +60,64 @@ function formatBytes(bytes: number): string {
 }
 
 type AuthType = "cookie" | "passkey" | "cookie_passkey" | "api_key";
+type CredentialField = "cookie" | "passkey" | "api_key";
+
+const credentialFieldLabels: Record<CredentialField, string> = {
+  cookie: "Cookie",
+  passkey: "Passkey",
+  api_key: "API Key",
+};
+
+function credentialFieldsFor(authType: SiteRecord["auth_type"]): CredentialField[] {
+  switch (authType) {
+    case "cookie":
+      return ["cookie"];
+    case "passkey":
+      return ["passkey"];
+    case "cookie_passkey":
+      return ["cookie", "passkey"];
+    case "api_key":
+      return ["api_key"];
+    default:
+      return [];
+  }
+}
+
+function credentialStateKey(siteId: number, field: CredentialField): string {
+  return `${siteId}:${field}`;
+}
+
+function credentialActionStateKey(
+  siteId: number,
+  field: CredentialField,
+  action: "reveal" | "copy",
+): string {
+  return `${credentialStateKey(siteId, field)}:${action}`;
+}
+
+async function writeClipboardText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall through for browsers that expose Clipboard API but deny it on HTTP.
+    }
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.opacity = "0";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) {
+    throw new Error("当前浏览器不支持复制到剪切板");
+  }
+}
 
 interface SiteForm {
   name: string;
@@ -333,6 +399,93 @@ function buildAuthConfig(form: SiteForm): object {
   }
 }
 
+function SiteCredentialList({
+  site,
+  credentials,
+  revealedKeys,
+  loadingKeys,
+  copiedKey,
+  compact = false,
+  onToggle,
+  onCopy,
+}: {
+  site: SiteRecord;
+  credentials?: SiteCredentialsRecord;
+  revealedKeys: Set<string>;
+  loadingKeys: Set<string>;
+  copiedKey: string | null;
+  compact?: boolean;
+  onToggle: (site: SiteRecord, field: CredentialField) => void;
+  onCopy: (site: SiteRecord, field: CredentialField) => void;
+}) {
+  const fields = credentialFieldsFor(site.auth_type);
+  if (!site.auth_configured || fields.length === 0) {
+    return <span className="text-xs text-muted">未配置</span>;
+  }
+
+  return (
+    <div className={compact ? "space-y-1.5" : "min-w-[230px] space-y-1.5"}>
+      {fields.map((field) => {
+        const stateKey = credentialStateKey(site.id, field);
+        const revealed = revealedKeys.has(stateKey);
+        const revealLoading = loadingKeys.has(credentialActionStateKey(site.id, field, "reveal"));
+        const copyLoading = loadingKeys.has(credentialActionStateKey(site.id, field, "copy"));
+        const loading = revealLoading || copyLoading;
+        const copied = copiedKey === stateKey;
+        const value = credentials?.[field] ?? "";
+        const visibleValue = revealed ? value || "未配置" : "••••••••••••";
+
+        return (
+          <div key={field} className="flex h-8 min-w-0 items-center gap-1.5">
+            <span className="w-[4.25rem] shrink-0 text-[11px] font-semibold text-muted">
+              {credentialFieldLabels[field]}
+            </span>
+            <span
+              className={`min-w-0 flex-1 truncate font-mono text-xs ${revealed ? "text-foreground" : "select-none text-muted"}`}
+              title={revealed ? visibleValue : "凭据已隐藏"}
+            >
+              {visibleValue}
+            </span>
+            <button
+              type="button"
+              className="flex size-7 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-wait disabled:opacity-60"
+              onClick={() => onToggle(site, field)}
+              disabled={loading}
+              aria-label={`${revealed ? "隐藏" : "显示"}${site.name}的${credentialFieldLabels[field]}`}
+              aria-pressed={revealed}
+              title={revealed ? "隐藏明文" : "显示明文"}
+            >
+              {revealLoading ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : revealed ? (
+                <EyeOff className="size-4" />
+              ) : (
+                <Eye className="size-4" />
+              )}
+            </button>
+            <button
+              type="button"
+              className="flex size-7 shrink-0 items-center justify-center rounded-lg text-muted transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-wait disabled:opacity-60"
+              onClick={() => onCopy(site, field)}
+              disabled={loading}
+              aria-label={`${copied ? "已复制" : "复制"}${site.name}的${credentialFieldLabels[field]}`}
+              title={copied ? "已复制" : "复制"}
+            >
+              {copyLoading ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : copied ? (
+                <Check className="size-4 text-jade" />
+              ) : (
+                <Copy className="size-4" />
+              )}
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -341,6 +494,10 @@ export function SitesPage() {
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [siteCredentials, setSiteCredentials] = useState<Record<number, SiteCredentialsRecord>>({});
+  const [revealedCredentialKeys, setRevealedCredentialKeys] = useState<Set<string>>(() => new Set());
+  const [loadingCredentialKeys, setLoadingCredentialKeys] = useState<Set<string>>(() => new Set());
+  const [copiedCredentialKey, setCopiedCredentialKey] = useState<string | null>(null);
 
   // form dialog
   const [formOpen, setFormOpen] = useState(false);
@@ -384,6 +541,10 @@ export function SitesPage() {
 
   function loadSites() {
     setLoading(true);
+    setSiteCredentials({});
+    setRevealedCredentialKeys(new Set());
+    setLoadingCredentialKeys(new Set());
+    setCopiedCredentialKey(null);
     api<SiteRecord[]>("/api/sites")
       .then((data) => {
         setSites(data);
@@ -399,6 +560,88 @@ export function SitesPage() {
   useEffect(() => {
     loadSites();
   }, []);
+
+  async function loadSiteCredentials(site: SiteRecord): Promise<SiteCredentialsRecord> {
+    const cached = siteCredentials[site.id];
+    if (cached) return cached;
+
+    const credentials = await api<SiteCredentialsRecord>(`/api/sites/${site.id}/credentials`);
+    setSiteCredentials((current) => ({ ...current, [site.id]: credentials }));
+    return credentials;
+  }
+
+  function setCredentialLoading(stateKey: string, loadingState: boolean) {
+    setLoadingCredentialKeys((current) => {
+      const next = new Set(current);
+      if (loadingState) {
+        next.add(stateKey);
+      } else {
+        next.delete(stateKey);
+      }
+      return next;
+    });
+  }
+
+  async function handleToggleCredential(site: SiteRecord, field: CredentialField) {
+    const stateKey = credentialStateKey(site.id, field);
+    if (revealedCredentialKeys.has(stateKey)) {
+      setRevealedCredentialKeys((current) => {
+        const next = new Set(current);
+        next.delete(stateKey);
+        return next;
+      });
+      return;
+    }
+
+    const loadingKey = credentialActionStateKey(site.id, field, "reveal");
+    setCredentialLoading(loadingKey, true);
+    try {
+      const credentials = await loadSiteCredentials(site);
+      if (!credentials[field]) {
+        throw new Error(`${credentialFieldLabels[field]} 未配置`);
+      }
+      setRevealedCredentialKeys((current) => new Set(current).add(stateKey));
+    } catch (error) {
+      setMessage((error as Error).message || "读取站点凭据失败");
+    } finally {
+      setCredentialLoading(loadingKey, false);
+    }
+  }
+
+  async function handleCopyCredential(site: SiteRecord, field: CredentialField) {
+    const stateKey = credentialStateKey(site.id, field);
+    const loadingKey = credentialActionStateKey(site.id, field, "copy");
+    setCredentialLoading(loadingKey, true);
+    try {
+      const credentials = await loadSiteCredentials(site);
+      const value = credentials[field];
+      if (!value) {
+        throw new Error(`${credentialFieldLabels[field]} 未配置`);
+      }
+      await writeClipboardText(value);
+      setCopiedCredentialKey(stateKey);
+      setMessage(`${site.name} 的 ${credentialFieldLabels[field]} 已复制`);
+      window.setTimeout(() => {
+        setCopiedCredentialKey((current) => (current === stateKey ? null : current));
+      }, 2000);
+    } catch (error) {
+      setMessage((error as Error).message || "复制站点凭据失败");
+    } finally {
+      setCredentialLoading(loadingKey, false);
+    }
+  }
+
+  function handleOpenSite(site: SiteRecord) {
+    try {
+      const url = new URL(site.base_url.trim());
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        throw new Error("unsupported protocol");
+      }
+      window.open(url.href, "_blank", "noopener,noreferrer");
+    } catch {
+      setMessage(`${site.name} 的站点地址无效，仅支持 HTTP 或 HTTPS`);
+    }
+  }
 
   /* ---- form helpers ---- */
 
@@ -722,60 +965,94 @@ export function SitesPage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead>名称</TableHead>
-                      <TableHead>类型</TableHead>
-                      <TableHead>基础URL</TableHead>
-                      <TableHead>上传量</TableHead>
-                      <TableHead>下载量</TableHead>
-                      <TableHead>创建时间</TableHead>
+                      <TableHead>站点</TableHead>
+                      <TableHead>认证凭据</TableHead>
+                      <TableHead>传输统计</TableHead>
                       <TableHead className="text-right">操作</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {sites.map((site) => (
                       <TableRow key={site.id}>
-                        <TableCell className="font-medium">
-                          {site.name}
+                        <TableCell className="px-3 py-4">
+                          <div className="min-w-[190px] max-w-[240px]">
+                            <div className="flex min-w-0 items-center gap-2">
+                              <span className="min-w-0 truncate font-semibold">{site.name}</span>
+                              <span className="shrink-0 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">
+                                {site.site_type}
+                              </span>
+                            </div>
+                            <div className="mt-1 truncate text-xs text-muted" title={site.base_url}>
+                              {site.base_url}
+                            </div>
+                          </div>
                         </TableCell>
-                        <TableCell>
-                          <span className="rounded-full bg-violet-100 px-2 py-0.5 text-xs text-violet-700">
-                            {site.site_type}
-                          </span>
+                        <TableCell className="px-3 py-4">
+                          <SiteCredentialList
+                            site={site}
+                            credentials={siteCredentials[site.id]}
+                            revealedKeys={revealedCredentialKeys}
+                            loadingKeys={loadingCredentialKeys}
+                            copiedKey={copiedCredentialKey}
+                            onToggle={handleToggleCredential}
+                            onCopy={handleCopyCredential}
+                          />
                         </TableCell>
-                        <TableCell className="max-w-[260px] truncate text-muted">
-                          {site.base_url}
+                        <TableCell className="px-3 py-4">
+                          <div className="min-w-[150px] space-y-2 text-xs">
+                            <div className="flex items-center gap-2">
+                              <UploadCloud className="size-4 shrink-0 text-primary" />
+                              <span className="w-7 shrink-0 text-muted">上传</span>
+                              <span className="font-semibold">
+                                {site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "待刷新"}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <DownloadCloud className="size-4 shrink-0 text-jade" />
+                              <span className="w-7 shrink-0 text-muted">下载</span>
+                              <span className="font-semibold text-muted">
+                                {site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "待刷新"}
+                              </span>
+                            </div>
+                          </div>
                         </TableCell>
-                        <TableCell className="font-semibold">
-                          {site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "待刷新"}
-                        </TableCell>
-                        <TableCell className="text-muted">
-                          {site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "待刷新"}
-                        </TableCell>
-                        <TableCell className="text-muted">
-                          {formatDate(site.created_at)}
-                        </TableCell>
-                        <TableCell>
+                        <TableCell className="px-3 py-4">
                           <div className="flex justify-end gap-2">
                             <Button
                               variant="outline"
-                              onClick={() => handleTest(site)}
+                              className="size-9 p-0"
+                              onClick={() => handleOpenSite(site)}
+                              aria-label={`打开${site.name}主页`}
+                              title="在新标签页打开站点主页"
                             >
-                              <Activity className="mr-2 h-4 w-4" />
-                              测试连接
+                              <ExternalLink className="size-4" />
+                            </Button>
+                            <Button
+                              variant="outline"
+                              className="size-9 p-0"
+                              onClick={() => handleTest(site)}
+                              aria-label={`测试${site.name}连接`}
+                              title="测试连接"
+                            >
+                              <Activity className="size-4" />
                             </Button>
                             <Button
                               variant="secondary"
+                              className="size-9 p-0"
                               onClick={() => openEdit(site)}
+                              aria-label={`编辑${site.name}`}
+                              title="编辑站点"
                             >
-                              <Pencil className="mr-2 h-4 w-4" />
-                              编辑
+                              <Pencil className="size-4" />
                             </Button>
                             <Button
                               variant="destructive"
+                              className="size-9 p-0"
                               onClick={() => setDeleteTarget(site)}
+                              aria-label={`删除${site.name}`}
+                              title="删除站点"
                             >
-                              <Trash2 className="mr-2 h-4 w-4" />
-                              删除
+                              <Trash2 className="size-4" />
                             </Button>
                           </div>
                         </TableCell>
@@ -801,6 +1078,18 @@ export function SitesPage() {
                     <p className="mt-1 truncate text-[11px] text-muted">
                       {site.base_url}
                     </p>
+                    <div className="mt-3 border-t border-border/70 pt-2.5">
+                      <SiteCredentialList
+                        site={site}
+                        credentials={siteCredentials[site.id]}
+                        revealedKeys={revealedCredentialKeys}
+                        loadingKeys={loadingCredentialKeys}
+                        copiedKey={copiedCredentialKey}
+                        compact
+                        onToggle={handleToggleCredential}
+                        onCopy={handleCopyCredential}
+                      />
+                    </div>
                     <div className="mt-2.5 grid grid-cols-2 gap-2 text-sm">
                       <div className="rounded-xl bg-card/70 p-2">
                         <div className="text-[10px] font-bold text-muted">上: <span className="font-black text-foreground">{site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "-"}</span></div>
@@ -809,7 +1098,15 @@ export function SitesPage() {
                         <div className="text-[10px] font-bold text-muted">下: <span className="font-black text-foreground">{site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "-"}</span></div>
                       </div>
                     </div>
-                    <div className="mt-2.5 grid grid-cols-3 gap-2">
+                    <div className="mt-2.5 grid grid-cols-4 gap-2">
+                      <Button
+                        variant="outline"
+                        className="h-7 px-0 text-[11px]"
+                        onClick={() => handleOpenSite(site)}
+                      >
+                        <ExternalLink className="mr-1 h-3 w-3" />
+                        打开
+                      </Button>
                       <Button
                         variant="outline"
                         className="h-7 px-0 text-[11px]"
