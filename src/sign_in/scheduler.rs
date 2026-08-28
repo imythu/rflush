@@ -11,6 +11,14 @@ use tracing::{debug, error, info, warn};
 use crate::db::Database;
 use crate::sign_in::{SignInTaskRecord, execute_task};
 
+const AUTOMATIC_DELAY_MAX_SECS: u64 = 360;
+
+#[derive(Clone, Copy)]
+enum TriggerSource {
+    Automatic,
+    Manual,
+}
+
 pub struct SignInScheduler {
     db: Database,
     base_dir: PathBuf,
@@ -48,14 +56,8 @@ impl SignInScheduler {
                 continue;
             }
 
-            let running = self.running_tasks.read().await;
-            if running.contains_key(&task.id) {
-                continue;
-            }
-            drop(running);
-
             if should_trigger(&task) {
-                self.spawn_task(task).await;
+                self.spawn_task(task, TriggerSource::Automatic).await;
             }
         }
         Ok(())
@@ -68,12 +70,9 @@ impl SignInScheduler {
             .await
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "签到任务不存在".to_string())?;
-        let running = self.running_tasks.read().await;
-        if running.contains_key(&task_id) {
+        if !self.spawn_task(task, TriggerSource::Manual).await {
             return Err("签到任务正在运行中".to_string());
         }
-        drop(running);
-        self.spawn_task(task).await;
         Ok(())
     }
 
@@ -84,15 +83,33 @@ impl SignInScheduler {
         }
     }
 
-    async fn spawn_task(&self, task: SignInTaskRecord) {
+    async fn spawn_task(&self, task: SignInTaskRecord, trigger: TriggerSource) -> bool {
+        let mut running = self.running_tasks.write().await;
+        if running.contains_key(&task.id) {
+            return false;
+        }
+
         let db = self.db.clone();
         let base_dir = self.base_dir.clone();
         let running_tasks = self.running_tasks.clone();
         let task_id = task.id;
         let task_name = task.name.clone();
+        let delay_secs = trigger_delay_secs(trigger, task_id);
 
-        info!("[签到][{}] 开始执行 (id={})", task_name, task_id);
+        match trigger {
+            TriggerSource::Automatic => info!(
+                "[签到][{}] cron 触发，随机延迟 {} 秒后执行 (id={})",
+                task_name, delay_secs, task_id
+            ),
+            TriggerSource::Manual => {
+                info!("[签到][{}] 手动触发 (id={})", task_name, task_id)
+            }
+        }
         let handle = tokio::spawn(async move {
+            if delay_secs > 0 {
+                sleep(Duration::from_secs(delay_secs)).await;
+            }
+            info!("[签到][{}] 开始执行 (id={})", task_name, task_id);
             if let Err(error) = run_and_record(&db, base_dir, task).await {
                 error!("[签到][{}] 执行失败: {}", task_name, error);
             }
@@ -100,9 +117,33 @@ impl SignInScheduler {
             running.remove(&task_id);
         });
 
-        let mut running = self.running_tasks.write().await;
         running.insert(task_id, handle);
+        true
     }
+}
+
+fn trigger_delay_secs(trigger: TriggerSource, task_id: i64) -> u64 {
+    match trigger {
+        TriggerSource::Automatic => random_automatic_delay_secs(task_id),
+        TriggerSource::Manual => 0,
+    }
+}
+
+fn random_automatic_delay_secs(task_id: i64) -> u64 {
+    let mut random = [0_u8; 8];
+    if let Err(error) = getrandom::fill(&mut random) {
+        let fallback = task_id.unsigned_abs() % (AUTOMATIC_DELAY_MAX_SECS + 1);
+        warn!(
+            "[签到][{}] 生成随机延迟失败，使用 {} 秒确定性延迟: {}",
+            task_id, fallback, error
+        );
+        return fallback;
+    }
+    automatic_delay_secs_from_random(u64::from_le_bytes(random))
+}
+
+fn automatic_delay_secs_from_random(random: u64) -> u64 {
+    random % (AUTOMATIC_DELAY_MAX_SECS + 1)
 }
 
 async fn run_and_record(
@@ -287,5 +328,24 @@ mod tests {
             &task,
             now + chrono::Duration::seconds(25)
         ));
+    }
+
+    #[test]
+    fn automatic_delay_includes_zero_and_maximum() {
+        assert_eq!(automatic_delay_secs_from_random(0), 0);
+        assert_eq!(
+            automatic_delay_secs_from_random(AUTOMATIC_DELAY_MAX_SECS),
+            AUTOMATIC_DELAY_MAX_SECS
+        );
+        assert_eq!(
+            automatic_delay_secs_from_random(AUTOMATIC_DELAY_MAX_SECS + 1),
+            0
+        );
+        assert!(automatic_delay_secs_from_random(u64::MAX) <= AUTOMATIC_DELAY_MAX_SECS);
+    }
+
+    #[test]
+    fn manual_trigger_has_no_random_delay() {
+        assert_eq!(trigger_delay_secs(TriggerSource::Manual, 1), 0);
     }
 }
