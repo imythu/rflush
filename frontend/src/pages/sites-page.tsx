@@ -637,6 +637,12 @@ export function SitesPage() {
       if (url.protocol !== "http:" && url.protocol !== "https:") {
         throw new Error("unsupported protocol");
       }
+      if (
+        (site.site_type === "nexusphp" || site.site_type === "nexus_php") &&
+        !url.pathname.endsWith("/index.php")
+      ) {
+        url.pathname = `${url.pathname.replace(/\/+$/, "")}/index.php`;
+      }
       window.open(url.href, "_blank", "noopener,noreferrer");
     } catch {
       setMessage(`${site.name} 的站点地址无效，仅支持 HTTP 或 HTTPS`);
