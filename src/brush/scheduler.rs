@@ -4,6 +4,7 @@ use std::sync::Arc;
 use cached::{Cached, TimedCache};
 use chrono::Utc;
 use cron::Schedule;
+use reqwest::header::HeaderMap;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, trace, warn};
@@ -20,8 +21,8 @@ use crate::downloader::{DownloaderClient, DownloaderClientPool, DownloaderRecord
 use crate::net::client_factory;
 use crate::net::http::AppHttpClient;
 use crate::rss;
-use crate::site::SiteAdapter;
 use crate::site::factory as site_factory;
+use crate::site::{SiteAdapter, parse_site_request_headers, site_request_header_map};
 
 use super::cleaner;
 use super::u2;
@@ -508,6 +509,23 @@ fn snapshot_task(
     async move { task.read().await.clone() }
 }
 
+async fn load_brush_site_request_headers(
+    db: &Database,
+    task: &BrushTaskRecord,
+) -> Result<HeaderMap, String> {
+    let Some(site_id) = task.site_id else {
+        return Ok(HeaderMap::new());
+    };
+    let site = db
+        .get_site(site_id)
+        .await
+        .map_err(|error| format!("加载站点失败 (site_id={site_id}): {error}"))?
+        .ok_or_else(|| format!("站点不存在: site_id={site_id}"))?;
+    parse_site_request_headers(&site.request_headers)
+        .and_then(|headers| site_request_header_map(&headers))
+        .map_err(|error| format!("解析站点请求头配置失败 (site_id={site_id}): {error}"))
+}
+
 async fn execute_brush_task(
     db: &Database,
     pool: &Arc<DownloaderClientPool>,
@@ -549,6 +567,12 @@ async fn execute_brush_task_inner(
     let inner_start = std::time::Instant::now();
     let task = snapshot_task(&shared_task).await;
     info!("[刷流][{}] 开始执行任务 (id={})", task.name, task.id);
+    let is_u2_source = u2::is_u2_shoutbox_url(&task.rss_url);
+    let site_request_headers = if is_u2_source {
+        HeaderMap::new()
+    } else {
+        load_brush_site_request_headers(db, &task).await?
+    };
 
     // 1. 加载所有绑定下载器，并执行 per-qb 空间门禁
     let mut qb_clients: HashMap<i64, (DownloaderRecord, Arc<dyn DownloaderClient>)> =
@@ -799,7 +823,7 @@ async fn execute_brush_task_inner(
     // 空间门禁已在步骤 1 完成，qb_free_space 缓存了各 qb 的剩余空间，供选 qb 时使用
 
     // 6. 获取种子列表（RSS 或 U2 shoutbox）
-    let snapshot = if u2::is_u2_shoutbox_url(&task.rss_url) {
+    let snapshot = if is_u2_source {
         last_run_info.source.source_type = "u2_shoutbox".to_string();
         info!(
             "[刷流][{}] 检测到 U2 shoutbox URL，使用 shoutbox 解析器",
@@ -811,7 +835,7 @@ async fn execute_brush_task_inner(
         last_run_info.source.source_type = "rss".to_string();
         info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
         let rss_resp = http
-            .get("brush-rss", &task.rss_url)
+            .get_with_header_map("brush-rss", &task.rss_url, &site_request_headers)
             .await
             .map_err(|e| format!("RSS 请求失败: {}", e))?;
         if !rss_resp.status.is_success() {
@@ -1127,7 +1151,11 @@ async fn execute_brush_task_inner(
             }
         } else {
             match http
-                .get("brush-torrent", &effective_item.download_url)
+                .get_with_header_map(
+                    "brush-torrent",
+                    &effective_item.download_url,
+                    &site_request_headers,
+                )
                 .await
             {
                 Ok(resp) => {
@@ -1478,12 +1506,14 @@ fn check_filter_reason(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use tempfile::tempdir;
 
     use crate::brush::BrushTaskRecord;
+    use crate::db::Database;
     use crate::downloader::{TorrentInfo, calculate_pending_download_bytes};
     use crate::rss::TorrentItem;
 
-    use super::{FilterStage, check_filter_reason};
+    use super::{FilterStage, check_filter_reason, load_brush_site_request_headers};
 
     fn task() -> BrushTaskRecord {
         BrushTaskRecord {
@@ -1543,6 +1573,31 @@ mod tests {
             minimum_ratio: None,
             minimum_seed_time: None,
         }
+    }
+
+    #[tokio::test]
+    async fn direct_brush_requests_load_headers_from_the_associated_site() {
+        let directory = tempdir().unwrap();
+        let db = Database::open(directory.path()).await.unwrap();
+        let request_headers = r#"[{"name":"User-Agent","value":"Configured Browser"},{"name":"X-Site-Header","value":"configured"}]"#;
+        let site_id = db
+            .create_site(
+                "test",
+                "nexusphp",
+                "https://tracker.example",
+                r#"{"auth_type":"cookie","cookie":"uid=1"}"#,
+                request_headers,
+                false,
+            )
+            .await
+            .unwrap();
+        let mut task = task();
+        task.site_id = Some(site_id);
+
+        let headers = load_brush_site_request_headers(&db, &task).await.unwrap();
+
+        assert_eq!(headers["user-agent"], "Configured Browser");
+        assert_eq!(headers["x-site-header"], "configured");
     }
 
     #[test]

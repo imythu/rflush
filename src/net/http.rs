@@ -80,10 +80,28 @@ impl AppHttpClient {
     }
 
     pub async fn get(&self, purpose: &str, url: &str) -> Result<AppResponse, HttpError> {
+        let headers = HeaderMap::new();
+        self.get_with_header_map(purpose, url, &headers).await
+    }
+
+    /// 与 `get` 相同，但允许附加已校验的请求头。
+    /// 额外 header 会覆盖客户端的同名默认 header。
+    pub async fn get_with_header_map(
+        &self,
+        purpose: &str,
+        url: &str,
+        extra_headers: &HeaderMap,
+    ) -> Result<AppResponse, HttpError> {
         let key = extract_rate_limit_key(url).map_err(HttpError::InvalidUrl)?;
         self.rate_limiter.acquire(&key, self.policy).await;
 
-        let response = match self.inner.get(url).send().await {
+        let response = match self
+            .inner
+            .get(url)
+            .headers(extra_headers.clone())
+            .send()
+            .await
+        {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -159,71 +177,16 @@ impl AppHttpClient {
         url: &str,
         extra_headers: &[(&str, &str)],
     ) -> Result<AppResponse, HttpError> {
-        let key = extract_rate_limit_key(url).map_err(HttpError::InvalidUrl)?;
-        self.rate_limiter.acquire(&key, self.policy).await;
-
-        let mut req = self.inner.get(url);
+        let mut headers = HeaderMap::with_capacity(extra_headers.len());
         for (name, value) in extra_headers {
-            req = req.header(
+            headers.insert(
                 HeaderName::from_bytes(name.as_bytes())
                     .unwrap_or_else(|_| HeaderName::from_static("x-unknown")),
                 HeaderValue::from_bytes(value.as_bytes())
                     .unwrap_or_else(|_| HeaderValue::from_static("")),
             );
         }
-
-        let response = match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    debug!(
-                        task = %current_task_context(),
-                        "HTTP {} ok: purpose=\"{}\" url={}",
-                        status.as_u16(),
-                        purpose,
-                        url
-                    );
-                } else {
-                    warn!(
-                        task = %current_task_context(),
-                        "HTTP {} error: purpose=\"{}\" url={}",
-                        status.as_u16(),
-                        purpose,
-                        url
-                    );
-                }
-                resp
-            }
-            Err(error) => {
-                warn!(
-                    task = %current_task_context(),
-                    "HTTP transport error: purpose=\"{}\" url={} detail={}",
-                    purpose,
-                    url,
-                    error
-                );
-                return Err(HttpError::Transport { source: error });
-            }
-        };
-
-        let status = response.status();
-        let body = response.bytes().await.map_err(|error| {
-            warn!(
-                task = %current_task_context(),
-                "HTTP body read failed: purpose=\"{}\" url={} status={} detail={}",
-                purpose,
-                url,
-                status,
-                error
-            );
-            HttpError::Transport { source: error }
-        })?;
-
-        Ok(AppResponse {
-            status,
-            headers: HeaderMap::new(),
-            body,
-        })
+        self.get_with_header_map(purpose, url, &headers).await
     }
 }
 
@@ -280,4 +243,59 @@ fn is_rate_limited_json(body: &[u8]) -> bool {
         .and_then(|m| m.as_str())
         .unwrap_or_default();
     code == 1 && message.contains(RATE_LIMIT_MESSAGE)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::AppHttpClient;
+    use crate::net::rate_limiter::{RateLimitPolicy, SharedRateLimiter};
+
+    #[tokio::test]
+    async fn header_map_is_sent_on_direct_get_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let policy = RateLimitPolicy::new(10, Duration::from_secs(1), Duration::from_secs(1));
+        let client = AppHttpClient::new(Arc::new(SharedRateLimiter::new()), policy, None).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static("Configured Browser"));
+        headers.insert("x-site-header", HeaderValue::from_static("configured"));
+
+        let response = client
+            .get_with_header_map("test", &format!("http://{address}/rss"), &headers)
+            .await
+            .unwrap();
+        assert_eq!(response.body.as_ref(), b"ok");
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("user-agent: configured browser\r\n"));
+        assert!(request.contains("x-site-header: configured\r\n"));
+    }
 }
