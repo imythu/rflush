@@ -2636,12 +2636,14 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<GlobalConfig
 
 async fn update_settings(
     State(state): State<AppState>,
-    Json(settings): Json<GlobalConfig>,
+    Json(mut settings): Json<GlobalConfig>,
 ) -> Result<Json<GlobalConfig>, ApiError> {
+    normalize_sign_in_settings(&mut settings);
     validate_settings(&settings)?;
     state.db.update_settings(&settings).await?;
-    crate::logging::update_log_filter(settings.log_level.as_deref())?;
-    Ok(Json(settings))
+    let saved = state.db.get_settings().await?;
+    crate::logging::update_log_filter(saved.log_level.as_deref())?;
+    Ok(Json(saved))
 }
 
 async fn list_rss(State(state): State<AppState>) -> Result<Json<Vec<RssSubscription>>, ApiError> {
@@ -3449,6 +3451,11 @@ struct SignInRecordsQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SignInBrowserProbeRequest {
+    browser: String,
+}
+
 async fn list_sign_in_tasks(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::sign_in::SignInTaskRecord>>, ApiError> {
@@ -3515,14 +3522,15 @@ async fn run_sign_in_task_once(
 async fn probe_sign_in_task_1_1_1_1(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> Result<Json<crate::sign_in::LightpandaProbeResult>, ApiError> {
+) -> Result<Json<crate::sign_in::BrowserProbeResult>, ApiError> {
     let task = state
         .db
         .get_sign_in_task(id)
         .await?
         .ok_or_else(|| ApiError::not_found("签到任务不存在"))?;
     let settings = state.db.get_settings().await?;
-    let result = crate::sign_in::probe_lightpanda_1_1_1_1(task, settings.use_proxy_for_lightpanda)
+    validate_sign_in_browser_config(&task.browser, &settings)?;
+    let result = crate::sign_in::probe_browser_1_1_1_1(task.browser, settings)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(result))
@@ -3530,23 +3538,16 @@ async fn probe_sign_in_task_1_1_1_1(
 
 async fn probe_sign_in_form_1_1_1_1(
     State(state): State<AppState>,
-    Json(mut body): Json<crate::sign_in::SignInTaskRequest>,
-) -> Result<Json<crate::sign_in::LightpandaProbeResult>, ApiError> {
-    body.lightpanda_endpoint = body
-        .lightpanda_endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    body.lightpanda_token = body.lightpanda_token.trim().to_string();
-    if body.lightpanda_endpoint.is_none() && body.lightpanda_token.is_empty() {
-        return Err(ApiError::bad_request("Lightpanda endpoint 不能为空"));
-    }
+    Json(body): Json<SignInBrowserProbeRequest>,
+) -> Result<Json<crate::sign_in::BrowserProbeResult>, ApiError> {
+    let browser = crate::sign_in::normalize_sign_in_browser(&body.browser)
+        .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda 或 cloakbrowser"))?
+        .to_string();
     let settings = state.db.get_settings().await?;
-    let result =
-        crate::sign_in::probe_lightpanda_request_1_1_1_1(body, settings.use_proxy_for_lightpanda)
-            .await
-            .map_err(ApiError::internal)?;
+    validate_sign_in_browser_config(&browser, &settings)?;
+    let result = crate::sign_in::probe_browser_1_1_1_1(browser, settings)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(result))
 }
 
@@ -3568,43 +3569,13 @@ async fn validate_sign_in_task(
 ) -> Result<(), ApiError> {
     body.name = body.name.trim().to_string();
     body.cron_expression = normalize_cron(&body.cron_expression);
-    body.lightpanda_token = body.lightpanda_token.trim().to_string();
-    body.lightpanda_endpoint = body
-        .lightpanda_endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    body.lightpanda_region = Some(
-        body.lightpanda_region
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("euwest")
-            .to_string(),
-    );
-    body.browser = Some(
+    let browser = crate::sign_in::normalize_sign_in_browser(
         body.browser
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("lightpanda")
-            .to_string(),
-    );
-    body.proxy = Some(
-        body.proxy
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("fast_dc")
-            .to_string(),
-    );
-    body.country = body
-        .country
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+            .unwrap_or(crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA),
+    )
+    .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda 或 cloakbrowser"))?;
+    body.browser = Some(browser.to_string());
     body.sign_in_method = Some(crate::sign_in::normalize_sign_in_method(
         body.sign_in_method
             .as_deref()
@@ -3613,9 +3584,6 @@ async fn validate_sign_in_task(
 
     if body.name.is_empty() {
         return Err(ApiError::bad_request("名称不能为空"));
-    }
-    if body.lightpanda_endpoint.is_none() && body.lightpanda_token.is_empty() {
-        return Err(ApiError::bad_request("Lightpanda Token 不能为空"));
     }
     body.cron_expression
         .parse::<cron::Schedule>()
@@ -3627,6 +3595,44 @@ async fn validate_sign_in_task(
         .ok_or_else(|| ApiError::bad_request("所选站点不存在"))?;
     if site.site_type != "nexusphp" && site.site_type != "nexus_php" {
         return Err(ApiError::bad_request("自动签到目前仅支持 NexusPHP 站点"));
+    }
+    let settings = state.db.get_settings().await?;
+    validate_sign_in_browser_config(browser, &settings)?;
+    Ok(())
+}
+
+fn validate_sign_in_browser_config(browser: &str, settings: &GlobalConfig) -> Result<(), ApiError> {
+    match browser {
+        crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA => {
+            let endpoint_configured = settings
+                .lightpanda
+                .endpoint
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let token_configured = settings
+                .lightpanda
+                .token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            if !endpoint_configured && !token_configured {
+                return Err(ApiError::bad_request(
+                    "请先配置公共 Lightpanda endpoint 或 token",
+                ));
+            }
+        }
+        crate::sign_in::SIGN_IN_BROWSER_CLOAKBROWSER => {
+            if !settings
+                .cloakbrowser
+                .license_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(ApiError::bad_request(
+                    "请先配置公共 CloakBrowser license key",
+                ));
+            }
+        }
+        _ => return Err(ApiError::bad_request("未知签到浏览器")),
     }
     Ok(())
 }
@@ -5103,6 +5109,33 @@ async fn get_system_stats_history(
     Ok(Json(data))
 }
 
+fn normalize_sign_in_settings(settings: &mut GlobalConfig) {
+    for value in [
+        &mut settings.lightpanda.endpoint,
+        &mut settings.lightpanda.token,
+        &mut settings.lightpanda.proxy,
+        &mut settings.lightpanda.country,
+        &mut settings.cloakbrowser.license_key,
+        &mut settings.cloakbrowser.proxy,
+    ] {
+        *value = value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+    }
+    settings.lightpanda.region = settings.lightpanda.region.trim().to_ascii_lowercase();
+    settings.lightpanda.browser = settings.lightpanda.browser.trim().to_string();
+    if settings.lightpanda.browser.is_empty() {
+        settings.lightpanda.browser = "lightpanda".to_string();
+    }
+    settings.cloakbrowser.human_preset = settings
+        .cloakbrowser
+        .human_preset
+        .trim()
+        .to_ascii_lowercase();
+}
+
 fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
     const ALLOWED_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
@@ -5127,19 +5160,48 @@ fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
         }
     }
     if let Some(proxy) = settings.proxy.as_deref() {
-        let proxy = proxy.trim();
-        if !proxy.is_empty()
-            && !proxy.starts_with("http://")
-            && !proxy.starts_with("https://")
-            && !proxy.starts_with("socks5://")
-            && !proxy.starts_with("socks5h://")
-        {
+        validate_proxy_scheme(proxy, "proxy")?;
+    }
+    if !matches!(settings.lightpanda.region.as_str(), "euwest" | "uswest") {
+        return Err(ApiError::bad_request(
+            "lightpanda.region 必须是 euwest 或 uswest",
+        ));
+    }
+    if let Some(endpoint) = settings.lightpanda.endpoint.as_deref() {
+        if !endpoint.starts_with("ws://") && !endpoint.starts_with("wss://") {
             return Err(ApiError::bad_request(
-                "proxy must start with http://, https://, socks5://, or socks5h://",
+                "lightpanda.endpoint 必须以 ws:// 或 wss:// 开头",
             ));
         }
     }
+    if !matches!(
+        settings.cloakbrowser.human_preset.as_str(),
+        "default" | "careful"
+    ) {
+        return Err(ApiError::bad_request(
+            "cloakbrowser.human_preset 必须是 default 或 careful",
+        ));
+    }
+    if let Some(proxy) = settings.cloakbrowser.proxy.as_deref() {
+        validate_proxy_scheme(proxy, "cloakbrowser.proxy")?;
+    }
     Ok(())
+}
+
+fn validate_proxy_scheme(proxy: &str, field: &str) -> Result<(), ApiError> {
+    let proxy = proxy.trim();
+    if proxy.is_empty()
+        || proxy.starts_with("http://")
+        || proxy.starts_with("https://")
+        || proxy.starts_with("socks5://")
+        || proxy.starts_with("socks5h://")
+    {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "{} must start with http://, https://, socks5://, or socks5h://",
+        field
+    )))
 }
 
 fn find_live_brush_torrent<'a>(

@@ -117,7 +117,14 @@ impl Database {
             let conn = open_connection(&path)?;
             let settings = conn
                 .query_row(
-                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins, ocr_api_key FROM global_settings WHERE id = 1",
+                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit,
+                            retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches,
+                            throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins,
+                            ocr_api_key, lightpanda_endpoint, lightpanda_token, lightpanda_region,
+                            lightpanda_browser, lightpanda_proxy, lightpanda_country,
+                            cloakbrowser_license_key, cloakbrowser_headless, cloakbrowser_humanize,
+                            cloakbrowser_human_preset, cloakbrowser_proxy, cloakbrowser_geoip
+                     FROM global_settings WHERE id = 1",
                     [],
                     |row| {
                         Ok(GlobalConfig {
@@ -133,6 +140,22 @@ impl Database {
                             throttle_interval_secs: row.get(7)?,
                             proxy: row.get(8)?,
                             use_proxy_for_lightpanda: row.get::<_, i32>(9).unwrap_or(1) != 0,
+                            lightpanda: crate::config::LightpandaConfig {
+                                endpoint: row.get(12)?,
+                                token: row.get(13)?,
+                                region: row.get(14)?,
+                                browser: row.get(15)?,
+                                proxy: row.get(16)?,
+                                country: row.get(17)?,
+                            },
+                            cloakbrowser: crate::config::CloakBrowserConfig {
+                                license_key: row.get(18)?,
+                                headless: row.get::<_, i32>(19)? != 0,
+                                humanize: row.get::<_, i32>(20)? != 0,
+                                human_preset: row.get(21)?,
+                                proxy: row.get(22)?,
+                                geoip: row.get::<_, i32>(23)? != 0,
+                            },
                             tag_rule_scan_interval_mins: row.get::<_, i64>(10).unwrap_or(7) as u64,
                             ocr_api_key: row.get(11)?,
                         })
@@ -151,7 +174,16 @@ impl Database {
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE global_settings SET download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?, retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?, max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?, use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ?, ocr_api_key = ? WHERE id = 1",
+                "UPDATE global_settings SET
+                    download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?,
+                    retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?,
+                    max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?,
+                    use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ?, ocr_api_key = ?,
+                    lightpanda_endpoint = ?, lightpanda_token = ?, lightpanda_region = ?,
+                    lightpanda_browser = ?, lightpanda_proxy = ?, lightpanda_country = ?,
+                    cloakbrowser_license_key = ?, cloakbrowser_headless = ?, cloakbrowser_humanize = ?,
+                    cloakbrowser_human_preset = ?, cloakbrowser_proxy = ?, cloakbrowser_geoip = ?
+                 WHERE id = 1",
                 params![
                     settings.download_rate_limit.requests,
                     settings.download_rate_limit.interval,
@@ -170,7 +202,19 @@ impl Database {
                     settings.ocr_api_key.as_deref().and_then(|value| {
                         let value = value.trim();
                         (!value.is_empty()).then_some(value)
-                    })
+                    }),
+                    settings.lightpanda.endpoint.as_deref().and_then(non_empty_trimmed),
+                    settings.lightpanda.token.as_deref().and_then(non_empty_trimmed),
+                    normalize_lightpanda_region(&settings.lightpanda.region),
+                    non_empty_trimmed(&settings.lightpanda.browser).unwrap_or("lightpanda"),
+                    settings.lightpanda.proxy.as_deref().and_then(non_empty_trimmed),
+                    settings.lightpanda.country.as_deref().and_then(non_empty_trimmed),
+                    settings.cloakbrowser.license_key.as_deref().and_then(non_empty_trimmed),
+                    settings.cloakbrowser.headless as i32,
+                    settings.cloakbrowser.humanize as i32,
+                    normalize_human_preset(&settings.cloakbrowser.human_preset),
+                    settings.cloakbrowser.proxy.as_deref().and_then(non_empty_trimmed),
+                    settings.cloakbrowser.geoip as i32,
                 ],
             )
             .map_err(sql_error)?;
@@ -825,15 +869,12 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
-                     lightpanda_region, browser, proxy, country, sign_in_method, enabled, last_status, last_message,
-                     last_run_at, created_at, updated_at
+                    "SELECT id, name, site_id, cron_expression, browser, sign_in_method, enabled,
+                     last_status, last_message, last_run_at, created_at, updated_at
                      FROM sign_in_tasks ORDER BY id",
                 )
                 .map_err(sql_error)?;
-            let rows = stmt
-                .query_map([], map_sign_in_task)
-                .map_err(sql_error)?;
+            let rows = stmt.query_map([], map_sign_in_task).map_err(sql_error)?;
             let mut list = Vec::new();
             for row in rows {
                 list.push(row.map_err(sql_error)?);
@@ -849,9 +890,8 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
-                 lightpanda_region, browser, proxy, country, sign_in_method, enabled, last_status, last_message,
-                 last_run_at, created_at, updated_at
+                "SELECT id, name, site_id, cron_expression, browser, sign_in_method, enabled,
+                 last_status, last_message, last_run_at, created_at, updated_at
                  FROM sign_in_tasks WHERE id = ?",
                 params![id],
                 map_sign_in_task,
@@ -873,18 +913,12 @@ impl Database {
                 "INSERT INTO sign_in_tasks
                  (name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
                   lightpanda_region, browser, proxy, country, sign_in_method, enabled, created_at, updated_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                  VALUES (?, ?, ?, NULL, '', 'euwest', ?, 'fast_dc', NULL, ?, 1, ?, ?)",
                 params![
                     req.name,
                     req.site_id,
                     req.cron_expression,
-                    req.lightpanda_endpoint,
-                    req.lightpanda_token,
-                    req.lightpanda_region
-                        .unwrap_or_else(|| "euwest".to_string()),
                     req.browser.unwrap_or_else(|| "lightpanda".to_string()),
-                    req.proxy.unwrap_or_else(|| "fast_dc".to_string()),
-                    req.country,
                     req.sign_in_method
                         .as_deref()
                         .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
@@ -911,19 +945,13 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.execute(
                 "UPDATE sign_in_tasks SET
-                 name = ?, site_id = ?, cron_expression = ?, lightpanda_endpoint = ?, lightpanda_token = ?,
-                 lightpanda_region = ?, browser = ?, proxy = ?, country = ?, sign_in_method = ?, updated_at = ?
+                 name = ?, site_id = ?, cron_expression = ?, browser = ?, sign_in_method = ?, updated_at = ?
                  WHERE id = ?",
                 params![
                     req.name,
                     req.site_id,
                     req.cron_expression,
-                    req.lightpanda_endpoint,
-                    req.lightpanda_token,
-                    req.lightpanda_region.unwrap_or_else(|| "euwest".to_string()),
                     req.browser.unwrap_or_else(|| "lightpanda".to_string()),
-                    req.proxy.unwrap_or_else(|| "fast_dc".to_string()),
-                    req.country,
                     req.sign_in_method
                         .as_deref()
                         .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
@@ -2518,7 +2546,22 @@ impl Database {
                     max_concurrent_rss_fetches INTEGER NOT NULL,
                     throttle_interval_secs INTEGER NOT NULL,
                     proxy TEXT,
-                    ocr_api_key TEXT
+                    use_proxy_for_lightpanda INTEGER NOT NULL DEFAULT 1,
+                    tag_rule_scan_interval_mins INTEGER NOT NULL DEFAULT 7,
+                    ocr_api_key TEXT,
+                    lightpanda_endpoint TEXT,
+                    lightpanda_token TEXT,
+                    lightpanda_region TEXT NOT NULL DEFAULT 'euwest',
+                    lightpanda_browser TEXT NOT NULL DEFAULT 'lightpanda',
+                    lightpanda_proxy TEXT,
+                    lightpanda_country TEXT,
+                    cloakbrowser_license_key TEXT,
+                    cloakbrowser_headless INTEGER NOT NULL DEFAULT 0,
+                    cloakbrowser_humanize INTEGER NOT NULL DEFAULT 1,
+                    cloakbrowser_human_preset TEXT NOT NULL DEFAULT 'careful',
+                    cloakbrowser_proxy TEXT,
+                    cloakbrowser_geoip INTEGER NOT NULL DEFAULT 1,
+                    sign_in_browser_config_migrated INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS rss_subscriptions (
@@ -2888,6 +2931,62 @@ impl Database {
                 "ocr_api_key",
                 "ALTER TABLE global_settings ADD COLUMN ocr_api_key TEXT",
             )?;
+            for (column, sql) in [
+                (
+                    "lightpanda_endpoint",
+                    "ALTER TABLE global_settings ADD COLUMN lightpanda_endpoint TEXT",
+                ),
+                (
+                    "lightpanda_token",
+                    "ALTER TABLE global_settings ADD COLUMN lightpanda_token TEXT",
+                ),
+                (
+                    "lightpanda_region",
+                    "ALTER TABLE global_settings ADD COLUMN lightpanda_region TEXT NOT NULL DEFAULT 'euwest'",
+                ),
+                (
+                    "lightpanda_browser",
+                    "ALTER TABLE global_settings ADD COLUMN lightpanda_browser TEXT NOT NULL DEFAULT 'lightpanda'",
+                ),
+                (
+                    "lightpanda_proxy",
+                    "ALTER TABLE global_settings ADD COLUMN lightpanda_proxy TEXT",
+                ),
+                (
+                    "lightpanda_country",
+                    "ALTER TABLE global_settings ADD COLUMN lightpanda_country TEXT",
+                ),
+                (
+                    "cloakbrowser_license_key",
+                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_license_key TEXT",
+                ),
+                (
+                    "cloakbrowser_headless",
+                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_headless INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "cloakbrowser_humanize",
+                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_humanize INTEGER NOT NULL DEFAULT 1",
+                ),
+                (
+                    "cloakbrowser_human_preset",
+                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_human_preset TEXT NOT NULL DEFAULT 'careful'",
+                ),
+                (
+                    "cloakbrowser_proxy",
+                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_proxy TEXT",
+                ),
+                (
+                    "cloakbrowser_geoip",
+                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_geoip INTEGER NOT NULL DEFAULT 1",
+                ),
+                (
+                    "sign_in_browser_config_migrated",
+                    "ALTER TABLE global_settings ADD COLUMN sign_in_browser_config_migrated INTEGER NOT NULL DEFAULT 0",
+                ),
+            ] {
+                ensure_column(&conn, "global_settings", column, sql)?;
+            }
             ensure_column(
                 &conn,
                 "sites",
@@ -3481,8 +3580,91 @@ impl Database {
             }
 
             conn.execute(
-                "INSERT OR IGNORE INTO global_settings (id, download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins, ocr_api_key) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![2, 1, "second", 5, "info", 32, 8, 30, Option::<String>::None, 1, 7, Option::<String>::None],
+                "INSERT OR IGNORE INTO global_settings
+                 (id, download_rate_limit_requests, download_rate_limit_interval,
+                  download_rate_limit_unit, retry_interval_secs, log_level,
+                  max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs,
+                  proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins, ocr_api_key,
+                  lightpanda_endpoint, lightpanda_token, lightpanda_region, lightpanda_browser,
+                  lightpanda_proxy, lightpanda_country, cloakbrowser_license_key,
+                  cloakbrowser_headless, cloakbrowser_humanize, cloakbrowser_human_preset,
+                  cloakbrowser_proxy, cloakbrowser_geoip, sign_in_browser_config_migrated)
+                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                params![
+                    2,
+                    1,
+                    "second",
+                    5,
+                    "info",
+                    32,
+                    8,
+                    30,
+                    Option::<String>::None,
+                    1,
+                    7,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    "euwest",
+                    "lightpanda",
+                    "fast_dc",
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    0,
+                    1,
+                    "careful",
+                    Option::<String>::None,
+                    1,
+                ],
+            )
+            .map_err(sql_error)?;
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+
+                 UPDATE global_settings
+                 SET lightpanda_endpoint = (
+                         SELECT NULLIF(TRIM(lightpanda_endpoint), '')
+                         FROM sign_in_tasks ORDER BY id LIMIT 1
+                     ),
+                     lightpanda_token = (
+                         SELECT NULLIF(TRIM(lightpanda_token), '')
+                         FROM sign_in_tasks ORDER BY id LIMIT 1
+                     ),
+                     lightpanda_region = COALESCE((
+                         SELECT NULLIF(TRIM(lightpanda_region), '')
+                         FROM sign_in_tasks ORDER BY id LIMIT 1
+                     ), 'euwest'),
+                     lightpanda_browser = COALESCE((
+                         SELECT NULLIF(TRIM(browser), '')
+                         FROM sign_in_tasks ORDER BY id LIMIT 1
+                     ), 'lightpanda'),
+                     lightpanda_proxy = CASE WHEN use_proxy_for_lightpanda != 0 THEN COALESCE((
+                         SELECT NULLIF(TRIM(proxy), '')
+                         FROM sign_in_tasks ORDER BY id LIMIT 1
+                     ), 'fast_dc') ELSE NULL END,
+                     lightpanda_country = (
+                         SELECT NULLIF(TRIM(country), '')
+                         FROM sign_in_tasks ORDER BY id LIMIT 1
+                     )
+                 WHERE id = 1 AND sign_in_browser_config_migrated = 0;
+
+                 UPDATE sign_in_tasks
+                 SET lightpanda_endpoint = NULL,
+                     lightpanda_token = '',
+                     lightpanda_region = 'euwest',
+                     browser = 'lightpanda',
+                     proxy = 'fast_dc',
+                     country = NULL
+                 WHERE EXISTS (
+                     SELECT 1 FROM global_settings
+                     WHERE id = 1 AND sign_in_browser_config_migrated = 0
+                 );
+
+                 UPDATE global_settings
+                 SET sign_in_browser_config_migrated = 1
+                 WHERE id = 1 AND sign_in_browser_config_migrated = 0;
+
+                 COMMIT;",
             )
             .map_err(sql_error)?;
             Ok(())
@@ -3587,19 +3769,14 @@ fn map_sign_in_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInTaskRecor
         name: row.get(1)?,
         site_id: row.get(2)?,
         cron_expression: row.get(3)?,
-        lightpanda_endpoint: row.get(4)?,
-        lightpanda_token: row.get(5)?,
-        lightpanda_region: row.get(6)?,
-        browser: row.get(7)?,
-        proxy: row.get(8)?,
-        country: row.get(9)?,
-        sign_in_method: row.get(10)?,
-        enabled: row.get::<_, i32>(11)? != 0,
-        last_status: row.get(12)?,
-        last_message: row.get(13)?,
-        last_run_at: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        browser: row.get(4)?,
+        sign_in_method: row.get(5)?,
+        enabled: row.get::<_, i32>(6)? != 0,
+        last_status: row.get(7)?,
+        last_message: row.get(8)?,
+        last_run_at: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -3791,6 +3968,25 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Res
     Ok(())
 }
 
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn normalize_lightpanda_region(value: &str) -> &'static str {
+    match value.trim() {
+        "uswest" => "uswest",
+        _ => "euwest",
+    }
+}
+
+fn normalize_human_preset(value: &str) -> &'static str {
+    match value.trim() {
+        "default" => "default",
+        _ => "careful",
+    }
+}
+
 fn migrate_media_relocation_jobs_for_manual_transfers(conn: &Connection) -> Result<(), AppError> {
     let media_download_not_null = conn
         .prepare("PRAGMA table_info(media_relocation_jobs)")
@@ -3974,6 +4170,105 @@ fn final_status_name(status: FinalStatus) -> &'static str {
 mod migration_tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn legacy_sign_in_browser_config_moves_to_global_settings_once() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let site_id = db
+            .create_site(
+                "legacy-site",
+                "nexusphp",
+                "https://tracker.example.com",
+                r#"{"type":"cookie","cookie":"uid=1"}"#,
+                true,
+            )
+            .await
+            .unwrap();
+        let task_id = db
+            .create_sign_in_task(&SignInTaskRequest {
+                name: "legacy-sign-in".to_string(),
+                site_id,
+                cron_expression: "0 0 0/8 * * *".to_string(),
+                browser: Some("lightpanda".to_string()),
+                sign_in_method: Some(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string()),
+            })
+            .await
+            .unwrap();
+
+        let db_path = dir.path().join("rflush.db");
+        let conn = open_connection(&db_path).unwrap();
+        conn.execute(
+            "UPDATE sign_in_tasks
+             SET lightpanda_endpoint = ?, lightpanda_token = ?, lightpanda_region = ?,
+                 browser = ?, proxy = ?, country = ?
+             WHERE id = ?",
+            params![
+                "wss://legacy.example/ws",
+                "legacy-token",
+                "uswest",
+                "chrome",
+                "datacenter",
+                "DE",
+                task_id,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE global_settings
+             SET lightpanda_endpoint = NULL, lightpanda_token = NULL,
+                 sign_in_browser_config_migrated = 0
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = Database::open(dir.path()).await.unwrap();
+        let settings = migrated.get_settings().await.unwrap();
+        assert_eq!(
+            settings.lightpanda.endpoint.as_deref(),
+            Some("wss://legacy.example/ws")
+        );
+        assert_eq!(settings.lightpanda.token.as_deref(), Some("legacy-token"));
+        assert_eq!(settings.lightpanda.region, "uswest");
+        assert_eq!(settings.lightpanda.browser, "chrome");
+        assert_eq!(settings.lightpanda.proxy.as_deref(), Some("datacenter"));
+        assert_eq!(settings.lightpanda.country.as_deref(), Some("DE"));
+        assert_eq!(
+            migrated
+                .get_sign_in_task(task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .browser,
+            crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA
+        );
+
+        migrated
+            .update_sign_in_task(
+                task_id,
+                &SignInTaskRequest {
+                    name: "legacy-sign-in".to_string(),
+                    site_id,
+                    cron_expression: "0 0 0/8 * * *".to_string(),
+                    browser: Some(crate::sign_in::SIGN_IN_BROWSER_CLOAKBROWSER.to_string()),
+                    sign_in_method: Some(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        let reopened = Database::open(dir.path()).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_sign_in_task(task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .browser,
+            crate::sign_in::SIGN_IN_BROWSER_CLOAKBROWSER
+        );
+    }
 
     #[test]
     fn every_database_connection_uses_power_loss_durable_wal_commits() {

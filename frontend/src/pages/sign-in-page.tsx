@@ -1,5 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { CalendarCheck, Edit, Loader2, Pause, Play, Plus, RefreshCw, Trash2, Zap } from "lucide-react";
+import {
+  CalendarCheck,
+  CheckCircle2,
+  Cloud,
+  Edit,
+  FlaskConical,
+  Loader2,
+  Pause,
+  Play,
+  Plus,
+  RefreshCw,
+  Save,
+  ShieldCheck,
+  Trash2,
+  X,
+  Zap,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -9,21 +25,25 @@ import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate, statusBadge } from "@/lib/format";
-import type { LightpandaProbeResult, SignInRecord, SignInTaskRecord, SignInTaskRequest, SiteRecord } from "@/types";
+import { cn } from "@/lib/utils";
+import type {
+  BrowserProbeResult,
+  GlobalConfig,
+  SignInRecord,
+  SignInTaskRecord,
+  SignInTaskRequest,
+  SiteRecord,
+} from "@/types";
 
 const SIGN_IN_INTERVAL_HOURS = [6, 8, 12, 16, 20, 24] as const;
 type SignInIntervalHours = (typeof SIGN_IN_INTERVAL_HOURS)[number];
+type SignInBrowser = "lightpanda" | "cloakbrowser";
 
 const emptyForm: SignInTaskRequest = {
   name: "",
   site_id: 0,
   cron_expression: intervalToCron(8),
-  lightpanda_endpoint: null,
-  lightpanda_token: "",
-  lightpanda_region: null,
-  browser: null,
-  proxy: null,
-  country: null,
+  browser: "lightpanda",
   sign_in_method: "open_page",
 };
 
@@ -32,12 +52,7 @@ function taskToForm(task: SignInTaskRecord): SignInTaskRequest {
     name: task.name,
     site_id: task.site_id,
     cron_expression: task.cron_expression,
-    lightpanda_endpoint: task.lightpanda_endpoint,
-    lightpanda_token: task.lightpanda_token,
-    lightpanda_region: null,
-    browser: null,
-    proxy: null,
-    country: null,
+    browser: task.browser,
     sign_in_method: task.sign_in_method,
   };
 }
@@ -61,6 +76,10 @@ function signInMethodLabel(method: string | null | undefined) {
   return "打开页面签到";
 }
 
+function browserLabel(browser: string | null | undefined) {
+  return browser === "cloakbrowser" ? "CloakBrowser" : "Lightpanda";
+}
+
 function intervalToCron(hours: SignInIntervalHours) {
   return `0 0 0/${hours} * * *`;
 }
@@ -73,19 +92,31 @@ function cronToInterval(cron: string): SignInIntervalHours {
   return SIGN_IN_INTERVAL_HOURS.includes(hours as SignInIntervalHours) ? (hours as SignInIntervalHours) : 8;
 }
 
+function isBrowserConfigured(settings: GlobalConfig | null, browser: SignInBrowser) {
+  if (!settings) return false;
+  if (browser === "lightpanda") {
+    return Boolean(settings.lightpanda.endpoint?.trim() || settings.lightpanda.token?.trim());
+  }
+  return Boolean(settings.cloakbrowser.license_key?.trim());
+}
+
 export function SignInPage() {
   const [tasks, setTasks] = useState<SignInTaskRecord[]>([]);
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [records, setRecords] = useState<SignInRecord[]>([]);
+  const [settings, setSettings] = useState<GlobalConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [configTab, setConfigTab] = useState<SignInBrowser>("lightpanda");
+  const [configFeedback, setConfigFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+  const [savingBrowser, setSavingBrowser] = useState(false);
+  const [probingBrowser, setProbingBrowser] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<SignInTaskRequest>({ ...emptyForm });
   const [intervalHours, setIntervalHours] = useState<SignInIntervalHours>(8);
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [probing, setProbing] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SignInTaskRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
 
@@ -101,11 +132,13 @@ export function SignInPage() {
       api<SignInTaskRecord[]>("/api/sign-in-tasks"),
       api<SiteRecord[]>("/api/sites"),
       api<SignInRecord[]>("/api/sign-in-records?limit=100"),
+      api<GlobalConfig>("/api/settings"),
     ])
-      .then(([nextTasks, nextSites, nextRecords]) => {
+      .then(([nextTasks, nextSites, nextRecords, nextSettings]) => {
         setTasks(nextTasks);
         setSites(nextSites);
         setRecords(nextRecords);
+        setSettings(nextSettings);
       })
       .catch((error: Error) => setMessage(error.message || "加载自动签到数据失败"))
       .finally(() => setLoading(false));
@@ -116,12 +149,36 @@ export function SignInPage() {
   }, []);
 
   function setField<K extends keyof SignInTaskRequest>(key: K, value: SignInTaskRequest[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
+    setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function setLightpandaField<K extends keyof GlobalConfig["lightpanda"]>(
+    key: K,
+    value: GlobalConfig["lightpanda"][K],
+  ) {
+    setSettings((current) =>
+      current ? { ...current, lightpanda: { ...current.lightpanda, [key]: value } } : current,
+    );
+    setConfigFeedback(null);
+  }
+
+  function setCloakBrowserField<K extends keyof GlobalConfig["cloakbrowser"]>(
+    key: K,
+    value: GlobalConfig["cloakbrowser"][K],
+  ) {
+    setSettings((current) =>
+      current ? { ...current, cloakbrowser: { ...current.cloakbrowser, [key]: value } } : current,
+    );
+    setConfigFeedback(null);
   }
 
   function openAdd() {
+    const defaultBrowser: SignInBrowser =
+      !isBrowserConfigured(settings, "lightpanda") && isBrowserConfigured(settings, "cloakbrowser")
+        ? "cloakbrowser"
+        : "lightpanda";
     setEditingId(null);
-    setForm({ ...emptyForm, site_id: nexusSites[0]?.id ?? 0 });
+    setForm({ ...emptyForm, site_id: nexusSites[0]?.id ?? 0, browser: defaultBrowser });
     setIntervalHours(8);
     setSubmitError("");
     setFormOpen(true);
@@ -138,15 +195,10 @@ export function SignInPage() {
   function copyFromTask(taskId: number) {
     const source = tasks.find((task) => task.id === taskId);
     if (!source) return;
-    setForm((prev) => ({
-      ...prev,
+    setForm((current) => ({
+      ...current,
       cron_expression: source.cron_expression,
-      lightpanda_endpoint: source.lightpanda_endpoint,
-      lightpanda_token: source.lightpanda_token,
-      lightpanda_region: null,
-      browser: null,
-      proxy: null,
-      country: null,
+      browser: source.browser,
       sign_in_method: source.sign_in_method,
     }));
     setIntervalHours(cronToInterval(source.cron_expression));
@@ -158,6 +210,51 @@ export function SignInPage() {
     setSubmitError("");
   }
 
+  async function persistBrowserSettings(probe: boolean) {
+    if (!settings) return;
+    if (probe && configTab === "lightpanda" && !settings.lightpanda.endpoint?.trim() && !settings.lightpanda.token?.trim()) {
+      setConfigFeedback({ tone: "error", text: "Lightpanda endpoint 或 token 至少填写一个" });
+      return;
+    }
+    if (probe && configTab === "cloakbrowser" && !settings.cloakbrowser.license_key?.trim()) {
+      setConfigFeedback({ tone: "error", text: "CloakBrowser license key 不能为空" });
+      return;
+    }
+
+    setSavingBrowser(true);
+    setProbingBrowser(probe);
+    setConfigFeedback(null);
+    try {
+      const saved = await api<GlobalConfig>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(settings),
+      });
+      setSettings(saved);
+      if (!probe) {
+        setConfigFeedback({ tone: "success", text: `${browserLabel(configTab)} 公共配置已保存` });
+        return;
+      }
+
+      const result = await api<BrowserProbeResult>("/api/sign-in-probe-1-1-1-1", {
+        method: "POST",
+        body: JSON.stringify({ browser: configTab }),
+      });
+      if (!result.success) throw new Error(result.message);
+      setConfigFeedback({
+        tone: "success",
+        text: `测试成功：已打开 ${result.url}${result.title ? `，标题：${result.title}` : ""}`,
+      });
+    } catch (error) {
+      setConfigFeedback({
+        tone: "error",
+        text: (error as Error).message || `${browserLabel(configTab)} 配置保存失败`,
+      });
+    } finally {
+      setSavingBrowser(false);
+      setProbingBrowser(false);
+    }
+  }
+
   async function handleSubmit() {
     if (!form.name.trim()) {
       setSubmitError("名称不能为空");
@@ -167,21 +264,12 @@ export function SignInPage() {
       setSubmitError("请选择 NexusPHP 站点");
       return;
     }
-    if (!form.lightpanda_token.trim() && !form.lightpanda_endpoint?.trim()) {
-      setSubmitError("Lightpanda token 或自定义 endpoint 至少填写一个");
-      return;
-    }
 
     const body: SignInTaskRequest = {
       ...form,
       name: form.name.trim(),
       cron_expression: intervalToCron(intervalHours),
-      lightpanda_endpoint: form.lightpanda_endpoint?.trim() || null,
-      lightpanda_token: form.lightpanda_token.trim(),
-      lightpanda_region: "euwest",
-      browser: "lightpanda",
-      proxy: "fast_dc",
-      country: null,
+      browser: form.browser ?? "lightpanda",
       sign_in_method: form.sign_in_method ?? "open_page",
     };
 
@@ -200,39 +288,6 @@ export function SignInPage() {
       setSubmitError((error as Error).message || "保存自动签到任务失败");
     } finally {
       setSubmitting(false);
-    }
-  }
-
-  async function probeEndpoint() {
-    if (!form.lightpanda_endpoint?.trim() && !form.lightpanda_token.trim()) {
-      setSubmitError("Lightpanda endpoint 不能为空");
-      return;
-    }
-
-    setProbing(true);
-    setSubmitError("");
-    try {
-      const result = await api<LightpandaProbeResult>("/api/sign-in-probe-1-1-1-1", {
-        method: "POST",
-        body: JSON.stringify({
-          ...form,
-          cron_expression: intervalToCron(intervalHours),
-          lightpanda_endpoint: form.lightpanda_endpoint?.trim() || null,
-          lightpanda_token: form.lightpanda_token.trim(),
-          lightpanda_region: "euwest",
-          browser: "lightpanda",
-          proxy: "fast_dc",
-          country: null,
-        }),
-      });
-      if (!result.success) {
-        throw new Error(result.message);
-      }
-      setSubmitError(`测试成功：已打开 ${result.url}${result.title ? `，标题：${result.title}` : ""}`);
-    } catch (error) {
-      setSubmitError((error as Error).message || "Lightpanda 测试失败");
-    } finally {
-      setProbing(false);
     }
   }
 
@@ -264,13 +319,243 @@ export function SignInPage() {
   return (
     <div className="space-y-6">
       <Card>
+        <CardHeader className="gap-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <CardTitle className="flex items-center gap-2">
+                <ShieldCheck className="h-5 w-5" />
+                签到浏览器
+              </CardTitle>
+              <CardDescription>所有自动签到任务共用以下浏览器连接配置。</CardDescription>
+            </div>
+            <span className="w-fit rounded-full border border-border bg-surface-container px-3 py-1 text-xs font-medium text-muted">
+              CloakBrowser 并发 1
+            </span>
+          </div>
+
+          <div className="grid h-11 w-full grid-cols-2 rounded-2xl border border-border bg-surface-container p-1 sm:w-[360px]" role="tablist" aria-label="签到浏览器配置">
+            {(["lightpanda", "cloakbrowser"] as const).map((browser) => {
+              const selected = configTab === browser;
+              const configured = isBrowserConfigured(settings, browser);
+              return (
+                <button
+                  key={browser}
+                  id={`sign-in-browser-tab-${browser}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  aria-controls={`sign-in-browser-panel-${browser}`}
+                  onClick={() => {
+                    setConfigTab(browser);
+                    setConfigFeedback(null);
+                  }}
+                  className={cn(
+                    "flex min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-xl px-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:gap-2 sm:px-3 sm:text-sm",
+                    selected ? "bg-card text-foreground shadow-sm" : "text-muted hover:text-foreground",
+                  )}
+                >
+                  {browser === "lightpanda" ? <Cloud className="h-4 w-4 shrink-0" /> : <ShieldCheck className="h-4 w-4 shrink-0" />}
+                  <span className="whitespace-nowrap">{browserLabel(browser)}</span>
+                  {configured ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" aria-label="已配置" /> : null}
+                </button>
+              );
+            })}
+          </div>
+        </CardHeader>
+
+        <CardContent className="space-y-5">
+          {!settings && loading ? (
+            <div className="flex items-center justify-center py-8 text-sm text-muted">
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              加载配置中...
+            </div>
+          ) : null}
+
+          {settings && configTab === "lightpanda" ? (
+            <div
+              id="sign-in-browser-panel-lightpanda"
+              className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
+              role="tabpanel"
+              aria-labelledby="sign-in-browser-tab-lightpanda"
+            >
+              <div className="space-y-2 sm:col-span-2 xl:col-span-3">
+                <Label htmlFor="lightpanda-endpoint">Endpoint</Label>
+                <Input
+                  id="lightpanda-endpoint"
+                  value={settings.lightpanda.endpoint ?? ""}
+                  onChange={(event) => setLightpandaField("endpoint", event.target.value || null)}
+                  placeholder="wss://euwest.cloud.lightpanda.io/ws?token=..."
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="lightpanda-token">Token</Label>
+                <Input
+                  id="lightpanda-token"
+                  type="password"
+                  autoComplete="off"
+                  value={settings.lightpanda.token ?? ""}
+                  onChange={(event) => setLightpandaField("token", event.target.value || null)}
+                  placeholder="Lightpanda token"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="lightpanda-region">区域</Label>
+                <Select
+                  id="lightpanda-region"
+                  value={settings.lightpanda.region}
+                  onChange={(value) => setLightpandaField("region", value)}
+                  options={[
+                    { value: "euwest", label: "EU West" },
+                    { value: "uswest", label: "US West" },
+                  ]}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="lightpanda-browser">云端浏览器类型</Label>
+                <Input
+                  id="lightpanda-browser"
+                  value={settings.lightpanda.browser}
+                  onChange={(event) => setLightpandaField("browser", event.target.value)}
+                  placeholder="lightpanda"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="lightpanda-proxy">代理策略</Label>
+                <Input
+                  id="lightpanda-proxy"
+                  value={settings.lightpanda.proxy ?? ""}
+                  disabled={!settings.use_proxy_for_lightpanda}
+                  onChange={(event) => setLightpandaField("proxy", event.target.value || null)}
+                  placeholder="fast_dc"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="lightpanda-country">国家代码</Label>
+                <Input
+                  id="lightpanda-country"
+                  value={settings.lightpanda.country ?? ""}
+                  onChange={(event) => setLightpandaField("country", event.target.value || null)}
+                  placeholder="US"
+                />
+              </div>
+              <label className="flex min-h-11 cursor-pointer items-center gap-3 self-end text-sm font-medium">
+                <input
+                  type="checkbox"
+                  className="size-4 accent-primary"
+                  checked={settings.use_proxy_for_lightpanda}
+                  onChange={(event) => {
+                    setSettings((current) => current ? { ...current, use_proxy_for_lightpanda: event.target.checked } : current);
+                    setConfigFeedback(null);
+                  }}
+                />
+                使用 Lightpanda 代理
+              </label>
+            </div>
+          ) : null}
+
+          {settings && configTab === "cloakbrowser" ? (
+            <div
+              id="sign-in-browser-panel-cloakbrowser"
+              className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
+              role="tabpanel"
+              aria-labelledby="sign-in-browser-tab-cloakbrowser"
+            >
+              <div className="space-y-2 sm:col-span-2 xl:col-span-3">
+                <Label htmlFor="cloakbrowser-license">License key</Label>
+                <Input
+                  id="cloakbrowser-license"
+                  type="password"
+                  autoComplete="off"
+                  value={settings.cloakbrowser.license_key ?? ""}
+                  onChange={(event) => setCloakBrowserField("license_key", event.target.value || null)}
+                  placeholder="cb_xxxxxxxx"
+                />
+              </div>
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="cloakbrowser-proxy">代理</Label>
+                <Input
+                  id="cloakbrowser-proxy"
+                  type="password"
+                  autoComplete="off"
+                  value={settings.cloakbrowser.proxy ?? ""}
+                  onChange={(event) => setCloakBrowserField("proxy", event.target.value || null)}
+                  placeholder="http://user:pass@residential-host:port"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="cloakbrowser-human-preset">Human preset</Label>
+                <Select
+                  id="cloakbrowser-human-preset"
+                  value={settings.cloakbrowser.human_preset}
+                  disabled={!settings.cloakbrowser.humanize}
+                  onChange={(value) => setCloakBrowserField("human_preset", value)}
+                  options={[
+                    { value: "careful", label: "Careful" },
+                    { value: "default", label: "Default" },
+                  ]}
+                />
+              </div>
+              <div className="flex flex-wrap gap-x-6 gap-y-3 sm:col-span-2 xl:col-span-3">
+                {[
+                  { key: "headless" as const, label: "无头模式" },
+                  { key: "humanize" as const, label: "Humanize" },
+                  { key: "geoip" as const, label: "GeoIP" },
+                ].map((option) => (
+                  <label key={option.key} className="flex min-h-10 cursor-pointer items-center gap-3 text-sm font-medium">
+                    <input
+                      type="checkbox"
+                      className="size-4 accent-primary"
+                      checked={settings.cloakbrowser[option.key]}
+                      onChange={(event) => setCloakBrowserField(option.key, event.target.checked)}
+                    />
+                    {option.label}
+                  </label>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          {configFeedback ? (
+            <div
+              role="status"
+              className={cn(
+                "rounded-xl border px-4 py-3 text-sm",
+                configFeedback.tone === "success"
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                  : "border-destructive/30 bg-destructive/5 text-destructive",
+              )}
+            >
+              {configFeedback.text}
+            </div>
+          ) : null}
+
+          <div className="flex flex-wrap gap-2 border-t border-border pt-4">
+            <Button disabled={!settings || savingBrowser} onClick={() => void persistBrowserSettings(false)}>
+              {savingBrowser && !probingBrowser ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Save className="mr-2 h-4 w-4" />}
+              保存配置
+            </Button>
+            <Button variant="outline" disabled={!settings || savingBrowser} onClick={() => void persistBrowserSettings(true)}>
+              {probingBrowser ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <FlaskConical className="mr-2 h-4 w-4" />}
+              {probingBrowser ? "测试中..." : "保存并测试"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
         <CardHeader>
           {message ? (
-            <div className="rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
+            <div className="rounded-xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
               <div className="flex items-start justify-between gap-3">
                 <span>{message}</span>
-                <button type="button" className="text-muted hover:text-foreground" onClick={() => setMessage("")}>
-                  关闭
+                <button
+                  type="button"
+                  className="cursor-pointer text-muted transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                  title="关闭消息"
+                  aria-label="关闭消息"
+                  onClick={() => setMessage("")}
+                >
+                  <X className="h-4 w-4" />
                 </button>
               </div>
             </div>
@@ -307,15 +592,11 @@ export function SignInPage() {
             <div className="grid gap-3">
               {tasks.map((task) => (
                 <div key={task.id} className="rounded-[20px] border border-border bg-surface-container/70 p-3.5 shadow-sm">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-semibold text-sm truncate">{task.name}</span>
-                        <span
-                          className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
-                            task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
-                          }`}
-                        >
+                        <span className="min-w-0 break-words text-sm font-semibold sm:truncate">{task.name}</span>
+                        <span className={cn("shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium", task.enabled ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700")}>
                           {task.enabled ? "已启用" : "已停用"}
                         </span>
                         <span className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${statusBadge(task.last_status ?? "")}`}>
@@ -324,54 +605,35 @@ export function SignInPage() {
                       </div>
                       <div className="mt-0.5 text-[11px] text-muted">#{task.id}</div>
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/run`, { method: "POST" }), "已触发运行一次")}>
-                        <Zap className="mr-1.5 h-3.5 w-3.5" />
-                        运行一次
+                    <div className="flex w-full flex-wrap gap-2 sm:w-auto">
+                      <Button variant="outline" className="h-7 px-2.5 text-[11px]" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/run`, { method: "POST" }), "已触发运行一次")}>
+                        <Zap className="mr-1.5 h-3.5 w-3.5" />运行一次
                       </Button>
                       {task.enabled ? (
-                        <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/stop`, { method: "POST" }), "自动签到任务已停用")}>
-                          <Pause className="mr-1.5 h-3.5 w-3.5" />
-                          停用
+                        <Button variant="outline" className="h-7 px-2.5 text-[11px]" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/stop`, { method: "POST" }), "自动签到任务已停用")}>
+                          <Pause className="mr-1.5 h-3.5 w-3.5" />停用
                         </Button>
                       ) : (
-                        <Button variant="secondary" className="h-7 text-[11px] px-2.5" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/start`, { method: "POST" }), "自动签到任务已启用")}>
-                          <Play className="mr-1.5 h-3.5 w-3.5" />
-                          启用
+                        <Button variant="secondary" className="h-7 px-2.5 text-[11px]" onClick={() => void runAction(api(`/api/sign-in-tasks/${task.id}/start`, { method: "POST" }), "自动签到任务已启用")}>
+                          <Play className="mr-1.5 h-3.5 w-3.5" />启用
                         </Button>
                       )}
-                      <Button variant="outline" className="h-7 text-[11px] px-2.5" onClick={() => openEdit(task)}>
-                        <Edit className="mr-1.5 h-3.5 w-3.5" />
-                        编辑
+                      <Button variant="outline" className="h-7 px-2.5 text-[11px]" onClick={() => openEdit(task)}>
+                        <Edit className="mr-1.5 h-3.5 w-3.5" />编辑
                       </Button>
-                      <Button variant="destructive" className="h-7 text-[11px] px-2.5" onClick={() => setDeleteTarget(task)}>
-                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                        删除
+                      <Button variant="destructive" className="h-7 px-2.5 text-[11px]" onClick={() => setDeleteTarget(task)}>
+                        <Trash2 className="mr-1.5 h-3.5 w-3.5" />删除
                       </Button>
                     </div>
                   </div>
 
-                  <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2 xl:grid-cols-4">
-                    <div className="truncate">
-                      <span className="font-medium text-foreground">站点: </span>
-                      {siteNameById.get(task.site_id) ?? `#${task.site_id}`}
-                    </div>
-                    <div className="truncate">
-                      <span className="font-medium text-foreground">间隔: </span>
-                      每 {cronToInterval(task.cron_expression)} 小时
-                    </div>
-                    <div className="truncate">
-                      <span className="font-medium text-foreground">方式: </span>
-                      {signInMethodLabel(task.sign_in_method)}
-                    </div>
-                    <div className="truncate">
-                      <span className="font-medium text-foreground">最近时间: </span>
-                      {formatDate(task.last_run_at)}
-                    </div>
-                    <div className="sm:col-span-2 xl:col-span-4 truncate">
-                      <span className="font-medium text-foreground">最近消息: </span>
-                      {task.last_message || "-"}
-                    </div>
+                  <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2 xl:grid-cols-5">
+                    <div className="truncate"><span className="font-medium text-foreground">站点: </span>{siteNameById.get(task.site_id) ?? `#${task.site_id}`}</div>
+                    <div className="truncate"><span className="font-medium text-foreground">浏览器: </span>{browserLabel(task.browser)}</div>
+                    <div className="truncate"><span className="font-medium text-foreground">间隔: </span>每 {cronToInterval(task.cron_expression)} 小时</div>
+                    <div className="truncate"><span className="font-medium text-foreground">方式: </span>{signInMethodLabel(task.sign_in_method)}</div>
+                    <div className="truncate"><span className="font-medium text-foreground">最近时间: </span>{formatDate(task.last_run_at)}</div>
+                    <div className="truncate sm:col-span-2 xl:col-span-5"><span className="font-medium text-foreground">最近消息: </span>{task.last_message || "-"}</div>
                   </div>
                 </div>
               ))}
@@ -405,14 +667,8 @@ export function SignInPage() {
                   <TableRow key={record.id}>
                     <TableCell>#{record.task_id}</TableCell>
                     <TableCell>{record.site_name || siteNameById.get(record.site_id) || `#${record.site_id}`}</TableCell>
-                    <TableCell>
-                      <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusBadge(record.status)}`}>
-                        {displayStatus(record.status)}
-                      </span>
-                    </TableCell>
-                    <TableCell className="max-w-[360px] truncate text-muted" title={record.message}>
-                      {record.message || "-"}
-                    </TableCell>
+                    <TableCell><span className={`rounded-full px-3 py-1 text-xs font-medium ${statusBadge(record.status)}`}>{displayStatus(record.status)}</span></TableCell>
+                    <TableCell className="max-w-[360px] truncate text-muted" title={record.message}>{record.message || "-"}</TableCell>
                     <TableCell className="text-muted">{formatDate(record.started_at)}</TableCell>
                     <TableCell className="text-muted">{formatDate(record.finished_at)}</TableCell>
                   </TableRow>
@@ -427,14 +683,12 @@ export function SignInPage() {
         open={formOpen}
         onClose={closeForm}
         title={editingId !== null ? "编辑自动签到任务" : "添加自动签到任务"}
-        description="配置 NexusPHP 站点、执行间隔和 Lightpanda 云端浏览器地址。"
+        description="配置 NexusPHP 站点、执行间隔、签到方式和使用的浏览器。"
         escMode="double"
       >
         <div className="space-y-6 p-4 sm:p-6">
           {submitError ? (
-            <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-              {submitError}
-            </div>
+            <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{submitError}</div>
           ) : null}
 
           <div className="grid gap-4 sm:grid-cols-2">
@@ -443,94 +697,70 @@ export function SignInPage() {
                 <Label>从已有任务复制</Label>
                 <Select
                   value=""
-                  onChange={(val) => {
-                    if (val) {
-                      copyFromTask(Number(val));
-                    }
-                  }}
+                  onChange={(value) => { if (value) copyFromTask(Number(value)); }}
                   options={[
                     { value: "", label: "选择已有任务复制配置" },
-                    ...tasks.map((task) => ({
-                      value: String(task.id),
-                      label: `${task.name} · 每 ${cronToInterval(task.cron_expression)} 小时`,
-                    })),
+                    ...tasks.map((task) => ({ value: String(task.id), label: `${task.name} · 每 ${cronToInterval(task.cron_expression)} 小时` })),
                   ]}
                 />
               </div>
             ) : null}
 
             <div className="space-y-2">
-              <Label>名称</Label>
-              <Input value={form.name} onChange={(event) => setField("name", event.target.value)} placeholder="每日签到" />
+              <Label htmlFor="sign-in-name">名称</Label>
+              <Input id="sign-in-name" value={form.name} onChange={(event) => setField("name", event.target.value)} placeholder="每日签到" />
             </div>
             <div className="space-y-2">
-              <Label>站点</Label>
+              <Label htmlFor="sign-in-site">站点</Label>
               <Select
+                id="sign-in-site"
                 value={form.site_id ? String(form.site_id) : ""}
-                onChange={(val) => setField("site_id", val === "" ? 0 : Number(val))}
-                options={
-                  nexusSites.length === 0
-                    ? [{ value: "", label: "请先添加 NexusPHP 站点" }]
-                    : nexusSites.map((site) => ({ value: String(site.id), label: `${site.name} (${site.site_type})` }))
-                }
+                onChange={(value) => setField("site_id", value === "" ? 0 : Number(value))}
+                options={nexusSites.length === 0 ? [{ value: "", label: "请先添加 NexusPHP 站点" }] : nexusSites.map((site) => ({ value: String(site.id), label: `${site.name} (${site.site_type})` }))}
               />
             </div>
             <div className="space-y-2">
-              <Label>执行间隔</Label>
+              <Label htmlFor="sign-in-interval">执行间隔</Label>
               <Select
+                id="sign-in-interval"
                 value={String(intervalHours)}
-                onChange={(val) => setIntervalHours(Number(val) as SignInIntervalHours)}
-                options={SIGN_IN_INTERVAL_HOURS.map((hours) => ({
-                  value: String(hours),
-                  label: `每 ${hours} 小时`,
-                }))}
+                onChange={(value) => setIntervalHours(Number(value) as SignInIntervalHours)}
+                options={SIGN_IN_INTERVAL_HOURS.map((hours) => ({ value: String(hours), label: `每 ${hours} 小时` }))}
               />
             </div>
             <div className="space-y-2">
-              <Label>Lightpanda token</Label>
-              <Input
-                value={form.lightpanda_token}
-                onChange={(event) => setField("lightpanda_token", event.target.value)}
-                placeholder="Lightpanda token"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>签到方式</Label>
+              <Label htmlFor="sign-in-browser">浏览器</Label>
               <Select
+                id="sign-in-browser"
+                value={form.browser ?? "lightpanda"}
+                onChange={(value) => setField("browser", value)}
+                options={[
+                  { value: "lightpanda", label: "Lightpanda" },
+                  { value: "cloakbrowser", label: "CloakBrowser" },
+                ]}
+              />
+            </div>
+            <div className="space-y-2 sm:col-span-2">
+              <Label htmlFor="sign-in-method">签到方式</Label>
+              <Select
+                id="sign-in-method"
                 value={form.sign_in_method ?? "open_page"}
-                onChange={(val) => setField("sign_in_method", val)}
+                onChange={(value) => setField("sign_in_method", value)}
                 options={[
                   { value: "open_page", label: "打开页面签到" },
                   { value: "cloudflare", label: "CF 签到" },
                   { value: "ocr_captcha", label: "OCR 验证码签到" },
                 ]}
               />
-              <p className="text-xs text-muted-foreground">
-                打开页面签到：访问签到页停留即完成；CF 签到：等待 Cloudflare 挑战通过后点击签到；OCR 验证码签到：点击签到并自动识别图片验证码。
-              </p>
-            </div>
-            <div className="space-y-2 sm:col-span-2">
-              <Label>Lightpanda endpoint</Label>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <Input
-                  value={form.lightpanda_endpoint ?? ""}
-                  onChange={(event) => setField("lightpanda_endpoint", event.target.value || null)}
-                  placeholder="wss://euwest.cloud.lightpanda.io/ws?token=..."
-                />
-                <Button type="button" variant="outline" disabled={probing} onClick={() => void probeEndpoint()}>
-                  {probing ? "测试中..." : "测试 1.1.1.1"}
-                </Button>
-              </div>
             </div>
           </div>
 
-          <div className="flex gap-3 border-t border-border pt-4">
+          <div className="flex flex-wrap gap-3 border-t border-border pt-4">
             <Button disabled={submitting} onClick={() => void handleSubmit()}>
+              {submitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               {submitting ? "提交中..." : editingId !== null ? "保存修改" : "创建任务"}
             </Button>
-            <Button variant="outline" disabled={submitting} onClick={closeForm}>
-              取消
-            </Button>
+            <Button variant="outline" disabled={submitting} onClick={closeForm}>取消</Button>
           </div>
         </div>
       </Dialog>
@@ -542,9 +772,7 @@ export function SignInPage() {
         description={`确定要删除自动签到任务「${deleteTarget?.name ?? ""}」吗？此操作不可撤销。`}
       >
         <div className="flex justify-end gap-2 pt-2">
-          <Button variant="secondary" onClick={() => setDeleteTarget(null)}>
-            取消
-          </Button>
+          <Button variant="secondary" onClick={() => setDeleteTarget(null)}>取消</Button>
           <Button variant="destructive" onClick={() => void confirmDelete()} disabled={deleting}>
             {deleting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Trash2 className="mr-2 h-4 w-4" />}
             删除

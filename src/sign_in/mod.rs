@@ -1,5 +1,8 @@
 pub mod scheduler;
 
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,7 +11,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tungstenite::{Message, connect};
 
+use crate::config::{CloakBrowserConfig, GlobalConfig, LightpandaConfig};
 use crate::site::{SiteAuth, SiteRecord};
+
+pub const SIGN_IN_BROWSER_LIGHTPANDA: &str = "lightpanda";
+pub const SIGN_IN_BROWSER_CLOAKBROWSER: &str = "cloakbrowser";
+
+static CLOAKBROWSER_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignInTaskRecord {
@@ -16,12 +25,7 @@ pub struct SignInTaskRecord {
     pub name: String,
     pub site_id: i64,
     pub cron_expression: String,
-    pub lightpanda_endpoint: Option<String>,
-    pub lightpanda_token: String,
-    pub lightpanda_region: String,
     pub browser: String,
-    pub proxy: String,
-    pub country: Option<String>,
     pub sign_in_method: String,
     pub enabled: bool,
     pub last_status: Option<String>,
@@ -36,12 +40,7 @@ pub struct SignInTaskRequest {
     pub name: String,
     pub site_id: i64,
     pub cron_expression: String,
-    pub lightpanda_endpoint: Option<String>,
-    pub lightpanda_token: String,
-    pub lightpanda_region: Option<String>,
     pub browser: Option<String>,
-    pub proxy: Option<String>,
-    pub country: Option<String>,
     pub sign_in_method: Option<String>,
 }
 
@@ -66,66 +65,43 @@ pub struct SignInResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LightpandaProbeResult {
+pub struct BrowserProbeResult {
     pub success: bool,
     pub url: String,
     pub message: String,
     pub title: Option<String>,
 }
 
-pub async fn probe_lightpanda_1_1_1_1(
-    task: SignInTaskRecord,
-    use_proxy_for_lightpanda: bool,
-) -> Result<LightpandaProbeResult, String> {
-    let endpoint = build_lightpanda_endpoint(&task, use_proxy_for_lightpanda)?;
-    probe_lightpanda_endpoint_1_1_1_1(endpoint).await
-}
-
-pub async fn probe_lightpanda_request_1_1_1_1(
-    request: SignInTaskRequest,
-    use_proxy_for_lightpanda: bool,
-) -> Result<LightpandaProbeResult, String> {
-    let task = SignInTaskRecord {
-        id: 0,
-        name: request.name,
-        site_id: request.site_id,
-        cron_expression: request.cron_expression,
-        lightpanda_endpoint: request.lightpanda_endpoint,
-        lightpanda_token: request.lightpanda_token,
-        lightpanda_region: request
-            .lightpanda_region
-            .unwrap_or_else(|| "euwest".to_string()),
-        browser: request.browser.unwrap_or_else(|| "lightpanda".to_string()),
-        proxy: request.proxy.unwrap_or_else(|| "fast_dc".to_string()),
-        country: request.country,
-        sign_in_method: request
-            .sign_in_method
-            .unwrap_or_else(|| SIGN_IN_METHOD_OPEN_PAGE.to_string()),
-        enabled: true,
-        last_status: None,
-        last_message: None,
-        last_run_at: None,
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
-    let endpoint = build_lightpanda_endpoint(&task, use_proxy_for_lightpanda)?;
-    probe_lightpanda_endpoint_1_1_1_1(endpoint).await
-}
-
-async fn probe_lightpanda_endpoint_1_1_1_1(
-    endpoint: String,
-) -> Result<LightpandaProbeResult, String> {
-    tokio::task::spawn_blocking(move || run_cdp_probe(endpoint, "https://1.1.1.1"))
+pub async fn probe_browser_1_1_1_1(
+    browser: String,
+    settings: GlobalConfig,
+) -> Result<BrowserProbeResult, String> {
+    match browser.as_str() {
+        SIGN_IN_BROWSER_LIGHTPANDA => {
+            let endpoint =
+                build_lightpanda_endpoint(&settings.lightpanda, settings.use_proxy_for_lightpanda)?;
+            tokio::task::spawn_blocking(move || {
+                run_cdp_probe(endpoint, "https://1.1.1.1", "Lightpanda")
+            })
+            .await
+            .map_err(|e| format!("Lightpanda 探测任务 join 失败: {}", e))?
+        }
+        SIGN_IN_BROWSER_CLOAKBROWSER => tokio::task::spawn_blocking(move || {
+            with_cloakbrowser(settings.cloakbrowser, |endpoint| {
+                run_cdp_probe(endpoint, "https://1.1.1.1", "CloakBrowser")
+            })
+        })
         .await
-        .map_err(|e| format!("Lightpanda 探测任务 join 失败: {}", e))?
+        .map_err(|e| format!("CloakBrowser 探测任务 join 失败: {}", e))?,
+        _ => Err(format!("未知签到浏览器: {}", browser)),
+    }
 }
 
 pub async fn execute_task(
     _base_dir: std::path::PathBuf,
     task: SignInTaskRecord,
     site: SiteRecord,
-    use_proxy_for_lightpanda: bool,
-    ocr_api_key: Option<String>,
+    settings: GlobalConfig,
 ) -> Result<SignInResult, String> {
     if site.site_type != "nexusphp" && site.site_type != "nexus_php" {
         return Err("自动签到目前仅支持 NexusPHP 站点".to_string());
@@ -141,11 +117,41 @@ pub async fn execute_task(
         return Err("Cookie 不能为空".to_string());
     }
 
-    let endpoint = build_lightpanda_endpoint(&task, use_proxy_for_lightpanda)?;
     let base_url = site.base_url.trim_end_matches('/').to_string();
     let started_at = Utc::now().to_rfc3339();
-    let output =
-        run_cdp_sign_in(endpoint, base_url, cookie, task.sign_in_method, ocr_api_key).await?;
+    let output = match task.browser.as_str() {
+        SIGN_IN_BROWSER_LIGHTPANDA => {
+            let endpoint =
+                build_lightpanda_endpoint(&settings.lightpanda, settings.use_proxy_for_lightpanda)?;
+            run_cdp_sign_in(
+                endpoint,
+                base_url,
+                cookie,
+                task.sign_in_method,
+                settings.ocr_api_key,
+            )
+            .await?
+        }
+        SIGN_IN_BROWSER_CLOAKBROWSER => {
+            let config = settings.cloakbrowser;
+            let sign_in_method = task.sign_in_method;
+            let ocr_api_key = settings.ocr_api_key;
+            tokio::task::spawn_blocking(move || {
+                with_cloakbrowser(config, |endpoint| {
+                    run_cdp_sign_in_blocking(
+                        endpoint,
+                        base_url,
+                        cookie,
+                        sign_in_method,
+                        ocr_api_key,
+                    )
+                })
+            })
+            .await
+            .map_err(|e| format!("CloakBrowser 签到任务 join 失败: {}", e))??
+        }
+        _ => return Err(format!("未知签到浏览器: {}", task.browser)),
+    };
     let finished_at = Utc::now().to_rfc3339();
 
     Ok(SignInResult {
@@ -156,14 +162,18 @@ pub async fn execute_task(
     })
 }
 
-fn run_cdp_probe(endpoint: String, url: &str) -> Result<LightpandaProbeResult, String> {
+fn run_cdp_probe(
+    endpoint: String,
+    url: &str,
+    browser_name: &str,
+) -> Result<BrowserProbeResult, String> {
     let mut client = CdpClient::connect(endpoint)?;
     let session_id = create_target_session(&mut client)?;
 
     let _ = client.call("Page.enable", json!({}), Some(&session_id));
     let navigate = client.call("Page.navigate", json!({ "url": url }), Some(&session_id));
     if let Err(error) = navigate {
-        return Ok(LightpandaProbeResult {
+        return Ok(BrowserProbeResult {
             success: false,
             url: url.to_string(),
             message: format!("Page.navigate 失败: {}", error),
@@ -190,10 +200,10 @@ fn run_cdp_probe(endpoint: String, url: &str) -> Result<LightpandaProbeResult, S
                 .map(str::to_string)
         });
 
-    Ok(LightpandaProbeResult {
+    Ok(BrowserProbeResult {
         success: true,
         url: url.to_string(),
-        message: "Lightpanda 已成功导航到 1.1.1.1".to_string(),
+        message: format!("{} 已成功导航到 1.1.1.1", browser_name),
         title,
     })
 }
@@ -237,7 +247,7 @@ struct CdpClient {
 impl CdpClient {
     fn connect(endpoint: String) -> Result<Self, String> {
         let (socket, _) =
-            connect(endpoint.as_str()).map_err(|e| format!("连接 Lightpanda CDP 失败: {}", e))?;
+            connect(endpoint.as_str()).map_err(|e| format!("连接浏览器 CDP 失败: {}", e))?;
         Ok(Self { socket, next_id: 0 })
     }
 
@@ -283,6 +293,12 @@ impl CdpClient {
     }
 }
 
+impl Drop for CdpClient {
+    fn drop(&mut self) {
+        let _ = self.socket.close(None);
+    }
+}
+
 async fn run_cdp_sign_in(
     endpoint: String,
     base_url: String,
@@ -291,39 +307,47 @@ async fn run_cdp_sign_in(
     ocr_api_key: Option<String>,
 ) -> Result<SignInOutput, String> {
     tokio::task::spawn_blocking(move || {
-        let mut client = CdpClient::connect(endpoint)?;
-        let session_id = create_target_session(&mut client)?;
-
-        client.call("Page.enable", json!({}), Some(&session_id))?;
-        client.call("Runtime.enable", json!({}), Some(&session_id))?;
-        client.call("Network.enable", json!({}), Some(&session_id))?;
-        set_cookies_via_cdp(&mut client, &session_id, &base_url, &cookie)?;
-
-        let index_url = format!("{}/index.php", base_url);
-        navigate_via_cdp(&mut client, &session_id, &index_url, "打开首页失败")?;
-        wait_for_cloudflare(&mut client, &session_id)?;
-        let text = page_text_via_cdp(&mut client, &session_id)?;
-        if looks_logged_out(&text) {
-            return Err("Cookie 无效或已过期".to_string());
-        }
-
-        let attendance_url = format!("{}/attendance.php", base_url);
-        navigate_via_cdp(&mut client, &session_id, &attendance_url, "打开签到页失败")?;
-        wait_for_cloudflare(&mut client, &session_id)?;
-
-        match sign_in_method.as_str() {
-            SIGN_IN_METHOD_OPEN_PAGE => run_open_page_sign_in(&mut client, &session_id),
-            SIGN_IN_METHOD_CLOUDFLARE => {
-                run_cloudflare_sign_in(&mut client, &session_id, &base_url)
-            }
-            SIGN_IN_METHOD_OCR_CAPTCHA => {
-                run_ocr_captcha_sign_in(&mut client, &session_id, &base_url, ocr_api_key.as_deref())
-            }
-            other => Err(format!("未知签到方式: {}", other)),
-        }
+        run_cdp_sign_in_blocking(endpoint, base_url, cookie, sign_in_method, ocr_api_key)
     })
     .await
     .map_err(|e| format!("签到任务 join 失败: {}", e))?
+}
+
+fn run_cdp_sign_in_blocking(
+    endpoint: String,
+    base_url: String,
+    cookie: String,
+    sign_in_method: String,
+    ocr_api_key: Option<String>,
+) -> Result<SignInOutput, String> {
+    let mut client = CdpClient::connect(endpoint)?;
+    let session_id = create_target_session(&mut client)?;
+
+    client.call("Page.enable", json!({}), Some(&session_id))?;
+    client.call("Runtime.enable", json!({}), Some(&session_id))?;
+    client.call("Network.enable", json!({}), Some(&session_id))?;
+    set_cookies_via_cdp(&mut client, &session_id, &base_url, &cookie)?;
+
+    let index_url = format!("{}/index.php", base_url);
+    navigate_via_cdp(&mut client, &session_id, &index_url, "打开首页失败")?;
+    wait_for_cloudflare(&mut client, &session_id)?;
+    let text = page_text_via_cdp(&mut client, &session_id)?;
+    if looks_logged_out(&text) {
+        return Err("Cookie 无效或已过期".to_string());
+    }
+
+    let attendance_url = format!("{}/attendance.php", base_url);
+    navigate_via_cdp(&mut client, &session_id, &attendance_url, "打开签到页失败")?;
+    wait_for_cloudflare(&mut client, &session_id)?;
+
+    match sign_in_method.as_str() {
+        SIGN_IN_METHOD_OPEN_PAGE => run_open_page_sign_in(&mut client, &session_id),
+        SIGN_IN_METHOD_CLOUDFLARE => run_cloudflare_sign_in(&mut client, &session_id, &base_url),
+        SIGN_IN_METHOD_OCR_CAPTCHA => {
+            run_ocr_captcha_sign_in(&mut client, &session_id, &base_url, ocr_api_key.as_deref())
+        }
+        other => Err(format!("未知签到方式: {}", other)),
+    }
 }
 
 fn run_open_page_sign_in(client: &mut CdpClient, session_id: &str) -> Result<SignInOutput, String> {
@@ -782,11 +806,11 @@ fn evaluate_bool_via_cdp(
 }
 
 fn build_lightpanda_endpoint(
-    task: &SignInTaskRecord,
+    config: &LightpandaConfig,
     use_proxy_for_lightpanda: bool,
 ) -> Result<String, String> {
-    if let Some(endpoint) = task
-        .lightpanda_endpoint
+    if let Some(endpoint) = config
+        .endpoint
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -794,25 +818,30 @@ fn build_lightpanda_endpoint(
         return Ok(endpoint.to_string());
     }
 
-    let token = task.lightpanda_token.trim();
+    let token = config.token.as_deref().unwrap_or_default().trim();
     if token.is_empty() {
         return Err("Lightpanda Token 不能为空".to_string());
     }
 
     let mut endpoint = format!(
         "wss://{}.cloud.lightpanda.io/ws?token={}",
-        normalize_region(&task.lightpanda_region),
+        normalize_region(&config.region),
         urlencoding::encode(token)
     );
-    if !task.browser.trim().is_empty() {
+    if !config.browser.trim().is_empty() {
         endpoint.push_str("&browser=");
-        endpoint.push_str(&urlencoding::encode(task.browser.trim()));
+        endpoint.push_str(&urlencoding::encode(config.browser.trim()));
     }
-    if use_proxy_for_lightpanda && !task.proxy.trim().is_empty() {
+    if let Some(proxy) = use_proxy_for_lightpanda
+        .then_some(config.proxy.as_deref())
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         endpoint.push_str("&proxy=");
-        endpoint.push_str(&urlencoding::encode(task.proxy.trim()));
+        endpoint.push_str(&urlencoding::encode(proxy));
     }
-    if let Some(country) = task
+    if let Some(country) = config
         .country
         .as_deref()
         .map(str::trim)
@@ -830,6 +859,288 @@ fn normalize_region(region: &str) -> &str {
         _ => "euwest",
     }
 }
+
+pub fn normalize_sign_in_browser(browser: &str) -> Option<&'static str> {
+    match browser.trim().to_ascii_lowercase().as_str() {
+        SIGN_IN_BROWSER_LIGHTPANDA => Some(SIGN_IN_BROWSER_LIGHTPANDA),
+        SIGN_IN_BROWSER_CLOAKBROWSER => Some(SIGN_IN_BROWSER_CLOAKBROWSER),
+        _ => None,
+    }
+}
+
+fn with_cloakbrowser<T>(
+    config: CloakBrowserConfig,
+    operation: impl FnOnce(String) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = CLOAKBROWSER_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut browser = CloakBrowserProcess::launch(&config)?;
+    let operation_result = operation(browser.endpoint.clone());
+    let close_result = browser.close();
+
+    match (operation_result, close_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(close_error)) => Err(close_error),
+        (Err(error), Err(close_error)) => {
+            Err(format!("{}；CloakBrowser 关闭失败: {}", error, close_error))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct CloakBrowserLauncherMessage {
+    endpoint: Option<String>,
+    error: Option<String>,
+}
+
+struct CloakBrowserProcess {
+    endpoint: String,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    _stdout: BufReader<ChildStdout>,
+}
+
+impl CloakBrowserProcess {
+    fn launch(config: &CloakBrowserConfig) -> Result<Self, String> {
+        if config
+            .license_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
+            return Err("CloakBrowser license key 不能为空".to_string());
+        }
+
+        let payload = serde_json::to_string(config)
+            .map_err(|error| format!("序列化 CloakBrowser 配置失败: {}", error))?;
+        let mut child = spawn_cloakbrowser_helper()?;
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("无法打开 CloakBrowser 启动器 stdin".to_string());
+        };
+        if let Err(error) = writeln!(stdin, "{}", payload).and_then(|_| stdin.flush()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("发送 CloakBrowser 配置失败: {}", error));
+        }
+
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("无法打开 CloakBrowser 启动器 stdout".to_string());
+        };
+        let mut stdout = BufReader::new(stdout);
+        for _ in 0..2_000 {
+            let mut line = String::new();
+            let read = match stdout.read_line(&mut line) {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("读取 CloakBrowser 启动结果失败: {}", error));
+                }
+            };
+            if read == 0 {
+                let status = child.try_wait().ok().flatten();
+                let still_running = status.is_none();
+                let error = match status {
+                    Some(status) => format!("CloakBrowser 启动器提前退出: {}", status),
+                    None => "CloakBrowser 启动器未返回 CDP endpoint".to_string(),
+                };
+                if still_running {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+            let Ok(message) = serde_json::from_str::<CloakBrowserLauncherMessage>(&line) else {
+                continue;
+            };
+            if let Some(error) = message.error {
+                let _ = child.wait();
+                return Err(redact_cloakbrowser_error(&error, config));
+            }
+            if let Some(endpoint) = message
+                .endpoint
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(Self {
+                    endpoint,
+                    child: Some(child),
+                    stdin: Some(stdin),
+                    _stdout: stdout,
+                });
+            }
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+        Err("CloakBrowser 启动器输出过多，未找到 CDP endpoint".to_string())
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let write_error = self.stdin.take().and_then(|mut stdin| {
+            writeln!(stdin, "close")
+                .and_then(|_| stdin.flush())
+                .err()
+                .map(|error| error.to_string())
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return Err(format!("CloakBrowser 启动器退出状态异常: {}", status));
+                    }
+                    if let Some(error) = write_error {
+                        return Err(format!("发送 close 指令失败: {}", error));
+                    }
+                    return Ok(());
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("等待 CloakBrowser close 超时，已终止进程".to_string());
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("等待 CloakBrowser 关闭失败: {}", error));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for CloakBrowserProcess {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+fn spawn_cloakbrowser_helper() -> Result<Child, String> {
+    let executables = std::env::var("CLOAKBROWSER_PYTHON")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value])
+        .unwrap_or_else(|| vec!["python3".to_string(), "python".to_string()]);
+    let mut errors = Vec::new();
+    for executable in executables {
+        match Command::new(&executable)
+            .args(["-u", "-c", CLOAKBROWSER_LAUNCHER])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) => errors.push(format!("{}: {}", executable, error)),
+        }
+    }
+    Err(format!(
+        "无法启动 Python；请安装 Python 3 和 cloakbrowser[geoip]：{}",
+        errors.join("；")
+    ))
+}
+
+fn redact_cloakbrowser_error(message: &str, config: &CloakBrowserConfig) -> String {
+    let mut redacted = message.to_string();
+    let mut secrets = [config.license_key.as_deref(), config.proxy.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if let Some(proxy) = config.proxy.as_deref()
+        && let Ok(proxy_url) = reqwest::Url::parse(proxy.trim())
+    {
+        if !proxy_url.username().is_empty() {
+            secrets.push(proxy_url.username().to_string());
+        }
+        if let Some(password) = proxy_url.password().filter(|value| !value.is_empty()) {
+            secrets.push(password.to_string());
+        }
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    for secret in secrets {
+        redacted = redacted.replace(&secret, "[redacted]");
+    }
+    format!("CloakBrowser 启动失败: {}", redacted)
+}
+
+const CLOAKBROWSER_LAUNCHER: &str = r#"
+import json
+import socket
+import sys
+import time
+import urllib.request
+
+browser = None
+
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=True), flush=True)
+
+try:
+    from cloakbrowser import launch
+
+    config = json.loads(sys.stdin.readline())
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as port_socket:
+        port_socket.bind(("127.0.0.1", 0))
+        port = port_socket.getsockname()[1]
+
+    options = {
+        "license_key": config.get("license_key"),
+        "headless": bool(config.get("headless", False)),
+        "humanize": bool(config.get("humanize", True)),
+        "human_preset": config.get("human_preset") or "careful",
+        "geoip": bool(config.get("geoip", True)),
+        "args": [
+            "--remote-debugging-address=127.0.0.1",
+            f"--remote-debugging-port={port}",
+        ],
+    }
+    proxy = (config.get("proxy") or "").strip()
+    if proxy:
+        options["proxy"] = proxy
+
+    browser = launch(**options)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    endpoint = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            with opener.open(f"http://127.0.0.1:{port}/json/version", timeout=1) as response:
+                endpoint = json.load(response).get("webSocketDebuggerUrl")
+            if endpoint:
+                break
+        except Exception:
+            time.sleep(0.1)
+    if not endpoint:
+        raise TimeoutError("CDP endpoint did not become ready within 30 seconds")
+
+    emit({"endpoint": endpoint})
+    sys.stdin.readline()
+except Exception as error:
+    emit({"error": f"{type(error).__name__}: {error}"})
+finally:
+    if browser is not None:
+        browser.close()
+"#;
 
 #[derive(Debug)]
 struct SignInOutput {
@@ -931,7 +1242,60 @@ pub fn normalize_sign_in_method(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn lightpanda_endpoint_uses_global_browser_configuration() {
+        let config = LightpandaConfig {
+            endpoint: None,
+            token: Some("token with space".to_string()),
+            region: "uswest".to_string(),
+            browser: "chrome".to_string(),
+            proxy: Some("datacenter".to_string()),
+            country: Some("DE".to_string()),
+        };
+
+        assert_eq!(
+            build_lightpanda_endpoint(&config, true).unwrap(),
+            "wss://uswest.cloud.lightpanda.io/ws?token=token%20with%20space&browser=chrome&proxy=datacenter&country=DE"
+        );
+        assert_eq!(
+            build_lightpanda_endpoint(&config, false).unwrap(),
+            "wss://uswest.cloud.lightpanda.io/ws?token=token%20with%20space&browser=chrome&country=DE"
+        );
+    }
+
+    #[test]
+    fn sign_in_browser_only_accepts_supported_providers() {
+        assert_eq!(
+            normalize_sign_in_browser(" CloakBrowser "),
+            Some(SIGN_IN_BROWSER_CLOAKBROWSER)
+        );
+        assert_eq!(
+            normalize_sign_in_browser("lightpanda"),
+            Some(SIGN_IN_BROWSER_LIGHTPANDA)
+        );
+        assert_eq!(normalize_sign_in_browser("chrome"), None);
+    }
+
+    #[test]
+    fn cloakbrowser_errors_redact_credentials() {
+        let config = CloakBrowserConfig {
+            license_key: Some("cb_secret".to_string()),
+            proxy: Some("http://secret_user:secret_pass@proxy:8080".to_string()),
+            ..CloakBrowserConfig::default()
+        };
+        let message = redact_cloakbrowser_error(
+            "launch cb_secret through http://secret_user:secret_pass@proxy:8080 failed for secret_user / secret_pass",
+            &config,
+        );
+
+        assert!(!message.contains("cb_secret"));
+        assert!(!message.contains("secret_user"));
+        assert!(!message.contains("secret_pass"));
+        assert_eq!(message.matches("[redacted]").count(), 4);
+    }
 
     #[test]
     fn cron_0_8_hour_schedule_next() {

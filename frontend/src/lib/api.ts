@@ -14,6 +14,24 @@ export const defaultSettings: GlobalConfig = {
   max_concurrent_rss_fetches: 8,
   log_level: "info",
   proxy: null,
+  use_proxy_for_lightpanda: true,
+  lightpanda: {
+    endpoint: null,
+    token: null,
+    region: "euwest",
+    browser: "lightpanda",
+    proxy: "fast_dc",
+    country: null,
+  },
+  cloakbrowser: {
+    license_key: null,
+    headless: false,
+    humanize: true,
+    human_preset: "careful",
+    proxy: null,
+    geoip: true,
+  },
+  tag_rule_scan_interval_mins: 7,
   ocr_api_key: null,
 };
 

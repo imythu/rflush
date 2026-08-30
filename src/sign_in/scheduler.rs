@@ -158,14 +158,7 @@ async fn run_and_record(
         .ok_or_else(|| "站点不存在".to_string())?;
     let settings = db.get_settings().await.map_err(|e| e.to_string())?;
     let site_name = site.name.clone();
-    let result = execute_task(
-        base_dir,
-        task.clone(),
-        site,
-        settings.use_proxy_for_lightpanda,
-        settings.ocr_api_key,
-    )
-    .await;
+    let result = execute_task(base_dir, task.clone(), site, settings).await;
     match result {
         Ok(result) => {
             info!(
@@ -288,12 +281,7 @@ mod tests {
             name: "test".to_string(),
             site_id: 1,
             cron_expression: "0 0 0/8 * * *".to_string(),
-            lightpanda_endpoint: None,
-            lightpanda_token: "token".to_string(),
-            lightpanda_region: "euwest".to_string(),
             browser: "lightpanda".to_string(),
-            proxy: "fast_dc".to_string(),
-            country: None,
             sign_in_method: crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string(),
             enabled: true,
             last_status: None,

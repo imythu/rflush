@@ -12,7 +12,25 @@ export type GlobalConfig = {
   max_concurrent_rss_fetches: number;
   log_level: string | null;
   proxy: string | null;
+  use_proxy_for_lightpanda: boolean;
+  lightpanda: {
+    endpoint: string | null;
+    token: string | null;
+    region: "euwest" | "uswest" | string;
+    browser: string;
+    proxy: string | null;
+    country: string | null;
+  };
+  cloakbrowser: {
+    license_key: string | null;
+    headless: boolean;
+    humanize: boolean;
+    human_preset: "default" | "careful" | string;
+    proxy: string | null;
+    geoip: boolean;
+  };
   tag_rule_scan_interval_mins?: number;
+  ocr_api_key: string | null;
 };
 
 export type ProxyTestRequest = {
@@ -301,12 +319,7 @@ export type SignInTaskRecord = {
   name: string;
   site_id: number;
   cron_expression: string;
-  lightpanda_endpoint: string | null;
-  lightpanda_token: string;
-  lightpanda_region: string;
   browser: string;
-  proxy: string;
-  country: string | null;
   sign_in_method: string;
   enabled: boolean;
   last_status: string | null;
@@ -320,12 +333,7 @@ export type SignInTaskRequest = {
   name: string;
   site_id: number;
   cron_expression: string;
-  lightpanda_endpoint?: string | null;
-  lightpanda_token: string;
-  lightpanda_region?: "euwest" | "uswest" | string | null;
-  browser?: "lightpanda" | "chrome" | string | null;
-  proxy?: "fast_dc" | "datacenter" | string | null;
-  country?: string | null;
+  browser?: "lightpanda" | "cloakbrowser" | string | null;
   sign_in_method?: string | null;
 };
 
@@ -340,7 +348,7 @@ export type SignInRecord = {
   message: string;
 };
 
-export type LightpandaProbeResult = {
+export type BrowserProbeResult = {
   success: boolean;
   url: string;
   message: string;

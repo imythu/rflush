@@ -19,6 +19,80 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/GlobalConfig'}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/sign-in-tasks:
+    get:
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SignInTask'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SignInTaskRequest'}}}
+      responses:
+        '200': {description: Created, content: {application/json: {schema: {type: object, properties: {id: {type: integer, format: int64}}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-tasks/{id}:
+    put:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SignInTaskRequest'}}}
+      responses:
+        '200': {description: OK}
+        default: {$ref: '#/components/responses/Error'}
+    delete:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-tasks/{id}/start:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Enabled}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-tasks/{id}/stop:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Disabled}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-tasks/{id}/run:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: Triggered}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-tasks/{id}/probe-1-1-1-1:
+    post:
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/BrowserProbeResult'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-probe-1-1-1-1:
+    post:
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SignInBrowserProbeRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/BrowserProbeResult'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sign-in-records:
+    get:
+      parameters:
+        - {name: task_id, in: query, schema: {type: integer, format: int64}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SignInRecord'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
   /api/rss:
     get:
       responses:
@@ -753,7 +827,7 @@ components:
 
     GlobalConfig:
       type: object
-      required: [download_rate_limit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs]
+      required: [download_rate_limit, retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs, proxy, use_proxy_for_lightpanda, lightpanda, cloakbrowser, tag_rule_scan_interval_mins, ocr_api_key]
       properties:
         download_rate_limit:
           type: object
@@ -767,6 +841,86 @@ components:
         max_concurrent_downloads: {type: integer, format: int64}
         max_concurrent_rss_fetches: {type: integer, format: int64}
         throttle_interval_secs: {type: integer, format: int64}
+        proxy: {type: string, nullable: true}
+        use_proxy_for_lightpanda: {type: boolean}
+        lightpanda: {$ref: '#/components/schemas/LightpandaConfig'}
+        cloakbrowser: {$ref: '#/components/schemas/CloakBrowserConfig'}
+        tag_rule_scan_interval_mins: {type: integer, format: int64}
+        ocr_api_key: {type: string, nullable: true, format: password}
+
+    LightpandaConfig:
+      type: object
+      required: [endpoint, token, region, browser, proxy, country]
+      properties:
+        endpoint: {type: string, nullable: true, pattern: '^wss?://'}
+        token: {type: string, nullable: true, format: password}
+        region: {type: string, enum: [euwest, uswest]}
+        browser: {type: string, default: lightpanda}
+        proxy: {type: string, nullable: true, default: fast_dc}
+        country: {type: string, nullable: true}
+
+    CloakBrowserConfig:
+      type: object
+      required: [license_key, headless, humanize, human_preset, proxy, geoip]
+      properties:
+        license_key: {type: string, nullable: true, format: password}
+        headless: {type: boolean, default: false}
+        humanize: {type: boolean, default: true}
+        human_preset: {type: string, enum: [default, careful], default: careful}
+        proxy: {type: string, nullable: true}
+        geoip: {type: boolean, default: true}
+
+    SignInTaskRequest:
+      type: object
+      required: [name, site_id, cron_expression]
+      properties:
+        name: {type: string}
+        site_id: {type: integer, format: int64}
+        cron_expression: {type: string}
+        browser: {type: string, enum: [lightpanda, cloakbrowser], default: lightpanda}
+        sign_in_method: {type: string, enum: [open_page, cloudflare, ocr_captcha], default: open_page}
+
+    SignInTask:
+      allOf:
+        - {$ref: '#/components/schemas/SignInTaskRequest'}
+        - type: object
+          required: [id, browser, sign_in_method, enabled, created_at, updated_at]
+          properties:
+            id: {type: integer, format: int64}
+            enabled: {type: boolean}
+            last_status: {type: string, nullable: true}
+            last_message: {type: string, nullable: true}
+            last_run_at: {type: string, format: date-time, nullable: true}
+            created_at: {type: string, format: date-time}
+            updated_at: {type: string, format: date-time}
+
+    SignInBrowserProbeRequest:
+      type: object
+      required: [browser]
+      properties:
+        browser: {type: string, enum: [lightpanda, cloakbrowser]}
+
+    BrowserProbeResult:
+      type: object
+      required: [success, url, message, title]
+      properties:
+        success: {type: boolean}
+        url: {type: string, format: uri}
+        message: {type: string}
+        title: {type: string, nullable: true}
+
+    SignInRecord:
+      type: object
+      required: [id, task_id, site_id, site_name, started_at, finished_at, status, message]
+      properties:
+        id: {type: integer, format: int64}
+        task_id: {type: integer, format: int64}
+        site_id: {type: integer, format: int64}
+        site_name: {type: string}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        status: {type: string, enum: [success, already, failed]}
+        message: {type: string}
 
     RssSubscription:
       type: object
