@@ -56,7 +56,6 @@ use crate::relocation::{
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
 use crate::site::{SiteAuth, SiteStatsRecord, SiteType, SiteWithStats};
-use crate::site_stats::SiteStatsRefresher;
 use crate::tag_rule::scheduler::TagRuleScheduler;
 
 #[derive(Clone)]
@@ -66,7 +65,6 @@ pub struct AppState {
     jobs: Arc<JobRegistry>,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
-    site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     media: Arc<MediaService>,
@@ -171,7 +169,6 @@ impl AppState {
         engine: DownloadEngine,
         scheduler: Arc<BrushScheduler>,
         sign_in_scheduler: Arc<SignInScheduler>,
-        site_stats_refresher: Arc<SiteStatsRefresher>,
         collector: Arc<DownloaderSnapshotCollector>,
         pool: Arc<DownloaderClientPool>,
         media: Arc<MediaService>,
@@ -187,7 +184,6 @@ impl AppState {
             jobs: Arc::new(JobRegistry::default()),
             scheduler,
             sign_in_scheduler,
-            site_stats_refresher,
             collector,
             pool,
             media,
@@ -335,7 +331,6 @@ pub async fn serve(
     db: Database,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
-    site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     media: Arc<MediaService>,
@@ -355,7 +350,6 @@ pub async fn serve(
         engine,
         scheduler,
         sign_in_scheduler,
-        site_stats_refresher,
         collector,
         pool,
         media,
@@ -3413,8 +3407,8 @@ async fn get_sites_stats_overview(
 ) -> Result<Json<Vec<SiteResponse>>, ApiError> {
     Ok(Json(
         state
-            .site_stats_refresher
-            .refresh_all()
+            .db
+            .list_sites_with_stats()
             .await?
             .into_iter()
             .map(SiteResponse::from)

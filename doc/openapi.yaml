@@ -290,6 +290,7 @@ paths:
 
   /api/sites/stats-overview:
     get:
+      description: Returns the latest site statistics stored in the local database without triggering remote site requests.
       responses:
         '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SiteResponse'}}}}}
         default: {$ref: '#/components/responses/Error'}

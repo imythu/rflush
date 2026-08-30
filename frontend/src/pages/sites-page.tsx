@@ -756,7 +756,7 @@ export function SitesPage() {
           }),
         );
       })
-      .catch((error: Error) => setMessage(error.message || "刷新站点总览失败"))
+      .catch((error: Error) => setMessage(error.message || "加载站点总览失败"))
       .then(() => setOverviewGeneratedAt(new Date()))
       .finally(() => setOverviewLoading(false));
   }
@@ -1319,7 +1319,7 @@ export function SitesPage() {
         {overviewLoading ? (
           <div className="flex min-h-[420px] items-center justify-center py-8 text-muted">
             <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-            正在并发拉取所有站点数据…
+            正在读取站点统计数据…
           </div>
         ) : overviewRows.length === 0 ? (
           <p className="py-8 text-center text-muted">暂无站点统计数据</p>
