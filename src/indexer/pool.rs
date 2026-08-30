@@ -17,8 +17,6 @@ use super::{
     create_indexer, normalize_base_url,
 };
 
-const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-
 struct CachedIndexer {
     config_digest: u64,
     adapter: Arc<dyn IndexerAdapter>,
@@ -201,7 +199,6 @@ fn build_indexer_client(
 ) -> Result<Client, IndexerError> {
     normalize_base_url(&record.base_url)?;
     let mut builder = Client::builder()
-        .user_agent(BROWSER_USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(Policy::none());
@@ -222,6 +219,7 @@ fn config_digest(record: &SiteRecord, effective_proxy: Option<&str>) -> u64 {
     record.site_type.hash(&mut hasher);
     record.base_url.hash(&mut hasher);
     record.auth_config.hash(&mut hasher);
+    record.request_headers.hash(&mut hasher);
     record.use_proxy.hash(&mut hasher);
     effective_proxy.hash(&mut hasher);
     hasher.finish()
@@ -682,6 +680,7 @@ mod tests {
             site_type: "nexusphp".to_string(),
             base_url: base_url.to_string(),
             auth_config: r#"{"auth_type":"api_key","api_key":"test"}"#.to_string(),
+            request_headers: "[]".to_string(),
             use_proxy: false,
             created_at: String::new(),
             updated_at: String::new(),
@@ -1050,6 +1049,7 @@ mod tests {
             site_type: "nexusphp".to_string(),
             base_url: "https://tracker.example".to_string(),
             auth_config: r#"{"auth_type":"api_key","api_key":"one"}"#.to_string(),
+            request_headers: "[]".to_string(),
             use_proxy: true,
             created_at: String::new(),
             updated_at: String::new(),
@@ -1063,6 +1063,12 @@ mod tests {
         assert_ne!(
             initial,
             config_digest(&record, Some("http://proxy-two:8080"))
+        );
+        let before_headers = config_digest(&record, Some("http://proxy-one:8080"));
+        record.request_headers = r#"[{"name":"X-Browser-Profile","value":"desktop"}]"#.to_string();
+        assert_ne!(
+            before_headers,
+            config_digest(&record, Some("http://proxy-one:8080"))
         );
     }
 }

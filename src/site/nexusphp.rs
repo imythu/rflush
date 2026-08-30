@@ -1,6 +1,6 @@
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use reqwest::Client;
-use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use tracing::debug;
@@ -9,19 +9,24 @@ use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats}
 use std::future::Future;
 use std::pin::Pin;
 
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-
 pub struct NexusPhpAdapter {
     base_url: String,
     auth: SiteAuth,
+    request_headers: HeaderMap,
     client: Client,
 }
 
 impl NexusPhpAdapter {
-    pub fn new(base_url: String, auth: SiteAuth, client: Client) -> Self {
+    pub fn new(
+        base_url: String,
+        auth: SiteAuth,
+        request_headers: HeaderMap,
+        client: Client,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
+            request_headers,
             client,
         }
     }
@@ -35,8 +40,7 @@ impl NexusPhpAdapter {
     }
 
     fn build_headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
+        let mut headers = self.request_headers.clone();
         if let Some(cookie) = self.cookie_value() {
             if let Ok(val) = HeaderValue::from_str(cookie) {
                 headers.insert(COOKIE, val);
@@ -484,7 +488,29 @@ fn looks_like_datetime(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::NexusPhpAdapter;
+    use reqwest::Client;
+    use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
+
+    use super::{NexusPhpAdapter, SiteAuth};
+
+    #[test]
+    fn custom_headers_are_applied_without_overriding_authentication() {
+        let mut custom = HeaderMap::new();
+        custom.insert("x-browser-profile", HeaderValue::from_static("desktop"));
+        custom.insert(COOKIE, HeaderValue::from_static("stale=1"));
+        let adapter = NexusPhpAdapter::new(
+            "https://tracker.example".to_string(),
+            SiteAuth::Cookie {
+                cookie: "uid=1".to_string(),
+            },
+            custom,
+            Client::new(),
+        );
+
+        let headers = adapter.build_headers();
+        assert_eq!(headers["x-browser-profile"], "desktop");
+        assert_eq!(headers[COOKIE], "uid=1");
+    }
 
     #[test]
     fn detects_free_and_hr_from_detail_html() {

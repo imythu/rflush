@@ -33,6 +33,7 @@ pub struct NexusPhpIndexer {
     site_name: String,
     base_url: Url,
     mode: NexusMode,
+    request_headers: HeaderMap,
     client: Client,
     access_gate: Arc<OriginAccessGate>,
     // Signed links are deliberately transient and never enter SearchResult or persistence.
@@ -45,6 +46,7 @@ impl NexusPhpIndexer {
         site_name: String,
         base_url: &str,
         auth: SiteAuth,
+        request_headers: HeaderMap,
         client: Client,
         access_gate: Arc<OriginAccessGate>,
     ) -> Result<Self, IndexerError> {
@@ -113,6 +115,7 @@ impl NexusPhpIndexer {
             site_name: site_name.trim().to_string(),
             base_url,
             mode,
+            request_headers,
             client,
             access_gate,
             api_download_urls: Mutex::new(HashMap::new()),
@@ -120,11 +123,13 @@ impl NexusPhpIndexer {
     }
 
     fn headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/json, text/html;q=0.9, */*;q=0.8"),
-        );
+        let mut headers = self.request_headers.clone();
+        if !headers.contains_key(ACCEPT) {
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/json, text/html;q=0.9, */*;q=0.8"),
+            );
+        }
         match &self.mode {
             NexusMode::Api { authorization } => {
                 headers.insert(AUTHORIZATION, authorization.clone());
@@ -743,11 +748,39 @@ fn parse_datetime(raw: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use reqwest::Url;
+    use std::sync::Arc;
+
+    use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
+    use reqwest::{Client, Url};
 
     use crate::indexer::IndexerError;
+    use crate::indexer::access::{OriginAccessGate, default_indexer_access_policy};
+    use crate::site::SiteAuth;
 
-    use super::{ensure_nexus_success, parse_api_results, parse_html_results};
+    use super::{NexusPhpIndexer, ensure_nexus_success, parse_api_results, parse_html_results};
+
+    #[test]
+    fn search_headers_include_custom_values_and_protect_authentication() {
+        let mut custom = HeaderMap::new();
+        custom.insert("x-browser-profile", HeaderValue::from_static("desktop"));
+        custom.insert(COOKIE, HeaderValue::from_static("stale=1"));
+        let indexer = NexusPhpIndexer::new(
+            1,
+            "Tracker".to_string(),
+            "https://tracker.example",
+            SiteAuth::Cookie {
+                cookie: "uid=1".to_string(),
+            },
+            custom,
+            Client::new(),
+            Arc::new(OriginAccessGate::new(default_indexer_access_policy())),
+        )
+        .unwrap();
+
+        let headers = indexer.headers();
+        assert_eq!(headers["x-browser-profile"], "desktop");
+        assert_eq!(headers[COOKIE], "uid=1");
+    }
 
     #[test]
     fn parses_nexus_api_fixture_without_persisting_download_secret() {

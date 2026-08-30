@@ -274,6 +274,23 @@ paths:
               schema: {$ref: '#/components/schemas/SiteCredentialsResponse'}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/sites/{id}/request-headers:
+    get:
+      summary: Retrieve stored custom request headers for one site on demand
+      parameters: [{$ref: '#/components/parameters/IdPath'}]
+      responses:
+        '200':
+          description: OK
+          headers:
+            Cache-Control:
+              schema: {type: string, example: no-store}
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/SiteRequestHeader'}
+        default: {$ref: '#/components/responses/Error'}
+
   /api/sites/{id}/test:
     post:
       parameters: [{$ref: '#/components/parameters/IdPath'}]
@@ -1083,6 +1100,11 @@ components:
         site_type: {type: string}
         base_url: {type: string}
         auth_config: {$ref: '#/components/schemas/SiteAuthConfig'}
+        request_headers:
+          type: array
+          maxItems: 64
+          items: {$ref: '#/components/schemas/SiteRequestHeader'}
+          description: Defaults to the built-in browser fingerprint headers when omitted.
         use_proxy: {type: boolean, default: true}
 
     UpdateSiteRequest:
@@ -1092,6 +1114,11 @@ components:
         name: {type: string}
         site_type: {type: string}
         base_url: {type: string}
+        request_headers:
+          type: array
+          maxItems: 64
+          items: {$ref: '#/components/schemas/SiteRequestHeader'}
+          description: Omission preserves the existing request headers; an empty array removes all of them.
         auth_config:
           allOf: [{$ref: '#/components/schemas/SiteAuthConfig'}]
           nullable: true
@@ -1115,6 +1142,14 @@ components:
         cookie: {type: string, nullable: true, writeOnly: true}
         passkey: {type: string, nullable: true, writeOnly: true}
         api_key: {type: string, nullable: true, writeOnly: true}
+
+    SiteRequestHeader:
+      type: object
+      additionalProperties: false
+      required: [name, value]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128}
+        value: {type: string, maxLength: 8192}
 
     UserStats:
       type: object

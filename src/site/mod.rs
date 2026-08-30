@@ -7,6 +7,143 @@ use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+const MAX_REQUEST_HEADERS: usize = 64;
+const MAX_REQUEST_HEADER_NAME_BYTES: usize = 128;
+const MAX_REQUEST_HEADER_VALUE_BYTES: usize = 8 * 1024;
+const MAX_REQUEST_HEADERS_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteRequestHeader {
+    pub name: String,
+    pub value: String,
+}
+
+pub fn default_site_request_headers() -> Vec<SiteRequestHeader> {
+    [
+        (
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        ),
+        ("Accept-Encoding", "gzip, deflate, br, zstd"),
+        (
+            "Accept-Language",
+            "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
+        ),
+        ("DNT", "1"),
+        (
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        ),
+        (
+            "sec-ch-ua",
+            "\"Not=A?Brand\";v=\"99\", \"Google Chrome\";v=\"151\", \"Chromium\";v=\"151\"",
+        ),
+        ("sec-ch-ua-arch", "\"x86\""),
+        ("sec-ch-ua-bitness", "\"64\""),
+        ("sec-ch-ua-full-version", "\"151.0.7922.109\""),
+        (
+            "sec-ch-ua-full-version-list",
+            "\"Not=A?Brand\";v=\"99.0.0.0\", \"Google Chrome\";v=\"151.0.7922.109\", \"Chromium\";v=\"151.0.7922.109\"",
+        ),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-model", "\"\""),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("sec-ch-ua-platform-version", "\"19.0.0\""),
+    ]
+    .into_iter()
+    .map(|(name, value)| SiteRequestHeader {
+        name: name.to_string(),
+        value: value.to_string(),
+    })
+    .collect()
+}
+
+pub fn normalize_site_request_headers(
+    headers: Vec<SiteRequestHeader>,
+) -> Result<Vec<SiteRequestHeader>, String> {
+    if headers.len() > MAX_REQUEST_HEADERS {
+        return Err(format!("自定义请求头最多允许 {MAX_REQUEST_HEADERS} 项"));
+    }
+
+    let mut normalized = Vec::with_capacity(headers.len());
+    let mut parsed = HeaderMap::new();
+    let mut total_bytes = 0usize;
+    for (index, header) in headers.into_iter().enumerate() {
+        let name = header.name.trim();
+        let value = header.value.trim();
+        if name.is_empty() {
+            return Err(format!("第 {} 个请求头名称不能为空", index + 1));
+        }
+        if name.len() > MAX_REQUEST_HEADER_NAME_BYTES {
+            return Err(format!("请求头 {name} 的名称过长"));
+        }
+        if value.len() > MAX_REQUEST_HEADER_VALUE_BYTES {
+            return Err(format!("请求头 {name} 的值过长"));
+        }
+
+        let parsed_name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("请求头名称无效: {name}"))?;
+        if is_managed_request_header(&parsed_name) {
+            return Err(format!("请求头 {name} 由 HTTP 客户端管理，不能自定义"));
+        }
+        if parsed.contains_key(&parsed_name) {
+            return Err(format!("请求头名称不能重复: {name}"));
+        }
+
+        let mut parsed_value =
+            HeaderValue::from_str(value).map_err(|_| format!("请求头 {name} 的值包含无效字符"))?;
+        parsed_value.set_sensitive(true);
+        parsed.insert(parsed_name, parsed_value);
+
+        total_bytes = total_bytes.saturating_add(name.len() + value.len());
+        if total_bytes > MAX_REQUEST_HEADERS_BYTES {
+            return Err("自定义请求头总大小不能超过 64 KiB".to_string());
+        }
+        normalized.push(SiteRequestHeader {
+            name: name.to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
+pub fn parse_site_request_headers(raw: &str) -> Result<Vec<SiteRequestHeader>, String> {
+    let headers: Vec<SiteRequestHeader> =
+        serde_json::from_str(raw).map_err(|error| format!("请求头配置解析失败: {error}"))?;
+    normalize_site_request_headers(headers)
+}
+
+pub fn site_request_header_map(headers: &[SiteRequestHeader]) -> Result<HeaderMap, String> {
+    let mut map = HeaderMap::new();
+    for header in headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| format!("请求头名称无效: {}", header.name))?;
+        let mut value = HeaderValue::from_str(&header.value)
+            .map_err(|_| format!("请求头 {} 的值包含无效字符", header.name))?;
+        value.set_sensitive(true);
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+fn is_managed_request_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 /// PT 站点认证配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "auth_type")]
@@ -57,6 +194,7 @@ pub struct SiteRecord {
     pub site_type: String,
     pub base_url: String,
     pub auth_config: String,
+    pub request_headers: String,
     pub use_proxy: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -85,6 +223,7 @@ pub struct SiteWithStats {
     pub site_type: String,
     pub base_url: String,
     pub auth_config: String,
+    pub request_headers: String,
     pub use_proxy: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -132,4 +271,51 @@ pub trait SiteAdapter: Send + Sync {
         &self,
         detail_url: &str,
     ) -> Pin<Box<dyn Future<Output = Result<TorrentAttributes, String>> + Send + '_>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SiteRequestHeader, default_site_request_headers, normalize_site_request_headers,
+        site_request_header_map,
+    };
+
+    fn header(name: &str, value: &str) -> SiteRequestHeader {
+        SiteRequestHeader {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn browser_defaults_are_valid_and_exclude_connection_specific_values() {
+        let defaults = default_site_request_headers();
+        let map = site_request_header_map(&defaults).unwrap();
+
+        assert_eq!(map["dnt"], "1");
+        assert!(map["accept"].to_str().unwrap().contains("text/html"));
+        assert!(map["user-agent"].to_str().unwrap().contains("Chrome/151"));
+        assert!(!map.contains_key("cookie"));
+        assert!(!map.contains_key("host"));
+        assert!(!map.contains_key("connection"));
+    }
+
+    #[test]
+    fn request_header_validation_rejects_duplicates_managed_headers_and_newlines() {
+        assert!(
+            normalize_site_request_headers(vec![header("X-Test", "one"), header("x-test", "two")])
+                .unwrap_err()
+                .contains("不能重复")
+        );
+        assert!(
+            normalize_site_request_headers(vec![header("Host", "tracker.example")])
+                .unwrap_err()
+                .contains("HTTP 客户端管理")
+        );
+        assert!(
+            normalize_site_request_headers(vec![header("X-Test", "one\r\ntwo")])
+                .unwrap_err()
+                .contains("无效字符")
+        );
+    }
 }

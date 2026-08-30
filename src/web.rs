@@ -55,7 +55,10 @@ use crate::relocation::{
 };
 use crate::sign_in::scheduler::SignInScheduler;
 use crate::site::factory as site_factory;
-use crate::site::{SiteAuth, SiteStatsRecord, SiteType, SiteWithStats};
+use crate::site::{
+    SiteAuth, SiteRequestHeader, SiteStatsRecord, SiteType, SiteWithStats,
+    default_site_request_headers, normalize_site_request_headers, parse_site_request_headers,
+};
 use crate::tag_rule::scheduler::TagRuleScheduler;
 
 #[derive(Clone)]
@@ -411,6 +414,10 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         .route("/api/sites/stats-overview", get(get_sites_stats_overview))
         .route("/api/sites/{id}", put(update_site).delete(delete_site))
         .route("/api/sites/{id}/credentials", get(get_site_credentials))
+        .route(
+            "/api/sites/{id}/request-headers",
+            get(get_site_request_headers),
+        )
         .route("/api/sites/{id}/test", post(test_site))
         .route("/api/sites/{id}/stats", get(get_site_stats))
         .route("/api/proxy/test", post(test_proxy))
@@ -2987,6 +2994,8 @@ struct CreateSiteRequest {
     site_type: String,
     base_url: String,
     auth_config: serde_json::Value,
+    #[serde(default = "default_site_request_headers")]
+    request_headers: Vec<SiteRequestHeader>,
     #[serde(default = "default_true")]
     use_proxy: bool,
 }
@@ -2997,6 +3006,7 @@ struct UpdateSiteRequest {
     site_type: String,
     base_url: String,
     auth_config: Option<serde_json::Value>,
+    request_headers: Option<Vec<SiteRequestHeader>>,
     #[serde(default)]
     clear_auth_config: bool,
     #[serde(default = "default_true")]
@@ -3136,6 +3146,12 @@ fn parse_site_auth_input(value: serde_json::Value) -> Result<SiteAuth, ApiError>
         }),
         _ => Err(ApiError::bad_request("不支持的认证类型")),
     }
+}
+
+fn serialize_site_request_headers(headers: Vec<SiteRequestHeader>) -> Result<String, ApiError> {
+    let headers = normalize_site_request_headers(headers).map_err(ApiError::bad_request)?;
+    serde_json::to_string(&headers)
+        .map_err(|error| ApiError::bad_request(format!("请求头配置序列化失败: {error}")))
 }
 
 fn parse_site_type(value: &str) -> Result<SiteType, ApiError> {
@@ -3293,6 +3309,25 @@ async fn get_site_credentials(
         .into_response())
 }
 
+async fn get_site_request_headers(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let site = state
+        .db
+        .get_site(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("站点不存在"))?;
+    let request_headers = parse_site_request_headers(&site.request_headers)
+        .map_err(|_| ApiError::internal("现有请求头配置无效"))?;
+
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(request_headers),
+    )
+        .into_response())
+}
+
 async fn create_site(
     State(state): State<AppState>,
     Json(body): Json<CreateSiteRequest>,
@@ -3306,6 +3341,7 @@ async fn create_site(
     require_configured_site_auth(&auth)?;
     let auth_str = serde_json::to_string(&auth)
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
+    let request_headers = serialize_site_request_headers(body.request_headers)?;
     let id = state
         .db
         .create_site(
@@ -3313,6 +3349,7 @@ async fn create_site(
             &body.site_type,
             &body.base_url,
             &auth_str,
+            &request_headers,
             body.use_proxy,
         )
         .await?;
@@ -3340,6 +3377,10 @@ async fn update_site(
     )?;
     let auth_str = serde_json::to_string(&auth)
         .map_err(|e| ApiError::bad_request(format!("认证配置序列化失败: {}", e)))?;
+    let request_headers = match body.request_headers {
+        Some(headers) => serialize_site_request_headers(headers)?,
+        None => existing.request_headers,
+    };
     state
         .db
         .update_site(
@@ -3348,6 +3389,7 @@ async fn update_site(
             &body.site_type,
             &body.base_url,
             &auth_str,
+            &request_headers,
             body.use_proxy,
         )
         .await?;
@@ -3372,7 +3414,7 @@ async fn test_site(
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
     let settings = state.db.get_settings().await?;
-    let client = client_factory::resolve_client(settings.proxy.as_deref(), site.use_proxy)
+    let client = client_factory::resolve_site_client(settings.proxy.as_deref(), site.use_proxy)
         .map_err(|e| ApiError::internal(format!("创建 HTTP 客户端失败: {}", e)))?;
     let adapter = site_factory::create_adapter(&site, client).map_err(ApiError::bad_request)?;
     let result = adapter
@@ -3392,7 +3434,7 @@ async fn get_site_stats(
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
     let settings = state.db.get_settings().await?;
-    let client = client_factory::resolve_client(settings.proxy.as_deref(), site.use_proxy)
+    let client = client_factory::resolve_site_client(settings.proxy.as_deref(), site.use_proxy)
         .map_err(|e| ApiError::internal(format!("创建 HTTP 客户端失败: {}", e)))?;
     let adapter = site_factory::create_adapter(&site, client).map_err(ApiError::bad_request)?;
     let stats = adapter
@@ -6239,6 +6281,8 @@ mod security_boundary_tests {
             site_type: "nexusphp".to_string(),
             base_url: "https://tracker.example".to_string(),
             auth_config: r#"{"auth_type":"cookie","cookie":"dummy-site-secret"}"#.to_string(),
+            request_headers: r#"[{"name":"X-Private-Token","value":"dummy-header-secret"}]"#
+                .to_string(),
             use_proxy: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6248,7 +6292,9 @@ mod security_boundary_tests {
         assert_eq!(site_json["auth_type"], "cookie");
         assert_eq!(site_json["auth_configured"], true);
         assert!(site_json.get("auth_config").is_none());
+        assert!(site_json.get("request_headers").is_none());
         assert!(!site_json.to_string().contains("dummy-site-secret"));
+        assert!(!site_json.to_string().contains("dummy-header-secret"));
 
         let downloader = DownloaderResponse::from(crate::downloader::DownloaderRecord {
             id: 2,
@@ -6292,6 +6338,7 @@ mod security_boundary_tests {
             site_type: "nexusphp".to_string(),
             base_url: "https://tracker.example".to_string(),
             auth_config: r#"{"auth_type":"cookie","cookie":"dummy-site-secret"}"#.to_string(),
+            request_headers: "[]".to_string(),
             use_proxy: true,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

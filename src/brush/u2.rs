@@ -4,7 +4,12 @@ use crate::brush::BrushTaskRecord;
 use crate::db::Database;
 use crate::net::http::AppHttpClient;
 use crate::rss;
-use crate::site::u2_shoutbox;
+use crate::site::{SiteRequestHeader, parse_site_request_headers, u2_shoutbox};
+
+struct U2SiteRequestConfig {
+    cookie: String,
+    request_headers: Vec<SiteRequestHeader>,
+}
 
 /// 检测 URL 是否为 U2 站点 (u2.dmhy.org) 的 shoutbox 请求。
 pub fn is_u2_shoutbox_url(url: &str) -> bool {
@@ -12,38 +17,66 @@ pub fn is_u2_shoutbox_url(url: &str) -> bool {
 }
 
 /// 构造 U2 请求的公共头（模拟浏览器），外加 Cookie 和 Referer。
-fn u2_headers<'a>(
+fn u2_headers<'a, 'b>(
     cookie: &'a str,
     referer: &'a str,
-    buf: &'a mut Vec<(&'a str, &'a str)>,
-) -> &'a [(&'a str, &'a str)] {
+    request_headers: &'a [SiteRequestHeader],
+    buf: &'b mut Vec<(&'a str, &'a str)>,
+) -> &'b [(&'a str, &'a str)] {
     buf.clear();
+    for header in request_headers {
+        if !header.name.eq_ignore_ascii_case("cookie") {
+            buf.push((header.name.as_str(), header.value.as_str()));
+        }
+    }
+
+    let has_custom = |name: &str| {
+        request_headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case(name))
+    };
+    let fallbacks = [
+        ("Referer", referer),
+        (
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        ),
+        (
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        ),
+        (
+            "Accept-Language",
+            "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
+        ),
+        ("DNT", "1"),
+        ("Upgrade-Insecure-Requests", "1"),
+        ("Sec-Fetch-Dest", "iframe"),
+        ("Sec-Fetch-Mode", "navigate"),
+        ("Sec-Fetch-Site", "same-origin"),
+        ("Sec-Fetch-User", "?1"),
+        (
+            "sec-ch-ua",
+            "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
+        ),
+        ("sec-ch-ua-mobile", "?0"),
+        ("sec-ch-ua-platform", "\"Windows\""),
+        ("Cache-Control", "max-age=0"),
+    ];
+    for (name, value) in fallbacks {
+        if !has_custom(name) {
+            buf.push((name, value));
+        }
+    }
     buf.push(("Cookie", cookie));
-    buf.push(("Referer", referer));
-    buf.push(("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"));
-    buf.push(("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"));
-    buf.push((
-        "Accept-Language",
-        "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
-    ));
-    buf.push(("DNT", "1"));
-    buf.push(("Upgrade-Insecure-Requests", "1"));
-    buf.push(("Sec-Fetch-Dest", "iframe"));
-    buf.push(("Sec-Fetch-Mode", "navigate"));
-    buf.push(("Sec-Fetch-Site", "same-origin"));
-    buf.push(("Sec-Fetch-User", "?1"));
-    buf.push((
-        "sec-ch-ua",
-        "\"Chromium\";v=\"148\", \"Google Chrome\";v=\"148\", \"Not/A)Brand\";v=\"99\"",
-    ));
-    buf.push(("sec-ch-ua-mobile", "?0"));
-    buf.push(("sec-ch-ua-platform", "\"Windows\""));
-    buf.push(("Cache-Control", "max-age=0"));
     buf.as_slice()
 }
 
-/// 从站点配置中提取 U2 Cookie。
-pub async fn get_u2_site_cookie(task: &BrushTaskRecord, db: &Database) -> Result<String, String> {
+/// 从站点配置中提取 U2 Cookie 和站点级请求头。
+async fn get_u2_site_request_config(
+    task: &BrushTaskRecord,
+    db: &Database,
+) -> Result<U2SiteRequestConfig, String> {
     let site_id = task
         .site_id
         .ok_or_else(|| "U2 shoutbox 需要关联站点以获取 Cookie".to_string())?;
@@ -57,7 +90,7 @@ pub async fn get_u2_site_cookie(task: &BrushTaskRecord, db: &Database) -> Result
     let auth: crate::site::SiteAuth = serde_json::from_str(&site.auth_config)
         .map_err(|e| format!("解析站点认证配置失败 (site_id={site_id}): {e}"))?;
 
-    Ok(match &auth {
+    let cookie = match &auth {
         crate::site::SiteAuth::Cookie { cookie } => cookie.clone(),
         crate::site::SiteAuth::CookiePasskey { cookie, .. } => cookie.clone(),
         _ => {
@@ -65,15 +98,25 @@ pub async fn get_u2_site_cookie(task: &BrushTaskRecord, db: &Database) -> Result
                 "U2 shoutbox 需要 Cookie 认证，当前认证类型不支持 (site_id={site_id})"
             ));
         }
+    };
+    let request_headers = parse_site_request_headers(&site.request_headers)
+        .map_err(|error| format!("解析站点请求头配置失败 (site_id={site_id}): {error}"))?;
+    Ok(U2SiteRequestConfig {
+        cookie,
+        request_headers,
     })
 }
 
 /// 使用站点 Cookie 预热 U2 会话，访问 /index.php 保持登录状态。
-async fn warmup_session(task: &BrushTaskRecord, cookie: &str, http: &AppHttpClient) {
+async fn warmup_session(
+    task: &BrushTaskRecord,
+    config: &U2SiteRequestConfig,
+    http: &AppHttpClient,
+) {
     let url = "https://u2.dmhy.org/index.php";
     let referer = "https://u2.dmhy.org/index.php";
     let mut buf = Vec::new();
-    let headers = u2_headers(cookie, referer, &mut buf);
+    let headers = u2_headers(&config.cookie, referer, &config.request_headers, &mut buf);
 
     match http.get_with_headers("u2-warmup", url, headers).await {
         Ok(resp) if resp.status.is_success() => {
@@ -98,10 +141,10 @@ pub async fn fetch_shoutbox_html(
     db: &Database,
     http: &AppHttpClient,
 ) -> Result<String, String> {
-    let cookie = get_u2_site_cookie(task, db).await?;
+    let config = get_u2_site_request_config(task, db).await?;
 
     // 预热会话：先访问 /index.php 保持 Cookie 有效
-    warmup_session(task, &cookie, http).await;
+    warmup_session(task, &config, http).await;
 
     info!(
         "[刷流][{}] 使用站点 Cookie 拉取 U2 shoutbox: {}",
@@ -110,7 +153,7 @@ pub async fn fetch_shoutbox_html(
 
     let referer = task.rss_url.as_str();
     let mut buf = Vec::new();
-    let headers = u2_headers(&cookie, referer, &mut buf);
+    let headers = u2_headers(&config.cookie, referer, &config.request_headers, &mut buf);
 
     let resp = http
         .get_with_headers("u2-shoutbox", &task.rss_url, headers)
@@ -162,8 +205,8 @@ pub async fn enrich_item(
     item: &mut rss::TorrentItem,
 ) {
     let detail_url = format!("https://u2.dmhy.org/details.php?id={}&hit=1", item.guid);
-    let cookie = match get_u2_site_cookie(task, db).await {
-        Ok(c) => c,
+    let config = match get_u2_site_request_config(task, db).await {
+        Ok(config) => config,
         Err(e) => {
             warn!("[刷流][{}] 获取 U2 cookie 失败: {}", task.name, e);
             return;
@@ -174,7 +217,7 @@ pub async fn enrich_item(
 
     let referer = "https://u2.dmhy.org/torrents.php";
     let mut buf = Vec::new();
-    let headers = u2_headers(&cookie, referer, &mut buf);
+    let headers = u2_headers(&config.cookie, referer, &config.request_headers, &mut buf);
 
     let resp = match http
         .get_with_headers("u2-detail", &detail_url, headers)
@@ -231,7 +274,12 @@ pub async fn enrich_item(
         let peer_referer = format!("https://u2.dmhy.org/details.php?id={}&hits=1", item.guid);
 
         let mut buf2 = Vec::new();
-        let peer_headers = u2_headers(&cookie, &peer_referer, &mut buf2);
+        let peer_headers = u2_headers(
+            &config.cookie,
+            &peer_referer,
+            &config.request_headers,
+            &mut buf2,
+        );
 
         match http
             .get_with_headers("u2-peerlist", &peer_list_url, peer_headers)
@@ -306,7 +354,7 @@ pub async fn download_torrent(
     http: &AppHttpClient,
     download_url: &str,
 ) -> Result<Vec<u8>, String> {
-    let cookie = get_u2_site_cookie(task, db).await?;
+    let config = get_u2_site_request_config(task, db).await?;
 
     info!(
         "[刷流][{}] 使用站点 Cookie 下载 U2 种子: {}",
@@ -315,7 +363,7 @@ pub async fn download_torrent(
 
     let referer = "https://u2.dmhy.org/torrents.php";
     let mut buf = Vec::new();
-    let headers = u2_headers(&cookie, referer, &mut buf);
+    let headers = u2_headers(&config.cookie, referer, &config.request_headers, &mut buf);
 
     let resp = http
         .get_with_headers("u2-torrent", download_url, headers)
@@ -327,4 +375,55 @@ pub async fn download_torrent(
     }
 
     Ok(resp.body.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SiteRequestHeader, u2_headers};
+
+    #[test]
+    fn configured_u2_headers_replace_fallbacks_but_not_authentication_cookie() {
+        let configured = vec![
+            SiteRequestHeader {
+                name: "User-Agent".to_string(),
+                value: "Custom Browser".to_string(),
+            },
+            SiteRequestHeader {
+                name: "Cookie".to_string(),
+                value: "stale=1".to_string(),
+            },
+            SiteRequestHeader {
+                name: "X-Test".to_string(),
+                value: "enabled".to_string(),
+            },
+        ];
+        let mut buffer = Vec::new();
+        let headers = u2_headers("uid=1", "https://u2.dmhy.org/", &configured, &mut buffer);
+
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| *value),
+            Some("Custom Browser")
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>(),
+            vec!["uid=1"]
+        );
+        assert!(
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-test") && *value == "enabled"
+            })
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("accept"))
+        );
+    }
 }

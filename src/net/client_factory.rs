@@ -2,7 +2,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
-use reqwest::{Client, Proxy};
+use reqwest::redirect::Policy;
+use reqwest::{Client, Proxy, Url};
 use serde::Serialize;
 use tracing::warn;
 
@@ -28,6 +29,32 @@ fn base_builder() -> reqwest::ClientBuilder {
         .timeout(Duration::from_secs(30))
 }
 
+fn site_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .redirect(Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("站点重定向次数过多");
+            }
+            if attempt
+                .previous()
+                .first()
+                .is_some_and(|origin| same_origin(origin, attempt.url()))
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 /// 构建一个 reqwest::Client，可选带代理。
 pub fn build_client(proxy: Option<&str>) -> Result<Client, reqwest::Error> {
     let mut builder = base_builder();
@@ -37,22 +64,26 @@ pub fn build_client(proxy: Option<&str>) -> Result<Client, reqwest::Error> {
     builder.build()
 }
 
-/// 根据 (全局代理地址, use_proxy 开关) 决定返回带代理还是直连的 Client。
-///
-/// - `use_proxy=true` 且 `proxy` 有值 → 返回带代理 Client
-/// - `use_proxy=true` 且 `proxy` 为空 → 每个进程 warn 一次 + 返回直连 Client（静默降级）
-/// - `use_proxy=false` → 返回直连 Client
-pub fn resolve_client(proxy: Option<&str>, use_proxy: bool) -> Result<Client, reqwest::Error> {
+fn build_site_client(proxy: Option<&str>) -> Result<Client, reqwest::Error> {
+    let mut builder = site_builder();
+    if let Some(proxy_url) = proxy.map(str::trim).filter(|v| !v.is_empty()) {
+        builder = builder.proxy(Proxy::all(proxy_url)?);
+    }
+    builder.build()
+}
+
+/// 构建站点专用客户端。请求头由站点适配器逐次添加，删除已保存的默认头后不会被客户端补回。
+pub fn resolve_site_client(proxy: Option<&str>, use_proxy: bool) -> Result<Client, reqwest::Error> {
     let effective_proxy = proxy.map(str::trim).filter(|v| !v.is_empty());
     if use_proxy {
         if let Some(url) = effective_proxy {
-            return build_client(Some(url));
+            return build_site_client(Some(url));
         }
         MISSING_PROXY_WARNING.call_once(|| {
             warn!("站点标记了使用代理，但全局代理地址未配置，将直连访问");
         });
     }
-    build_client(None)
+    build_site_client(None)
 }
 
 /// 代理连通性测试：用指定代理 GET 一个 URL，返回结果。
@@ -100,5 +131,29 @@ pub async fn test_proxy(proxy: &str, test_url: &str) -> ProxyTestResult {
                 message: format!("请求失败: {}", e),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::Url;
+
+    use super::same_origin;
+
+    #[test]
+    fn site_redirect_origin_requires_matching_scheme_host_and_effective_port() {
+        let base = Url::parse("https://tracker.example/path").unwrap();
+        assert!(same_origin(
+            &base,
+            &Url::parse("https://tracker.example:443/next").unwrap()
+        ));
+        assert!(!same_origin(
+            &base,
+            &Url::parse("http://tracker.example/next").unwrap()
+        ));
+        assert!(!same_origin(
+            &base,
+            &Url::parse("https://cdn.example/next").unwrap()
+        ));
     }
 }

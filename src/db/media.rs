@@ -4027,6 +4027,7 @@ mod tests {
                 "nexusphp",
                 "https://tracker.example",
                 r#"{"auth_type":"cookie","cookie":"test=1"}"#,
+                "[]",
                 false,
             )
             .await

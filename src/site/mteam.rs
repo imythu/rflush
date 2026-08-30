@@ -1,6 +1,6 @@
 use chrono::{FixedOffset, NaiveDateTime, TimeZone};
 use reqwest::Client;
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
@@ -9,18 +9,23 @@ use std::future::Future;
 use std::pin::Pin;
 
 const MTEAM_DEFAULT_API: &str = "https://api.m-team.cc";
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 /// M-Team 详情请求间最小间隔（毫秒），防止 API 限流
 const MTEAM_REQUEST_INTERVAL_MS: u64 = 4000;
 
 pub struct MTeamAdapter {
     base_url: String,
     api_key: String,
+    request_headers: HeaderMap,
     client: Client,
 }
 
 impl MTeamAdapter {
-    pub fn new(base_url: String, auth: SiteAuth, client: Client) -> Self {
+    pub fn new(
+        base_url: String,
+        auth: SiteAuth,
+        request_headers: HeaderMap,
+        client: Client,
+    ) -> Self {
         let api_key = match &auth {
             SiteAuth::ApiKey { api_key } => api_key.clone(),
             _ => String::new(),
@@ -33,13 +38,13 @@ impl MTeamAdapter {
         Self {
             base_url: url,
             api_key,
+            request_headers,
             client,
         }
     }
 
     fn build_headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
+        let mut headers = self.request_headers.clone();
         if let Ok(val) = HeaderValue::from_str(&self.api_key) {
             headers.insert("x-api-key", val);
         }
@@ -363,7 +368,29 @@ fn parse_mteam_datetime(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::MTeamAdapter;
+    use reqwest::Client;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::{MTeamAdapter, SiteAuth};
+
+    #[test]
+    fn custom_headers_are_applied_without_overriding_api_key() {
+        let mut custom = HeaderMap::new();
+        custom.insert("x-browser-profile", HeaderValue::from_static("desktop"));
+        custom.insert("x-api-key", HeaderValue::from_static("stale"));
+        let adapter = MTeamAdapter::new(
+            "https://api.m-team.cc".to_string(),
+            SiteAuth::ApiKey {
+                api_key: "current".to_string(),
+            },
+            custom,
+            Client::new(),
+        );
+
+        let headers = adapter.build_headers();
+        assert_eq!(headers["x-browser-profile"], "desktop");
+        assert_eq!(headers["x-api-key"], "current");
+    }
 
     #[test]
     fn parse_discount_maps_current_api_enum() {

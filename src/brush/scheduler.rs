@@ -966,7 +966,7 @@ async fn execute_brush_task_inner(
                         match db.get_site(site_id).await {
                             Ok(Some(site)) => {
                                 let proxy = db.get_settings().await.ok().and_then(|s| s.proxy);
-                                let client = match client_factory::resolve_client(
+                                let client = match client_factory::resolve_site_client(
                                     proxy.as_deref(),
                                     site.use_proxy,
                                 ) {

@@ -15,7 +15,9 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::site::{SiteAuth, SiteRecord, SiteType};
+use crate::site::{
+    SiteAuth, SiteRecord, SiteType, parse_site_request_headers, site_request_header_map,
+};
 
 #[allow(unused_imports)]
 pub use pool::{AggregateSearchResult, IndexerAggregator, IndexerPool, SiteSearchError};
@@ -246,6 +248,9 @@ pub(crate) fn create_indexer(
     let auth: SiteAuth = serde_json::from_str(&record.auth_config).map_err(|error| {
         IndexerError::Configuration(format!("invalid site authentication config: {error}"))
     })?;
+    let request_headers = parse_site_request_headers(&record.request_headers)
+        .and_then(|headers| site_request_header_map(&headers))
+        .map_err(IndexerError::Configuration)?;
 
     match site_type {
         SiteType::NexusPhp => Ok(Arc::new(nexusphp::NexusPhpIndexer::new(
@@ -253,6 +258,7 @@ pub(crate) fn create_indexer(
             record.name.clone(),
             &record.base_url,
             auth,
+            request_headers,
             client,
             Arc::clone(&access_gate),
         )?)),
@@ -261,6 +267,7 @@ pub(crate) fn create_indexer(
             record.name.clone(),
             &record.base_url,
             auth,
+            request_headers,
             client,
             access_gate,
         )?)),

@@ -2833,6 +2833,7 @@ mod tests {
                 "nexusphp",
                 "https://a.example",
                 r#"{"auth_type":"cookie","cookie":"test=1"}"#,
+                "[]",
                 false,
             )
             .await
@@ -2843,6 +2844,7 @@ mod tests {
                 "nexusphp",
                 "https://b.example",
                 r#"{"auth_type":"cookie","cookie":"test=1"}"#,
+                "[]",
                 false,
             )
             .await

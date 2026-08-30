@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Globe,
   Plus,
@@ -18,6 +18,7 @@ import {
   EyeOff,
   ExternalLink,
   Download as DownloadIcon,
+  RotateCcw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -43,6 +44,7 @@ import { api } from "@/lib/api";
 import type {
   SiteCredentialsRecord,
   SiteRecord,
+  SiteRequestHeader,
   SiteStatsRecord,
   SiteTestResult,
 } from "@/types";
@@ -128,6 +130,43 @@ interface SiteForm {
   cookie: string;
   passkey: string;
   api_key: string;
+  request_headers: SiteRequestHeader[];
+}
+
+const defaultRequestHeaders: ReadonlyArray<Readonly<SiteRequestHeader>> = [
+  {
+    name: "Accept",
+    value: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+  },
+  { name: "Accept-Encoding", value: "gzip, deflate, br, zstd" },
+  {
+    name: "Accept-Language",
+    value: "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-TW;q=0.6",
+  },
+  { name: "DNT", value: "1" },
+  {
+    name: "User-Agent",
+    value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+  },
+  {
+    name: "sec-ch-ua",
+    value: '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"',
+  },
+  { name: "sec-ch-ua-arch", value: '"x86"' },
+  { name: "sec-ch-ua-bitness", value: '"64"' },
+  { name: "sec-ch-ua-full-version", value: '"151.0.7922.109"' },
+  {
+    name: "sec-ch-ua-full-version-list",
+    value: '"Not=A?Brand";v="99.0.0.0", "Google Chrome";v="151.0.7922.109", "Chromium";v="151.0.7922.109"',
+  },
+  { name: "sec-ch-ua-mobile", value: "?0" },
+  { name: "sec-ch-ua-model", value: '""' },
+  { name: "sec-ch-ua-platform", value: '"Windows"' },
+  { name: "sec-ch-ua-platform-version", value: '"19.0.0"' },
+];
+
+function freshDefaultRequestHeaders(): SiteRequestHeader[] {
+  return defaultRequestHeaders.map((header) => ({ ...header }));
 }
 
 function formatBytesCompact(bytes: number): { value: string; unit: string } {
@@ -375,6 +414,7 @@ const emptySiteForm: SiteForm = {
   cookie: "",
   passkey: "",
   api_key: "",
+  request_headers: freshDefaultRequestHeaders(),
 };
 
 function buildAuthConfig(form: SiteForm): object {
@@ -486,6 +526,108 @@ function SiteCredentialList({
   );
 }
 
+function SiteRequestHeadersEditor({
+  headers,
+  loading,
+  onChange,
+  onAdd,
+  onRemove,
+  onRestore,
+}: {
+  headers: SiteRequestHeader[];
+  loading: boolean;
+  onChange: (index: number, field: keyof SiteRequestHeader, value: string) => void;
+  onAdd: () => void;
+  onRemove: (index: number) => void;
+  onRestore: () => void;
+}) {
+  return (
+    <section className="min-w-0 space-y-3" aria-labelledby="site-request-headers-label">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-baseline gap-2">
+          <Label id="site-request-headers-label">自定义请求头</Label>
+          <span className="text-xs text-muted">{headers.length} 项</span>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            className="h-8 px-3 text-xs"
+            onClick={onRestore}
+            disabled={loading}
+          >
+            <RotateCcw className="mr-1.5 size-3.5" />
+            恢复默认
+          </Button>
+          <Button
+            type="button"
+            variant="secondary"
+            className="h-8 px-3 text-xs"
+            onClick={onAdd}
+            disabled={loading || headers.length >= 64}
+          >
+            <Plus className="mr-1.5 size-3.5" />
+            添加请求头
+          </Button>
+        </div>
+      </div>
+
+      <div className="overflow-hidden rounded-2xl border border-border bg-surface-container/45">
+        <div className="hidden grid-cols-[minmax(8rem,0.7fr)_minmax(12rem,1.3fr)_2.25rem] gap-2 border-b border-border bg-card/65 px-3 py-2 text-xs font-semibold text-muted sm:grid">
+          <span>名称</span>
+          <span>值</span>
+          <span className="sr-only">操作</span>
+        </div>
+        {loading ? (
+          <div className="flex h-40 items-center justify-center text-sm text-muted">
+            <Loader2 className="mr-2 size-4 animate-spin" />
+            加载请求头…
+          </div>
+        ) : headers.length === 0 ? (
+          <div className="flex h-28 items-center justify-center text-sm text-muted">
+            未配置请求头
+          </div>
+        ) : (
+          <div className="max-h-[min(44dvh,28rem)] space-y-2 overflow-y-auto p-2.5">
+            {headers.map((header, index) => (
+              <div
+                key={index}
+                className="grid grid-cols-[minmax(0,1fr)_2.25rem] gap-2 rounded-xl border border-border/70 bg-card/75 p-2 sm:grid-cols-[minmax(8rem,0.7fr)_minmax(12rem,1.3fr)_2.25rem]"
+              >
+                <Input
+                  className="h-9 min-w-0 rounded-xl px-3 font-mono text-xs"
+                  value={header.name}
+                  onChange={(event) => onChange(index, "name", event.target.value)}
+                  placeholder="请求头名称"
+                  aria-label={`第 ${index + 1} 个请求头名称`}
+                  spellCheck={false}
+                />
+                <Input
+                  className="col-start-1 row-start-2 h-9 min-w-0 rounded-xl px-3 font-mono text-xs sm:col-start-2 sm:row-start-1"
+                  value={header.value}
+                  onChange={(event) => onChange(index, "value", event.target.value)}
+                  placeholder="请求头值"
+                  aria-label={`第 ${index + 1} 个请求头值`}
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  className="col-start-2 row-span-2 row-start-1 flex size-9 cursor-pointer items-center justify-center self-center rounded-xl text-muted transition-colors duration-200 hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:col-start-3 sm:row-span-1"
+                  onClick={() => onRemove(index)}
+                  aria-label={`删除第 ${index + 1} 个请求头`}
+                  title="删除请求头"
+                >
+                  <Trash2 className="size-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -510,6 +652,9 @@ export function SitesPage() {
   } | null>(null);
   const [clearAuthConfig, setClearAuthConfig] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState("");
+  const [requestHeadersLoading, setRequestHeadersLoading] = useState(false);
+  const requestHeadersLoadRef = useRef(0);
 
   // delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<SiteRecord | null>(null);
@@ -655,15 +800,58 @@ export function SitesPage() {
     setForm((prev) => ({ ...prev, ...partial }));
   }
 
+  function closeForm() {
+    requestHeadersLoadRef.current += 1;
+    setRequestHeadersLoading(false);
+    setFormError("");
+    setFormOpen(false);
+  }
+
+  function updateRequestHeader(
+    index: number,
+    field: keyof SiteRequestHeader,
+    value: string,
+  ) {
+    setForm((current) => ({
+      ...current,
+      request_headers: current.request_headers.map((header, headerIndex) =>
+        headerIndex === index ? { ...header, [field]: value } : header,
+      ),
+    }));
+  }
+
+  function addRequestHeader() {
+    setForm((current) => ({
+      ...current,
+      request_headers: [...current.request_headers, { name: "", value: "" }],
+    }));
+  }
+
+  function removeRequestHeader(index: number) {
+    setForm((current) => ({
+      ...current,
+      request_headers: current.request_headers.filter((_, headerIndex) => headerIndex !== index),
+    }));
+  }
+
+  function restoreDefaultRequestHeaders() {
+    patch({ request_headers: freshDefaultRequestHeaders() });
+  }
+
   function openAdd() {
+    requestHeadersLoadRef.current += 1;
     setEditingId(null);
-    setForm(emptySiteForm);
+    setForm({ ...emptySiteForm, request_headers: freshDefaultRequestHeaders() });
     setExistingAuth(null);
     setClearAuthConfig(false);
+    setFormError("");
+    setRequestHeadersLoading(false);
     setFormOpen(true);
   }
 
   function openEdit(site: SiteRecord) {
+    const loadId = requestHeadersLoadRef.current + 1;
+    requestHeadersLoadRef.current = loadId;
     setEditingId(site.id);
     const siteType = (site.site_type as SiteForm["site_type"]) || "nexusphp";
     const authType = site.auth_type ?? (siteType === "mteam" ? "api_key" : "cookie");
@@ -674,13 +862,49 @@ export function SitesPage() {
       base_url: site.base_url,
       use_proxy: site.use_proxy,
       auth_type: authType,
+      request_headers: [],
     });
     setExistingAuth({ siteType, authType, configured: site.auth_configured });
     setClearAuthConfig(false);
+    setFormError("");
+    setRequestHeadersLoading(true);
     setFormOpen(true);
+    api<SiteRequestHeader[]>(`/api/sites/${site.id}/request-headers`)
+      .then((requestHeaders) => {
+        if (requestHeadersLoadRef.current !== loadId) return;
+        patch({ request_headers: requestHeaders });
+      })
+      .catch((error: Error) => {
+        if (requestHeadersLoadRef.current !== loadId) return;
+        setMessage(error.message || "加载站点请求头失败");
+        closeForm();
+      })
+      .finally(() => {
+        if (requestHeadersLoadRef.current === loadId) {
+          setRequestHeadersLoading(false);
+        }
+      });
   }
 
   function handleSubmit() {
+    const requestHeaders = form.request_headers.filter(
+      (header) => header.name.trim() || header.value.trim(),
+    );
+    const missingNameIndex = requestHeaders.findIndex((header) => !header.name.trim());
+    if (missingNameIndex >= 0) {
+      setFormError(`第 ${missingNameIndex + 1} 个请求头名称不能为空`);
+      return;
+    }
+    const seenHeaderNames = new Set<string>();
+    for (const header of requestHeaders) {
+      const normalizedName = header.name.trim().toLowerCase();
+      if (seenHeaderNames.has(normalizedName)) {
+        setFormError(`请求头名称不能重复：${header.name.trim()}`);
+        return;
+      }
+      seenHeaderNames.add(normalizedName);
+    }
+    setFormError("");
     setSubmitting(true);
     const body = {
       name: form.name,
@@ -688,6 +912,7 @@ export function SitesPage() {
       base_url: form.base_url,
       use_proxy: form.use_proxy,
       auth_config: buildAuthConfig(form),
+      request_headers: requestHeaders,
       clear_auth_config: editingId != null && clearAuthConfig,
     };
     const req =
@@ -702,11 +927,11 @@ export function SitesPage() {
           });
     req
       .then(() => {
-        setFormOpen(false);
+        closeForm();
         setMessage(editingId != null ? "站点已更新" : "站点已创建");
         loadSites();
       })
-      .catch((error: Error) => setMessage(error.message || "保存站点失败"))
+      .catch((error: Error) => setFormError(error.message || "保存站点失败"))
       .finally(() => setSubmitting(false));
   }
 
@@ -1149,7 +1374,7 @@ export function SitesPage() {
       {/* ---- add / edit dialog ---- */}
       <Dialog
         open={formOpen}
-        onClose={() => setFormOpen(false)}
+        onClose={closeForm}
         title={editingId != null ? "编辑站点" : "添加站点"}
         description={
           editingId != null
@@ -1157,70 +1382,90 @@ export function SitesPage() {
             : "填写站点信息以添加新的 PT 站点"
         }
         escMode="double"
+        panelClassName="max-w-6xl"
       >
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label>名称</Label>
-            <Input
-              value={form.name}
-              onChange={(e) => patch({ name: e.target.value })}
-              placeholder="站点名称"
-            />
-          </div>
-
-          <div className="space-y-2">
-            <Label>站点类型</Label>
-            <Select
-              value={form.site_type}
-              onChange={(val) => {
-                const v = val as SiteForm["site_type"];
-                setClearAuthConfig(false);
-                patch({
-                  site_type: v,
-                  auth_type: v === "mteam" ? "api_key" : "cookie",
-                });
-              }}
-              options={[
-                { value: "nexusphp", label: "NexusPHP" },
-                { value: "mteam", label: "M-Team" },
-              ]}
-            />
-          </div>
-
-          <div className="space-y-2">
-            <Label>基础 URL</Label>
-            <Input
-              value={form.base_url}
-              onChange={(e) => patch({ base_url: e.target.value })}
-              placeholder="https://example.com"
-            />
-          </div>
-
-          {renderAuthFields()}
-
-          {canPreserveAuth ? (
-            <Label className="flex cursor-pointer items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                className="size-4 accent-primary"
-                checked={clearAuthConfig}
-                onChange={(event) => {
-                  const checked = event.target.checked;
-                  setClearAuthConfig(checked);
-                  if (checked) {
-                    patch({ cookie: "", passkey: "", api_key: "" });
-                  }
-                }}
-              />
-              清除已保存的认证凭据
-            </Label>
+        <div className="grid gap-5 p-4 sm:p-6 lg:grid-cols-[minmax(17rem,0.72fr)_minmax(28rem,1.28fr)] lg:items-start">
+          {formError ? (
+            <div
+              role="alert"
+              className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-sm text-destructive lg:col-span-2"
+            >
+              {formError}
+            </div>
           ) : null}
+          <div className="min-w-0 space-y-4">
+            <div className="space-y-2">
+              <Label>名称</Label>
+              <Input
+                value={form.name}
+                onChange={(e) => patch({ name: e.target.value })}
+                placeholder="站点名称"
+              />
+            </div>
 
-          <div className="flex justify-end gap-2 pt-2">
-            <Button variant="secondary" onClick={() => setFormOpen(false)}>
+            <div className="space-y-2">
+              <Label>站点类型</Label>
+              <Select
+                value={form.site_type}
+                onChange={(val) => {
+                  const v = val as SiteForm["site_type"];
+                  setClearAuthConfig(false);
+                  patch({
+                    site_type: v,
+                    auth_type: v === "mteam" ? "api_key" : "cookie",
+                  });
+                }}
+                options={[
+                  { value: "nexusphp", label: "NexusPHP" },
+                  { value: "mteam", label: "M-Team" },
+                ]}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label>基础 URL</Label>
+              <Input
+                value={form.base_url}
+                onChange={(e) => patch({ base_url: e.target.value })}
+                placeholder="https://example.com"
+              />
+            </div>
+
+            {renderAuthFields()}
+
+            {canPreserveAuth ? (
+              <Label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4 accent-primary"
+                  checked={clearAuthConfig}
+                  onChange={(event) => {
+                    const checked = event.target.checked;
+                    setClearAuthConfig(checked);
+                    if (checked) {
+                      patch({ cookie: "", passkey: "", api_key: "" });
+                    }
+                  }}
+                />
+                清除已保存的认证凭据
+              </Label>
+            ) : null}
+          </div>
+
+          <SiteRequestHeadersEditor
+            headers={form.request_headers}
+            loading={requestHeadersLoading}
+            onChange={updateRequestHeader}
+            onAdd={addRequestHeader}
+            onRemove={removeRequestHeader}
+            onRestore={restoreDefaultRequestHeaders}
+          />
+
+          <div className="flex justify-end gap-2 border-t border-border pt-4 lg:col-span-2">
+            <Button variant="secondary" onClick={closeForm}>
               取消
             </Button>
-            <Button onClick={handleSubmit} disabled={submitting}>
+            <Button onClick={handleSubmit} disabled={submitting || requestHeadersLoading}>
               {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {editingId != null ? "保存" : "添加"}
             </Button>

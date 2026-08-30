@@ -23,6 +23,7 @@ pub struct MTeamIndexer {
     site_name: String,
     base_url: Url,
     api_key: HeaderValue,
+    request_headers: HeaderMap,
     client: Client,
     access_gate: Arc<OriginAccessGate>,
 }
@@ -33,6 +34,7 @@ impl MTeamIndexer {
         site_name: String,
         base_url: &str,
         auth: SiteAuth,
+        request_headers: HeaderMap,
         client: Client,
         access_gate: Arc<OriginAccessGate>,
     ) -> Result<Self, IndexerError> {
@@ -64,16 +66,31 @@ impl MTeamIndexer {
             site_name: site_name.trim().to_string(),
             base_url,
             api_key,
+            request_headers,
             client,
             access_gate,
         })
     }
 
     fn headers(&self) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json, */*"));
+        let mut headers = self.request_headers.clone();
+        if !headers.contains_key(ACCEPT) {
+            headers.insert(ACCEPT, HeaderValue::from_static("application/json, */*"));
+        }
         headers.insert("x-api-key", self.api_key.clone());
         headers
+    }
+
+    fn download_headers(&self, url: &Url) -> HeaderMap {
+        if same_origin(&self.base_url, url) {
+            return self.headers();
+        }
+
+        self.request_headers
+            .iter()
+            .filter(|(name, _)| is_cross_origin_browser_header(name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
     }
 
     async fn search_api(&self, request: &SearchRequest) -> Result<Vec<SearchResult>, IndexerError> {
@@ -191,7 +208,14 @@ impl MTeamIndexer {
                     "M-Team download URL uses an untrusted origin".to_string(),
                 ));
             }
-            let response = self.access_gate.send(self.client.get(url.clone())).await?;
+            let response = self
+                .access_gate
+                .send(
+                    self.client
+                        .get(url.clone())
+                        .headers(self.download_headers(&url)),
+                )
+                .await?;
             if !response.status().is_redirection() {
                 let final_url = response.url().clone();
                 return read_torrent_response(response, &final_url).await;
@@ -215,6 +239,21 @@ impl MTeamIndexer {
 
         unreachable!("redirect loop always returns")
     }
+}
+
+fn is_cross_origin_browser_header(name: &str) -> bool {
+    matches!(
+        name,
+        "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "cache-control"
+            | "dnt"
+            | "pragma"
+            | "upgrade-insecure-requests"
+            | "user-agent"
+    ) || name.starts_with("sec-ch-ua")
+        || name.starts_with("sec-fetch-")
 }
 
 fn is_allowed_download_url(base_url: &Url, candidate: &Url) -> bool {
@@ -425,11 +464,67 @@ fn parse_datetime(raw: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use reqwest::Url;
+    use std::sync::Arc;
+
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use reqwest::{Client, Url};
 
     use crate::indexer::IndexerError;
+    use crate::indexer::access::{OriginAccessGate, default_indexer_access_policy};
+    use crate::site::SiteAuth;
 
-    use super::{ensure_mteam_success, is_allowed_download_url, parse_search_results};
+    use super::{
+        MTeamIndexer, ensure_mteam_success, is_allowed_download_url, parse_search_results,
+    };
+
+    #[test]
+    fn search_headers_include_custom_values_and_protect_api_key() {
+        let mut custom = HeaderMap::new();
+        custom.insert("x-browser-profile", HeaderValue::from_static("desktop"));
+        custom.insert("x-api-key", HeaderValue::from_static("stale"));
+        let indexer = MTeamIndexer::new(
+            1,
+            "M-Team".to_string(),
+            "https://api.m-team.cc",
+            SiteAuth::ApiKey {
+                api_key: "current".to_string(),
+            },
+            custom,
+            Client::new(),
+            Arc::new(OriginAccessGate::new(default_indexer_access_policy())),
+        )
+        .unwrap();
+
+        let headers = indexer.headers();
+        assert_eq!(headers["x-browser-profile"], "desktop");
+        assert_eq!(headers["x-api-key"], "current");
+    }
+
+    #[test]
+    fn cross_origin_download_only_receives_browser_fingerprint_headers() {
+        let mut custom = HeaderMap::new();
+        custom.insert("user-agent", HeaderValue::from_static("Custom Browser"));
+        custom.insert("sec-ch-ua", HeaderValue::from_static("Chromium"));
+        custom.insert("x-private-token", HeaderValue::from_static("secret"));
+        let indexer = MTeamIndexer::new(
+            1,
+            "M-Team".to_string(),
+            "https://api.m-team.cc",
+            SiteAuth::ApiKey {
+                api_key: "current".to_string(),
+            },
+            custom,
+            Client::new(),
+            Arc::new(OriginAccessGate::new(default_indexer_access_policy())),
+        )
+        .unwrap();
+
+        let headers = indexer.download_headers(&Url::parse("https://halomt.com/file").unwrap());
+        assert_eq!(headers["user-agent"], "Custom Browser");
+        assert_eq!(headers["sec-ch-ua"], "Chromium");
+        assert!(!headers.contains_key("x-private-token"));
+        assert!(!headers.contains_key("x-api-key"));
+    }
 
     #[test]
     fn allows_only_mteam_api_and_official_download_origins() {

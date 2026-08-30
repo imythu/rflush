@@ -10,7 +10,9 @@ use crate::downloader::DownloaderRecord;
 use crate::error::AppError;
 use crate::history::{FinalStatus, RunHistory, TorrentRunRecord};
 use crate::sign_in::{SignInRecord, SignInResult, SignInTaskRecord, SignInTaskRequest};
-use crate::site::{SiteRecord, SiteStatsRecord, SiteWithStats, UserStats};
+use crate::site::{
+    SiteRecord, SiteStatsRecord, SiteWithStats, UserStats, default_site_request_headers,
+};
 use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
 mod media;
@@ -602,7 +604,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
-                .prepare("SELECT id, name, site_type, base_url, auth_config, use_proxy, created_at, updated_at FROM sites ORDER BY id")
+                .prepare("SELECT id, name, site_type, base_url, auth_config, request_headers, use_proxy, created_at, updated_at FROM sites ORDER BY id")
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |row| {
@@ -612,9 +614,10 @@ impl Database {
                         site_type: row.get(2)?,
                         base_url: row.get(3)?,
                         auth_config: row.get(4)?,
-                        use_proxy: row.get::<_, i32>(5).unwrap_or(1) != 0,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        request_headers: row.get(5)?,
+                        use_proxy: row.get::<_, i32>(6).unwrap_or(1) != 0,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
                     })
                 })
                 .map_err(sql_error)?;
@@ -634,7 +637,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.use_proxy, s.created_at, s.updated_at,
+                    "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.request_headers, s.use_proxy, s.created_at, s.updated_at,
                             st.site_id, st.uid, st.username, st.uploaded, st.downloaded, st.ratio, st.bonus,
                             st.seeding_count, st.leeching_count, st.updated_at, st.last_checked_at, st.last_error
                      FROM sites s
@@ -644,37 +647,38 @@ impl Database {
                 .map_err(sql_error)?;
             let rows = stmt
                 .query_map([], |row| {
-                    let stats_site_id: Option<i64> = row.get(8)?;
+                    let stats_site_id: Option<i64> = row.get(9)?;
                     Ok(SiteWithStats {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         site_type: row.get(2)?,
                         base_url: row.get(3)?,
                         auth_config: row.get(4)?,
-                        use_proxy: row.get::<_, i32>(5).unwrap_or(1) != 0,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        request_headers: row.get(5)?,
+                        use_proxy: row.get::<_, i32>(6).unwrap_or(1) != 0,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
                         stats: stats_site_id.map(|site_id| SiteStatsRecord {
                             site_id,
-                            uid: row.get(9).ok().flatten(),
-                            username: row.get(10).ok().flatten(),
-                            uploaded: row.get::<_, Option<i64>>(11).ok().flatten().map(|v| v as u64),
-                            downloaded: row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v as u64),
-                            ratio: row.get(13).ok().flatten(),
-                            bonus: row.get(14).ok().flatten(),
+                            uid: row.get(10).ok().flatten(),
+                            username: row.get(11).ok().flatten(),
+                            uploaded: row.get::<_, Option<i64>>(12).ok().flatten().map(|v| v as u64),
+                            downloaded: row.get::<_, Option<i64>>(13).ok().flatten().map(|v| v as u64),
+                            ratio: row.get(14).ok().flatten(),
+                            bonus: row.get(15).ok().flatten(),
                             seeding_count: row
-                                .get::<_, Option<i64>>(15)
-                                .ok()
-                                .flatten()
-                                .map(|v| v as u32),
-                            leeching_count: row
                                 .get::<_, Option<i64>>(16)
                                 .ok()
                                 .flatten()
                                 .map(|v| v as u32),
-                            updated_at: row.get(17).ok().flatten(),
-                            last_checked_at: row.get(18).unwrap_or_default(),
-                            last_error: row.get(19).ok().flatten(),
+                            leeching_count: row
+                                .get::<_, Option<i64>>(17)
+                                .ok()
+                                .flatten()
+                                .map(|v| v as u32),
+                            updated_at: row.get(18).ok().flatten(),
+                            last_checked_at: row.get(19).unwrap_or_default(),
+                            last_error: row.get(20).ok().flatten(),
                         }),
                     })
                 })
@@ -694,7 +698,7 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, site_type, base_url, auth_config, use_proxy, created_at, updated_at FROM sites WHERE id = ?",
+                "SELECT id, name, site_type, base_url, auth_config, request_headers, use_proxy, created_at, updated_at FROM sites WHERE id = ?",
                 params![id],
                 |row| {
                     Ok(SiteRecord {
@@ -703,9 +707,10 @@ impl Database {
                         site_type: row.get(2)?,
                         base_url: row.get(3)?,
                         auth_config: row.get(4)?,
-                        use_proxy: row.get::<_, i32>(5).unwrap_or(1) != 0,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
+                        request_headers: row.get(5)?,
+                        use_proxy: row.get::<_, i32>(6).unwrap_or(1) != 0,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
                     })
                 },
             )
@@ -722,21 +727,23 @@ impl Database {
         site_type: &str,
         base_url: &str,
         auth_config: &str,
+        request_headers: &str,
         use_proxy: bool,
     ) -> Result<i64, AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
-        let (name, site_type, base_url, auth_config) = (
+        let (name, site_type, base_url, auth_config, request_headers) = (
             name.to_string(),
             site_type.to_string(),
             base_url.to_string(),
             auth_config.to_string(),
+            request_headers.to_string(),
         );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "INSERT INTO sites (name, site_type, base_url, auth_config, use_proxy, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![name, site_type, base_url, auth_config, use_proxy as i32, now, now],
+                "INSERT INTO sites (name, site_type, base_url, auth_config, request_headers, use_proxy, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                params![name, site_type, base_url, auth_config, request_headers, use_proxy as i32, now, now],
             )
             .map_err(sql_error)?;
             Ok(conn.last_insert_rowid())
@@ -752,21 +759,23 @@ impl Database {
         site_type: &str,
         base_url: &str,
         auth_config: &str,
+        request_headers: &str,
         use_proxy: bool,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
         let now = Utc::now().to_rfc3339();
-        let (name, site_type, base_url, auth_config) = (
+        let (name, site_type, base_url, auth_config, request_headers) = (
             name.to_string(),
             site_type.to_string(),
             base_url.to_string(),
             auth_config.to_string(),
+            request_headers.to_string(),
         );
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.execute(
-                "UPDATE sites SET name = ?, site_type = ?, base_url = ?, auth_config = ?, use_proxy = ?, updated_at = ? WHERE id = ?",
-                params![name, site_type, base_url, auth_config, use_proxy as i32, now, id],
+                "UPDATE sites SET name = ?, site_type = ?, base_url = ?, auth_config = ?, request_headers = ?, use_proxy = ?, updated_at = ? WHERE id = ?",
+                params![name, site_type, base_url, auth_config, request_headers, use_proxy as i32, now, id],
             )
             .map_err(sql_error)?;
             Ok(())
@@ -2610,6 +2619,7 @@ impl Database {
                     site_type TEXT NOT NULL,
                     base_url TEXT NOT NULL,
                     auth_config TEXT NOT NULL,
+                    request_headers TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -2987,12 +2997,28 @@ impl Database {
             ] {
                 ensure_column(&conn, "global_settings", column, sql)?;
             }
+            let sites_had_request_headers = column_exists(&conn, "sites", "request_headers");
             ensure_column(
                 &conn,
                 "sites",
                 "use_proxy",
                 "ALTER TABLE sites ADD COLUMN use_proxy INTEGER NOT NULL DEFAULT 1",
             )?;
+            ensure_column(
+                &conn,
+                "sites",
+                "request_headers",
+                "ALTER TABLE sites ADD COLUMN request_headers TEXT NOT NULL DEFAULT '[]'",
+            )?;
+            if !sites_had_request_headers {
+                let defaults = serde_json::to_string(&default_site_request_headers()).map_err(
+                    |error| {
+                        sql_error(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+                    },
+                )?;
+                conn.execute("UPDATE sites SET request_headers = ?1", [defaults])
+                    .map_err(sql_error)?;
+            }
 
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS tag_rules (
@@ -4169,7 +4195,40 @@ fn final_status_name(status: FinalStatus) -> &'static str {
 #[cfg(test)]
 mod migration_tests {
     use super::*;
+    use rusqlite::Connection;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn legacy_sites_receive_default_request_headers() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("rflush.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                site_type TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                auth_config TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO sites
+                (name, site_type, base_url, auth_config, created_at, updated_at)
+            VALUES
+                ('legacy-site', 'nexusphp', 'https://tracker.example',
+                 '{\"auth_type\":\"cookie\",\"cookie\":\"uid=1\"}',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Database::open(dir.path()).await.unwrap();
+        let site = db.get_site(1).await.unwrap().unwrap();
+        let headers = crate::site::parse_site_request_headers(&site.request_headers).unwrap();
+
+        assert_eq!(headers, default_site_request_headers());
+    }
 
     #[tokio::test]
     async fn legacy_sign_in_browser_config_moves_to_global_settings_once() {
@@ -4181,6 +4240,7 @@ mod migration_tests {
                 "nexusphp",
                 "https://tracker.example.com",
                 r#"{"type":"cookie","cookie":"uid=1"}"#,
+                "[]",
                 true,
             )
             .await

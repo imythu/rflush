@@ -47,7 +47,7 @@ impl SiteStatsRefresher {
             let db = db.clone();
             async move {
                 let checked_at = Utc::now().to_rfc3339();
-                let result = match client_factory::resolve_client(proxy, site.use_proxy) {
+                let result = match client_factory::resolve_site_client(proxy, site.use_proxy) {
                     Ok(client) => match site_factory::create_adapter(&site, client) {
                         Ok(adapter) => adapter.get_user_stats().await,
                         Err(error) => Err(error),
