@@ -3,6 +3,7 @@ import {
   type FormEvent,
   type SetStateAction,
   useCallback,
+  useDeferredValue,
   useEffect,
   useId,
   useMemo,
@@ -18,6 +19,7 @@ import {
   Download,
   Film,
   FileSearch2,
+  Globe2,
   HardDriveDownload,
   ImageOff,
   LoaderCircle,
@@ -49,6 +51,12 @@ import {
   type OpenListAutomationSettings,
 } from "@/components/openlist-automation-panel";
 import { api, ApiError } from "@/lib/api";
+import {
+  matchesLocalResourceQuery,
+  parseLocalReleaseScope,
+  type LocalReleaseScope,
+  type LocalReleaseScopeKind,
+} from "@/lib/media-release-scope";
 import { cn } from "@/lib/utils";
 
 type MediaMode = "subscriptions" | "tmdb" | "resources" | "settings";
@@ -306,6 +314,11 @@ type ResourceCandidate = {
   raw: Record<string, unknown>;
 };
 
+type ScopedResourceCandidate = {
+  candidate: ResourceCandidate;
+  localScope: LocalReleaseScope;
+};
+
 type MediaTarget =
   | { target_type: "movie"; tmdb_id: number; titles: string[]; year: number | null }
   | {
@@ -524,6 +537,19 @@ const MODES: Array<{ value: MediaMode; label: string; icon: typeof Tv }> = [
   { value: "tmdb", label: "TMDB 添加", icon: Plus },
   { value: "resources", label: "资源搜索", icon: Search },
   { value: "settings", label: "质量与设置", icon: SlidersHorizontal },
+];
+
+const LOCAL_SCOPE_FILTERS: Array<{
+  value: "all" | LocalReleaseScopeKind;
+  label: string;
+}> = [
+  { value: "all", label: "全部" },
+  { value: "season_episode", label: "季 + 集" },
+  { value: "season_only", label: "仅季 · 无集数" },
+  { value: "season_pack", label: "全季" },
+  { value: "episode_only", label: "仅集 · 无季数" },
+  { value: "absolute_episode", label: "绝对集" },
+  { value: "unmatched", label: "未识别" },
 ];
 
 function isRecord(value: unknown): value is UnknownRecord {
@@ -1011,7 +1037,9 @@ function extractSiteErrors(payload: unknown): string[] {
   if (Array.isArray(raw)) {
     return raw.map((item) => {
       if (!isRecord(item)) return describeUnknown(item);
-      const site = optionalString(item.site_name) ?? (item.site_id != null ? `站点 #${numberValue(item.site_id)}` : null);
+      const site = optionalString(item.source_site)
+        ?? optionalString(item.site_name)
+        ?? (item.site_id != null ? `站点 #${numberValue(item.site_id)}` : null);
       const message = describeUnknown(item);
       return site ? `${site}: ${message}` : message;
     });
@@ -4000,7 +4028,49 @@ function ResourcesPanel({
   onSearch: (event: FormEvent) => void;
   onQueue: (candidate: ResourceCandidate) => void;
 }) {
-  const acceptedCount = candidates.filter((item) => item.decision?.accepted).length;
+  const [localQuery, setLocalQuery] = useState("");
+  const deferredLocalQuery = useDeferredValue(localQuery);
+  const [scopeFilter, setScopeFilter] = useState<"all" | LocalReleaseScopeKind>("all");
+  const scopedCandidates = useMemo<ScopedResourceCandidate[]>(
+    () => candidates.map((candidate) => ({
+      candidate,
+      localScope: parseLocalReleaseScope(candidate.result.title),
+    })),
+    [candidates],
+  );
+  const scopeCounts = useMemo<Record<LocalReleaseScopeKind, number>>(() => {
+    const counts: Record<LocalReleaseScopeKind, number> = {
+      season_episode: 0,
+      season_only: 0,
+      season_pack: 0,
+      episode_only: 0,
+      absolute_episode: 0,
+      unmatched: 0,
+    };
+    for (const item of scopedCandidates) counts[item.localScope.kind] += 1;
+    return counts;
+  }, [scopedCandidates]);
+  const visibleCandidates = useMemo(
+    () => scopedCandidates.filter(({ candidate, localScope }) => {
+      if (scopeFilter !== "all" && localScope.kind !== scopeFilter) return false;
+      return matchesLocalResourceQuery(
+        [
+          candidate.result.title,
+          candidate.result.source_site,
+          candidate.result.torrent_id,
+          candidate.release?.title ?? "",
+          ...(candidate.release?.alternate_titles ?? []),
+          candidate.release?.resolution ?? "",
+          candidate.release?.source ?? "",
+          candidate.release?.codec ?? "",
+        ],
+        localScope,
+        deferredLocalQuery,
+      );
+    }),
+    [deferredLocalQuery, scopeFilter, scopedCandidates],
+  );
+  const acceptedCount = visibleCandidates.filter(({ candidate }) => candidate.decision?.accepted).length;
   return (
     <div className="flex flex-col gap-6">
       <Card>
@@ -4076,84 +4146,157 @@ function ResourcesPanel({
           <CardHeader className="flex-row items-center justify-between gap-4">
             <div>
               <CardTitle>候选资源</CardTitle>
-              <CardDescription>{candidates.length} 个结果 · {acceptedCount} 个通过匹配</CardDescription>
+              <CardDescription aria-live="polite">
+                {visibleCandidates.length === candidates.length
+                  ? `${candidates.length} 个结果`
+                  : `显示 ${visibleCandidates.length} / ${candidates.length} 个结果`}
+                {` · ${acceptedCount} 个通过匹配`}
+              </CardDescription>
             </div>
           </CardHeader>
           <CardContent>
-            <div className="hidden xl:block">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>资源</TableHead>
-                    <TableHead>解析</TableHead>
-                    <TableHead>匹配</TableHead>
-                    <TableHead>站点</TableHead>
-                    <TableHead>活跃度</TableHead>
-                    <TableHead className="text-right">操作</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {candidates.map((candidate) => (
-                    <TableRow key={candidate.key}>
-                      <TableCell>
-                        <div className="max-w-[380px]">
-                          <div className="line-clamp-2 font-semibold" title={candidate.result.title}>{candidate.result.title}</div>
-                          <div className="mt-1 text-xs text-muted">{formatBytes(candidate.result.size)} · {formatDate(candidate.result.publish_time)}</div>
-                        </div>
-                      </TableCell>
-                      <TableCell><ReleaseSummary candidate={candidate} /></TableCell>
-                      <TableCell><DecisionSummary candidate={candidate} /></TableCell>
-                      <TableCell><StatusPill label={candidate.result.source_site} /></TableCell>
-                      <TableCell>
-                        <div className="text-sm font-semibold">{candidate.result.seeders} 做种</div>
-                        <div className="mt-1 text-xs text-muted">{candidate.result.leechers} 下载</div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex justify-end">
-                          <Button
-                            variant={queuedCandidateKeys.has(candidate.key) ? "outline" : candidateNeedsOverride(candidate) ? "destructive" : "default"}
-                            className="h-8 px-3"
-                            disabled={busyKey === `queue:${candidate.key}`}
-                            onClick={() => onQueue(candidate)}
-                          >
-                            {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : queuedCandidateKeys.has(candidate.key) ? <RefreshCw data-icon="inline-start" /> : <Download data-icon="inline-start" />}
-                            {queuedCandidateKeys.has(candidate.key) ? "检查并重新入队" : candidateNeedsOverride(candidate) ? "覆盖入队" : "入队"}
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+            <div className="mb-5 border-b border-border pb-5">
+              <div className="max-w-2xl">
+                <Label htmlFor="resource-local-query">本地快速查找</Label>
+                <div className="relative mt-2">
+                  <Search className="pointer-events-none absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted" aria-hidden="true" />
+                  <Input
+                    id="resource-local-query"
+                    value={localQuery}
+                    onChange={(event) => setLocalQuery(event.target.value)}
+                    className="pl-10 pr-10"
+                    placeholder="标题、来源站点或 S01E01"
+                    autoComplete="off"
+                  />
+                  {localQuery ? (
+                    <button
+                      type="button"
+                      aria-label="清空本地查找"
+                      title="清空本地查找"
+                      className="absolute right-2 top-1/2 flex size-8 -translate-y-1/2 items-center justify-center rounded-lg text-muted transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                      onClick={() => setLocalQuery("")}
+                    >
+                      <X className="size-4" aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="季集识别类型">
+                {LOCAL_SCOPE_FILTERS.map((filter) => {
+                  const count = filter.value === "all" ? candidates.length : scopeCounts[filter.value];
+                  const active = scopeFilter === filter.value;
+                  const highlightsMissingEpisode = filter.value === "season_only" && count > 0;
+                  return (
+                    <button
+                      key={filter.value}
+                      type="button"
+                      aria-pressed={active}
+                      disabled={count === 0 && filter.value !== "all"}
+                      onClick={() => setScopeFilter(filter.value)}
+                      className={cn(
+                        "inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-45",
+                        active
+                          ? highlightsMissingEpisode
+                            ? "border-amber-400 bg-amber-100 text-amber-950"
+                            : "border-primary bg-primary text-primary-foreground"
+                          : highlightsMissingEpisode
+                            ? "border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100"
+                            : "border-border bg-card text-muted hover:border-primary/35 hover:bg-accent hover:text-foreground",
+                      )}
+                    >
+                      {highlightsMissingEpisode ? <AlertCircle className="size-3.5" aria-hidden="true" /> : null}
+                      <span>{filter.label}</span>
+                      <span className={cn("tabular-nums", active && !highlightsMissingEpisode ? "text-primary-foreground/80" : "opacity-70")}>
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
-            <div className="grid gap-3 xl:hidden">
-              {candidates.map((candidate) => (
-                <article key={candidate.key} className="rounded-[20px] border border-border bg-surface-container/45 p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <h3 className="line-clamp-2 text-sm font-semibold">{candidate.result.title}</h3>
-                      <div className="mt-1 flex flex-wrap gap-2 text-xs text-muted">
-                        <span>{candidate.result.source_site}</span>
-                        <span>{formatBytes(candidate.result.size)}</span>
-                        <span>{candidate.result.seeders} 做种</span>
+            {visibleCandidates.length > 0 ? (
+              <>
+                <div className="hidden xl:block">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>资源</TableHead>
+                        <TableHead>解析</TableHead>
+                        <TableHead>匹配</TableHead>
+                        <TableHead>来源站点</TableHead>
+                        <TableHead>活跃度</TableHead>
+                        <TableHead className="text-right">操作</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {visibleCandidates.map(({ candidate, localScope }) => (
+                        <TableRow key={candidate.key}>
+                          <TableCell>
+                            <div className="max-w-[380px]">
+                              <div className="line-clamp-2 font-semibold" title={candidate.result.title}>{candidate.result.title}</div>
+                              <div className="mt-1 text-xs text-muted">{formatBytes(candidate.result.size)} · {formatDate(candidate.result.publish_time)}</div>
+                              <div className="mt-2"><LocalScopeBadge scope={localScope} /></div>
+                            </div>
+                          </TableCell>
+                          <TableCell><ReleaseSummary candidate={candidate} /></TableCell>
+                          <TableCell><DecisionSummary candidate={candidate} /></TableCell>
+                          <TableCell><SourceSiteBadge name={candidate.result.source_site} /></TableCell>
+                          <TableCell>
+                            <div className="text-sm font-semibold">{candidate.result.seeders} 做种</div>
+                            <div className="mt-1 text-xs text-muted">{candidate.result.leechers} 下载</div>
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex justify-end">
+                              <Button
+                                variant={queuedCandidateKeys.has(candidate.key) ? "outline" : candidateNeedsOverride(candidate) ? "destructive" : "default"}
+                                className="h-8 px-3"
+                                disabled={busyKey === `queue:${candidate.key}`}
+                                onClick={() => onQueue(candidate)}
+                              >
+                                {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : queuedCandidateKeys.has(candidate.key) ? <RefreshCw data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                                {queuedCandidateKeys.has(candidate.key) ? "检查并重新入队" : candidateNeedsOverride(candidate) ? "覆盖入队" : "入队"}
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+
+                <div className="grid gap-3 xl:hidden">
+                  {visibleCandidates.map(({ candidate, localScope }) => (
+                    <article key={candidate.key} className="rounded-[20px] border border-border bg-surface-container/45 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <h3 className="line-clamp-2 text-sm font-semibold">{candidate.result.title}</h3>
+                          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted">
+                            <SourceSiteBadge name={candidate.result.source_site} compact />
+                            <span>{formatBytes(candidate.result.size)}</span>
+                            <span>{candidate.result.seeders} 做种</span>
+                          </div>
+                          <div className="mt-2"><LocalScopeBadge scope={localScope} /></div>
+                        </div>
+                        <DecisionBadge candidate={candidate} />
                       </div>
-                    </div>
-                    <DecisionBadge candidate={candidate} />
-                  </div>
-                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    <ReleaseSummary candidate={candidate} />
-                    <DecisionSummary candidate={candidate} />
-                  </div>
-                  <div className="mt-4 flex justify-end">
-                    <Button variant={queuedCandidateKeys.has(candidate.key) ? "outline" : candidateNeedsOverride(candidate) ? "destructive" : "default"} className="h-8 px-3" disabled={busyKey === `queue:${candidate.key}`} onClick={() => onQueue(candidate)}>
-                      {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : queuedCandidateKeys.has(candidate.key) ? <RefreshCw data-icon="inline-start" /> : <Download data-icon="inline-start" />}
-                      {queuedCandidateKeys.has(candidate.key) ? "检查并重新入队" : candidateNeedsOverride(candidate) ? "覆盖入队" : "加入下载队列"}
-                    </Button>
-                  </div>
-                </article>
-              ))}
-            </div>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                        <ReleaseSummary candidate={candidate} />
+                        <DecisionSummary candidate={candidate} />
+                      </div>
+                      <div className="mt-4 flex justify-end">
+                        <Button variant={queuedCandidateKeys.has(candidate.key) ? "outline" : candidateNeedsOverride(candidate) ? "destructive" : "default"} className="h-8 px-3" disabled={busyKey === `queue:${candidate.key}`} onClick={() => onQueue(candidate)}>
+                          {busyKey === `queue:${candidate.key}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : queuedCandidateKeys.has(candidate.key) ? <RefreshCw data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                          {queuedCandidateKeys.has(candidate.key) ? "检查并重新入队" : candidateNeedsOverride(candidate) ? "覆盖入队" : "加入下载队列"}
+                        </Button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <EmptyState icon={FileSearch2} title="当前本地条件没有匹配结果" />
+            )}
           </CardContent>
         </Card>
       ) : searched ? (
@@ -4162,6 +4305,42 @@ function ResourcesPanel({
         <EmptyState icon={Search} title="输入关键词或选择订阅目标" />
       )}
     </div>
+  );
+}
+
+function SourceSiteBadge({ name, compact = false }: { name: string; compact?: boolean }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex max-w-[14rem] items-center gap-1.5 border border-primary/20 bg-primary/10 font-semibold text-foreground",
+        compact ? "rounded-lg px-2 py-1 text-xs" : "rounded-full px-2.5 py-1 text-xs",
+      )}
+      title={`来源站点：${name}`}
+    >
+      <Globe2 className="size-3.5 shrink-0 text-primary" aria-hidden="true" />
+      <span className="truncate">{compact ? `来源 · ${name}` : name}</span>
+    </span>
+  );
+}
+
+function LocalScopeBadge({ scope }: { scope: LocalReleaseScope }) {
+  const missingEpisode = scope.kind === "season_only";
+  const incomplete = missingEpisode || scope.kind === "episode_only" || scope.kind === "unmatched";
+  return (
+    <span
+      className={cn(
+        "inline-flex max-w-full items-center gap-1.5 rounded-lg border px-2 py-1 text-xs font-semibold",
+        missingEpisode
+          ? "border-amber-300 bg-amber-50 text-amber-900"
+          : incomplete
+            ? "border-border bg-surface-container text-muted"
+            : "border-jade/30 bg-jade/10 text-foreground",
+      )}
+      title={scope.kind === "season_only" ? "标题中识别到季号，但没有识别到集数" : scope.label}
+    >
+      {missingEpisode ? <AlertCircle className="size-3.5 shrink-0" aria-hidden="true" /> : null}
+      <span className="truncate">{scope.label}</span>
+    </span>
   );
 }
 
