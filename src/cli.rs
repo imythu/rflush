@@ -9,8 +9,8 @@ use crate::error::AppError;
 #[command(
     name = "rflush",
     version,
-    about = "PT 刷流与 RSS 下载控制台",
-    long_about = "启动 rflush Web 服务。\n\n默认行为:\n- 监听地址: 127.0.0.1:3000\n- 数据库: ./data/rflush.db\n- RSS 下载输出: 当前目录\n\n指定 --data-dir 后:\n- 数据库与下载输出都写入该目录\n\n示例:\n- rflush\n- rflush -H 127.0.0.1 -p 8080\n- rflush -d ./runtime-data\n- RFLUSH_DATA_DIR=/data rflush"
+    about = "PT 自动化管理控制台",
+    long_about = "启动 rflush Web 服务。\n\n默认行为:\n- 监听地址: 127.0.0.1:3000\n- 数据库: ./data/rflush.db\n\n指定 --data-dir 后，数据库和运行数据都写入该目录。\n\n示例:\n- rflush\n- rflush -H 127.0.0.1 -p 8080\n- rflush -d ./runtime-data\n- RFLUSH_DATA_DIR=/data rflush"
 )]
 pub struct Cli {
     #[arg(
@@ -36,7 +36,7 @@ pub struct Cli {
         long = "data-dir",
         env = "RFLUSH_DATA_DIR",
         value_name = "DIR",
-        help = "应用数据目录。指定后数据库和本地下载输出都写入该目录 (env: RFLUSH_DATA_DIR)"
+        help = "应用数据目录。指定后数据库和运行数据都写入该目录 (env: RFLUSH_DATA_DIR)"
     )]
     pub data_dir: Option<PathBuf>,
 }

@@ -1,15 +1,4 @@
-export type TimeUnit = "second" | "minute" | "hour";
-
 export type GlobalConfig = {
-  download_rate_limit: {
-    requests: number;
-    interval: number;
-    unit: TimeUnit;
-  };
-  retry_interval_secs: number;
-  throttle_interval_secs: number;
-  max_concurrent_downloads: number;
-  max_concurrent_rss_fetches: number;
   log_level: string | null;
   proxy: string | null;
   use_proxy_for_lightpanda: boolean;
@@ -43,75 +32,6 @@ export type ProxyTestResult = {
   status_code: number | null;
   elapsed_ms: number;
   message: string;
-};
-
-export type RssSubscription = {
-  id: number;
-  name: string;
-  url: string;
-  enabled: boolean;
-  downloader_id: number | null;
-  created_at: string;
-  updated_at: string;
-};
-
-export type DownloadRecord = {
-  id: number;
-  run_id: number;
-  task_id: number | null;
-  finished_at: string;
-  rss_name: string;
-  guid: string;
-  title: string;
-  retry_count: number;
-  refresh_count: number;
-  bytes: number | null;
-  final_status: string;
-  final_message: string | null;
-};
-
-export type JobInfo = {
-  id: number;
-  scope: string;
-  task_id: number | null;
-  status: string;
-  started_at: string;
-  finished_at: string | null;
-  run_id: number | null;
-  summary: {
-    total: number;
-    succeeded: number;
-    skipped_existing: number;
-    failed: number;
-  } | null;
-  error: string | null;
-};
-
-export type DownloadRun = {
-  id: number;
-  started_at: string;
-  finished_at: string;
-  retry_delay_secs: number;
-  total: number;
-  succeeded: number;
-  skipped_existing: number;
-  failed: number;
-};
-
-export type PaginatedRunRecords = {
-  run: DownloadRun;
-  page: number;
-  page_size: number;
-  total_records: number;
-  records: DownloadRecord[];
-};
-
-export type TaskRecordsResponse = {
-  task: RssSubscription;
-  page: number;
-  page_size: number;
-  total_records: number;
-  records: DownloadRecord[];
 };
 
 // ========== PT 刷流模块类型 ==========

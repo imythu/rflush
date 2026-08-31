@@ -12,7 +12,6 @@ use crate::net::rate_limiter::{RateLimitPolicy, SharedRateLimiter};
 
 const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const REDIRECT_LIMIT: usize = 20;
-const EXPIRED_MESSAGE: &str = "連結不可用！ 超出有效期";
 const RATE_LIMIT_MESSAGE: &str = "\u{8acb}\u{6c42}\u{904e}\u{65bc}\u{983b}\u{7e41}";
 
 pub struct AppHttpClient {
@@ -23,7 +22,6 @@ pub struct AppHttpClient {
 
 pub struct AppResponse {
     pub status: StatusCode,
-    pub headers: HeaderMap,
     pub body: Bytes,
 }
 
@@ -79,12 +77,7 @@ impl AppHttpClient {
         })
     }
 
-    pub async fn get(&self, purpose: &str, url: &str) -> Result<AppResponse, HttpError> {
-        let headers = HeaderMap::new();
-        self.get_with_header_map(purpose, url, &headers).await
-    }
-
-    /// 与 `get` 相同，但允许附加已校验的请求头。
+    /// 执行 GET，并允许附加已校验的请求头。
     /// 额外 header 会覆盖客户端的同名默认 header。
     pub async fn get_with_header_map(
         &self,
@@ -136,7 +129,6 @@ impl AppHttpClient {
         };
 
         let status = response.status();
-        let headers = response.headers().clone();
         let body = response.bytes().await.map_err(|error| {
             warn!(
                 task = %current_task_context(),
@@ -162,14 +154,10 @@ impl AppHttpClient {
             return Err(HttpError::RateLimited { key });
         }
 
-        Ok(AppResponse {
-            status,
-            headers,
-            body,
-        })
+        Ok(AppResponse { status, body })
     }
 
-    /// 与 `get` 相同，但允许附加自定义请求头（如 Cookie）。
+    /// 执行 GET，并允许附加自定义请求头（如 Cookie）。
     /// 额外 header 会覆盖同名的默认 header。
     pub async fn get_with_headers(
         &self,
@@ -188,33 +176,6 @@ impl AppHttpClient {
         }
         self.get_with_header_map(purpose, url, &headers).await
     }
-}
-
-pub fn is_expired_response(body: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(body) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-        return false;
-    };
-    value
-        .get("message")
-        .and_then(|m| m.as_str())
-        .is_some_and(|m| m.contains(EXPIRED_MESSAGE))
-}
-
-pub fn parse_api_error_response(body: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(body).ok()?;
-    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
-    let code = value.get("code")?.as_i64()?;
-    let message = value.get("message")?.as_str()?;
-    if code == 0 {
-        return None;
-    }
-    Some(format!(
-        "remote API error code={} message={}",
-        code, message
-    ))
 }
 
 fn extract_rate_limit_key(url: &str) -> Result<String, String> {

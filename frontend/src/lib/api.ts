@@ -3,15 +3,6 @@ import type { GlobalConfig } from "@/types";
 export const API_BASE = "";
 
 export const defaultSettings: GlobalConfig = {
-  download_rate_limit: {
-    requests: 2,
-    interval: 1,
-    unit: "second",
-  },
-  retry_interval_secs: 5,
-  throttle_interval_secs: 30,
-  max_concurrent_downloads: 32,
-  max_concurrent_rss_fetches: 8,
   log_level: "info",
   proxy: null,
   use_proxy_for_lightpanda: true,

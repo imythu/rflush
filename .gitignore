@@ -1,8 +1,5 @@
 /target
-/merge/
 /data/
-/rss.yaml
-/*.torrent
 /frontend/node_modules/
 /frontend/dist/*
 !/frontend/dist/.keep
@@ -11,10 +8,6 @@ __pycache__/
 *.py[cod]
 .claude
 .idea
-
-# torrent download dirs (auto-created per RSS name)
-/猎魔-*/
-nas-tools
 
 # Prompt file with potential sensitive data
 提示词.md

@@ -3,11 +3,8 @@ mod cli;
 mod collector;
 mod config;
 mod db;
-mod download;
 mod downloader;
-mod engine;
 mod error;
-mod history;
 mod indexer;
 mod logging;
 mod media;
@@ -153,7 +150,6 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         pool,
         media_service,
         media_scheduler.clone(),
-        limiter,
         monitor,
         tag_rule_scheduler,
         relocation_scheduler.clone(),

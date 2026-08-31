@@ -30,7 +30,7 @@ pub enum U2ShoutboxParseError {
 
 /// 解析 U2 shoutbox HTML，提取所有 下载0.00 且发布时间不超过 12 小时的魔法条目。
 ///
-/// 返回的 `TorrentItem` 中 `rss_name` 和 `version` 字段由调用方填充。
+/// 返回的 `TorrentItem` 中 `rss_name` 字段由调用方填充。
 pub fn parse_shoutbox(html: &str) -> Result<Vec<TorrentItem>, U2ShoutboxParseError> {
     let document = Html::parse_document(html);
 
@@ -104,7 +104,6 @@ pub fn parse_shoutbox(html: &str) -> Result<Vec<TorrentItem>, U2ShoutboxParseErr
             link: None,
             pub_date: None,
             download_url: format!("https://u2.dmhy.org/download.php?id={id}", id = seed_id),
-            version: 0,
             size_bytes: None,
             seeders: None,
             leechers: None,

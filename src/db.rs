@@ -5,10 +5,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use crate::brush::{BrushTaskRecord, BrushTaskRequest, BrushTorrentRecord};
-use crate::config::{GlobalConfig, RssConfig, RssSubscription, TimeUnit};
+use crate::config::GlobalConfig;
 use crate::downloader::DownloaderRecord;
 use crate::error::AppError;
-use crate::history::{FinalStatus, RunHistory, TorrentRunRecord};
 use crate::sign_in::{SignInRecord, SignInResult, SignInTaskRecord, SignInTaskRequest};
 use crate::site::{
     SiteRecord, SiteStatsRecord, SiteWithStats, UserStats, default_site_request_headers,
@@ -26,43 +25,6 @@ pub use openlist::{
 #[derive(Clone)]
 pub struct Database {
     path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DownloadHistoryRecord {
-    pub id: i64,
-    pub run_id: i64,
-    pub task_id: Option<i64>,
-    pub finished_at: String,
-    pub rss_name: String,
-    pub guid: String,
-    pub title: String,
-    pub retry_count: u32,
-    pub refresh_count: u32,
-    pub bytes: Option<u64>,
-    pub final_status: String,
-    pub final_message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DownloadRunRecord {
-    pub id: i64,
-    pub started_at: String,
-    pub finished_at: String,
-    pub retry_delay_secs: u64,
-    pub total: usize,
-    pub succeeded: usize,
-    pub skipped_existing: usize,
-    pub failed: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PaginatedRunRecords {
-    pub run: DownloadRunRecord,
-    pub page: usize,
-    pub page_size: usize,
-    pub total_records: usize,
-    pub records: Vec<DownloadHistoryRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,9 +81,7 @@ impl Database {
             let conn = open_connection(&path)?;
             let settings = conn
                 .query_row(
-                    "SELECT download_rate_limit_requests, download_rate_limit_interval, download_rate_limit_unit,
-                            retry_interval_secs, log_level, max_concurrent_downloads, max_concurrent_rss_fetches,
-                            throttle_interval_secs, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins,
+                    "SELECT log_level, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins,
                             ocr_api_key, lightpanda_endpoint, lightpanda_token, lightpanda_region,
                             lightpanda_browser, lightpanda_proxy, lightpanda_country,
                             cloakbrowser_license_key, cloakbrowser_headless, cloakbrowser_humanize,
@@ -130,36 +90,27 @@ impl Database {
                     [],
                     |row| {
                         Ok(GlobalConfig {
-                            download_rate_limit: crate::config::DownloadRateLimit {
-                                requests: row.get(0)?,
-                                interval: row.get(1)?,
-                                unit: parse_time_unit(row.get::<_, String>(2)?),
-                            },
-                            retry_interval_secs: row.get(3)?,
-                            log_level: row.get(4)?,
-                            max_concurrent_downloads: row.get(5)?,
-                            max_concurrent_rss_fetches: row.get(6)?,
-                            throttle_interval_secs: row.get(7)?,
-                            proxy: row.get(8)?,
-                            use_proxy_for_lightpanda: row.get::<_, i32>(9).unwrap_or(1) != 0,
+                            log_level: row.get(0)?,
+                            proxy: row.get(1)?,
+                            use_proxy_for_lightpanda: row.get::<_, i32>(2).unwrap_or(1) != 0,
                             lightpanda: crate::config::LightpandaConfig {
-                                endpoint: row.get(12)?,
-                                token: row.get(13)?,
-                                region: row.get(14)?,
-                                browser: row.get(15)?,
-                                proxy: row.get(16)?,
-                                country: row.get(17)?,
+                                endpoint: row.get(5)?,
+                                token: row.get(6)?,
+                                region: row.get(7)?,
+                                browser: row.get(8)?,
+                                proxy: row.get(9)?,
+                                country: row.get(10)?,
                             },
                             cloakbrowser: crate::config::CloakBrowserConfig {
-                                license_key: row.get(18)?,
-                                headless: row.get::<_, i32>(19)? != 0,
-                                humanize: row.get::<_, i32>(20)? != 0,
-                                human_preset: row.get(21)?,
-                                proxy: row.get(22)?,
-                                geoip: row.get::<_, i32>(23)? != 0,
+                                license_key: row.get(11)?,
+                                headless: row.get::<_, i32>(12)? != 0,
+                                humanize: row.get::<_, i32>(13)? != 0,
+                                human_preset: row.get(14)?,
+                                proxy: row.get(15)?,
+                                geoip: row.get::<_, i32>(16)? != 0,
                             },
-                            tag_rule_scan_interval_mins: row.get::<_, i64>(10).unwrap_or(7) as u64,
-                            ocr_api_key: row.get(11)?,
+                            tag_rule_scan_interval_mins: row.get::<_, i64>(3).unwrap_or(7) as u64,
+                            ocr_api_key: row.get(4)?,
                         })
                     },
                 )
@@ -177,9 +128,7 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.execute(
                 "UPDATE global_settings SET
-                    download_rate_limit_requests = ?, download_rate_limit_interval = ?, download_rate_limit_unit = ?,
-                    retry_interval_secs = ?, log_level = ?, max_concurrent_downloads = ?,
-                    max_concurrent_rss_fetches = ?, throttle_interval_secs = ?, proxy = ?,
+                    log_level = ?, proxy = ?,
                     use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ?, ocr_api_key = ?,
                     lightpanda_endpoint = ?, lightpanda_token = ?, lightpanda_region = ?,
                     lightpanda_browser = ?, lightpanda_proxy = ?, lightpanda_country = ?,
@@ -187,14 +136,7 @@ impl Database {
                     cloakbrowser_human_preset = ?, cloakbrowser_proxy = ?, cloakbrowser_geoip = ?
                  WHERE id = 1",
                 params![
-                    settings.download_rate_limit.requests,
-                    settings.download_rate_limit.interval,
-                    time_unit_name(settings.download_rate_limit.unit),
-                    settings.retry_interval_secs,
                     settings.log_level,
-                    settings.max_concurrent_downloads,
-                    settings.max_concurrent_rss_fetches,
-                    settings.throttle_interval_secs,
                     settings.proxy.as_deref().and_then(|value| {
                         let value = value.trim();
                         (!value.is_empty()).then_some(value)
@@ -221,377 +163,6 @@ impl Database {
             )
             .map_err(sql_error)?;
             Ok(())
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn list_rss(&self) -> Result<Vec<RssSubscription>, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<RssSubscription>, AppError> {
-            let conn = open_connection(&path)?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, name, url, enabled, downloader_id, created_at, updated_at FROM rss_subscriptions ORDER BY id DESC",
-                )
-                .map_err(sql_error)?;
-            let rows = stmt
-                .query_map([], |row| {
-                    map_rss_subscription(row)
-                })
-                .map_err(sql_error)?;
-            let mut rss = Vec::new();
-            for row in rows {
-                rss.push(row.map_err(sql_error)?);
-            }
-            Ok(rss)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn get_rss(&self, id: i64) -> Result<Option<RssSubscription>, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<RssSubscription>, AppError> {
-            let conn = open_connection(&path)?;
-            conn.query_row(
-                "SELECT id, name, url, enabled, downloader_id, created_at, updated_at FROM rss_subscriptions WHERE id = ?",
-                [id],
-                map_rss_subscription,
-            )
-            .optional()
-            .map_err(sql_error)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn create_rss(
-        &self,
-        rss: RssConfig,
-        enabled: bool,
-    ) -> Result<RssSubscription, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<RssSubscription, AppError> {
-            let conn = open_connection(&path)?;
-            let now = Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO rss_subscriptions (name, url, enabled, downloader_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                params![rss.name, rss.url, if enabled { 1 } else { 0 }, rss.downloader_id, now, now],
-            )
-            .map_err(sql_error)?;
-            let id = conn.last_insert_rowid();
-            conn.query_row(
-                "SELECT id, name, url, enabled, downloader_id, created_at, updated_at FROM rss_subscriptions WHERE id = ?",
-                [id],
-                map_rss_subscription,
-            )
-            .map_err(sql_error)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn update_rss_enabled(&self, ids: &[i64], enabled: bool) -> Result<(), AppError> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-
-        let path = self.path.clone();
-        let ids = ids.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction().map_err(sql_error)?;
-            let now = Utc::now().to_rfc3339();
-            for id in ids {
-                tx.execute(
-                    "UPDATE rss_subscriptions SET enabled = ?, updated_at = ? WHERE id = ?",
-                    params![if enabled { 1 } else { 0 }, now, id],
-                )
-                .map_err(sql_error)?;
-            }
-            tx.commit().map_err(sql_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn set_all_rss_enabled(&self, enabled: bool) -> Result<(), AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let conn = open_connection(&path)?;
-            conn.execute(
-                "UPDATE rss_subscriptions SET enabled = ?, updated_at = ?",
-                params![if enabled { 1 } else { 0 }, Utc::now().to_rfc3339()],
-            )
-            .map_err(sql_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn delete_rss(&self, id: i64) -> Result<bool, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool, AppError> {
-            let conn = open_connection(&path)?;
-            let changed = conn
-                .execute("DELETE FROM rss_subscriptions WHERE id = ?", [id])
-                .map_err(sql_error)?;
-            Ok(changed > 0)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn delete_rss_batch(&self, ids: &[i64]) -> Result<(), AppError> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-
-        let path = self.path.clone();
-        let ids = ids.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction().map_err(sql_error)?;
-            for id in ids {
-                tx.execute("DELETE FROM rss_subscriptions WHERE id = ?", [id])
-                    .map_err(sql_error)?;
-            }
-            tx.commit().map_err(sql_error)?;
-            Ok(())
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn list_history(&self, limit: usize) -> Result<Vec<DownloadHistoryRecord>, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<DownloadHistoryRecord>, AppError> {
-            let conn = open_connection(&path)?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT dr.id, dr.run_id, dr.task_id, runs.finished_at, dr.rss_name, dr.guid, dr.title, dr.retry_count, dr.refresh_count, dr.bytes, dr.file_name, dr.saved_path, dr.final_status, dr.final_message, dr.file_deleted
-                     FROM download_records dr
-                     JOIN download_runs runs ON runs.id = dr.run_id
-                     ORDER BY dr.id DESC
-                     LIMIT ?",
-                )
-                .map_err(sql_error)?;
-            let rows = stmt
-                .query_map([limit as i64], |row| {
-                    map_history_record(row)
-                })
-                .map_err(sql_error)?;
-            let mut records = Vec::new();
-            for row in rows {
-                records.push(row.map_err(sql_error)?);
-            }
-            Ok(records)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn list_runs(&self, limit: usize) -> Result<Vec<DownloadRunRecord>, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<DownloadRunRecord>, AppError> {
-            let conn = open_connection(&path)?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, started_at, finished_at, retry_delay_secs, total, succeeded, skipped_existing, failed
-                     FROM download_runs
-                     ORDER BY id DESC
-                     LIMIT ?",
-                )
-                .map_err(sql_error)?;
-            let rows = stmt
-                .query_map([limit as i64], |row| {
-                    Ok(DownloadRunRecord {
-                        id: row.get(0)?,
-                        started_at: row.get(1)?,
-                        finished_at: row.get(2)?,
-                        retry_delay_secs: row.get::<_, i64>(3)? as u64,
-                        total: row.get::<_, i64>(4)? as usize,
-                        succeeded: row.get::<_, i64>(5)? as usize,
-                        skipped_existing: row.get::<_, i64>(6)? as usize,
-                        failed: row.get::<_, i64>(7)? as usize,
-                    })
-                })
-                .map_err(sql_error)?;
-            let mut runs = Vec::new();
-            for row in rows {
-                runs.push(row.map_err(sql_error)?);
-            }
-            Ok(runs)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn list_run_records(
-        &self,
-        run_id: i64,
-        page: usize,
-        page_size: usize,
-    ) -> Result<Option<PaginatedRunRecords>, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Option<PaginatedRunRecords>, AppError> {
-            let conn = open_connection(&path)?;
-            let run = conn
-                .query_row(
-                    "SELECT id, started_at, finished_at, retry_delay_secs, total, succeeded, skipped_existing, failed
-                     FROM download_runs
-                     WHERE id = ?",
-                    [run_id],
-                    |row| {
-                        Ok(DownloadRunRecord {
-                            id: row.get(0)?,
-                            started_at: row.get(1)?,
-                            finished_at: row.get(2)?,
-                            retry_delay_secs: row.get::<_, i64>(3)? as u64,
-                            total: row.get::<_, i64>(4)? as usize,
-                            succeeded: row.get::<_, i64>(5)? as usize,
-                            skipped_existing: row.get::<_, i64>(6)? as usize,
-                            failed: row.get::<_, i64>(7)? as usize,
-                        })
-                    },
-                )
-                .optional()
-                .map_err(sql_error)?;
-            let Some(run) = run else {
-                return Ok(None);
-            };
-
-            let page = page.max(1);
-            let page_size = page_size.clamp(1, 100);
-            let offset = (page - 1) * page_size;
-
-            let total_records = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM download_records WHERE run_id = ?",
-                    [run_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(sql_error)? as usize;
-
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, run_id, task_id, finished_at, rss_name, guid, title, retry_count, refresh_count, bytes, file_name, saved_path, final_status, final_message, file_deleted
-                     FROM download_records
-                     WHERE run_id = ?
-                     ORDER BY id DESC
-                     LIMIT ? OFFSET ?",
-                )
-                .map_err(sql_error)?;
-            let rows = stmt
-                .query_map(params![run_id, page_size as i64, offset as i64], |row| {
-                    map_history_record(row)
-                })
-                .map_err(sql_error)?;
-
-            let mut records = Vec::new();
-            for row in rows {
-                records.push(row.map_err(sql_error)?);
-            }
-
-            Ok(Some(PaginatedRunRecords {
-                run,
-                page,
-                page_size,
-                total_records,
-                records,
-            }))
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn list_task_records(
-        &self,
-        task_id: i64,
-        page: usize,
-        page_size: usize,
-    ) -> Result<Vec<DownloadHistoryRecord>, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<DownloadHistoryRecord>, AppError> {
-            let conn = open_connection(&path)?;
-            let page = page.max(1);
-            let page_size = page_size.clamp(1, 100);
-            let offset = (page - 1) * page_size;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, run_id, task_id, finished_at, rss_name, guid, title, retry_count, refresh_count, bytes, file_name, saved_path, final_status, final_message, file_deleted
-                     FROM download_records
-                     WHERE task_id = ?
-                     ORDER BY id DESC
-                     LIMIT ? OFFSET ?",
-                )
-                .map_err(sql_error)?;
-            let rows = stmt
-                .query_map(params![task_id, page_size as i64, offset as i64], map_history_record)
-                .map_err(sql_error)?;
-            let mut records = Vec::new();
-            for row in rows {
-                records.push(row.map_err(sql_error)?);
-            }
-            Ok(records)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn count_task_records(&self, task_id: i64) -> Result<usize, AppError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || -> Result<usize, AppError> {
-            let conn = open_connection(&path)?;
-            let total = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM download_records WHERE task_id = ?",
-                    [task_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(sql_error)?;
-            Ok(total as usize)
-        })
-        .await
-        .map_err(join_error)?
-    }
-
-    pub async fn save_history(
-        &self,
-        history: &RunHistory,
-        task_id: Option<i64>,
-        task_name: Option<&str>,
-    ) -> Result<i64, AppError> {
-        let path = self.path.clone();
-        let history = history.clone();
-        let task_name = task_name.map(str::to_string);
-        tokio::task::spawn_blocking(move || -> Result<i64, AppError> {
-            let mut conn = open_connection(&path)?;
-            let tx = conn.transaction().map_err(sql_error)?;
-            tx.execute(
-                "INSERT INTO download_runs (task_id, task_name, started_at, finished_at, retry_delay_secs, total, succeeded, skipped_existing, failed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    task_id,
-                    task_name,
-                    history.started_at,
-                    history.finished_at,
-                    history.retry_delay_secs,
-                    history.summary.total as i64,
-                    history.summary.succeeded as i64,
-                    history.summary.skipped_existing as i64,
-                    history.summary.failed as i64
-                ],
-            )
-            .map_err(sql_error)?;
-            let run_id = tx.last_insert_rowid();
-            for record in history.torrents {
-                insert_record(&tx, run_id, task_id, &history.finished_at, &record)?;
-            }
-            tx.commit().map_err(sql_error)?;
-            Ok(run_id)
         })
         .await
         .map_err(join_error)?
@@ -2546,14 +2117,7 @@ impl Database {
 
                 CREATE TABLE IF NOT EXISTS global_settings (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
-                    download_rate_limit_requests INTEGER NOT NULL,
-                    download_rate_limit_interval INTEGER NOT NULL,
-                    download_rate_limit_unit TEXT NOT NULL,
-                    retry_interval_secs INTEGER NOT NULL,
                     log_level TEXT,
-                    max_concurrent_downloads INTEGER NOT NULL,
-                    max_concurrent_rss_fetches INTEGER NOT NULL,
-                    throttle_interval_secs INTEGER NOT NULL,
                     proxy TEXT,
                     use_proxy_for_lightpanda INTEGER NOT NULL DEFAULT 1,
                     tag_rule_scan_interval_mins INTEGER NOT NULL DEFAULT 7,
@@ -2571,46 +2135,6 @@ impl Database {
                     cloakbrowser_proxy TEXT,
                     cloakbrowser_geoip INTEGER NOT NULL DEFAULT 1,
                     sign_in_browser_config_migrated INTEGER NOT NULL DEFAULT 0
-                );
-
-                CREATE TABLE IF NOT EXISTS rss_subscriptions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    url TEXT NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS download_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id INTEGER REFERENCES rss_subscriptions(id) ON DELETE SET NULL,
-                    task_name TEXT,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT NOT NULL,
-                    retry_delay_secs INTEGER NOT NULL,
-                    total INTEGER NOT NULL,
-                    succeeded INTEGER NOT NULL,
-                    skipped_existing INTEGER NOT NULL,
-                    failed INTEGER NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS download_records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id INTEGER NOT NULL REFERENCES download_runs(id) ON DELETE CASCADE,
-                    task_id INTEGER REFERENCES rss_subscriptions(id) ON DELETE SET NULL,
-                    finished_at TEXT NOT NULL,
-                    rss_name TEXT NOT NULL,
-                    guid TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    retry_count INTEGER NOT NULL,
-                    refresh_count INTEGER NOT NULL,
-                    bytes INTEGER,
-                    file_name TEXT,
-                    saved_path TEXT,
-                    final_status TEXT NOT NULL,
-                    final_message TEXT,
-                    file_deleted INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS sites (
@@ -2874,36 +2398,6 @@ impl Database {
                 "brush_tasks",
                 "last_run_info",
                 "ALTER TABLE brush_tasks ADD COLUMN last_run_info TEXT",
-            )?;
-            ensure_column(
-                &conn,
-                "rss_subscriptions",
-                "enabled",
-                "ALTER TABLE rss_subscriptions ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
-            )?;
-            ensure_column(
-                &conn,
-                "rss_subscriptions",
-                "downloader_id",
-                "ALTER TABLE rss_subscriptions ADD COLUMN downloader_id INTEGER REFERENCES downloaders(id) ON DELETE SET NULL",
-            )?;
-            ensure_column(
-                &conn,
-                "download_runs",
-                "task_id",
-                "ALTER TABLE download_runs ADD COLUMN task_id INTEGER REFERENCES rss_subscriptions(id) ON DELETE SET NULL",
-            )?;
-            ensure_column(
-                &conn,
-                "download_runs",
-                "task_name",
-                "ALTER TABLE download_runs ADD COLUMN task_name TEXT",
-            )?;
-            ensure_column(
-                &conn,
-                "download_records",
-                "task_id",
-                "ALTER TABLE download_records ADD COLUMN task_id INTEGER REFERENCES rss_subscriptions(id) ON DELETE SET NULL",
             )?;
             ensure_column(
                 &conn,
@@ -3607,24 +3101,15 @@ impl Database {
 
             conn.execute(
                 "INSERT OR IGNORE INTO global_settings
-                 (id, download_rate_limit_requests, download_rate_limit_interval,
-                  download_rate_limit_unit, retry_interval_secs, log_level,
-                  max_concurrent_downloads, max_concurrent_rss_fetches, throttle_interval_secs,
-                  proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins, ocr_api_key,
+                 (id, log_level, proxy, use_proxy_for_lightpanda,
+                  tag_rule_scan_interval_mins, ocr_api_key,
                   lightpanda_endpoint, lightpanda_token, lightpanda_region, lightpanda_browser,
                   lightpanda_proxy, lightpanda_country, cloakbrowser_license_key,
                   cloakbrowser_headless, cloakbrowser_humanize, cloakbrowser_human_preset,
                   cloakbrowser_proxy, cloakbrowser_geoip, sign_in_browser_config_migrated)
-                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 params![
-                    2,
-                    1,
-                    "second",
-                    5,
                     "info",
-                    32,
-                    8,
-                    30,
                     Option::<String>::None,
                     1,
                     7,
@@ -3748,47 +3233,6 @@ fn row_to_brush_task_at(
     })
 }
 
-fn insert_record(
-    tx: &rusqlite::Transaction<'_>,
-    run_id: i64,
-    task_id: Option<i64>,
-    finished_at: &str,
-    record: &TorrentRunRecord,
-) -> Result<(), AppError> {
-    tx.execute(
-        "INSERT INTO download_records (run_id, task_id, finished_at, rss_name, guid, title, retry_count, refresh_count, bytes, file_name, saved_path, final_status, final_message, file_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-        params![
-            run_id,
-            task_id,
-            finished_at,
-            record.rss_name,
-            record.guid,
-            record.title,
-            record.retry_count as i64,
-            record.refresh_count as i64,
-            record.bytes.map(|v| v as i64),
-            None::<String>,
-            None::<String>,
-            final_status_name(record.final_status),
-            record.final_message,
-        ],
-    )
-    .map_err(sql_error)?;
-    Ok(())
-}
-
-fn map_rss_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<RssSubscription> {
-    Ok(RssSubscription {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        url: row.get(2)?,
-        enabled: row.get::<_, i64>(3)? != 0,
-        downloader_id: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
-
 fn map_sign_in_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInTaskRecord> {
     Ok(SignInTaskRecord {
         id: row.get(0)?,
@@ -3816,23 +3260,6 @@ fn map_sign_in_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInRecord>
         finished_at: row.get(5)?,
         status: row.get(6)?,
         message: row.get(7)?,
-    })
-}
-
-fn map_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DownloadHistoryRecord> {
-    Ok(DownloadHistoryRecord {
-        id: row.get(0)?,
-        run_id: row.get(1)?,
-        task_id: row.get(2)?,
-        finished_at: row.get(3)?,
-        rss_name: row.get(4)?,
-        guid: row.get(5)?,
-        title: row.get(6)?,
-        retry_count: row.get::<_, i64>(7)? as u32,
-        refresh_count: row.get::<_, i64>(8)? as u32,
-        bytes: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-        final_status: row.get(12)?,
-        final_message: row.get(13)?,
     })
 }
 
@@ -4164,32 +3591,8 @@ fn migrate_media_download_infohash_uniqueness(conn: &Connection) -> Result<(), A
     .map_err(sql_error)
 }
 
-fn time_unit_name(unit: TimeUnit) -> &'static str {
-    match unit {
-        TimeUnit::Second => "second",
-        TimeUnit::Minute => "minute",
-        TimeUnit::Hour => "hour",
-    }
-}
-
-fn parse_time_unit(value: String) -> TimeUnit {
-    match value.as_str() {
-        "minute" => TimeUnit::Minute,
-        "hour" => TimeUnit::Hour,
-        _ => TimeUnit::Second,
-    }
-}
-
 fn clamp_u64_to_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
-}
-
-fn final_status_name(status: FinalStatus) -> &'static str {
-    match status {
-        FinalStatus::Success => "success",
-        FinalStatus::SkippedExisting => "skipped_existing",
-        FinalStatus::Failed => "failed",
-    }
 }
 
 #[cfg(test)]

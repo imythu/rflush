@@ -880,7 +880,7 @@ async fn execute_brush_task_inner(
         let rss_body =
             String::from_utf8(rss_resp.body.to_vec()).map_err(|_| "RSS 编码错误".to_string())?;
         let parsed = rss::parse_feed(&rss_body).map_err(|e| format!("RSS 解析失败: {}", e))?;
-        parsed.into_snapshot(task.name.clone(), 1)
+        parsed.into_snapshot(task.name.clone())
     };
     last_run_info.source.items_parsed = snapshot.items.len();
 
@@ -1602,7 +1602,6 @@ mod tests {
             link: Some("https://kp.m-team.cc/detail/1".to_string()),
             pub_date: None,
             download_url: "https://kp.m-team.cc/download/1".to_string(),
-            version: 1,
             size_bytes: Some(1024),
             seeders: Some(10),
             leechers: None,

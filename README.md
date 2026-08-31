@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square)](https://github.com/imythu/rflush/releases/latest)
 [![Docker Image](https://img.shields.io/github/v/release/imythu/rflush?style=flat-square&label=ghcr.io)](https://github.com/imythu/rflush/pkgs/container/rflush)
 
-云母是一套面向 PT 用户的 Web 管理工具，提供自动追剧、电影订阅、多站资源搜索、qBittorrent 下载、RSS 任务、刷流任务和站点数据总览。
+云母是一套面向 PT 用户的 Web 管理工具，提供自动追剧、电影订阅、多站资源搜索、qBittorrent 下载、刷流任务和站点数据总览。
 
 仓库、二进制、Docker 镜像和数据库文件仍使用 `rflush` 名称，对外产品名为“云母”。
 
@@ -17,7 +17,7 @@
 - 手动搜索资源，查看匹配结果、拒绝原因和质量信息
 - 自动或手动提交资源到 qBittorrent
 - 使用持久化下载队列处理重试、去重和状态对账
-- 管理 RSS 下载任务和 PT 刷流任务
+- 管理 PT 刷流任务
 - 使用公共 Lightpanda 或 CloakBrowser 配置执行自动签到
 - 查看 PT 站点上传量、下载量、分享率等账号数据
 - 导出站点账号总览图片
@@ -225,17 +225,7 @@ RFLUSH_DATA_DIR=/data
 - 在提交结果不明确时查询 qBittorrent 状态后再决定是否重试
 - 在最终失败后把关联剧集恢复为待搜索状态
 
-## RSS 与刷流
-
-### RSS 任务
-
-- 创建多个 RSS 任务并设置独立目录
-- 启动、暂停、删除单个或多个任务
-- 设置请求重试、限速和并发
-- 查看下载历史和执行结果
-- 删除任务时可选择清理已下载的种子文件
-
-### 刷流任务
+## 刷流任务
 
 - 绑定 PT 站点和 qBittorrent 下载器
 - 使用 cron 定时执行或手动立即执行
@@ -281,7 +271,7 @@ TMDB Token、PT Cookie、API Key、Passkey 和下载器密码保存在本地 SQL
 
 主要数据包括：
 
-- 全局下载设置和 RSS 任务
+- 全局系统设置
 - PT 站点、账号数据缓存和下载器配置
 - 刷流任务、种子记录和流量快照
 - TMDB 设置和质量配置
@@ -329,18 +319,3 @@ cargo build --release
 - [pt_mate](https://github.com/JustLookAtNow/pt_mate)：参考了 PT 多站资源聚合搜索、NexusPHP 与 M-Team 站点适配、搜索结果归一化和资源获取流程。
 
 云母没有直接照搬这些项目的实现，而是结合当前 Rust 后端、SQLite 状态管理、React 前端和已有 PT 站点配置体系重新设计并独立实现。感谢相关项目及其贡献者提供的思路和开源成果。
-
-## 合并种子文件
-
-将当前目录一级子目录中的 `.torrent` 文件合并到 `merge/`：
-
-```bash
-# Windows
-.\merge.ps1
-
-# Linux / macOS
-chmod +x merge.sh
-./merge.sh
-```
-
-脚本会跳过 `merge/`、`src/`、`target/`、`frontend/`、`data/` 等目录；同名文件不会覆盖。

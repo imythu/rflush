@@ -182,7 +182,6 @@ pub fn parse_shoutbox_snapshot(html: &str, task_name: &str) -> Result<rss::FeedS
 
     for item in &mut items {
         item.rss_name = task_name.to_string();
-        item.version = 1;
     }
 
     let mut item_map = std::collections::HashMap::with_capacity(items.len());
@@ -191,10 +190,7 @@ pub fn parse_shoutbox_snapshot(html: &str, task_name: &str) -> Result<rss::FeedS
         item_map.insert(guid, item);
     }
 
-    Ok(rss::FeedSnapshot {
-        version: 1,
-        items: item_map,
-    })
+    Ok(rss::FeedSnapshot { items: item_map })
 }
 
 /// 拉取 U2 种子详情页并解析大小、做种人数、免费剩余时间，填充到 item 中。

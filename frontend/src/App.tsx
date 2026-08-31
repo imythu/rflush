@@ -7,7 +7,6 @@ import {
   FileText,
   HardDrive,
   FolderInput,
-  History,
   LayoutDashboard,
   Menu,
   CalendarCheck,
@@ -22,7 +21,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { API_BASE, APP_VERSION, api, defaultSettings } from "@/lib/api";
-import type { DownloadRecord, DownloaderRecord, GlobalConfig, RssSubscription } from "@/types";
+import type { GlobalConfig } from "@/types";
 
 const MAX_LOG_LINES = 500;
 const LOG_FLUSH_INTERVAL_MS = 250;
@@ -40,10 +39,6 @@ const LOG_LEVELS: LogLevel[] = ["trace", "debug", "info", "warn", "error"];
 type AppPage =
   | "system-overview"
   | "media"
-  | "dashboard"
-  | "tasks"
-  | "settings"
-  | "history"
   | "sites"
   | "downloaders"
   | "torrent-transfer"
@@ -53,12 +48,8 @@ type AppPage =
   | "stats"
   | "system-settings";
 
-type NavGroup = "brush" | "rss" | "system";
+type NavGroup = "brush" | "system";
 
-const DashboardPage = lazy(() => import("@/pages/dashboard-page").then((module) => ({ default: module.DashboardPage })));
-const HistoryPage = lazy(() => import("@/pages/history-page").then((module) => ({ default: module.HistoryPage })));
-const SettingsPage = lazy(() => import("@/pages/settings-page").then((module) => ({ default: module.SettingsPage })));
-const TasksPage = lazy(() => import("@/pages/tasks-page").then((module) => ({ default: module.TasksPage })));
 const SitesPage = lazy(() => import("@/pages/sites-page").then((module) => ({ default: module.SitesPage })));
 const DownloadersPage = lazy(() => import("@/pages/downloaders-page").then((module) => ({ default: module.DownloadersPage })));
 const TorrentTransferPage = lazy(() => import("@/pages/torrent-transfer-page").then((module) => ({ default: module.TorrentTransferPage })));
@@ -138,34 +129,6 @@ const navItems: Array<{
     group: "brush",
   },
   {
-    key: "dashboard",
-    label: "概览",
-    description: "任务总览与快速操作",
-    icon: LayoutDashboard,
-    group: "rss",
-  },
-  {
-    key: "tasks",
-    label: "任务管理",
-    description: "新增、暂停、批量处理和按任务看历史",
-    icon: LayoutDashboard,
-    group: "rss",
-  },
-  {
-    key: "settings",
-    label: "任务设置",
-    description: "限流、并发和下载控制",
-    icon: Settings,
-    group: "rss",
-  },
-  {
-    key: "history",
-    label: "下载历史",
-    description: "全部历史记录与种子删除标记",
-    icon: History,
-    group: "rss",
-  },
-  {
     key: "system-settings",
     label: "系统设置",
     description: "全局日志级别与系统运行设置",
@@ -179,10 +142,6 @@ function readPageFromHash(): AppPage {
   const valid: AppPage[] = [
     "system-overview",
     "media",
-    "dashboard",
-    "tasks",
-    "settings",
-    "history",
     "sites",
     "downloaders",
     "torrent-transfer",
@@ -231,19 +190,11 @@ export default function App() {
   const [page, setPage] = useState<AppPage>(readPageFromHash());
   const [menuOpen, setMenuOpen] = useState(false);
   const [settings, setSettings] = useState<GlobalConfig>(defaultSettings);
-  const [tasks, setTasks] = useState<RssSubscription[]>([]);
-  const [history, setHistory] = useState<DownloadRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
-  const [taskForm, setTaskForm] = useState({ name: "", url: "", autoStart: true, downloaderId: 0 });
-  const [downloaders, setDownloaders] = useState<DownloaderRecord[]>([]);
-  const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [currentTime, setCurrentTime] = useState(() => new Date());
-  const [groupOpen, setGroupOpen] = useState<Record<"brush" | "rss", boolean>>({
-    brush: true,
-    rss: false,
-  });
+  const [automationOpen, setAutomationOpen] = useState(true);
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsConnected, setLogsConnected] = useState(false);
@@ -267,41 +218,8 @@ export default function App() {
     }
   }, [logsOpen, effectiveLogLevel]);
 
-  async function loadPageData(targetPage: AppPage) {
-    const settingsPromise = api<GlobalConfig>("/api/settings").then((s) => { setSettings(s); return s; });
-    switch (targetPage) {
-      case "dashboard": {
-        const [rss, history] = await Promise.all([
-          api<RssSubscription[]>("/api/rss"),
-          api<DownloadRecord[]>("/api/history"),
-          settingsPromise,
-        ]);
-        setTasks(rss);
-        setHistory(history);
-        break;
-      }
-      case "tasks": {
-        const [rss, dl] = await Promise.all([
-          api<RssSubscription[]>("/api/rss"),
-          api<DownloaderRecord[]>("/api/downloaders"),
-          settingsPromise,
-        ]);
-        setTasks(rss);
-        setDownloaders(dl);
-        break;
-      }
-      case "history": {
-        await Promise.all([
-          api<DownloadRecord[]>("/api/history").then((h) => setHistory(h)),
-          settingsPromise,
-        ]);
-        break;
-      }
-      default: {
-        await settingsPromise;
-        break;
-      }
-    }
+  async function loadSettings() {
+    setSettings(await api<GlobalConfig>("/api/settings"));
   }
 
   useEffect(() => {
@@ -311,7 +229,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    loadPageData(page)
+    loadSettings()
       .catch((error: Error) => setMessage(error.message))
       .finally(() => setLoading(false));
   }, [page]);
@@ -442,16 +360,6 @@ export default function App() {
     setMenuOpen(false);
   }
 
-  async function refreshWithMessage(action: Promise<unknown>, success: string) {
-    try {
-      await action;
-      await loadPageData(page);
-      setMessage(success);
-    } catch (error) {
-      setMessage((error as Error).message);
-    }
-  }
-
   async function saveSettings() {
     setSaving(true);
     try {
@@ -466,94 +374,6 @@ export default function App() {
     } finally {
       setSaving(false);
     }
-  }
-
-  async function addTask() {
-    await refreshWithMessage(
-      api<RssSubscription>("/api/rss", {
-        method: "POST",
-        body: JSON.stringify({
-          name: taskForm.name,
-          url: taskForm.url,
-          auto_start: taskForm.autoStart,
-          downloader_id: taskForm.downloaderId || null,
-        }),
-      }),
-      taskForm.autoStart ? "任务已添加并自动启动" : "任务已添加",
-    );
-    setTaskForm({ name: "", url: "", autoStart: true, downloaderId: 0 });
-  }
-
-  async function startTask(id: number) {
-    await refreshWithMessage(api(`/api/tasks/${id}/start`, { method: "POST" }), "任务已启动");
-  }
-
-  async function pauseTask(id: number) {
-    await refreshWithMessage(api(`/api/tasks/${id}/pause`, { method: "POST" }), "任务已暂停");
-  }
-
-  async function deleteTask(id: number) {
-    await refreshWithMessage(
-      api(`/api/tasks/${id}/delete`, {
-        method: "POST",
-        body: JSON.stringify({ ids: [id] }),
-      }),
-      "任务已删除",
-    );
-  }
-
-  async function startSelected() {
-    await refreshWithMessage(
-      api("/api/tasks/start", {
-        method: "POST",
-        body: JSON.stringify({ ids: selectedIds }),
-      }),
-      "所选任务已启动",
-    );
-  }
-
-  async function pauseSelected() {
-    await refreshWithMessage(
-      api("/api/tasks/pause", {
-        method: "POST",
-        body: JSON.stringify({ ids: selectedIds }),
-      }),
-      "所选任务已暂停",
-    );
-  }
-
-  async function deleteSelected() {
-    await refreshWithMessage(
-      api("/api/tasks/delete", {
-        method: "POST",
-        body: JSON.stringify({ ids: selectedIds }),
-      }),
-      "所选任务已删除",
-    );
-    setSelectedIds([]);
-  }
-
-  async function startAll() {
-    await refreshWithMessage(api("/api/tasks/start-all", { method: "POST" }), "全部任务已启动");
-  }
-
-  async function pauseAll() {
-    await refreshWithMessage(api("/api/tasks/pause-all", { method: "POST" }), "全部任务已暂停");
-  }
-
-  async function deleteAll() {
-    await refreshWithMessage(
-      api("/api/tasks/delete-all", {
-        method: "POST",
-        body: JSON.stringify({ ids: [] }),
-      }),
-      "全部任务已删除",
-    );
-    setSelectedIds([]);
-  }
-
-  function toggleGroup(group: "brush" | "rss") {
-    setGroupOpen((prev) => ({ ...prev, [group]: !prev[group] }));
   }
 
   if (loading) {
@@ -609,26 +429,16 @@ export default function App() {
           <NavSection
             index="01."
             title="PT 自动化"
-            open={groupOpen.brush}
-            onToggle={() => toggleGroup("brush")}
+            open={automationOpen}
+            onToggle={() => setAutomationOpen((open) => !open)}
             items={navItems.filter((item) => item.group === "brush")}
-            page={page}
-            navigate={navigate}
-          />
-
-          <NavSection
-            index="02."
-            title="RSS 下载"
-            open={groupOpen.rss}
-            onToggle={() => toggleGroup("rss")}
-            items={navItems.filter((item) => item.group === "rss")}
             page={page}
             navigate={navigate}
           />
 
           <div className="rounded-[24px] border border-border bg-surface-container/70 p-2 lg:p-1.5">
             <div className="mb-2 flex items-center justify-between px-2">
-              <span className="whitespace-nowrap text-[10px] font-black tracking-[0.18em] text-primary">03. 系统</span>
+              <span className="whitespace-nowrap text-[10px] font-black tracking-[0.18em] text-primary">02. 系统</span>
               <span className="ml-3 h-px flex-1 bg-border" />
             </div>
             <div className="space-y-1.5">
@@ -770,44 +580,6 @@ export default function App() {
             <div className="mt-4">
               {page === "system-overview" ? <SystemOverviewPage /> : null}
               {page === "media" ? <MediaPage /> : null}
-
-              {page === "dashboard" ? (
-                <DashboardPage
-                  rss={tasks}
-                  history={history}
-                  onRunAll={startAll}
-                  onGoRss={() => navigate("tasks")}
-                  onGoHistory={() => navigate("history")}
-                  onRunOne={startTask}
-                />
-              ) : null}
-
-              {page === "tasks" ? (
-                <TasksPage
-                  tasks={tasks}
-                  form={taskForm}
-                  setForm={setTaskForm}
-                  downloaders={downloaders}
-                  selectedIds={selectedIds}
-                  setSelectedIds={setSelectedIds}
-                  onAddTask={addTask}
-                  onStartTask={startTask}
-                  onPauseTask={pauseTask}
-                  onDeleteTask={deleteTask}
-                  onStartSelected={startSelected}
-                  onPauseSelected={pauseSelected}
-                  onDeleteSelected={deleteSelected}
-                  onStartAll={startAll}
-                  onPauseAll={pauseAll}
-                  onDeleteAll={deleteAll}
-                />
-              ) : null}
-
-              {page === "settings" ? (
-                <SettingsPage settings={settings} setSettings={setSettings} saving={saving} onSave={saveSettings} />
-              ) : null}
-
-              {page === "history" ? <HistoryPage history={history} /> : null}
               {page === "sites" ? <SitesPage /> : null}
               {page === "downloaders" ? <DownloadersPage /> : null}
               {page === "torrent-transfer" ? <TorrentTransferPage /> : null}

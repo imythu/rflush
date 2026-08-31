@@ -1,5 +1,3 @@
-pub mod feed;
-
 use std::collections::HashMap;
 
 use quick_xml::Reader;
@@ -24,7 +22,6 @@ pub struct TorrentItem {
     pub link: Option<String>,
     pub pub_date: Option<String>,
     pub download_url: String,
-    pub version: u64,
     pub size_bytes: Option<u64>,
     pub seeders: Option<i32>,
     pub leechers: Option<i32>,
@@ -62,7 +59,6 @@ impl TorrentItem {
 
 #[derive(Debug, Clone)]
 pub struct FeedSnapshot {
-    pub version: u64,
     pub items: HashMap<String, TorrentItem>,
 }
 
@@ -90,7 +86,7 @@ pub struct ParsedFeed {
 }
 
 impl ParsedFeed {
-    pub fn into_snapshot(self, rss_name: String, version: u64) -> FeedSnapshot {
+    pub fn into_snapshot(self, rss_name: String) -> FeedSnapshot {
         let mut items = HashMap::new();
 
         for item in self.items {
@@ -111,7 +107,6 @@ impl ParsedFeed {
                 link: item.link,
                 pub_date: item.pub_date,
                 download_url,
-                version,
                 size_bytes: item.size_bytes,
                 seeders: item.seeders,
                 leechers: item.leechers,
@@ -126,7 +121,7 @@ impl ParsedFeed {
             items.insert(guid.clone(), torrent);
         }
 
-        FeedSnapshot { version, items }
+        FeedSnapshot { items }
     }
 }
 
@@ -451,7 +446,7 @@ mod tests {
 </rss>"#;
 
         let parsed = parse_feed(xml).expect("rss should parse");
-        let snapshot = parsed.into_snapshot("test".to_string(), 1);
+        let snapshot = parsed.into_snapshot("test".to_string());
         let item = snapshot.items.get("abc").expect("item should exist");
 
         assert_eq!(item.seeders, Some(12));
@@ -481,7 +476,7 @@ mod tests {
 </rss>"#;
 
         let parsed = parse_feed(xml).expect("rss should parse");
-        let snapshot = parsed.into_snapshot("test".to_string(), 1);
+        let snapshot = parsed.into_snapshot("test".to_string());
         let item = snapshot.items.get("def").expect("item should exist");
 
         assert_eq!(item.download_volume_factor, Some(0.0));
@@ -505,7 +500,7 @@ mod tests {
 </rss>"#;
 
         let parsed = parse_feed(xml).expect("rss should parse");
-        let snapshot = parsed.into_snapshot("test".to_string(), 1);
+        let snapshot = parsed.into_snapshot("test".to_string());
         let item = snapshot.items.get("ghi").expect("item should exist");
 
         assert_eq!(item.download_volume_factor, Some(0.5));

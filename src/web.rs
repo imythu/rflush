@@ -1,20 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures::stream;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, info_span, warn};
@@ -22,17 +20,14 @@ use tracing::{info, info_span, warn};
 use crate::brush::BrushTaskRequest;
 use crate::brush::scheduler::BrushScheduler;
 use crate::collector::DownloaderSnapshotCollector;
-use crate::config::{AppConfig, GlobalConfig, RssConfig, RssSubscription};
+use crate::config::GlobalConfig;
 use crate::db::{
-    Database, DownloadHistoryRecord, DownloadRunRecord, ManualMediaRelocationTarget,
-    MediaRelocationJob, OpenListConfig, OpenListPathMapping, OpenListTargetDirectory,
-    PaginatedRunRecords,
+    Database, ManualMediaRelocationTarget, MediaRelocationJob, OpenListConfig, OpenListPathMapping,
+    OpenListTargetDirectory,
 };
 use crate::downloader::DownloaderSpaceStats;
 use crate::downloader::{DownloaderClient, DownloaderClientPool};
-use crate::engine::DownloadEngine;
 use crate::error::AppError;
-use crate::history::RunSummary;
 use crate::indexer::IndexerError;
 use crate::media::domain::{MediaTarget, ReleaseInfo, ReleaseParser};
 use crate::media::models::{
@@ -64,8 +59,6 @@ use crate::tag_rule::scheduler::TagRuleScheduler;
 #[derive(Clone)]
 pub struct AppState {
     db: Database,
-    engine: DownloadEngine,
-    jobs: Arc<JobRegistry>,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
     collector: Arc<DownloaderSnapshotCollector>,
@@ -78,79 +71,11 @@ pub struct AppState {
     self_use: bool,
 }
 
-struct JobRegistry {
-    next_id: AtomicU64,
-    jobs: Mutex<HashMap<u64, ManagedJob>>,
-}
-
-impl Default for JobRegistry {
-    fn default() -> Self {
-        Self {
-            next_id: AtomicU64::new(0),
-            jobs: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct ManagedJob {
-    info: JobInfo,
-    task_id: Option<i64>,
-    shutdown: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct JobInfo {
-    id: u64,
-    scope: String,
-    task_id: Option<i64>,
-    status: String,
-    started_at: String,
-    finished_at: Option<String>,
-    run_id: Option<i64>,
-    summary: Option<RunSummary>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HistoryQuery {
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RunRecordsQuery {
-    page: Option<usize>,
-    page_size: Option<usize>,
-}
-
 #[derive(Debug, Deserialize)]
 struct BrushTorrentsQuery {
     page: Option<usize>,
     page_size: Option<usize>,
     keyword: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateRssRequest {
-    name: String,
-    url: String,
-    auto_start: Option<bool>,
-    downloader_id: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TaskBatchRequest {
-    ids: Vec<i64>,
-    delete_files: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct TaskRecordsResponse {
-    task: RssSubscription,
-    page: usize,
-    page_size: usize,
-    total_records: usize,
-    records: Vec<DownloadHistoryRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,7 +94,6 @@ struct FrontendAssets;
 impl AppState {
     pub fn new(
         db: Database,
-        engine: DownloadEngine,
         scheduler: Arc<BrushScheduler>,
         sign_in_scheduler: Arc<SignInScheduler>,
         collector: Arc<DownloaderSnapshotCollector>,
@@ -183,8 +107,6 @@ impl AppState {
     ) -> Self {
         Self {
             db,
-            engine,
-            jobs: Arc::new(JobRegistry::default()),
             scheduler,
             sign_in_scheduler,
             collector,
@@ -195,136 +117,6 @@ impl AppState {
             tag_rule_scheduler,
             relocation_scheduler,
             self_use,
-        }
-    }
-
-    async fn build_config_for_all(&self) -> Result<AppConfig, AppError> {
-        let settings = self.db.get_settings().await?;
-        let rss = self
-            .db
-            .list_rss()
-            .await?
-            .into_iter()
-            .filter(|item| item.enabled)
-            .map(|item| RssConfig {
-                name: item.name,
-                url: item.url,
-                downloader_id: item.downloader_id,
-            })
-            .collect();
-        Ok(AppConfig {
-            global: settings,
-            rss,
-        })
-    }
-
-    async fn build_config_for_task(&self, task: &RssSubscription) -> Result<AppConfig, AppError> {
-        Ok(AppConfig {
-            global: self.db.get_settings().await?,
-            rss: vec![RssConfig {
-                name: task.name.clone(),
-                url: task.url.clone(),
-                downloader_id: task.downloader_id,
-            }],
-        })
-    }
-}
-
-impl JobRegistry {
-    async fn create(&self, scope: String, task_id: Option<i64>, shutdown: Arc<AtomicBool>) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut jobs = self.jobs.lock().await;
-        jobs.insert(
-            id,
-            ManagedJob {
-                info: JobInfo {
-                    id,
-                    scope,
-                    task_id,
-                    status: "queued".to_string(),
-                    started_at: Utc::now().to_rfc3339(),
-                    finished_at: None,
-                    run_id: None,
-                    summary: None,
-                    error: None,
-                },
-                task_id,
-                shutdown,
-            },
-        );
-        id
-    }
-
-    async fn get(&self, id: u64) -> Option<JobInfo> {
-        let jobs = self.jobs.lock().await;
-        jobs.get(&id).map(|job| job.info.clone())
-    }
-
-    async fn active_for_task(&self, task_id: i64) -> Option<JobInfo> {
-        let jobs = self.jobs.lock().await;
-        jobs.values()
-            .find(|job| {
-                job.task_id == Some(task_id)
-                    && matches!(job.info.status.as_str(), "queued" | "running")
-            })
-            .map(|job| job.info.clone())
-    }
-
-    async fn mark_running(&self, id: u64) {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(job) = jobs.get_mut(&id) {
-            job.info.status = "running".to_string();
-        }
-    }
-
-    async fn mark_completed(&self, id: u64, run_id: i64, summary: RunSummary) {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(job) = jobs.get_mut(&id) {
-            job.info.status = "completed".to_string();
-            job.info.finished_at = Some(Utc::now().to_rfc3339());
-            job.info.run_id = Some(run_id);
-            job.info.summary = Some(summary);
-        }
-    }
-
-    async fn mark_failed(&self, id: u64, error: String) {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(job) = jobs.get_mut(&id) {
-            job.info.status = "failed".to_string();
-            job.info.finished_at = Some(Utc::now().to_rfc3339());
-            job.info.error = Some(error);
-        }
-    }
-
-    async fn mark_paused(&self, id: u64, run_id: Option<i64>, summary: Option<RunSummary>) {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(job) = jobs.get_mut(&id) {
-            job.info.status = "paused".to_string();
-            job.info.finished_at = Some(Utc::now().to_rfc3339());
-            job.info.run_id = run_id;
-            job.info.summary = summary;
-        }
-    }
-
-    async fn stop_tasks(&self, task_ids: &[i64]) {
-        let jobs = self.jobs.lock().await;
-        for job in jobs.values() {
-            if job
-                .task_id
-                .is_some_and(|task_id| task_ids.contains(&task_id))
-                && matches!(job.info.status.as_str(), "queued" | "running")
-            {
-                job.shutdown.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-
-    async fn stop_all(&self) {
-        let jobs = self.jobs.lock().await;
-        for job in jobs.values() {
-            if matches!(job.info.status.as_str(), "queued" | "running") {
-                job.shutdown.store(true, Ordering::Relaxed);
-            }
         }
     }
 }
@@ -338,7 +130,6 @@ pub async fn serve(
     pool: Arc<DownloaderClientPool>,
     media: Arc<MediaService>,
     media_scheduler: Arc<MediaScheduler>,
-    rate_limiter: Arc<crate::net::rate_limiter::SharedRateLimiter>,
     monitor: Arc<SystemMonitor>,
     tag_rule_scheduler: Arc<TagRuleScheduler>,
     relocation_scheduler: Arc<RelocationScheduler>,
@@ -347,10 +138,8 @@ pub async fn serve(
     let addr = listener.local_addr().map_err(|error| AppError::Server {
         message: format!("failed to read bound web server address: {error}"),
     })?;
-    let engine = DownloadEngine::new(rate_limiter);
     let state = AppState::new(
         db,
-        engine,
         scheduler,
         sign_in_scheduler,
         collector,
@@ -392,23 +181,6 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
     let self_use = state.self_use;
     Router::new()
         .route("/api/settings", get(get_settings).put(update_settings))
-        .route("/api/rss", get(list_rss).post(create_rss))
-        .route("/api/rss/{id}", delete(delete_rss))
-        .route("/api/tasks/{id}/start", post(start_task))
-        .route("/api/tasks/{id}/pause", post(pause_task))
-        .route("/api/tasks/{id}/delete", post(delete_task))
-        .route("/api/tasks/{id}/records", get(get_task_records))
-        .route("/api/tasks/start", post(start_tasks))
-        .route("/api/tasks/pause", post(pause_tasks))
-        .route("/api/tasks/delete", post(delete_tasks))
-        .route("/api/tasks/start-all", post(start_all_tasks))
-        .route("/api/tasks/pause-all", post(pause_all_tasks))
-        .route("/api/tasks/delete-all", post(delete_all_tasks))
-        .route("/api/history", get(get_history))
-        .route("/api/runs", get(get_runs))
-        .route("/api/runs/{id}/records", get(get_run_records))
-        .route("/api/jobs/run-all", post(run_all))
-        .route("/api/jobs/run/{id}", post(run_one))
         // 站点管理
         .route("/api/sites", get(list_sites).post(create_site))
         .route("/api/sites/stats-overview", get(get_sites_stats_overview))
@@ -2648,317 +2420,6 @@ async fn update_settings(
     Ok(Json(saved))
 }
 
-async fn list_rss(State(state): State<AppState>) -> Result<Json<Vec<RssSubscription>>, ApiError> {
-    Ok(Json(state.db.list_rss().await?))
-}
-
-async fn create_rss(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateRssRequest>,
-) -> Result<(StatusCode, Json<RssSubscription>), ApiError> {
-    if payload.name.trim().is_empty() || payload.url.trim().is_empty() {
-        return Err(ApiError::bad_request("name and url are required"));
-    }
-    let auto_start = payload.auto_start.unwrap_or(true);
-    let rss = state
-        .db
-        .create_rss(
-            RssConfig {
-                name: payload.name.trim().to_string(),
-                url: payload.url.trim().to_string(),
-                downloader_id: payload.downloader_id,
-            },
-            auto_start,
-        )
-        .await?;
-    if auto_start {
-        spawn_task_job(state.clone(), rss.clone()).await?;
-    }
-    Ok((StatusCode::CREATED, Json(rss)))
-}
-
-async fn delete_rss(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    let deleted = state.db.delete_rss(id).await?;
-    if deleted {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::not_found("rss subscription not found"))
-    }
-}
-
-async fn get_task_records(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Query(query): Query<RunRecordsQuery>,
-) -> Result<Json<TaskRecordsResponse>, ApiError> {
-    let page = query.page.unwrap_or(1);
-    let page_size = query.page_size.unwrap_or(10);
-    let task = state
-        .db
-        .get_rss(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task not found"))?;
-    let records = state.db.list_task_records(id, page, page_size).await?;
-    let total_records = state.db.count_task_records(id).await?;
-    Ok(Json(TaskRecordsResponse {
-        task,
-        page,
-        page_size,
-        total_records,
-        records,
-    }))
-}
-
-async fn start_task(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<JobInfo>, ApiError> {
-    let task = state
-        .db
-        .get_rss(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task not found"))?;
-    state.db.update_rss_enabled(&[id], true).await?;
-    Ok(Json(spawn_task_job(state, task).await?))
-}
-
-async fn pause_task(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
-    state
-        .db
-        .get_rss(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task not found"))?;
-    state.db.update_rss_enabled(&[id], false).await?;
-    state.jobs.stop_tasks(&[id]).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn delete_task(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(payload): Json<TaskBatchRequest>,
-) -> Result<StatusCode, ApiError> {
-    let task = state
-        .db
-        .get_rss(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task not found"))?;
-    delete_tasks_inner(&state, vec![task], payload.delete_files.unwrap_or(false)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn start_tasks(
-    State(state): State<AppState>,
-    Json(payload): Json<TaskBatchRequest>,
-) -> Result<Json<Vec<JobInfo>>, ApiError> {
-    if payload.ids.is_empty() {
-        return Err(ApiError::bad_request("ids are required"));
-    }
-    state.db.update_rss_enabled(&payload.ids, true).await?;
-    let mut jobs = Vec::new();
-    for id in payload.ids {
-        if let Some(task) = state.db.get_rss(id).await? {
-            jobs.push(spawn_task_job(state.clone(), task).await?);
-        }
-    }
-    Ok(Json(jobs))
-}
-
-async fn pause_tasks(
-    State(state): State<AppState>,
-    Json(payload): Json<TaskBatchRequest>,
-) -> Result<StatusCode, ApiError> {
-    if payload.ids.is_empty() {
-        return Err(ApiError::bad_request("ids are required"));
-    }
-    state.db.update_rss_enabled(&payload.ids, false).await?;
-    state.jobs.stop_tasks(&payload.ids).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn delete_tasks(
-    State(state): State<AppState>,
-    Json(payload): Json<TaskBatchRequest>,
-) -> Result<StatusCode, ApiError> {
-    if payload.ids.is_empty() {
-        return Err(ApiError::bad_request("ids are required"));
-    }
-    let mut tasks = Vec::new();
-    for id in payload.ids {
-        if let Some(task) = state.db.get_rss(id).await? {
-            tasks.push(task);
-        }
-    }
-    delete_tasks_inner(&state, tasks, payload.delete_files.unwrap_or(false)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn start_all_tasks(State(state): State<AppState>) -> Result<Json<Vec<JobInfo>>, ApiError> {
-    let tasks = state.db.list_rss().await?;
-    if tasks.is_empty() {
-        return Err(ApiError::bad_request("no tasks configured"));
-    }
-    state.db.set_all_rss_enabled(true).await?;
-    let mut jobs = Vec::new();
-    for task in tasks {
-        jobs.push(spawn_task_job(state.clone(), task).await?);
-    }
-    Ok(Json(jobs))
-}
-
-async fn pause_all_tasks(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
-    state.db.set_all_rss_enabled(false).await?;
-    state.jobs.stop_all().await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn delete_all_tasks(
-    State(state): State<AppState>,
-    Json(payload): Json<TaskBatchRequest>,
-) -> Result<StatusCode, ApiError> {
-    let tasks = state.db.list_rss().await?;
-    delete_tasks_inner(&state, tasks, payload.delete_files.unwrap_or(false)).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn get_history(
-    State(state): State<AppState>,
-    Query(query): Query<HistoryQuery>,
-) -> Result<Json<Vec<DownloadHistoryRecord>>, ApiError> {
-    let limit = query.limit.unwrap_or(200).min(1000);
-    Ok(Json(state.db.list_history(limit).await?))
-}
-
-async fn get_runs(
-    State(state): State<AppState>,
-    Query(query): Query<HistoryQuery>,
-) -> Result<Json<Vec<DownloadRunRecord>>, ApiError> {
-    let limit = query.limit.unwrap_or(100).min(500);
-    Ok(Json(state.db.list_runs(limit).await?))
-}
-
-async fn get_run_records(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Query(query): Query<RunRecordsQuery>,
-) -> Result<Json<PaginatedRunRecords>, ApiError> {
-    let page = query.page.unwrap_or(1);
-    let page_size = query.page_size.unwrap_or(20);
-    let records = state
-        .db
-        .list_run_records(id, page, page_size)
-        .await?
-        .ok_or_else(|| ApiError::not_found("run not found"))?;
-    Ok(Json(records))
-}
-
-async fn run_all(State(state): State<AppState>) -> Result<Json<JobInfo>, ApiError> {
-    let config = state.build_config_for_all().await?;
-    if config.rss.is_empty() {
-        return Err(ApiError::bad_request("no RSS subscriptions configured"));
-    }
-    let job_id = spawn_job(state.clone(), "all".to_string(), None, config).await;
-    let job = state
-        .jobs
-        .get(job_id)
-        .await
-        .ok_or_else(|| ApiError::internal("job not found after enqueue"))?;
-    Ok(Json(job))
-}
-
-async fn run_one(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> Result<Json<JobInfo>, ApiError> {
-    let task = state
-        .db
-        .get_rss(id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("rss subscription not found"))?;
-    Ok(Json(spawn_task_job(state, task).await?))
-}
-
-async fn spawn_task_job(state: AppState, task: RssSubscription) -> Result<JobInfo, ApiError> {
-    if let Some(job) = state.jobs.active_for_task(task.id).await {
-        return Ok(job);
-    }
-
-    let config = state.build_config_for_task(&task).await?;
-    let job_id = spawn_job(state.clone(), task.name.clone(), Some(task.id), config).await;
-    state
-        .jobs
-        .get(job_id)
-        .await
-        .ok_or_else(|| ApiError::internal("job not found after enqueue"))
-}
-
-async fn spawn_job(state: AppState, scope: String, task_id: Option<i64>, config: AppConfig) -> u64 {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let job_id = state.jobs.create(scope, task_id, shutdown.clone()).await;
-    tokio::spawn(async move {
-        state.jobs.mark_running(job_id).await;
-        match state
-            .engine
-            .run_with_shutdown(
-                config,
-                shutdown.clone(),
-                Some(state.pool.clone()),
-                Some(state.db.clone()),
-            )
-            .await
-        {
-            Ok(history) => match state
-                .db
-                .save_history(
-                    &history,
-                    task_id,
-                    history.rss.first().map(|rss| rss.name.as_str()),
-                )
-                .await
-            {
-                Ok(run_id) => {
-                    state
-                        .jobs
-                        .mark_completed(job_id, run_id, history.summary.clone())
-                        .await
-                }
-                Err(error) => state.jobs.mark_failed(job_id, error.to_string()).await,
-            },
-            Err(error) => state.jobs.mark_failed(job_id, error.to_string()).await,
-        }
-
-        if shutdown.load(Ordering::Relaxed) {
-            let run_id = state.jobs.get(job_id).await.and_then(|job| job.run_id);
-            let summary = state.jobs.get(job_id).await.and_then(|job| job.summary);
-            state.jobs.mark_paused(job_id, run_id, summary).await;
-        }
-    });
-    job_id
-}
-
-async fn delete_tasks_inner(
-    state: &AppState,
-    tasks: Vec<RssSubscription>,
-    _delete_files: bool,
-) -> Result<(), ApiError> {
-    if tasks.is_empty() {
-        return Ok(());
-    }
-
-    let ids = tasks.iter().map(|task| task.id).collect::<Vec<_>>();
-    state.db.update_rss_enabled(&ids, false).await?;
-    state.jobs.stop_tasks(&ids).await;
-
-    state.db.delete_rss_batch(&ids).await?;
-    Ok(())
-}
-
 async fn index() -> impl IntoResponse {
     serve_asset("index.html")
 }
@@ -5176,19 +4637,6 @@ fn normalize_sign_in_settings(settings: &mut GlobalConfig) {
 fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
     const ALLOWED_LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
-    if settings.download_rate_limit.requests == 0 {
-        return Err(ApiError::bad_request(
-            "download_rate_limit.requests must be >= 1",
-        ));
-    }
-    if settings.download_rate_limit.interval == 0 {
-        return Err(ApiError::bad_request(
-            "download_rate_limit.interval must be >= 1",
-        ));
-    }
-    if settings.retry_interval_secs == 0 {
-        return Err(ApiError::bad_request("retry_interval_secs must be >= 1"));
-    }
     if let Some(log_level) = settings.log_level.as_deref() {
         if !ALLOWED_LOG_LEVELS.contains(&log_level) {
             return Err(ApiError::bad_request(

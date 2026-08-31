@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
@@ -21,8 +20,6 @@ const DEPENDENCY_LOG_DIRECTIVES: &[&str] = &[
     "tungstenite=info",
 ];
 const LOG_CHANNEL_CAPACITY: usize = 1024;
-
-static NEXT_ASYNC_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 tokio::task_local! {
     pub static TASK_LOG_CONTEXT: String;
@@ -107,10 +104,6 @@ pub fn update_log_filter(log_level: Option<&str>) -> Result<(), AppError> {
 
 pub fn subscribe_logs() -> broadcast::Receiver<String> {
     log_sender().subscribe()
-}
-
-pub fn next_async_task_id() -> u64 {
-    NEXT_ASYNC_TASK_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 pub fn current_task_context() -> String {
