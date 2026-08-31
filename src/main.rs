@@ -18,6 +18,7 @@ mod site;
 mod site_stats;
 mod stats;
 mod tag_rule;
+mod torrent_watcher;
 mod web;
 
 use std::sync::Arc;
@@ -102,6 +103,8 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let monitor = std::sync::Arc::new(monitor::SystemMonitor::new(db.clone()));
 
     let tag_rule_scheduler = tag_rule::scheduler::TagRuleScheduler::new(db.clone(), pool.clone());
+    let new_torrent_publisher = torrent_watcher::NewTorrentPublisher::new(db.clone(), pool.clone());
+    let new_torrent_notifications = new_torrent_publisher.subscribe();
     let relocation_scheduler =
         relocation::RelocationScheduler::new(db.clone(), pool.clone(), self_use);
 
@@ -136,6 +139,16 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let tag_rule_scheduler_handle = tokio::spawn(async move {
         tag_rule_scheduler_ref.start().await;
     });
+    let tag_rule_subscriber_ref = tag_rule_scheduler.clone();
+    let tag_rule_subscriber_handle = tokio::spawn(async move {
+        tag_rule_subscriber_ref
+            .start_new_torrent_subscriber(new_torrent_notifications)
+            .await;
+    });
+    let new_torrent_publisher_ref = new_torrent_publisher.clone();
+    let new_torrent_publisher_handle = tokio::spawn(async move {
+        new_torrent_publisher_ref.start().await;
+    });
     let relocation_scheduler_ref = relocation_scheduler.clone();
     let relocation_scheduler_handle = tokio::spawn(async move {
         relocation_scheduler_ref.start().await;
@@ -167,6 +180,8 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     site_stats_handle.abort();
     monitor_handle.abort();
     tag_rule_scheduler_handle.abort();
+    tag_rule_subscriber_handle.abort();
+    new_torrent_publisher_handle.abort();
     relocation_scheduler_handle.abort();
 
     if tokio::time::timeout(Duration::from_secs(10), &mut media_scheduler_handle)
@@ -195,6 +210,8 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
     let _ = site_stats_handle.await;
     let _ = monitor_handle.await;
     let _ = tag_rule_scheduler_handle.await;
+    let _ = tag_rule_subscriber_handle.await;
+    let _ = new_torrent_publisher_handle.await;
     let _ = relocation_scheduler_handle.await;
 
     web_result
