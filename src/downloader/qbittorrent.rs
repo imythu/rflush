@@ -42,6 +42,7 @@ struct TolerantTorrent {
     category: Option<String>,
     time_active: Option<i64>,
     last_activity: Option<i64>,
+    tracker: Option<String>,
 }
 
 fn valid_qbittorrent_hash(hash: &str) -> bool {
@@ -78,11 +79,11 @@ impl QBittorrentClient {
         })
     }
 
-    async fn list_torrents_tolerant(
+    async fn list_torrents_tolerant_raw(
         &self,
         tag: Option<&str>,
         hashes: Option<&str>,
-    ) -> Result<Vec<TorrentInfo>, String> {
+    ) -> Result<Vec<TolerantTorrent>, String> {
         let mut query = Vec::new();
         if let Some(tag) = tag {
             query.push(("tag", tag));
@@ -127,11 +128,20 @@ impl QBittorrentClient {
             return response
                 .json::<Vec<TolerantTorrent>>()
                 .await
-                .map(|torrents| torrents.into_iter().map(TorrentInfo::from).collect())
                 .map_err(|error| format!("解析种子列表失败: {error}"));
         }
 
         Err("获取种子列表失败: qBittorrent 会话已失效".to_string())
+    }
+
+    async fn list_torrents_tolerant(
+        &self,
+        tag: Option<&str>,
+        hashes: Option<&str>,
+    ) -> Result<Vec<TorrentInfo>, String> {
+        self.list_torrents_tolerant_raw(tag, hashes)
+            .await
+            .map(|torrents| torrents.into_iter().map(TorrentInfo::from).collect())
     }
 }
 
@@ -220,6 +230,27 @@ impl DownloaderClient for QBittorrentClient {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<TorrentInfo>, String>> + Send + '_>> {
         let tag = tag.map(|t| t.to_string());
         Box::pin(async move { self.list_torrents_tolerant(tag.as_deref(), None).await })
+    }
+
+    fn list_torrent_tracker_urls(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<String>>, String>> + Send + '_>> {
+        Box::pin(async move {
+            self.list_torrents_tolerant_raw(None, None)
+                .await
+                .map(|torrents| {
+                    torrents
+                        .into_iter()
+                        .map(|torrent| {
+                            torrent
+                                .tracker
+                                .filter(|url| !url.trim().is_empty())
+                                .into_iter()
+                                .collect()
+                        })
+                        .collect()
+                })
+        })
     }
 
     fn list_torrents_by_hashes<'a>(
@@ -569,6 +600,25 @@ mod tests {
         ]))
     }
 
+    async fn fake_qb_tracker_list(headers: HeaderMap) -> Json<serde_json::Value> {
+        assert!(
+            headers
+                .get("cookie")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("SID=test-session"))
+        );
+        Json(serde_json::json!([
+            {
+                "hash": "eadb91a4769b1fad89e0dd3a930523e7fc5814b8",
+                "tracker": "https://tracker.example/announce?passkey=dummy-secret"
+            },
+            {
+                "hash": "0123456789abcdef0123456789abcdef01234567",
+                "tracker": ""
+            }
+        ]))
+    }
+
     #[derive(Default)]
     struct ReauthState {
         login_calls: usize,
@@ -753,6 +803,34 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.login_calls, 2);
         assert_eq!(state.list_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn tracker_discovery_uses_the_batch_torrent_list() {
+        let app = Router::new()
+            .route("/api/v2/auth/login", post(fake_qb_login))
+            .route("/api/v2/torrents/info", get(fake_qb_tracker_list));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = QBittorrentClient::new(
+            format!("http://{address}"),
+            "user".to_string(),
+            "password".to_string(),
+            None,
+        )
+        .unwrap();
+
+        let trackers = client.list_torrent_tracker_urls().await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            trackers,
+            vec![
+                vec!["https://tracker.example/announce?passkey=dummy-secret".to_string()],
+                Vec::<String>::new(),
+            ]
+        );
     }
 
     #[tokio::test]

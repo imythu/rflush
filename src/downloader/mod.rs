@@ -198,6 +198,20 @@ pub trait DownloaderClient: Send + Sync {
         hash: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + '_>>;
 
+    /// 返回每个种子的 tracker URL 列表。客户端可以覆盖此方法，用批量接口避免逐个请求。
+    fn list_torrent_tracker_urls(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<String>>, String>> + Send + '_>> {
+        Box::pin(async move {
+            let torrents = self.list_torrents(None).await?;
+            let mut trackers = Vec::with_capacity(torrents.len());
+            for torrent in torrents {
+                trackers.push(self.get_torrent_trackers(&torrent.hash).await?);
+            }
+            Ok(trackers)
+        })
+    }
+
     /// 为指定种子添加标签
     fn add_torrent_tags(
         &self,

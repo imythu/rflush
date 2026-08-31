@@ -1,12 +1,17 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
 use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
 use crate::downloader::DownloaderClientPool;
-use crate::tag_rule::{TagMatchCriteria, TagRuleRecord};
+use crate::tag_rule::{
+    TagMatchCriteria, TagRuleRecord, TagRuleTrackerDiscovery, TagRuleTrackerOption,
+    extract_tracker_domain,
+};
 
 /// 标签规则调度器，每分钟扫描一次所有 QB 实例的种子并匹配标签
 pub struct TagRuleScheduler {
@@ -55,6 +60,82 @@ impl TagRuleScheduler {
                 error!("tag rule scheduler error: {}", e);
             }
         }
+    }
+
+    pub async fn discover_trackers(&self) -> Result<TagRuleTrackerDiscovery, String> {
+        let downloaders = self
+            .db
+            .list_downloaders()
+            .await
+            .map_err(|e| format!("加载下载器列表失败: {e}"))?;
+        let mut pending = FuturesUnordered::new();
+
+        for downloader in downloaders {
+            let pool = Arc::clone(&self.pool);
+            pending.push(async move {
+                let result = match pool.get(&downloader).await {
+                    Ok(client) => client.list_torrent_tracker_urls().await,
+                    Err(error) => Err(error),
+                };
+                (downloader.id, downloader.name, result)
+            });
+        }
+
+        let mut discovered = HashMap::<String, (usize, HashSet<i64>)>::new();
+        let mut failed_downloaders = Vec::new();
+        while let Some((downloader_id, downloader_name, result)) = pending.next().await {
+            let torrents = match result {
+                Ok(torrents) => torrents,
+                Err(error) => {
+                    warn!(
+                        "tag rule tracker discovery: 读取下载器 '{}' 失败: {}",
+                        downloader_name, error
+                    );
+                    failed_downloaders.push(downloader_name);
+                    continue;
+                }
+            };
+
+            for tracker_urls in torrents {
+                let domains = tracker_urls
+                    .iter()
+                    .filter_map(|url| extract_tracker_domain(url))
+                    .collect::<HashSet<_>>();
+                for domain in domains {
+                    let (torrent_count, downloader_ids) = discovered
+                        .entry(domain)
+                        .or_insert_with(|| (0, HashSet::new()));
+                    *torrent_count += 1;
+                    downloader_ids.insert(downloader_id);
+                }
+            }
+        }
+
+        let mut trackers = discovered
+            .into_iter()
+            .map(|(domain, (torrent_count, downloader_ids))| {
+                let mut downloader_ids = downloader_ids.into_iter().collect::<Vec<_>>();
+                downloader_ids.sort_unstable();
+                TagRuleTrackerOption {
+                    domain,
+                    torrent_count,
+                    downloader_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        trackers.sort_by(|left, right| {
+            right
+                .torrent_count
+                .cmp(&left.torrent_count)
+                .then_with(|| left.domain.cmp(&right.domain))
+        });
+        failed_downloaders.sort();
+        failed_downloaders.dedup();
+
+        Ok(TagRuleTrackerDiscovery {
+            trackers,
+            failed_downloaders,
+        })
     }
 
     pub async fn run_once(&self) -> Result<(), String> {
@@ -184,10 +265,10 @@ impl TagRuleScheduler {
                 };
 
                 // 提取每条 tracker 的域名用于匹配
-                let tracker_domains: Vec<(&str, &str)> = trackers
+                let tracker_domains: Vec<(&str, String)> = trackers
                     .iter()
                     .filter(|u| !u.is_empty() && !u.starts_with("**"))
-                    .filter_map(|u| extract_domain(u).map(|d| (u.as_str(), d)))
+                    .filter_map(|u| extract_tracker_domain(u).map(|d| (u.as_str(), d)))
                     .collect();
                 if tracker_domains.is_empty() {
                     total_no_tracker += 1;
@@ -281,7 +362,7 @@ impl TagRuleScheduler {
                             tracker_domains.len(),
                             tracker_domains
                                 .iter()
-                                .map(|(_, d)| *d)
+                                .map(|(_, d)| d.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
@@ -374,28 +455,6 @@ fn compile_criteria(criteria: &TagMatchCriteria) -> Result<CompiledCriteria, Str
             Ok(CompiledCriteria::Regex(re))
         }
         other => Err(format!("未知的匹配类型: {}", other)),
-    }
-}
-
-/// 从 tracker URL 中提取域名，例如 "https://kp.m-team.xyz/announce" → "kp.m-team.xyz"
-fn extract_domain(url: &str) -> Option<&str> {
-    let after_scheme = if let Some(pos) = url.find("://") {
-        &url[pos + 3..]
-    } else {
-        url
-    };
-    let end = after_scheme
-        .find('/')
-        .or_else(|| after_scheme.find('?'))
-        .or_else(|| after_scheme.find('#'))
-        .unwrap_or(after_scheme.len());
-    let host = &after_scheme[..end];
-    // 去掉端口号
-    let domain = host.split(':').next().unwrap_or(host);
-    if domain.is_empty() {
-        None
-    } else {
-        Some(domain)
     }
 }
 

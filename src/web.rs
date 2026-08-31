@@ -504,6 +504,7 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         .route("/api/system/stats/history", get(get_system_stats_history))
         // 标签规则
         .route("/api/tag-rules", get(list_tag_rules).post(create_tag_rule))
+        .route("/api/tag-rules/trackers", get(list_tag_rule_trackers))
         .route(
             "/api/tag-rules/{id}",
             get(get_tag_rule)
@@ -5295,6 +5296,17 @@ async fn list_tag_rules(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::tag_rule::TagRuleRecord>>, ApiError> {
     Ok(Json(state.db.list_tag_rules().await?))
+}
+
+async fn list_tag_rule_trackers(
+    State(state): State<AppState>,
+) -> Result<Json<crate::tag_rule::TagRuleTrackerDiscovery>, ApiError> {
+    state
+        .tag_rule_scheduler
+        .discover_trackers()
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 async fn get_tag_rule(

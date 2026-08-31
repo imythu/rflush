@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Clock, Edit, Loader2, Plus, Tag, Trash2, Zap } from "lucide-react";
+import { Check, Clock, Edit, Loader2, Plus, RadioTower, RefreshCw, Tag, Trash2, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -9,7 +9,14 @@ import { Select } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
 import { formatDate } from "@/lib/format";
-import type { DownloaderRecord, TagMatchCriteria, TagRuleRecord, TagRuleRequest } from "@/types";
+import type {
+  DownloaderRecord,
+  TagMatchCriteria,
+  TagRuleRecord,
+  TagRuleRequest,
+  TagRuleTrackerDiscovery,
+  TagRuleTrackerOption,
+} from "@/types";
 
 const MATCH_TYPES = [
   { value: "prefix", label: "前缀匹配" },
@@ -28,6 +35,65 @@ const emptyForm: TagRuleRequest = {
   enabled: true,
   downloader_ids: null,
 };
+
+const COMMON_SECOND_LEVEL_SUFFIXES = new Set([
+  "ac", "co", "com", "edu", "gov", "net", "org",
+]);
+
+type TrackerMatchCandidate = TagMatchCriteria & {
+  key: string;
+  title: string;
+  detail: string;
+  recommended?: boolean;
+};
+
+function trackerMatchCandidates(domain: string): TrackerMatchCandidate[] {
+  const normalized = domain.trim().replace(/^\.+|\.+$/g, "").toLowerCase();
+  if (!normalized) return [];
+
+  const exact: TrackerMatchCandidate = {
+    key: `exact:${normalized}`,
+    match_type: "exact",
+    pattern: normalized,
+    title: "仅此域名",
+    detail: "只命中当前 Tracker 域名",
+    recommended: true,
+  };
+  const labels = normalized.split(".").filter(Boolean);
+  const isIpv4 = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(normalized);
+  if (labels.length < 2 || isIpv4 || normalized.includes(":")) return [exact];
+
+  let registrableStart = Math.max(0, labels.length - 2);
+  if (
+    labels.length >= 3
+    && COMMON_SECOND_LEVEL_SUFFIXES.has(labels[labels.length - 2])
+  ) {
+    registrableStart = labels.length - 3;
+  }
+  const siteDomain = labels.slice(registrableStart).join(".");
+  const siteKeyword = labels[registrableStart];
+  const candidates: TrackerMatchCandidate[] = [
+    exact,
+    {
+      key: `suffix:${siteDomain}`,
+      match_type: "suffix",
+      pattern: siteDomain,
+      title: "同站点域名",
+      detail: `${siteDomain} 及其子域名`,
+    },
+  ];
+
+  if (siteKeyword.length >= 3 && !/^\d+$/.test(siteKeyword)) {
+    candidates.push({
+      key: `contains:${siteKeyword}`,
+      match_type: "contains",
+      pattern: siteKeyword,
+      title: "站点关键词",
+      detail: "命中范围较宽",
+    });
+  }
+  return candidates;
+}
 
 function ruleToForm(rule: TagRuleRecord): TagRuleRequest {
   let matchRules: TagMatchCriteria[] = [];
@@ -80,10 +146,32 @@ export function TagRulesPage() {
   const [scanning, setScanning] = useState(false);
   const [scanInterval, setScanInterval] = useState<number>(7);
   const [savingInterval, setSavingInterval] = useState(false);
+  const [trackerOptions, setTrackerOptions] = useState<TagRuleTrackerOption[]>([]);
+  const [trackersLoading, setTrackersLoading] = useState(false);
+  const [trackersError, setTrackersError] = useState("");
+  const [failedDownloaders, setFailedDownloaders] = useState<string[]>([]);
+  const [selectedTrackerDomain, setSelectedTrackerDomain] = useState("");
+  const [generatedRuleIndex, setGeneratedRuleIndex] = useState<number | null>(null);
 
   const downloaderNameById = useMemo(
     () => new Map(downloaders.map((d) => [d.id, d.name])),
     [downloaders],
+  );
+  const trackerByDomain = useMemo(
+    () => new Map(trackerOptions.map((tracker) => [tracker.domain, tracker])),
+    [trackerOptions],
+  );
+  const trackerSelectOptions = useMemo(
+    () => trackerOptions.map((tracker) => ({
+      value: tracker.domain,
+      label: `${tracker.domain} · ${tracker.torrent_count} 个种子`,
+    })),
+    [trackerOptions],
+  );
+  const selectedTracker = trackerByDomain.get(selectedTrackerDomain);
+  const generatedCandidates = useMemo(
+    () => trackerMatchCandidates(selectedTrackerDomain),
+    [selectedTrackerDomain],
   );
 
   function loadData() {
@@ -123,17 +211,42 @@ export function TagRulesPage() {
     loadData();
   }, []);
 
+  async function loadTrackerOptions() {
+    setTrackersLoading(true);
+    setTrackersError("");
+    try {
+      const discovery = await api<TagRuleTrackerDiscovery>("/api/tag-rules/trackers");
+      setTrackerOptions(discovery.trackers);
+      setFailedDownloaders(discovery.failed_downloaders);
+      setSelectedTrackerDomain((current) => (
+        discovery.trackers.some((tracker) => tracker.domain === current) ? current : ""
+      ));
+    } catch (err) {
+      setTrackerOptions([]);
+      setFailedDownloaders([]);
+      setSelectedTrackerDomain("");
+      setTrackersError((err as Error).message);
+    } finally {
+      setTrackersLoading(false);
+    }
+  }
+
   function openCreate() {
     setEditingId(null);
     setForm({ ...emptyForm, match_rules: [{ ...emptyRule }] });
     setSubmitError("");
+    setSelectedTrackerDomain("");
+    setGeneratedRuleIndex(null);
     setFormOpen(true);
+    void loadTrackerOptions();
   }
 
   function openEdit(rule: TagRuleRecord) {
     setEditingId(rule.id);
     setForm(ruleToForm(rule));
     setSubmitError("");
+    setSelectedTrackerDomain("");
+    setGeneratedRuleIndex(null);
     setFormOpen(true);
   }
 
@@ -220,6 +333,26 @@ export function TagRulesPage() {
       ...prev,
       match_rules: prev.match_rules.filter((_, i) => i !== index),
     }));
+    setGeneratedRuleIndex((current) => {
+      if (current === null) return null;
+      if (current === index) return null;
+      return current > index ? current - 1 : current;
+    });
+  }
+
+  function applyTrackerCandidate(candidate: TrackerMatchCandidate) {
+    const blankIndex = form.match_rules.findIndex((rule) => rule.pattern.trim() === "");
+    const targetIndex = generatedRuleIndex !== null && form.match_rules[generatedRuleIndex]
+      ? generatedRuleIndex
+      : blankIndex >= 0
+        ? blankIndex
+        : form.match_rules.length;
+    setForm((prev) => {
+      const next = [...prev.match_rules];
+      next[targetIndex] = { match_type: candidate.match_type, pattern: candidate.pattern };
+      return { ...prev, match_rules: next };
+    });
+    setGeneratedRuleIndex(targetIndex);
   }
 
   function toggleDownloader(id: number) {
@@ -455,6 +588,99 @@ export function TagRulesPage() {
             </button>
             <Label>启用</Label>
           </div>
+
+          {/* 从已有 Tracker 生成 */}
+          {editingId === null ? (
+            <div className="space-y-3 border-y border-border py-4">
+              <div className="flex items-center justify-between gap-3">
+                <Label htmlFor="existing-tracker" className="flex items-center gap-2">
+                  <RadioTower className="h-4 w-4 text-primary" aria-hidden="true" />
+                  已有 Tracker
+                </Label>
+                <button
+                  type="button"
+                  onClick={() => void loadTrackerOptions()}
+                  disabled={trackersLoading}
+                  aria-label="刷新已有 Tracker"
+                  title="刷新"
+                  className="cursor-pointer rounded-lg p-2 text-muted transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-4 w-4 ${trackersLoading ? "animate-spin" : ""}`} />
+                </button>
+              </div>
+              <Select
+                id="existing-tracker"
+                value={selectedTrackerDomain}
+                onChange={setSelectedTrackerDomain}
+                options={trackerSelectOptions}
+                disabled={trackersLoading || trackerSelectOptions.length === 0}
+                aria-describedby="existing-tracker-status"
+              />
+              <div id="existing-tracker-status" aria-live="polite">
+                {trackersLoading ? (
+                  <p className="flex items-center gap-2 text-xs text-muted">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                    正在读取 Tracker
+                  </p>
+                ) : trackersError ? (
+                  <p role="alert" className="text-xs text-destructive">读取失败：{trackersError}</p>
+                ) : trackerOptions.length === 0 ? (
+                  <p className="text-xs text-muted">未发现可用 Tracker</p>
+                ) : null}
+                {failedDownloaders.length > 0 ? (
+                  <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                    未能读取：{failedDownloaders.join("、")}
+                  </p>
+                ) : null}
+                {selectedTracker ? (
+                  <p className="mt-1 text-xs text-muted">
+                    {selectedTracker.torrent_count} 个种子 · {selectedTracker.downloader_ids
+                      .map((id) => downloaderNameById.get(id) ?? `#${id}`)
+                      .join("、")}
+                  </p>
+                ) : null}
+              </div>
+
+              {generatedCandidates.length > 0 ? (
+                <div className="space-y-2">
+                  <Label>候选匹配</Label>
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    {generatedCandidates.map((candidate) => {
+                      const generatedRule = generatedRuleIndex === null
+                        ? null
+                        : form.match_rules[generatedRuleIndex];
+                      const selected = generatedRule?.match_type === candidate.match_type
+                        && generatedRule.pattern === candidate.pattern;
+                      return (
+                        <button
+                          key={candidate.key}
+                          type="button"
+                          aria-pressed={selected}
+                          onClick={() => applyTrackerCandidate(candidate)}
+                          className={`min-w-0 cursor-pointer rounded-lg border px-3 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${
+                            selected
+                              ? "border-primary bg-primary/10 text-foreground"
+                              : "border-border bg-surface-container/35 text-foreground hover:border-primary/40 hover:bg-accent"
+                          }`}
+                        >
+                          <span className="flex items-center justify-between gap-2 text-sm font-semibold">
+                            <span>{candidate.title}</span>
+                            {selected ? (
+                              <Check className="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+                            ) : candidate.recommended ? (
+                              <span className="shrink-0 text-[10px] font-medium text-primary">推荐</span>
+                            ) : null}
+                          </span>
+                          <code className="mt-1 block truncate text-xs text-primary">{candidate.pattern}</code>
+                          <span className="mt-1 block text-xs leading-5 text-muted">{candidate.detail}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
           {/* 匹配规则 */}
           <div className="space-y-3">

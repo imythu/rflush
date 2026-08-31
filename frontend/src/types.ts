@@ -479,3 +479,14 @@ export type TagRuleRequest = {
   enabled?: boolean;
   downloader_ids?: number[] | null;
 };
+
+export type TagRuleTrackerOption = {
+  domain: string;
+  torrent_count: number;
+  downloader_ids: number[];
+};
+
+export type TagRuleTrackerDiscovery = {
+  trackers: TagRuleTrackerOption[];
+  failed_downloaders: string[];
+};
