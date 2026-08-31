@@ -5,7 +5,7 @@ use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde_json::{Value, json};
 
-use crate::site::SiteAuth;
+use crate::site::{SiteAuth, browser_request_header_map};
 
 use super::access::OriginAccessGate;
 use super::{
@@ -86,11 +86,7 @@ impl MTeamIndexer {
             return self.headers();
         }
 
-        self.request_headers
-            .iter()
-            .filter(|(name, _)| is_cross_origin_browser_header(name.as_str()))
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect()
+        browser_request_header_map(&self.request_headers)
     }
 
     async fn search_api(&self, request: &SearchRequest) -> Result<Vec<SearchResult>, IndexerError> {
@@ -239,21 +235,6 @@ impl MTeamIndexer {
 
         unreachable!("redirect loop always returns")
     }
-}
-
-fn is_cross_origin_browser_header(name: &str) -> bool {
-    matches!(
-        name,
-        "accept"
-            | "accept-encoding"
-            | "accept-language"
-            | "cache-control"
-            | "dnt"
-            | "pragma"
-            | "upgrade-insecure-requests"
-            | "user-agent"
-    ) || name.starts_with("sec-ch-ua")
-        || name.starts_with("sec-fetch-")
 }
 
 fn is_allowed_download_url(base_url: &Url, candidate: &Url) -> bool {

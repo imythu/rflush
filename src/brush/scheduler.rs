@@ -4,7 +4,7 @@ use std::sync::Arc;
 use cached::{Cached, TimedCache};
 use chrono::Utc;
 use cron::Schedule;
-use reqwest::header::HeaderMap;
+use reqwest::{Url, header::HeaderMap};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, trace, warn};
@@ -22,7 +22,9 @@ use crate::net::client_factory;
 use crate::net::http::AppHttpClient;
 use crate::rss;
 use crate::site::factory as site_factory;
-use crate::site::{SiteAdapter, parse_site_request_headers, site_request_header_map};
+use crate::site::{
+    SiteAdapter, browser_request_header_map, parse_site_request_headers, site_request_header_map,
+};
 
 use super::cleaner;
 use super::u2;
@@ -509,21 +511,51 @@ fn snapshot_task(
     async move { task.read().await.clone() }
 }
 
+struct BrushSiteRequestHeaders {
+    base_url: Url,
+    headers: HeaderMap,
+}
+
+impl BrushSiteRequestHeaders {
+    fn for_url(&self, raw_url: &str) -> HeaderMap {
+        let is_same_origin = Url::parse(raw_url)
+            .ok()
+            .is_some_and(|url| same_origin(&self.base_url, &url));
+        if is_same_origin {
+            self.headers.clone()
+        } else {
+            browser_request_header_map(&self.headers)
+        }
+    }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
 async fn load_brush_site_request_headers(
     db: &Database,
     task: &BrushTaskRecord,
-) -> Result<HeaderMap, String> {
+) -> Result<Option<BrushSiteRequestHeaders>, String> {
     let Some(site_id) = task.site_id else {
-        return Ok(HeaderMap::new());
+        return Ok(None);
     };
     let site = db
         .get_site(site_id)
         .await
         .map_err(|error| format!("加载站点失败 (site_id={site_id}): {error}"))?
         .ok_or_else(|| format!("站点不存在: site_id={site_id}"))?;
-    parse_site_request_headers(&site.request_headers)
+    let base_url = Url::parse(site.base_url.trim())
+        .map_err(|error| format!("站点基础 URL 无效 (site_id={site_id}): {error}"))?;
+    if !matches!(base_url.scheme(), "http" | "https") || base_url.host_str().is_none() {
+        return Err(format!("站点基础 URL 无效 (site_id={site_id})"));
+    }
+    let headers = parse_site_request_headers(&site.request_headers)
         .and_then(|headers| site_request_header_map(&headers))
-        .map_err(|error| format!("解析站点请求头配置失败 (site_id={site_id}): {error}"))
+        .map_err(|error| format!("解析站点请求头配置失败 (site_id={site_id}): {error}"))?;
+    Ok(Some(BrushSiteRequestHeaders { base_url, headers }))
 }
 
 async fn execute_brush_task(
@@ -569,7 +601,7 @@ async fn execute_brush_task_inner(
     info!("[刷流][{}] 开始执行任务 (id={})", task.name, task.id);
     let is_u2_source = u2::is_u2_shoutbox_url(&task.rss_url);
     let site_request_headers = if is_u2_source {
-        HeaderMap::new()
+        None
     } else {
         load_brush_site_request_headers(db, &task).await?
     };
@@ -834,8 +866,12 @@ async fn execute_brush_task_inner(
     } else {
         last_run_info.source.source_type = "rss".to_string();
         info!("[刷流][{}] 拉取 RSS: {}", task.name, task.rss_url);
+        let request_headers = site_request_headers
+            .as_ref()
+            .map(|headers| headers.for_url(&task.rss_url))
+            .unwrap_or_default();
         let rss_resp = http
-            .get_with_header_map("brush-rss", &task.rss_url, &site_request_headers)
+            .get_with_header_map("brush-rss", &task.rss_url, &request_headers)
             .await
             .map_err(|e| format!("RSS 请求失败: {}", e))?;
         if !rss_resp.status.is_success() {
@@ -1150,11 +1186,15 @@ async fn execute_brush_task_inner(
                 }
             }
         } else {
+            let request_headers = site_request_headers
+                .as_ref()
+                .map(|headers| headers.for_url(&effective_item.download_url))
+                .unwrap_or_default();
             match http
                 .get_with_header_map(
                     "brush-torrent",
                     &effective_item.download_url,
-                    &site_request_headers,
+                    &request_headers,
                 )
                 .await
             {
@@ -1576,10 +1616,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_brush_requests_load_headers_from_the_associated_site() {
+    async fn direct_brush_headers_are_scoped_to_the_associated_site_origin() {
         let directory = tempdir().unwrap();
         let db = Database::open(directory.path()).await.unwrap();
-        let request_headers = r#"[{"name":"User-Agent","value":"Configured Browser"},{"name":"X-Site-Header","value":"configured"}]"#;
+        let request_headers = r#"[{"name":"User-Agent","value":"Configured Browser"},{"name":"X-Private-Token","value":"secret"}]"#;
         let site_id = db
             .create_site(
                 "test",
@@ -1594,10 +1634,17 @@ mod tests {
         let mut task = task();
         task.site_id = Some(site_id);
 
-        let headers = load_brush_site_request_headers(&db, &task).await.unwrap();
+        let config = load_brush_site_request_headers(&db, &task)
+            .await
+            .unwrap()
+            .unwrap();
+        let same_origin_headers = config.for_url("https://tracker.example:443/rss");
+        let cross_origin_headers = config.for_url("https://cdn.example/file.torrent");
 
-        assert_eq!(headers["user-agent"], "Configured Browser");
-        assert_eq!(headers["x-site-header"], "configured");
+        assert_eq!(same_origin_headers["user-agent"], "Configured Browser");
+        assert_eq!(same_origin_headers["x-private-token"], "secret");
+        assert_eq!(cross_origin_headers["user-agent"], "Configured Browser");
+        assert!(!cross_origin_headers.contains_key("x-private-token"));
     }
 
     #[test]

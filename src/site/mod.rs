@@ -129,6 +129,30 @@ pub fn site_request_header_map(headers: &[SiteRequestHeader]) -> Result<HeaderMa
     Ok(map)
 }
 
+/// Keep only browser fingerprint headers that are safe to forward to another origin.
+pub fn browser_request_header_map(headers: &HeaderMap) -> HeaderMap {
+    headers
+        .iter()
+        .filter(|(name, _)| is_browser_request_header(name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+fn is_browser_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "accept"
+            | "accept-encoding"
+            | "accept-language"
+            | "cache-control"
+            | "dnt"
+            | "pragma"
+            | "upgrade-insecure-requests"
+            | "user-agent"
+    ) || name.starts_with("sec-ch-ua")
+        || name.starts_with("sec-fetch-")
+}
+
 fn is_managed_request_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
@@ -276,8 +300,8 @@ pub trait SiteAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        SiteRequestHeader, default_site_request_headers, normalize_site_request_headers,
-        site_request_header_map,
+        SiteRequestHeader, browser_request_header_map, default_site_request_headers,
+        normalize_site_request_headers, site_request_header_map,
     };
 
     fn header(name: &str, value: &str) -> SiteRequestHeader {
@@ -317,5 +341,21 @@ mod tests {
                 .unwrap_err()
                 .contains("无效字符")
         );
+    }
+
+    #[test]
+    fn browser_header_filter_drops_private_cross_origin_values() {
+        let headers = site_request_header_map(&[
+            header("User-Agent", "Configured Browser"),
+            header("sec-ch-ua", "Chromium"),
+            header("X-Private-Token", "secret"),
+        ])
+        .unwrap();
+
+        let filtered = browser_request_header_map(&headers);
+
+        assert_eq!(filtered["user-agent"], "Configured Browser");
+        assert_eq!(filtered["sec-ch-ua"], "Chromium");
+        assert!(!filtered.contains_key("x-private-token"));
     }
 }
