@@ -54,6 +54,7 @@ use crate::site::{
     SiteAuth, SiteRequestHeader, SiteStatsRecord, SiteType, SiteWithStats,
     default_site_request_headers, normalize_site_request_headers, parse_site_request_headers,
 };
+use crate::site_stats::SiteStatsRefresher;
 use crate::tag_rule::scheduler::TagRuleScheduler;
 
 #[derive(Clone)]
@@ -61,6 +62,7 @@ pub struct AppState {
     db: Database,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
+    site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     media: Arc<MediaService>,
@@ -96,6 +98,7 @@ impl AppState {
         db: Database,
         scheduler: Arc<BrushScheduler>,
         sign_in_scheduler: Arc<SignInScheduler>,
+        site_stats_refresher: Arc<SiteStatsRefresher>,
         collector: Arc<DownloaderSnapshotCollector>,
         pool: Arc<DownloaderClientPool>,
         media: Arc<MediaService>,
@@ -109,6 +112,7 @@ impl AppState {
             db,
             scheduler,
             sign_in_scheduler,
+            site_stats_refresher,
             collector,
             pool,
             media,
@@ -126,6 +130,7 @@ pub async fn serve(
     db: Database,
     scheduler: Arc<BrushScheduler>,
     sign_in_scheduler: Arc<SignInScheduler>,
+    site_stats_refresher: Arc<SiteStatsRefresher>,
     collector: Arc<DownloaderSnapshotCollector>,
     pool: Arc<DownloaderClientPool>,
     media: Arc<MediaService>,
@@ -142,6 +147,7 @@ pub async fn serve(
         db,
         scheduler,
         sign_in_scheduler,
+        site_stats_refresher,
         collector,
         pool,
         media,
@@ -184,6 +190,10 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         // 站点管理
         .route("/api/sites", get(list_sites).post(create_site))
         .route("/api/sites/stats-overview", get(get_sites_stats_overview))
+        .route(
+            "/api/sites/refresh-all",
+            get(get_sites_stats_refresh_status).post(start_sites_stats_refresh),
+        )
         .route("/api/sites/{id}", put(update_site).delete(delete_site))
         .route("/api/sites/{id}/credentials", get(get_site_credentials))
         .route(
@@ -2506,6 +2516,17 @@ struct SiteCredentialsResponse {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SiteStatsRefreshStartResponse {
+    started: bool,
+    refreshing: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SiteStatsRefreshStatusResponse {
+    refreshing: bool,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2918,6 +2939,30 @@ async fn get_sites_stats_overview(
             .map(SiteResponse::from)
             .collect(),
     ))
+}
+
+async fn start_sites_stats_refresh(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<SiteStatsRefreshStartResponse>) {
+    let started = state.site_stats_refresher.refresh_all_in_background();
+    let refreshing = state.site_stats_refresher.is_refreshing();
+    (
+        StatusCode::ACCEPTED,
+        Json(SiteStatsRefreshStartResponse {
+            started,
+            refreshing,
+        }),
+    )
+}
+
+async fn get_sites_stats_refresh_status(State(state): State<AppState>) -> Response {
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(SiteStatsRefreshStatusResponse {
+            refreshing: state.site_stats_refresher.is_refreshing(),
+        }),
+    )
+        .into_response()
 }
 
 // ========== Proxy Test API ==========

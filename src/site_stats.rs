@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use futures::future::join_all;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::db::Database;
@@ -15,11 +17,15 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone)]
 pub struct SiteStatsRefresher {
     db: Database,
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 impl SiteStatsRefresher {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            refresh_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub async fn start(&self) {
@@ -39,6 +45,33 @@ impl SiteStatsRefresher {
     }
 
     pub async fn refresh_all(&self) -> Result<Vec<SiteWithStats>, AppError> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+        self.refresh_all_unlocked().await
+    }
+
+    pub fn refresh_all_in_background(self: &Arc<Self>) -> bool {
+        let Ok(refresh_guard) = Arc::clone(&self.refresh_lock).try_lock_owned() else {
+            return false;
+        };
+        let refresher = Arc::clone(self);
+        tokio::spawn(async move {
+            let _refresh_guard = refresh_guard;
+            match refresher.refresh_all_unlocked().await {
+                Ok(sites) => info!(
+                    site_count = sites.len(),
+                    "manual site stats refresh completed"
+                ),
+                Err(error) => error!("manual site stats refresh failed: {}", error),
+            }
+        });
+        true
+    }
+
+    pub fn is_refreshing(&self) -> bool {
+        self.refresh_lock.try_lock().is_err()
+    }
+
+    async fn refresh_all_unlocked(&self) -> Result<Vec<SiteWithStats>, AppError> {
         let sites = self.db.list_sites().await?;
         let settings = self.db.get_settings().await?;
         let proxy = settings.proxy.as_deref();
@@ -72,5 +105,33 @@ impl SiteStatsRefresher {
         .collect::<Result<Vec<_>, _>>()?;
 
         self.db.list_sites_with_stats().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_refresh_is_deduplicated_while_another_refresh_is_running() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(temp.path()).await.unwrap();
+        let refresher = Arc::new(SiteStatsRefresher::new(db));
+        let refresh_guard = Arc::clone(&refresher.refresh_lock).lock_owned().await;
+
+        assert!(refresher.is_refreshing());
+        assert!(!refresher.refresh_all_in_background());
+
+        drop(refresh_guard);
+        assert!(!refresher.is_refreshing());
+        assert!(refresher.refresh_all_in_background());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while refresher.is_refreshing() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

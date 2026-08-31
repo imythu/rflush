@@ -18,6 +18,7 @@ import {
   EyeOff,
   ExternalLink,
   Download as DownloadIcon,
+  RefreshCw,
   RotateCcw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -45,6 +46,8 @@ import type {
   SiteCredentialsRecord,
   SiteRecord,
   SiteRequestHeader,
+  SiteStatsRefreshStartResponse,
+  SiteStatsRefreshStatusResponse,
   SiteStatsRecord,
   SiteTestResult,
 } from "@/types";
@@ -636,6 +639,8 @@ export function SitesPage() {
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [refreshAllSubmitting, setRefreshAllSubmitting] = useState(false);
+  const [refreshingAll, setRefreshingAll] = useState(false);
   const [siteCredentials, setSiteCredentials] = useState<Record<number, SiteCredentialsRecord>>({});
   const [revealedCredentialKeys, setRevealedCredentialKeys] = useState<Set<string>>(() => new Set());
   const [loadingCredentialKeys, setLoadingCredentialKeys] = useState<Set<string>>(() => new Set());
@@ -704,7 +709,79 @@ export function SitesPage() {
 
   useEffect(() => {
     loadSites();
+    api<SiteStatsRefreshStatusResponse>("/api/sites/refresh-all")
+      .then((status) => setRefreshingAll(status.refreshing))
+      .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    if (!refreshingAll) return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+    let consecutiveFailures = 0;
+
+    const scheduleStatusCheck = () => {
+      timer = window.setTimeout(checkStatus, 1200);
+    };
+
+    const checkStatus = async () => {
+      try {
+        const status = await api<SiteStatsRefreshStatusResponse>("/api/sites/refresh-all");
+        if (cancelled) return;
+        consecutiveFailures = 0;
+        if (status.refreshing) {
+          scheduleStatusCheck();
+          return;
+        }
+
+        const refreshedSites = await api<SiteRecord[]>("/api/sites");
+        if (cancelled) return;
+        setSites(refreshedSites);
+        setRefreshingAll(false);
+        const failedCount = refreshedSites.filter((site) => site.stats?.last_error).length;
+        setMessage(
+          failedCount > 0
+            ? `刷新完成，${failedCount} 个站点失败，可在总览中查看详情`
+            : "全部站点刷新完成",
+        );
+      } catch (error) {
+        if (cancelled) return;
+        consecutiveFailures += 1;
+        if (consecutiveFailures < 3) {
+          scheduleStatusCheck();
+          return;
+        }
+        setRefreshingAll(false);
+        setMessage(`刷新任务已提交，但无法确认执行结果：${(error as Error).message}`);
+      }
+    };
+
+    scheduleStatusCheck();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [refreshingAll]);
+
+  async function handleRefreshAll() {
+    setRefreshAllSubmitting(true);
+    try {
+      const response = await api<SiteStatsRefreshStartResponse>("/api/sites/refresh-all", {
+        method: "POST",
+      });
+      setRefreshingAll(true);
+      setMessage(
+        response.started
+          ? "已开始在后台刷新全部站点"
+          : "全部站点统计正在后台刷新",
+      );
+    } catch (error) {
+      setMessage((error as Error).message || "启动全站刷新失败");
+    } finally {
+      setRefreshAllSubmitting(false);
+    }
+  }
 
   async function loadSiteCredentials(site: SiteRecord): Promise<SiteCredentialsRecord> {
     const cached = siteCredentials[site.id];
@@ -1145,7 +1222,7 @@ export function SitesPage() {
     <div className="space-y-6">
       <Card className="rounded-2xl">
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <CardTitle className="flex items-center gap-2">
                 <Globe className="h-5 w-5" />
@@ -1153,7 +1230,26 @@ export function SitesPage() {
               </CardTitle>
               <CardDescription>管理 PT 站点连接配置</CardDescription>
             </div>
-            <div className="flex flex-wrap justify-end gap-2">
+            <div className="flex flex-wrap gap-2 sm:justify-end">
+              <Button
+                variant="outline"
+                onClick={() => void handleRefreshAll()}
+                disabled={
+                  loading ||
+                  sites.length === 0 ||
+                  refreshAllSubmitting ||
+                  refreshingAll
+                }
+                aria-busy={refreshAllSubmitting || refreshingAll}
+                title="在后台刷新全部站点统计"
+              >
+                <RefreshCw
+                  className={`mr-2 h-4 w-4 ${
+                    refreshAllSubmitting || refreshingAll ? "motion-safe:animate-spin" : ""
+                  }`}
+                />
+                {refreshAllSubmitting ? "提交中" : refreshingAll ? "刷新中" : "刷新所有"}
+              </Button>
               <Button
                 variant="outline"
                 onClick={handleOverview}
@@ -1172,7 +1268,11 @@ export function SitesPage() {
 
         <CardContent className="space-y-4">
           {message ? (
-            <div className="rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm">
+            <div
+              className="rounded-2xl border border-border bg-surface-container/70 px-4 py-3 text-sm"
+              role="status"
+              aria-live="polite"
+            >
               <div className="flex items-start justify-between gap-3">
                 <span>{message}</span>
                 <button type="button" className="text-muted hover:text-foreground" onClick={() => setMessage("")}>

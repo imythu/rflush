@@ -146,6 +146,7 @@ async fn bootstrap_and_run() -> Result<(), AppError> {
         db,
         scheduler,
         sign_in_scheduler,
+        site_stats_refresher,
         collector,
         pool,
         media_service,

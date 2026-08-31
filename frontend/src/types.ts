@@ -82,6 +82,15 @@ export type SiteTestResult = {
   user_stats: UserStats | null;
 };
 
+export type SiteStatsRefreshStartResponse = {
+  started: boolean;
+  refreshing: boolean;
+};
+
+export type SiteStatsRefreshStatusResponse = {
+  refreshing: boolean;
+};
+
 export type UserStats = {
   uid: string | null;
   username: string;
