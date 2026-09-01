@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   CalendarCheck,
-  CheckCircle2,
   Cloud,
   Edit,
   FlaskConical,
@@ -11,7 +10,6 @@ import {
   Plus,
   RefreshCw,
   Save,
-  ShieldCheck,
   Trash2,
   X,
   Zap,
@@ -37,7 +35,6 @@ import type {
 
 const SIGN_IN_INTERVAL_HOURS = [6, 8, 12, 16, 20, 24] as const;
 type SignInIntervalHours = (typeof SIGN_IN_INTERVAL_HOURS)[number];
-type SignInBrowser = "lightpanda" | "cloakbrowser";
 
 const emptyForm: SignInTaskRequest = {
   name: "",
@@ -52,7 +49,7 @@ function taskToForm(task: SignInTaskRecord): SignInTaskRequest {
     name: task.name,
     site_id: task.site_id,
     cron_expression: task.cron_expression,
-    browser: task.browser,
+    browser: "lightpanda",
     sign_in_method: task.sign_in_method,
   };
 }
@@ -76,10 +73,6 @@ function signInMethodLabel(method: string | null | undefined) {
   return "打开页面签到";
 }
 
-function browserLabel(browser: string | null | undefined) {
-  return browser === "cloakbrowser" ? "CloakBrowser" : "Lightpanda";
-}
-
 function intervalToCron(hours: SignInIntervalHours) {
   return `0 0 0/${hours} * * *`;
 }
@@ -92,14 +85,6 @@ function cronToInterval(cron: string): SignInIntervalHours {
   return SIGN_IN_INTERVAL_HOURS.includes(hours as SignInIntervalHours) ? (hours as SignInIntervalHours) : 8;
 }
 
-function isBrowserConfigured(settings: GlobalConfig | null, browser: SignInBrowser) {
-  if (!settings) return false;
-  if (browser === "lightpanda") {
-    return Boolean(settings.lightpanda.endpoint?.trim() || settings.lightpanda.token?.trim());
-  }
-  return Boolean(settings.cloakbrowser.license_key?.trim());
-}
-
 export function SignInPage() {
   const [tasks, setTasks] = useState<SignInTaskRecord[]>([]);
   const [sites, setSites] = useState<SiteRecord[]>([]);
@@ -107,7 +92,6 @@ export function SignInPage() {
   const [settings, setSettings] = useState<GlobalConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
-  const [configTab, setConfigTab] = useState<SignInBrowser>("lightpanda");
   const [configFeedback, setConfigFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [savingBrowser, setSavingBrowser] = useState(false);
   const [probingBrowser, setProbingBrowser] = useState(false);
@@ -162,23 +146,9 @@ export function SignInPage() {
     setConfigFeedback(null);
   }
 
-  function setCloakBrowserField<K extends keyof GlobalConfig["cloakbrowser"]>(
-    key: K,
-    value: GlobalConfig["cloakbrowser"][K],
-  ) {
-    setSettings((current) =>
-      current ? { ...current, cloakbrowser: { ...current.cloakbrowser, [key]: value } } : current,
-    );
-    setConfigFeedback(null);
-  }
-
   function openAdd() {
-    const defaultBrowser: SignInBrowser =
-      !isBrowserConfigured(settings, "lightpanda") && isBrowserConfigured(settings, "cloakbrowser")
-        ? "cloakbrowser"
-        : "lightpanda";
     setEditingId(null);
-    setForm({ ...emptyForm, site_id: nexusSites[0]?.id ?? 0, browser: defaultBrowser });
+    setForm({ ...emptyForm, site_id: nexusSites[0]?.id ?? 0 });
     setIntervalHours(8);
     setSubmitError("");
     setFormOpen(true);
@@ -198,7 +168,7 @@ export function SignInPage() {
     setForm((current) => ({
       ...current,
       cron_expression: source.cron_expression,
-      browser: source.browser,
+      browser: "lightpanda",
       sign_in_method: source.sign_in_method,
     }));
     setIntervalHours(cronToInterval(source.cron_expression));
@@ -212,12 +182,8 @@ export function SignInPage() {
 
   async function persistBrowserSettings(probe: boolean) {
     if (!settings) return;
-    if (probe && configTab === "lightpanda" && !settings.lightpanda.endpoint?.trim() && !settings.lightpanda.token?.trim()) {
+    if (probe && !settings.lightpanda.endpoint?.trim() && !settings.lightpanda.token?.trim()) {
       setConfigFeedback({ tone: "error", text: "Lightpanda endpoint 或 token 至少填写一个" });
-      return;
-    }
-    if (probe && configTab === "cloakbrowser" && !settings.cloakbrowser.license_key?.trim()) {
-      setConfigFeedback({ tone: "error", text: "CloakBrowser license key 不能为空" });
       return;
     }
 
@@ -231,13 +197,13 @@ export function SignInPage() {
       });
       setSettings(saved);
       if (!probe) {
-        setConfigFeedback({ tone: "success", text: `${browserLabel(configTab)} 公共配置已保存` });
+        setConfigFeedback({ tone: "success", text: "Lightpanda 公共配置已保存" });
         return;
       }
 
       const result = await api<BrowserProbeResult>("/api/sign-in-probe-1-1-1-1", {
         method: "POST",
-        body: JSON.stringify({ browser: configTab }),
+        body: JSON.stringify({ browser: "lightpanda" }),
       });
       if (!result.success) throw new Error(result.message);
       setConfigFeedback({
@@ -247,7 +213,7 @@ export function SignInPage() {
     } catch (error) {
       setConfigFeedback({
         tone: "error",
-        text: (error as Error).message || `${browserLabel(configTab)} 配置保存失败`,
+        text: (error as Error).message || "Lightpanda 配置保存失败",
       });
     } finally {
       setSavingBrowser(false);
@@ -319,48 +285,12 @@ export function SignInPage() {
   return (
     <div className="space-y-6">
       <Card>
-        <CardHeader className="gap-4">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <CardTitle className="flex items-center gap-2">
-                <ShieldCheck className="h-5 w-5" />
-                签到浏览器
-              </CardTitle>
-              <CardDescription>所有自动签到任务共用以下浏览器连接配置。</CardDescription>
-            </div>
-            <span className="w-fit rounded-full border border-border bg-surface-container px-3 py-1 text-xs font-medium text-muted">
-              CloakBrowser 并发 1
-            </span>
-          </div>
-
-          <div className="grid h-11 w-full grid-cols-2 rounded-2xl border border-border bg-surface-container p-1 sm:w-[360px]" role="tablist" aria-label="签到浏览器配置">
-            {(["lightpanda", "cloakbrowser"] as const).map((browser) => {
-              const selected = configTab === browser;
-              const configured = isBrowserConfigured(settings, browser);
-              return (
-                <button
-                  key={browser}
-                  id={`sign-in-browser-tab-${browser}`}
-                  type="button"
-                  role="tab"
-                  aria-selected={selected}
-                  aria-controls={`sign-in-browser-panel-${browser}`}
-                  onClick={() => {
-                    setConfigTab(browser);
-                    setConfigFeedback(null);
-                  }}
-                  className={cn(
-                    "flex min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-xl px-2 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:gap-2 sm:px-3 sm:text-sm",
-                    selected ? "bg-card text-foreground shadow-sm" : "text-muted hover:text-foreground",
-                  )}
-                >
-                  {browser === "lightpanda" ? <Cloud className="h-4 w-4 shrink-0" /> : <ShieldCheck className="h-4 w-4 shrink-0" />}
-                  <span className="whitespace-nowrap">{browserLabel(browser)}</span>
-                  {configured ? <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600" aria-label="已配置" /> : null}
-                </button>
-              );
-            })}
-          </div>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Cloud className="h-5 w-5" />
+            Lightpanda 签到浏览器
+          </CardTitle>
+          <CardDescription>所有自动签到任务共用以下 Lightpanda 连接配置。</CardDescription>
         </CardHeader>
 
         <CardContent className="space-y-5">
@@ -371,13 +301,8 @@ export function SignInPage() {
             </div>
           ) : null}
 
-          {settings && configTab === "lightpanda" ? (
-            <div
-              id="sign-in-browser-panel-lightpanda"
-              className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
-              role="tabpanel"
-              aria-labelledby="sign-in-browser-tab-lightpanda"
-            >
+          {settings ? (
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
               <div className="space-y-2 sm:col-span-2 xl:col-span-3">
                 <Label htmlFor="lightpanda-endpoint">Endpoint</Label>
                 <Input
@@ -450,68 +375,6 @@ export function SignInPage() {
                 />
                 使用 Lightpanda 代理
               </label>
-            </div>
-          ) : null}
-
-          {settings && configTab === "cloakbrowser" ? (
-            <div
-              id="sign-in-browser-panel-cloakbrowser"
-              className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
-              role="tabpanel"
-              aria-labelledby="sign-in-browser-tab-cloakbrowser"
-            >
-              <div className="space-y-2 sm:col-span-2 xl:col-span-3">
-                <Label htmlFor="cloakbrowser-license">License key</Label>
-                <Input
-                  id="cloakbrowser-license"
-                  type="password"
-                  autoComplete="off"
-                  value={settings.cloakbrowser.license_key ?? ""}
-                  onChange={(event) => setCloakBrowserField("license_key", event.target.value || null)}
-                  placeholder="cb_xxxxxxxx"
-                />
-              </div>
-              <div className="space-y-2 sm:col-span-2">
-                <Label htmlFor="cloakbrowser-proxy">代理</Label>
-                <Input
-                  id="cloakbrowser-proxy"
-                  type="password"
-                  autoComplete="off"
-                  value={settings.cloakbrowser.proxy ?? ""}
-                  onChange={(event) => setCloakBrowserField("proxy", event.target.value || null)}
-                  placeholder="http://user:pass@residential-host:port"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="cloakbrowser-human-preset">Human preset</Label>
-                <Select
-                  id="cloakbrowser-human-preset"
-                  value={settings.cloakbrowser.human_preset}
-                  disabled={!settings.cloakbrowser.humanize}
-                  onChange={(value) => setCloakBrowserField("human_preset", value)}
-                  options={[
-                    { value: "careful", label: "Careful" },
-                    { value: "default", label: "Default" },
-                  ]}
-                />
-              </div>
-              <div className="flex flex-wrap gap-x-6 gap-y-3 sm:col-span-2 xl:col-span-3">
-                {[
-                  { key: "headless" as const, label: "无头模式" },
-                  { key: "humanize" as const, label: "Humanize" },
-                  { key: "geoip" as const, label: "GeoIP" },
-                ].map((option) => (
-                  <label key={option.key} className="flex min-h-10 cursor-pointer items-center gap-3 text-sm font-medium">
-                    <input
-                      type="checkbox"
-                      className="size-4 accent-primary"
-                      checked={settings.cloakbrowser[option.key]}
-                      onChange={(event) => setCloakBrowserField(option.key, event.target.checked)}
-                    />
-                    {option.label}
-                  </label>
-                ))}
-              </div>
             </div>
           ) : null}
 
@@ -629,7 +492,7 @@ export function SignInPage() {
 
                   <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2 xl:grid-cols-5">
                     <div className="truncate"><span className="font-medium text-foreground">站点: </span>{siteNameById.get(task.site_id) ?? `#${task.site_id}`}</div>
-                    <div className="truncate"><span className="font-medium text-foreground">浏览器: </span>{browserLabel(task.browser)}</div>
+                    <div className="truncate"><span className="font-medium text-foreground">浏览器: </span>Lightpanda</div>
                     <div className="truncate"><span className="font-medium text-foreground">间隔: </span>每 {cronToInterval(task.cron_expression)} 小时</div>
                     <div className="truncate"><span className="font-medium text-foreground">方式: </span>{signInMethodLabel(task.sign_in_method)}</div>
                     <div className="truncate"><span className="font-medium text-foreground">最近时间: </span>{formatDate(task.last_run_at)}</div>
@@ -683,7 +546,7 @@ export function SignInPage() {
         open={formOpen}
         onClose={closeForm}
         title={editingId !== null ? "编辑自动签到任务" : "添加自动签到任务"}
-        description="配置 NexusPHP 站点、执行间隔、签到方式和使用的浏览器。"
+        description="配置 NexusPHP 站点、执行间隔和签到方式。"
         escMode="double"
       >
         <div className="space-y-6 p-4 sm:p-6">
@@ -726,18 +589,6 @@ export function SignInPage() {
                 value={String(intervalHours)}
                 onChange={(value) => setIntervalHours(Number(value) as SignInIntervalHours)}
                 options={SIGN_IN_INTERVAL_HOURS.map((hours) => ({ value: String(hours), label: `每 ${hours} 小时` }))}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="sign-in-browser">浏览器</Label>
-              <Select
-                id="sign-in-browser"
-                value={form.browser ?? "lightpanda"}
-                onChange={(value) => setField("browser", value)}
-                options={[
-                  { value: "lightpanda", label: "Lightpanda" },
-                  { value: "cloakbrowser", label: "CloakBrowser" },
-                ]}
               />
             </div>
             <div className="space-y-2 sm:col-span-2">

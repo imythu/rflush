@@ -18,7 +18,7 @@
 - 自动或手动提交资源到 qBittorrent
 - 使用持久化下载队列处理重试、去重和状态对账
 - 管理 PT 刷流任务
-- 使用公共 Lightpanda 或 CloakBrowser 配置执行自动签到
+- 使用公共 Lightpanda 配置执行自动签到
 - 查看 PT 站点上传量、下载量、分享率等账号数据
 - 导出站点账号总览图片
 - React Web 界面，适配桌面端和移动端
@@ -60,16 +60,6 @@ http://127.0.0.1:3000
 ```
 
 对应环境变量为 `RFLUSH_HOST`、`RFLUSH_PORT` 和 `RFLUSH_DATA_DIR`。
-
-使用 CloakBrowser 自动签到时，直接运行版还需要 Python 3 和 CloakBrowser SDK：
-
-```bash
-python3 -m pip install "cloakbrowser[geoip]>=0.5.10,<0.6"
-```
-
-程序默认依次查找 `python3` 和 `python`。需要使用虚拟环境或其它解释器时，设置
-`CLOAKBROWSER_PYTHON` 为对应 Python 可执行文件路径。Docker 镜像已包含 SDK、浏览器运行库和
-headed 模式所需的虚拟显示环境，不需要额外安装。
 
 ### Docker
 

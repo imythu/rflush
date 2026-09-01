@@ -83,9 +83,7 @@ impl Database {
                 .query_row(
                     "SELECT log_level, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins,
                             ocr_api_key, lightpanda_endpoint, lightpanda_token, lightpanda_region,
-                            lightpanda_browser, lightpanda_proxy, lightpanda_country,
-                            cloakbrowser_license_key, cloakbrowser_headless, cloakbrowser_humanize,
-                            cloakbrowser_human_preset, cloakbrowser_proxy, cloakbrowser_geoip
+                            lightpanda_browser, lightpanda_proxy, lightpanda_country
                      FROM global_settings WHERE id = 1",
                     [],
                     |row| {
@@ -100,14 +98,6 @@ impl Database {
                                 browser: row.get(8)?,
                                 proxy: row.get(9)?,
                                 country: row.get(10)?,
-                            },
-                            cloakbrowser: crate::config::CloakBrowserConfig {
-                                license_key: row.get(11)?,
-                                headless: row.get::<_, i32>(12)? != 0,
-                                humanize: row.get::<_, i32>(13)? != 0,
-                                human_preset: row.get(14)?,
-                                proxy: row.get(15)?,
-                                geoip: row.get::<_, i32>(16)? != 0,
                             },
                             tag_rule_scan_interval_mins: row.get::<_, i64>(3).unwrap_or(7) as u64,
                             ocr_api_key: row.get(4)?,
@@ -131,9 +121,7 @@ impl Database {
                     log_level = ?, proxy = ?,
                     use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ?, ocr_api_key = ?,
                     lightpanda_endpoint = ?, lightpanda_token = ?, lightpanda_region = ?,
-                    lightpanda_browser = ?, lightpanda_proxy = ?, lightpanda_country = ?,
-                    cloakbrowser_license_key = ?, cloakbrowser_headless = ?, cloakbrowser_humanize = ?,
-                    cloakbrowser_human_preset = ?, cloakbrowser_proxy = ?, cloakbrowser_geoip = ?
+                    lightpanda_browser = ?, lightpanda_proxy = ?, lightpanda_country = ?
                  WHERE id = 1",
                 params![
                     settings.log_level,
@@ -147,18 +135,28 @@ impl Database {
                         let value = value.trim();
                         (!value.is_empty()).then_some(value)
                     }),
-                    settings.lightpanda.endpoint.as_deref().and_then(non_empty_trimmed),
-                    settings.lightpanda.token.as_deref().and_then(non_empty_trimmed),
+                    settings
+                        .lightpanda
+                        .endpoint
+                        .as_deref()
+                        .and_then(non_empty_trimmed),
+                    settings
+                        .lightpanda
+                        .token
+                        .as_deref()
+                        .and_then(non_empty_trimmed),
                     normalize_lightpanda_region(&settings.lightpanda.region),
                     non_empty_trimmed(&settings.lightpanda.browser).unwrap_or("lightpanda"),
-                    settings.lightpanda.proxy.as_deref().and_then(non_empty_trimmed),
-                    settings.lightpanda.country.as_deref().and_then(non_empty_trimmed),
-                    settings.cloakbrowser.license_key.as_deref().and_then(non_empty_trimmed),
-                    settings.cloakbrowser.headless as i32,
-                    settings.cloakbrowser.humanize as i32,
-                    normalize_human_preset(&settings.cloakbrowser.human_preset),
-                    settings.cloakbrowser.proxy.as_deref().and_then(non_empty_trimmed),
-                    settings.cloakbrowser.geoip as i32,
+                    settings
+                        .lightpanda
+                        .proxy
+                        .as_deref()
+                        .and_then(non_empty_trimmed),
+                    settings
+                        .lightpanda
+                        .country
+                        .as_deref()
+                        .and_then(non_empty_trimmed),
                 ],
             )
             .map_err(sql_error)?;
@@ -2128,12 +2126,6 @@ impl Database {
                     lightpanda_browser TEXT NOT NULL DEFAULT 'lightpanda',
                     lightpanda_proxy TEXT,
                     lightpanda_country TEXT,
-                    cloakbrowser_license_key TEXT,
-                    cloakbrowser_headless INTEGER NOT NULL DEFAULT 0,
-                    cloakbrowser_humanize INTEGER NOT NULL DEFAULT 1,
-                    cloakbrowser_human_preset TEXT NOT NULL DEFAULT 'careful',
-                    cloakbrowser_proxy TEXT,
-                    cloakbrowser_geoip INTEGER NOT NULL DEFAULT 1,
                     sign_in_browser_config_migrated INTEGER NOT NULL DEFAULT 0
                 );
 
@@ -2459,30 +2451,6 @@ impl Database {
                 (
                     "lightpanda_country",
                     "ALTER TABLE global_settings ADD COLUMN lightpanda_country TEXT",
-                ),
-                (
-                    "cloakbrowser_license_key",
-                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_license_key TEXT",
-                ),
-                (
-                    "cloakbrowser_headless",
-                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_headless INTEGER NOT NULL DEFAULT 0",
-                ),
-                (
-                    "cloakbrowser_humanize",
-                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_humanize INTEGER NOT NULL DEFAULT 1",
-                ),
-                (
-                    "cloakbrowser_human_preset",
-                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_human_preset TEXT NOT NULL DEFAULT 'careful'",
-                ),
-                (
-                    "cloakbrowser_proxy",
-                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_proxy TEXT",
-                ),
-                (
-                    "cloakbrowser_geoip",
-                    "ALTER TABLE global_settings ADD COLUMN cloakbrowser_geoip INTEGER NOT NULL DEFAULT 1",
                 ),
                 (
                     "sign_in_browser_config_migrated",
@@ -3104,10 +3072,8 @@ impl Database {
                  (id, log_level, proxy, use_proxy_for_lightpanda,
                   tag_rule_scan_interval_mins, ocr_api_key,
                   lightpanda_endpoint, lightpanda_token, lightpanda_region, lightpanda_browser,
-                  lightpanda_proxy, lightpanda_country, cloakbrowser_license_key,
-                  cloakbrowser_headless, cloakbrowser_humanize, cloakbrowser_human_preset,
-                  cloakbrowser_proxy, cloakbrowser_geoip, sign_in_browser_config_migrated)
-                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                  lightpanda_proxy, lightpanda_country, sign_in_browser_config_migrated)
+                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 params![
                     "info",
                     Option::<String>::None,
@@ -3120,12 +3086,6 @@ impl Database {
                     "lightpanda",
                     "fast_dc",
                     Option::<String>::None,
-                    Option::<String>::None,
-                    0,
-                    1,
-                    "careful",
-                    Option::<String>::None,
-                    1,
                 ],
             )
             .map_err(sql_error)?;
@@ -3178,6 +3138,27 @@ impl Database {
                  COMMIT;",
             )
             .map_err(sql_error)?;
+            conn.execute(
+                "UPDATE sign_in_tasks SET browser = 'lightpanda' WHERE browser != 'lightpanda'",
+                [],
+            )
+            .map_err(sql_error)?;
+            for column in [
+                "cloakbrowser_license_key",
+                "cloakbrowser_headless",
+                "cloakbrowser_humanize",
+                "cloakbrowser_human_preset",
+                "cloakbrowser_proxy",
+                "cloakbrowser_geoip",
+            ] {
+                if column_exists(&conn, "global_settings", column) {
+                    conn.execute(
+                        &format!("ALTER TABLE global_settings DROP COLUMN {column}"),
+                        [],
+                    )
+                    .map_err(sql_error)?;
+                }
+            }
             Ok(())
         })
         .await
@@ -3430,13 +3411,6 @@ fn normalize_lightpanda_region(value: &str) -> &'static str {
     match value.trim() {
         "uswest" => "uswest",
         _ => "euwest",
-    }
-}
-
-fn normalize_human_preset(value: &str) -> &'static str {
-    match value.trim() {
-        "default" => "default",
-        _ => "careful",
     }
 }
 
@@ -3708,19 +3682,20 @@ mod migration_tests {
             crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA
         );
 
-        migrated
-            .update_sign_in_task(
-                task_id,
-                &SignInTaskRequest {
-                    name: "legacy-sign-in".to_string(),
-                    site_id,
-                    cron_expression: "0 0 0/8 * * *".to_string(),
-                    browser: Some(crate::sign_in::SIGN_IN_BROWSER_CLOAKBROWSER.to_string()),
-                    sign_in_method: Some(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string()),
-                },
-            )
-            .await
-            .unwrap();
+        let conn = open_connection(&db_path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE global_settings ADD COLUMN cloakbrowser_license_key TEXT;
+             ALTER TABLE global_settings ADD COLUMN cloakbrowser_headless INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE global_settings ADD COLUMN cloakbrowser_humanize INTEGER NOT NULL DEFAULT 1;
+             ALTER TABLE global_settings ADD COLUMN cloakbrowser_human_preset TEXT NOT NULL DEFAULT 'careful';
+             ALTER TABLE global_settings ADD COLUMN cloakbrowser_proxy TEXT;
+             ALTER TABLE global_settings ADD COLUMN cloakbrowser_geoip INTEGER NOT NULL DEFAULT 1;
+             UPDATE global_settings SET cloakbrowser_license_key = 'legacy-secret' WHERE id = 1;
+             UPDATE sign_in_tasks SET browser = 'retired-provider' WHERE id = 1;",
+        )
+        .unwrap();
+        drop(conn);
+
         let reopened = Database::open(dir.path()).await.unwrap();
         assert_eq!(
             reopened
@@ -3729,8 +3704,19 @@ mod migration_tests {
                 .unwrap()
                 .unwrap()
                 .browser,
-            crate::sign_in::SIGN_IN_BROWSER_CLOAKBROWSER
+            crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA
         );
+        let conn = open_connection(&db_path).unwrap();
+        for column in [
+            "cloakbrowser_license_key",
+            "cloakbrowser_headless",
+            "cloakbrowser_humanize",
+            "cloakbrowser_human_preset",
+            "cloakbrowser_proxy",
+            "cloakbrowser_geoip",
+        ] {
+            assert!(!column_exists(&conn, "global_settings", column));
+        }
     }
 
     #[test]

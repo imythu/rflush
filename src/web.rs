@@ -3084,7 +3084,7 @@ async fn probe_sign_in_form_1_1_1_1(
     Json(body): Json<SignInBrowserProbeRequest>,
 ) -> Result<Json<crate::sign_in::BrowserProbeResult>, ApiError> {
     let browser = crate::sign_in::normalize_sign_in_browser(&body.browser)
-        .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda 或 cloakbrowser"))?
+        .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda"))?
         .to_string();
     let settings = state.db.get_settings().await?;
     validate_sign_in_browser_config(&browser, &settings)?;
@@ -3117,7 +3117,7 @@ async fn validate_sign_in_task(
             .as_deref()
             .unwrap_or(crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA),
     )
-    .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda 或 cloakbrowser"))?;
+    .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda"))?;
     body.browser = Some(browser.to_string());
     body.sign_in_method = Some(crate::sign_in::normalize_sign_in_method(
         body.sign_in_method
@@ -3160,18 +3160,6 @@ fn validate_sign_in_browser_config(browser: &str, settings: &GlobalConfig) -> Re
             if !endpoint_configured && !token_configured {
                 return Err(ApiError::bad_request(
                     "请先配置公共 Lightpanda endpoint 或 token",
-                ));
-            }
-        }
-        crate::sign_in::SIGN_IN_BROWSER_CLOAKBROWSER => {
-            if !settings
-                .cloakbrowser
-                .license_key
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            {
-                return Err(ApiError::bad_request(
-                    "请先配置公共 CloakBrowser license key",
                 ));
             }
         }
@@ -4658,8 +4646,6 @@ fn normalize_sign_in_settings(settings: &mut GlobalConfig) {
         &mut settings.lightpanda.token,
         &mut settings.lightpanda.proxy,
         &mut settings.lightpanda.country,
-        &mut settings.cloakbrowser.license_key,
-        &mut settings.cloakbrowser.proxy,
     ] {
         *value = value
             .as_deref()
@@ -4672,11 +4658,6 @@ fn normalize_sign_in_settings(settings: &mut GlobalConfig) {
     if settings.lightpanda.browser.is_empty() {
         settings.lightpanda.browser = "lightpanda".to_string();
     }
-    settings.cloakbrowser.human_preset = settings
-        .cloakbrowser
-        .human_preset
-        .trim()
-        .to_ascii_lowercase();
 }
 
 fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
@@ -4703,17 +4684,6 @@ fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
                 "lightpanda.endpoint 必须以 ws:// 或 wss:// 开头",
             ));
         }
-    }
-    if !matches!(
-        settings.cloakbrowser.human_preset.as_str(),
-        "default" | "careful"
-    ) {
-        return Err(ApiError::bad_request(
-            "cloakbrowser.human_preset 必须是 default 或 careful",
-        ));
-    }
-    if let Some(proxy) = settings.cloakbrowser.proxy.as_deref() {
-        validate_proxy_scheme(proxy, "cloakbrowser.proxy")?;
     }
     Ok(())
 }

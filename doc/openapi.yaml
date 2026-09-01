@@ -726,13 +726,12 @@ components:
 
     GlobalConfig:
       type: object
-      required: [log_level, proxy, use_proxy_for_lightpanda, lightpanda, cloakbrowser, tag_rule_scan_interval_mins, ocr_api_key]
+      required: [log_level, proxy, use_proxy_for_lightpanda, lightpanda, tag_rule_scan_interval_mins, ocr_api_key]
       properties:
         log_level: {type: string, nullable: true, enum: [trace, debug, info, warn, error, null]}
         proxy: {type: string, nullable: true}
         use_proxy_for_lightpanda: {type: boolean}
         lightpanda: {$ref: '#/components/schemas/LightpandaConfig'}
-        cloakbrowser: {$ref: '#/components/schemas/CloakBrowserConfig'}
         tag_rule_scan_interval_mins: {type: integer, format: int64}
         ocr_api_key: {type: string, nullable: true, format: password}
 
@@ -747,17 +746,6 @@ components:
         proxy: {type: string, nullable: true, default: fast_dc}
         country: {type: string, nullable: true}
 
-    CloakBrowserConfig:
-      type: object
-      required: [license_key, headless, humanize, human_preset, proxy, geoip]
-      properties:
-        license_key: {type: string, nullable: true, format: password}
-        headless: {type: boolean, default: false}
-        humanize: {type: boolean, default: true}
-        human_preset: {type: string, enum: [default, careful], default: careful}
-        proxy: {type: string, nullable: true}
-        geoip: {type: boolean, default: true}
-
     SignInTaskRequest:
       type: object
       required: [name, site_id, cron_expression]
@@ -765,7 +753,7 @@ components:
         name: {type: string}
         site_id: {type: integer, format: int64}
         cron_expression: {type: string}
-        browser: {type: string, enum: [lightpanda, cloakbrowser], default: lightpanda}
+        browser: {type: string, enum: [lightpanda], default: lightpanda}
         sign_in_method: {type: string, enum: [open_page, cloudflare, ocr_captcha], default: open_page}
 
     SignInTask:
@@ -786,7 +774,7 @@ components:
       type: object
       required: [browser]
       properties:
-        browser: {type: string, enum: [lightpanda, cloakbrowser]}
+        browser: {type: string, enum: [lightpanda]}
 
     BrowserProbeResult:
       type: object

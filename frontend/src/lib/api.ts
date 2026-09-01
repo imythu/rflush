@@ -14,14 +14,6 @@ export const defaultSettings: GlobalConfig = {
     proxy: "fast_dc",
     country: null,
   },
-  cloakbrowser: {
-    license_key: null,
-    headless: false,
-    humanize: true,
-    human_preset: "careful",
-    proxy: null,
-    geoip: true,
-  },
   tag_rule_scan_interval_mins: 7,
   ocr_api_key: null,
 };

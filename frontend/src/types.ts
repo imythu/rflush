@@ -10,14 +10,6 @@ export type GlobalConfig = {
     proxy: string | null;
     country: string | null;
   };
-  cloakbrowser: {
-    license_key: string | null;
-    headless: boolean;
-    humanize: boolean;
-    human_preset: "default" | "careful" | string;
-    proxy: string | null;
-    geoip: boolean;
-  };
   tag_rule_scan_interval_mins?: number;
   ocr_api_key: string | null;
 };
@@ -267,7 +259,7 @@ export type SignInTaskRequest = {
   name: string;
   site_id: number;
   cron_expression: string;
-  browser?: "lightpanda" | "cloakbrowser" | string | null;
+  browser?: "lightpanda" | null;
   sign_in_method?: string | null;
 };
 
