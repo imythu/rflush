@@ -83,7 +83,8 @@ impl Database {
                 .query_row(
                     "SELECT log_level, proxy, use_proxy_for_lightpanda, tag_rule_scan_interval_mins,
                             ocr_api_key, lightpanda_endpoint, lightpanda_token, lightpanda_region,
-                            lightpanda_browser, lightpanda_proxy, lightpanda_country
+                            lightpanda_browser, lightpanda_proxy, lightpanda_country,
+                            browserless_address, browserless_token
                      FROM global_settings WHERE id = 1",
                     [],
                     |row| {
@@ -98,6 +99,10 @@ impl Database {
                                 browser: row.get(8)?,
                                 proxy: row.get(9)?,
                                 country: row.get(10)?,
+                            },
+                            browserless: crate::config::BrowserlessConfig {
+                                address: row.get(11)?,
+                                token: row.get(12)?,
                             },
                             tag_rule_scan_interval_mins: row.get::<_, i64>(3).unwrap_or(7) as u64,
                             ocr_api_key: row.get(4)?,
@@ -121,7 +126,8 @@ impl Database {
                     log_level = ?, proxy = ?,
                     use_proxy_for_lightpanda = ?, tag_rule_scan_interval_mins = ?, ocr_api_key = ?,
                     lightpanda_endpoint = ?, lightpanda_token = ?, lightpanda_region = ?,
-                    lightpanda_browser = ?, lightpanda_proxy = ?, lightpanda_country = ?
+                    lightpanda_browser = ?, lightpanda_proxy = ?, lightpanda_country = ?,
+                    browserless_address = ?, browserless_token = ?
                  WHERE id = 1",
                 params![
                     settings.log_level,
@@ -155,6 +161,16 @@ impl Database {
                     settings
                         .lightpanda
                         .country
+                        .as_deref()
+                        .and_then(non_empty_trimmed),
+                    settings
+                        .browserless
+                        .address
+                        .as_deref()
+                        .and_then(non_empty_trimmed),
+                    settings
+                        .browserless
+                        .token
                         .as_deref()
                         .and_then(non_empty_trimmed),
                 ],
@@ -447,7 +463,10 @@ impl Database {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, name, site_id, cron_expression, browser, sign_in_method, enabled,
+                    "SELECT id, name, site_id, cron_expression, browser, sign_in_method,
+                     browserless_selector, browserless_cf_mode, browserless_wait_ms,
+                     browserless_solve_timeout, browserless_action_timeout,
+                     browserless_post_click_wait_ms, enabled,
                      last_status, last_message, last_run_at, created_at, updated_at
                      FROM sign_in_tasks ORDER BY id",
                 )
@@ -468,7 +487,10 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
             conn.query_row(
-                "SELECT id, name, site_id, cron_expression, browser, sign_in_method, enabled,
+                "SELECT id, name, site_id, cron_expression, browser, sign_in_method,
+                 browserless_selector, browserless_cf_mode, browserless_wait_ms,
+                 browserless_solve_timeout, browserless_action_timeout,
+                 browserless_post_click_wait_ms, enabled,
                  last_status, last_message, last_run_at, created_at, updated_at
                  FROM sign_in_tasks WHERE id = ?",
                 params![id],
@@ -487,11 +509,15 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
+            let browserless = req.browserless.unwrap_or_default();
             conn.execute(
                 "INSERT INTO sign_in_tasks
                  (name, site_id, cron_expression, lightpanda_endpoint, lightpanda_token,
-                  lightpanda_region, browser, proxy, country, sign_in_method, enabled, created_at, updated_at)
-                  VALUES (?, ?, ?, NULL, '', 'euwest', ?, 'fast_dc', NULL, ?, 1, ?, ?)",
+                  lightpanda_region, browser, proxy, country, sign_in_method,
+                  browserless_selector, browserless_cf_mode, browserless_wait_ms,
+                  browserless_solve_timeout, browserless_action_timeout,
+                  browserless_post_click_wait_ms, enabled, created_at, updated_at)
+                  VALUES (?, ?, ?, NULL, '', 'euwest', ?, 'fast_dc', NULL, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 params![
                     req.name,
                     req.site_id,
@@ -500,6 +526,12 @@ impl Database {
                     req.sign_in_method
                         .as_deref()
                         .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
+                    browserless.selector,
+                    browserless.cf_mode,
+                    browserless.wait_ms.map(|value| value as i64),
+                    browserless.solve_timeout.map(|value| value as i64),
+                    browserless.action_timeout.map(|value| value as i64),
+                    browserless.post_click_wait_ms.map(|value| value as i64),
                     now,
                     now,
                 ],
@@ -521,9 +553,13 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
+            let browserless = req.browserless.unwrap_or_default();
             conn.execute(
                 "UPDATE sign_in_tasks SET
-                 name = ?, site_id = ?, cron_expression = ?, browser = ?, sign_in_method = ?, updated_at = ?
+                 name = ?, site_id = ?, cron_expression = ?, browser = ?, sign_in_method = ?,
+                 browserless_selector = ?, browserless_cf_mode = ?, browserless_wait_ms = ?,
+                 browserless_solve_timeout = ?, browserless_action_timeout = ?,
+                 browserless_post_click_wait_ms = ?, updated_at = ?
                  WHERE id = ?",
                 params![
                     req.name,
@@ -533,6 +569,12 @@ impl Database {
                     req.sign_in_method
                         .as_deref()
                         .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
+                    browserless.selector,
+                    browserless.cf_mode,
+                    browserless.wait_ms.map(|value| value as i64),
+                    browserless.solve_timeout.map(|value| value as i64),
+                    browserless.action_timeout.map(|value| value as i64),
+                    browserless.post_click_wait_ms.map(|value| value as i64),
                     now,
                     id,
                 ],
@@ -2126,6 +2168,8 @@ impl Database {
                     lightpanda_browser TEXT NOT NULL DEFAULT 'lightpanda',
                     lightpanda_proxy TEXT,
                     lightpanda_country TEXT,
+                    browserless_address TEXT,
+                    browserless_token TEXT,
                     sign_in_browser_config_migrated INTEGER NOT NULL DEFAULT 0
                 );
 
@@ -2262,6 +2306,12 @@ impl Database {
                     proxy TEXT NOT NULL DEFAULT 'fast_dc',
                     country TEXT,
                     sign_in_method TEXT NOT NULL DEFAULT 'open_page',
+                    browserless_selector TEXT NOT NULL DEFAULT 'input[type=''submit'']',
+                    browserless_cf_mode TEXT NOT NULL DEFAULT 'auto',
+                    browserless_wait_ms INTEGER,
+                    browserless_solve_timeout INTEGER,
+                    browserless_action_timeout INTEGER,
+                    browserless_post_click_wait_ms INTEGER,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_status TEXT,
                     last_message TEXT,
@@ -2453,11 +2503,47 @@ impl Database {
                     "ALTER TABLE global_settings ADD COLUMN lightpanda_country TEXT",
                 ),
                 (
+                    "browserless_address",
+                    "ALTER TABLE global_settings ADD COLUMN browserless_address TEXT",
+                ),
+                (
+                    "browserless_token",
+                    "ALTER TABLE global_settings ADD COLUMN browserless_token TEXT",
+                ),
+                (
                     "sign_in_browser_config_migrated",
                     "ALTER TABLE global_settings ADD COLUMN sign_in_browser_config_migrated INTEGER NOT NULL DEFAULT 0",
                 ),
             ] {
                 ensure_column(&conn, "global_settings", column, sql)?;
+            }
+            for (column, sql) in [
+                (
+                    "browserless_selector",
+                    "ALTER TABLE sign_in_tasks ADD COLUMN browserless_selector TEXT NOT NULL DEFAULT 'input[type=''submit'']'",
+                ),
+                (
+                    "browserless_cf_mode",
+                    "ALTER TABLE sign_in_tasks ADD COLUMN browserless_cf_mode TEXT NOT NULL DEFAULT 'auto'",
+                ),
+                (
+                    "browserless_wait_ms",
+                    "ALTER TABLE sign_in_tasks ADD COLUMN browserless_wait_ms INTEGER",
+                ),
+                (
+                    "browserless_solve_timeout",
+                    "ALTER TABLE sign_in_tasks ADD COLUMN browserless_solve_timeout INTEGER",
+                ),
+                (
+                    "browserless_action_timeout",
+                    "ALTER TABLE sign_in_tasks ADD COLUMN browserless_action_timeout INTEGER",
+                ),
+                (
+                    "browserless_post_click_wait_ms",
+                    "ALTER TABLE sign_in_tasks ADD COLUMN browserless_post_click_wait_ms INTEGER",
+                ),
+            ] {
+                ensure_column(&conn, "sign_in_tasks", column, sql)?;
             }
             let sites_had_request_headers = column_exists(&conn, "sites", "request_headers");
             ensure_column(
@@ -3072,8 +3158,9 @@ impl Database {
                  (id, log_level, proxy, use_proxy_for_lightpanda,
                   tag_rule_scan_interval_mins, ocr_api_key,
                   lightpanda_endpoint, lightpanda_token, lightpanda_region, lightpanda_browser,
-                  lightpanda_proxy, lightpanda_country, sign_in_browser_config_migrated)
-                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                  lightpanda_proxy, lightpanda_country, browserless_address, browserless_token,
+                  sign_in_browser_config_migrated)
+                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 params![
                     "info",
                     Option::<String>::None,
@@ -3085,6 +3172,8 @@ impl Database {
                     "euwest",
                     "lightpanda",
                     "fast_dc",
+                    Option::<String>::None,
+                    Option::<String>::None,
                     Option::<String>::None,
                 ],
             )
@@ -3139,7 +3228,8 @@ impl Database {
             )
             .map_err(sql_error)?;
             conn.execute(
-                "UPDATE sign_in_tasks SET browser = 'lightpanda' WHERE browser != 'lightpanda'",
+                "UPDATE sign_in_tasks SET browser = 'lightpanda'
+                 WHERE browser NOT IN ('lightpanda', 'browserless')",
                 [],
             )
             .map_err(sql_error)?;
@@ -3222,13 +3312,27 @@ fn map_sign_in_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInTaskRecor
         cron_expression: row.get(3)?,
         browser: row.get(4)?,
         sign_in_method: row.get(5)?,
-        enabled: row.get::<_, i32>(6)? != 0,
-        last_status: row.get(7)?,
-        last_message: row.get(8)?,
-        last_run_at: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        browserless: crate::sign_in::BrowserlessTaskConfig {
+            selector: row.get(6)?,
+            cf_mode: row.get(7)?,
+            wait_ms: optional_u64(row, 8)?,
+            solve_timeout: optional_u64(row, 9)?,
+            action_timeout: optional_u64(row, 10)?,
+            post_click_wait_ms: optional_u64(row, 11)?,
+        },
+        enabled: row.get::<_, i32>(12)? != 0,
+        last_status: row.get(13)?,
+        last_message: row.get(14)?,
+        last_run_at: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
+}
+
+fn optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    Ok(row
+        .get::<_, Option<i64>>(index)?
+        .and_then(|value| u64::try_from(value).ok()))
 }
 
 fn map_sign_in_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignInRecord> {
@@ -3629,6 +3733,7 @@ mod migration_tests {
                 cron_expression: "0 0 0/8 * * *".to_string(),
                 browser: Some("lightpanda".to_string()),
                 sign_in_method: Some(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string()),
+                browserless: None,
             })
             .await
             .unwrap();
@@ -3717,6 +3822,67 @@ mod migration_tests {
         ] {
             assert!(!column_exists(&conn, "global_settings", column));
         }
+    }
+
+    #[tokio::test]
+    async fn browserless_sign_in_configuration_survives_database_reopen() {
+        let dir = tempdir().unwrap();
+        let db = Database::open(dir.path()).await.unwrap();
+        let site_id = db
+            .create_site(
+                "browserless-site",
+                "nexusphp",
+                "https://tracker.example.com",
+                r#"{"type":"cookie","cookie":"uid=1"}"#,
+                "[]",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut settings = db.get_settings().await.unwrap();
+        settings.browserless.address = Some("https://production-sfo.browserless.io".to_string());
+        settings.browserless.token = Some("secret-token".to_string());
+        db.update_settings(&settings).await.unwrap();
+
+        let task_id = db
+            .create_sign_in_task(&SignInTaskRequest {
+                name: "browserless-sign-in".to_string(),
+                site_id,
+                cron_expression: "0 0 0/8 * * *".to_string(),
+                browser: Some(crate::sign_in::SIGN_IN_BROWSER_BROWSERLESS.to_string()),
+                sign_in_method: Some(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string()),
+                browserless: Some(crate::sign_in::BrowserlessTaskConfig {
+                    selector: "button.check-in".to_string(),
+                    cf_mode: crate::sign_in::BROWSERLESS_CF_MODE_PAGE.to_string(),
+                    wait_ms: None,
+                    solve_timeout: Some(45_000),
+                    action_timeout: None,
+                    post_click_wait_ms: Some(2_000),
+                }),
+            })
+            .await
+            .unwrap();
+        drop(db);
+
+        let reopened = Database::open(dir.path()).await.unwrap();
+        let settings = reopened.get_settings().await.unwrap();
+        assert_eq!(
+            settings.browserless.address.as_deref(),
+            Some("https://production-sfo.browserless.io")
+        );
+        assert_eq!(settings.browserless.token.as_deref(), Some("secret-token"));
+
+        let task = reopened.get_sign_in_task(task_id).await.unwrap().unwrap();
+        assert_eq!(task.browser, crate::sign_in::SIGN_IN_BROWSER_BROWSERLESS);
+        assert_eq!(task.browserless.selector, "button.check-in");
+        assert_eq!(
+            task.browserless.cf_mode,
+            crate::sign_in::BROWSERLESS_CF_MODE_PAGE
+        );
+        assert_eq!(task.browserless.wait_ms, None);
+        assert_eq!(task.browserless.solve_timeout, Some(45_000));
+        assert_eq!(task.browserless.post_click_wait_ms, Some(2_000));
     }
 
     #[test]

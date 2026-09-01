@@ -283,6 +283,7 @@ mod tests {
             cron_expression: "0 0 0/8 * * *".to_string(),
             browser: "lightpanda".to_string(),
             sign_in_method: crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE.to_string(),
+            browserless: crate::sign_in::BrowserlessTaskConfig::default(),
             enabled: true,
             last_status: None,
             last_message: None,

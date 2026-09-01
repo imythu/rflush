@@ -9,6 +9,8 @@ pub struct GlobalConfig {
     pub use_proxy_for_lightpanda: bool,
     #[serde(default)]
     pub lightpanda: LightpandaConfig,
+    #[serde(default)]
+    pub browserless: BrowserlessConfig,
     #[serde(default = "default_tag_rule_scan_interval_mins")]
     pub tag_rule_scan_interval_mins: u64,
     #[serde(default)]
@@ -22,6 +24,7 @@ impl Default for GlobalConfig {
             proxy: None,
             use_proxy_for_lightpanda: true,
             lightpanda: LightpandaConfig::default(),
+            browserless: BrowserlessConfig::default(),
             tag_rule_scan_interval_mins: default_tag_rule_scan_interval_mins(),
             ocr_api_key: None,
         }
@@ -55,6 +58,14 @@ impl Default for LightpandaConfig {
             country: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrowserlessConfig {
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 const fn default_true() -> bool {

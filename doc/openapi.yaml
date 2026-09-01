@@ -726,12 +726,13 @@ components:
 
     GlobalConfig:
       type: object
-      required: [log_level, proxy, use_proxy_for_lightpanda, lightpanda, tag_rule_scan_interval_mins, ocr_api_key]
+      required: [log_level, proxy, use_proxy_for_lightpanda, lightpanda, browserless, tag_rule_scan_interval_mins, ocr_api_key]
       properties:
         log_level: {type: string, nullable: true, enum: [trace, debug, info, warn, error, null]}
         proxy: {type: string, nullable: true}
         use_proxy_for_lightpanda: {type: boolean}
         lightpanda: {$ref: '#/components/schemas/LightpandaConfig'}
+        browserless: {$ref: '#/components/schemas/BrowserlessConfig'}
         tag_rule_scan_interval_mins: {type: integer, format: int64}
         ocr_api_key: {type: string, nullable: true, format: password}
 
@@ -746,6 +747,24 @@ components:
         proxy: {type: string, nullable: true, default: fast_dc}
         country: {type: string, nullable: true}
 
+    BrowserlessConfig:
+      type: object
+      required: [address, token]
+      properties:
+        address: {type: string, format: uri, nullable: true, pattern: '^https?://'}
+        token: {type: string, nullable: true, format: password}
+
+    BrowserlessTaskConfig:
+      type: object
+      required: [selector, cf_mode, wait_ms, solve_timeout, action_timeout, post_click_wait_ms]
+      properties:
+        selector: {type: string, default: "input[type='submit']"}
+        cf_mode: {type: string, enum: [auto, page, turnstile], default: auto}
+        wait_ms: {type: integer, format: int64, nullable: true, minimum: 0, maximum: 3600000}
+        solve_timeout: {type: integer, format: int64, nullable: true, minimum: 1, maximum: 3600000}
+        action_timeout: {type: integer, format: int64, nullable: true, minimum: 1, maximum: 3600000}
+        post_click_wait_ms: {type: integer, format: int64, nullable: true, minimum: 0, maximum: 3600000}
+
     SignInTaskRequest:
       type: object
       required: [name, site_id, cron_expression]
@@ -753,14 +772,15 @@ components:
         name: {type: string}
         site_id: {type: integer, format: int64}
         cron_expression: {type: string}
-        browser: {type: string, enum: [lightpanda], default: lightpanda}
+        browser: {type: string, enum: [lightpanda, browserless], default: lightpanda}
         sign_in_method: {type: string, enum: [open_page, cloudflare, ocr_captcha], default: open_page}
+        browserless: {$ref: '#/components/schemas/BrowserlessTaskConfig'}
 
     SignInTask:
       allOf:
         - {$ref: '#/components/schemas/SignInTaskRequest'}
         - type: object
-          required: [id, browser, sign_in_method, enabled, created_at, updated_at]
+          required: [id, browser, sign_in_method, browserless, enabled, created_at, updated_at]
           properties:
             id: {type: integer, format: int64}
             enabled: {type: boolean}
@@ -774,7 +794,7 @@ components:
       type: object
       required: [browser]
       properties:
-        browser: {type: string, enum: [lightpanda]}
+        browser: {type: string, enum: [lightpanda, browserless]}
 
     BrowserProbeResult:
       type: object

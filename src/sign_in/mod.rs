@@ -4,14 +4,58 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tungstenite::{Message, connect};
 
-use crate::config::{GlobalConfig, LightpandaConfig};
+use crate::config::{BrowserlessConfig, GlobalConfig, LightpandaConfig};
 use crate::site::{SiteAuth, SiteRecord};
 
 pub const SIGN_IN_BROWSER_LIGHTPANDA: &str = "lightpanda";
+pub const SIGN_IN_BROWSER_BROWSERLESS: &str = "browserless";
+
+pub const BROWSERLESS_CF_MODE_AUTO: &str = "auto";
+pub const BROWSERLESS_CF_MODE_PAGE: &str = "page";
+pub const BROWSERLESS_CF_MODE_TURNSTILE: &str = "turnstile";
+pub const DEFAULT_BROWSERLESS_SELECTOR: &str = "input[type='submit']";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserlessTaskConfig {
+    #[serde(default = "default_browserless_selector")]
+    pub selector: String,
+    #[serde(default = "default_browserless_cf_mode")]
+    pub cf_mode: String,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
+    #[serde(default)]
+    pub solve_timeout: Option<u64>,
+    #[serde(default)]
+    pub action_timeout: Option<u64>,
+    #[serde(default)]
+    pub post_click_wait_ms: Option<u64>,
+}
+
+impl Default for BrowserlessTaskConfig {
+    fn default() -> Self {
+        Self {
+            selector: default_browserless_selector(),
+            cf_mode: default_browserless_cf_mode(),
+            wait_ms: None,
+            solve_timeout: None,
+            action_timeout: None,
+            post_click_wait_ms: None,
+        }
+    }
+}
+
+fn default_browserless_selector() -> String {
+    DEFAULT_BROWSERLESS_SELECTOR.to_string()
+}
+
+fn default_browserless_cf_mode() -> String {
+    BROWSERLESS_CF_MODE_AUTO.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignInTaskRecord {
@@ -21,6 +65,7 @@ pub struct SignInTaskRecord {
     pub cron_expression: String,
     pub browser: String,
     pub sign_in_method: String,
+    pub browserless: BrowserlessTaskConfig,
     pub enabled: bool,
     pub last_status: Option<String>,
     pub last_message: Option<String>,
@@ -36,6 +81,8 @@ pub struct SignInTaskRequest {
     pub cron_expression: String,
     pub browser: Option<String>,
     pub sign_in_method: Option<String>,
+    #[serde(default)]
+    pub browserless: Option<BrowserlessTaskConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +127,7 @@ pub async fn probe_browser_1_1_1_1(
             .await
             .map_err(|e| format!("Lightpanda 探测任务 join 失败: {}", e))?
         }
+        SIGN_IN_BROWSER_BROWSERLESS => run_browserless_probe(&settings.browserless).await,
         _ => Err(format!("未知签到浏览器: {}", browser)),
     }
 }
@@ -118,6 +166,10 @@ pub async fn execute_task(
                 settings.ocr_api_key,
             )
             .await?
+        }
+        SIGN_IN_BROWSER_BROWSERLESS => {
+            run_browserless_sign_in(&settings.browserless, base_url, cookie, task.browserless)
+                .await?
         }
         _ => return Err(format!("未知签到浏览器: {}", task.browser)),
     };
@@ -175,6 +227,381 @@ fn run_cdp_probe(
         message: format!("{} 已成功导航到 1.1.1.1", browser_name),
         title,
     })
+}
+
+const BROWSERLESS_SIGN_IN_QUERY: &str = r#"
+mutation CheckIn(
+  $cookies: [CookieInput!]!
+  $url: String!
+  $selector: String!
+  $waitMs: Float!
+  $solveTimeout: Float!
+  $actionTimeout: Float!
+  $postClickWaitMs: Float!
+) {
+  setCookie: cookies(cookies: $cookies) {
+    cookies {
+      name
+      domain
+      path
+      secure
+    }
+  }
+
+  goto(url: $url, waitUntil: networkIdle) {
+    status
+  }
+
+  waitBeforeSolve: waitForTimeout(time: $waitMs) {
+    time
+  }
+
+  solve(type: cloudflare, timeout: $solveTimeout) {
+    found
+    solved
+    time
+  }
+
+  waitForSelector(
+    selector: $selector
+    visible: true
+    timeout: $actionTimeout
+  ) {
+    time
+  }
+
+  click(
+    selector: $selector
+    visible: true
+    timeout: $actionTimeout
+  ) {
+    time
+  }
+
+  waitAfterClick: waitForTimeout(time: $postClickWaitMs) {
+    time
+  }
+
+  html {
+    html
+  }
+}
+"#;
+
+const BROWSERLESS_PROBE_QUERY: &str = r#"
+mutation Probe($url: String!) {
+  goto(url: $url, waitUntil: networkIdle) {
+    status
+  }
+  html {
+    html
+  }
+}
+"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BrowserlessTimings {
+    wait_ms: u64,
+    solve_timeout: u64,
+    action_timeout: u64,
+    post_click_wait_ms: u64,
+}
+
+fn browserless_mode_defaults(cf_mode: &str) -> Option<BrowserlessTimings> {
+    match normalize_browserless_cf_mode(cf_mode)? {
+        BROWSERLESS_CF_MODE_AUTO | BROWSERLESS_CF_MODE_TURNSTILE => Some(BrowserlessTimings {
+            wait_ms: 5_000,
+            solve_timeout: 60_000,
+            action_timeout: 30_000,
+            post_click_wait_ms: 5_000,
+        }),
+        BROWSERLESS_CF_MODE_PAGE => Some(BrowserlessTimings {
+            wait_ms: 1_000,
+            solve_timeout: 30_000,
+            action_timeout: 30_000,
+            post_click_wait_ms: 3_000,
+        }),
+        _ => None,
+    }
+}
+
+fn resolve_browserless_timings(
+    config: &BrowserlessTaskConfig,
+) -> Result<BrowserlessTimings, String> {
+    let defaults = browserless_mode_defaults(&config.cf_mode)
+        .ok_or_else(|| format!("未知 Browserless CF 模式: {}", config.cf_mode))?;
+    Ok(BrowserlessTimings {
+        wait_ms: config.wait_ms.unwrap_or(defaults.wait_ms),
+        solve_timeout: config.solve_timeout.unwrap_or(defaults.solve_timeout),
+        action_timeout: config.action_timeout.unwrap_or(defaults.action_timeout),
+        post_click_wait_ms: config
+            .post_click_wait_ms
+            .unwrap_or(defaults.post_click_wait_ms),
+    })
+}
+
+async fn run_browserless_probe(config: &BrowserlessConfig) -> Result<BrowserProbeResult, String> {
+    const PROBE_URL: &str = "https://1.1.1.1";
+    let result = post_browserless_bql(
+        config,
+        BROWSERLESS_PROBE_QUERY,
+        "Probe",
+        json!({ "url": PROBE_URL }),
+        Duration::from_secs(45),
+    )
+    .await?;
+
+    if let Some(message) = browserless_error_message(&result) {
+        return Ok(BrowserProbeResult {
+            success: false,
+            url: PROBE_URL.to_string(),
+            message,
+            title: None,
+        });
+    }
+
+    let status = result.pointer("/data/goto/status").and_then(Value::as_u64);
+    let success = status.is_some_and(|status| (200..400).contains(&status));
+    let html = result
+        .pointer("/data/html/html")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(BrowserProbeResult {
+        success,
+        url: PROBE_URL.to_string(),
+        message: match status {
+            Some(status) if success => {
+                format!("Browserless 已成功导航到 1.1.1.1（HTTP {}）", status)
+            }
+            Some(status) => format!("Browserless 导航失败（HTTP {}）", status),
+            None => "Browserless 未返回导航状态".to_string(),
+        },
+        title: html_title(html),
+    })
+}
+
+async fn run_browserless_sign_in(
+    service_config: &BrowserlessConfig,
+    base_url: String,
+    cookie_header: String,
+    task_config: BrowserlessTaskConfig,
+) -> Result<SignInOutput, String> {
+    let timings = resolve_browserless_timings(&task_config)?;
+    let target_url = reqwest::Url::parse(&format!("{}/attendance.php", base_url))
+        .map_err(|error| format!("签到地址无效: {}", error))?;
+    let domain = target_url
+        .host_str()
+        .ok_or_else(|| "签到地址缺少域名".to_string())?;
+    let cookies = browserless_cookies(&cookie_header, domain, target_url.as_str());
+    if cookies.is_empty() {
+        return Err("Cookie 不能为空".to_string());
+    }
+
+    let request_timeout_ms = timings
+        .wait_ms
+        .saturating_add(timings.solve_timeout)
+        .saturating_add(timings.action_timeout.saturating_mul(2))
+        .saturating_add(timings.post_click_wait_ms)
+        .saturating_add(30_000);
+    let result = post_browserless_bql(
+        service_config,
+        BROWSERLESS_SIGN_IN_QUERY,
+        "CheckIn",
+        json!({
+            "cookies": cookies,
+            "url": target_url.as_str(),
+            "selector": task_config.selector,
+            "waitMs": timings.wait_ms,
+            "solveTimeout": timings.solve_timeout,
+            "actionTimeout": timings.action_timeout,
+            "postClickWaitMs": timings.post_click_wait_ms,
+        }),
+        Duration::from_millis(request_timeout_ms),
+    )
+    .await?;
+
+    summarize_browserless_sign_in(&result)
+}
+
+async fn post_browserless_bql(
+    config: &BrowserlessConfig,
+    query: &str,
+    operation_name: &str,
+    variables: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let endpoint = build_browserless_bql_url(config)?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("创建 Browserless 客户端失败: {}", error))?;
+    let response = client
+        .post(endpoint)
+        .json(&json!({
+            "query": query,
+            "operationName": operation_name,
+            "variables": variables,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "Browserless 请求超时".to_string()
+            } else {
+                "Browserless 请求失败，请检查地址、Token 和网络连接".to_string()
+            }
+        })?;
+    let status = response.status();
+    let result = response
+        .json::<Value>()
+        .await
+        .map_err(|_| format!("Browserless 返回了无效的 JSON（HTTP {}）", status.as_u16()))?;
+    if !status.is_success() {
+        return Err(browserless_error_message(&result)
+            .unwrap_or_else(|| format!("Browserless 请求失败（HTTP {}）", status.as_u16())));
+    }
+    Ok(result)
+}
+
+fn build_browserless_bql_url(config: &BrowserlessConfig) -> Result<reqwest::Url, String> {
+    let address = config.address.as_deref().unwrap_or_default().trim();
+    if address.is_empty() {
+        return Err("Browserless 地址不能为空".to_string());
+    }
+    let token = config.token.as_deref().unwrap_or_default().trim();
+    if token.is_empty() {
+        return Err("Browserless Token 不能为空".to_string());
+    }
+
+    let mut endpoint =
+        reqwest::Url::parse(address).map_err(|error| format!("Browserless 地址无效: {}", error))?;
+    if !matches!(endpoint.scheme(), "http" | "https") {
+        return Err("Browserless 地址必须以 http:// 或 https:// 开头".to_string());
+    }
+    let current_path = endpoint.path().trim_end_matches('/');
+    let bql_path = if current_path.ends_with("/bql") {
+        current_path.to_string()
+    } else if current_path.ends_with("/stealth") {
+        format!("{}/bql", current_path)
+    } else if current_path.is_empty() {
+        "/stealth/bql".to_string()
+    } else {
+        format!("{}/stealth/bql", current_path)
+    };
+    endpoint.set_path(&bql_path);
+    endpoint.set_fragment(None);
+
+    let existing_pairs = endpoint
+        .query_pairs()
+        .filter(|(key, _)| key != "token")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    endpoint.set_query(None);
+    {
+        let mut query = endpoint.query_pairs_mut();
+        for (key, value) in existing_pairs {
+            query.append_pair(&key, &value);
+        }
+        query.append_pair("token", token);
+    }
+    Ok(endpoint)
+}
+
+fn browserless_cookies(cookie_header: &str, domain: &str, url: &str) -> Vec<Value> {
+    parse_cookie_pairs(cookie_header)
+        .into_iter()
+        .map(|(name, value)| {
+            json!({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+                "secure": url.starts_with("https://"),
+                "url": url,
+            })
+        })
+        .collect()
+}
+
+fn summarize_browserless_sign_in(result: &Value) -> Result<SignInOutput, String> {
+    if let Some(message) = browserless_error_message(result) {
+        return Err(message);
+    }
+
+    let data = result.get("data").unwrap_or(&Value::Null);
+    let goto_status = data.pointer("/goto/status").and_then(Value::as_u64);
+    if goto_status != Some(200) {
+        return Err(match goto_status {
+            Some(status) => format!("Browserless 打开签到页失败（HTTP {}）", status),
+            None => "Browserless 未执行页面导航".to_string(),
+        });
+    }
+
+    let solve_found = data.pointer("/solve/found").and_then(Value::as_bool);
+    let solve_solved = data.pointer("/solve/solved").and_then(Value::as_bool);
+    if solve_found == Some(true) && solve_solved == Some(false) {
+        return Err("Browserless 找到 Cloudflare 验证，但未能完成验证".to_string());
+    }
+    if data.get("click").is_none_or(Value::is_null) {
+        return Err("Browserless 未执行签到点击，请检查 selector".to_string());
+    }
+
+    let html = data
+        .pointer("/html/html")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if html.contains("未登录") || html.contains("必须在登录后才能访问") {
+        return Err("Cookie 无效或已过期".to_string());
+    }
+    if html.contains("签到成功") {
+        return Ok(SignInOutput {
+            status: "success".to_string(),
+            message: "Browserless 签到成功".to_string(),
+        });
+    }
+    if html.contains("已经签到") || html.contains("今日已签到") || html.contains("今天已经签到")
+    {
+        return Ok(SignInOutput {
+            status: "already".to_string(),
+            message: "今日已经签到".to_string(),
+        });
+    }
+    if html.contains("cf-turnstile") || html.contains("立即签到") {
+        return Ok(SignInOutput {
+            status: "failed".to_string(),
+            message: "Browserless 已点击签到入口，但页面仍停留在验证或签到状态".to_string(),
+        });
+    }
+
+    Ok(SignInOutput {
+        status: "failed".to_string(),
+        message: "Browserless 已完成点击，但未识别到签到成功结果".to_string(),
+    })
+}
+
+fn browserless_error_message(result: &Value) -> Option<String> {
+    let messages = result
+        .get("errors")?
+        .as_array()?
+        .iter()
+        .filter_map(|error| error.get("message").and_then(Value::as_str))
+        .take(3)
+        .collect::<Vec<_>>();
+    (!messages.is_empty()).then(|| format!("Browserless BQL 执行失败: {}", messages.join("; ")))
+}
+
+fn html_title(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("title").ok()?;
+    let title = document
+        .select(&selector)
+        .next()?
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_string())
 }
 
 fn create_target_session(client: &mut CdpClient) -> Result<String, String> {
@@ -832,6 +1259,16 @@ fn normalize_region(region: &str) -> &str {
 pub fn normalize_sign_in_browser(browser: &str) -> Option<&'static str> {
     match browser.trim().to_ascii_lowercase().as_str() {
         SIGN_IN_BROWSER_LIGHTPANDA => Some(SIGN_IN_BROWSER_LIGHTPANDA),
+        SIGN_IN_BROWSER_BROWSERLESS => Some(SIGN_IN_BROWSER_BROWSERLESS),
+        _ => None,
+    }
+}
+
+pub fn normalize_browserless_cf_mode(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        BROWSERLESS_CF_MODE_AUTO => Some(BROWSERLESS_CF_MODE_AUTO),
+        BROWSERLESS_CF_MODE_PAGE => Some(BROWSERLESS_CF_MODE_PAGE),
+        BROWSERLESS_CF_MODE_TURNSTILE => Some(BROWSERLESS_CF_MODE_TURNSTILE),
         _ => None,
     }
 }
@@ -966,7 +1403,100 @@ mod tests {
             normalize_sign_in_browser("lightpanda"),
             Some(SIGN_IN_BROWSER_LIGHTPANDA)
         );
+        assert_eq!(
+            normalize_sign_in_browser(" Browserless "),
+            Some(SIGN_IN_BROWSER_BROWSERLESS)
+        );
         assert_eq!(normalize_sign_in_browser("chrome"), None);
+    }
+
+    #[test]
+    fn browserless_mode_defaults_and_overrides_match_reference_script() {
+        assert_eq!(
+            resolve_browserless_timings(&BrowserlessTaskConfig::default()).unwrap(),
+            BrowserlessTimings {
+                wait_ms: 5_000,
+                solve_timeout: 60_000,
+                action_timeout: 30_000,
+                post_click_wait_ms: 5_000,
+            }
+        );
+
+        let page = BrowserlessTaskConfig {
+            cf_mode: BROWSERLESS_CF_MODE_PAGE.to_string(),
+            action_timeout: Some(12_345),
+            ..BrowserlessTaskConfig::default()
+        };
+        assert_eq!(
+            resolve_browserless_timings(&page).unwrap(),
+            BrowserlessTimings {
+                wait_ms: 1_000,
+                solve_timeout: 30_000,
+                action_timeout: 12_345,
+                post_click_wait_ms: 3_000,
+            }
+        );
+    }
+
+    #[test]
+    fn browserless_endpoint_accepts_service_address_and_replaces_token() {
+        let endpoint = build_browserless_bql_url(&BrowserlessConfig {
+            address: Some("https://production-sfo.browserless.io?region=us&token=old".to_string()),
+            token: Some("token with space".to_string()),
+        })
+        .unwrap();
+
+        assert_eq!(endpoint.path(), "/stealth/bql");
+        let pairs = endpoint.query_pairs().collect::<Vec<_>>();
+        assert!(
+            pairs
+                .iter()
+                .any(|(key, value)| key == "region" && value == "us")
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, _)| key == "token")
+                .map(|(_, value)| value.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["token with space"]
+        );
+    }
+
+    #[test]
+    fn browserless_result_distinguishes_success_already_and_failure() {
+        let success = summarize_browserless_sign_in(&json!({
+            "data": {
+                "goto": { "status": 200 },
+                "solve": { "found": true, "solved": true },
+                "click": { "time": 25 },
+                "html": { "html": "<main>签到成功</main>" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(success.status, "success");
+
+        let already = summarize_browserless_sign_in(&json!({
+            "data": {
+                "goto": { "status": 200 },
+                "solve": { "found": false, "solved": false },
+                "click": { "time": 10 },
+                "html": { "html": "<main>今日已签到</main>" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(already.status, "already");
+
+        let error = summarize_browserless_sign_in(&json!({
+            "data": {
+                "goto": { "status": 200 },
+                "solve": { "found": true, "solved": false },
+                "click": null,
+                "html": { "html": "" }
+            }
+        }))
+        .unwrap_err();
+        assert!(error.contains("未能完成验证"));
     }
 
     #[test]

@@ -3084,7 +3084,7 @@ async fn probe_sign_in_form_1_1_1_1(
     Json(body): Json<SignInBrowserProbeRequest>,
 ) -> Result<Json<crate::sign_in::BrowserProbeResult>, ApiError> {
     let browser = crate::sign_in::normalize_sign_in_browser(&body.browser)
-        .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda"))?
+        .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda 或 browserless"))?
         .to_string();
     let settings = state.db.get_settings().await?;
     validate_sign_in_browser_config(&browser, &settings)?;
@@ -3117,13 +3117,31 @@ async fn validate_sign_in_task(
             .as_deref()
             .unwrap_or(crate::sign_in::SIGN_IN_BROWSER_LIGHTPANDA),
     )
-    .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda"))?;
+    .ok_or_else(|| ApiError::bad_request("browser 必须是 lightpanda 或 browserless"))?;
     body.browser = Some(browser.to_string());
     body.sign_in_method = Some(crate::sign_in::normalize_sign_in_method(
         body.sign_in_method
             .as_deref()
             .unwrap_or(crate::sign_in::SIGN_IN_METHOD_OPEN_PAGE),
     ));
+    let mut browserless = body.browserless.take().unwrap_or_default();
+    browserless.selector = browserless.selector.trim().to_string();
+    if browserless.selector.is_empty() {
+        return Err(ApiError::bad_request("Browserless selector 不能为空"));
+    }
+    if browserless.selector.chars().count() > 2_048 {
+        return Err(ApiError::bad_request(
+            "Browserless selector 不能超过 2048 个字符",
+        ));
+    }
+    browserless.cf_mode = crate::sign_in::normalize_browserless_cf_mode(&browserless.cf_mode)
+        .ok_or_else(|| ApiError::bad_request("Browserless cf_mode 必须是 auto、page 或 turnstile"))?
+        .to_string();
+    validate_browserless_timing("wait_ms", browserless.wait_ms, true)?;
+    validate_browserless_timing("solve_timeout", browserless.solve_timeout, false)?;
+    validate_browserless_timing("action_timeout", browserless.action_timeout, false)?;
+    validate_browserless_timing("post_click_wait_ms", browserless.post_click_wait_ms, true)?;
+    body.browserless = Some(browserless);
 
     if body.name.is_empty() {
         return Err(ApiError::bad_request("名称不能为空"));
@@ -3163,7 +3181,47 @@ fn validate_sign_in_browser_config(browser: &str, settings: &GlobalConfig) -> Re
                 ));
             }
         }
+        crate::sign_in::SIGN_IN_BROWSER_BROWSERLESS => {
+            let address_configured = settings
+                .browserless
+                .address
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let token_configured = settings
+                .browserless
+                .token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            if !address_configured || !token_configured {
+                return Err(ApiError::bad_request(
+                    "请先配置公共 Browserless 地址和 Token",
+                ));
+            }
+        }
         _ => return Err(ApiError::bad_request("未知签到浏览器")),
+    }
+    Ok(())
+}
+
+fn validate_browserless_timing(
+    field: &str,
+    value: Option<u64>,
+    allow_zero: bool,
+) -> Result<(), ApiError> {
+    const MAX_BROWSERLESS_TIMING_MS: u64 = 3_600_000;
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if (!allow_zero && value == 0) || value > MAX_BROWSERLESS_TIMING_MS {
+        let range = if allow_zero {
+            "0..=3600000"
+        } else {
+            "1..=3600000"
+        };
+        return Err(ApiError::bad_request(format!(
+            "Browserless {} 必须在 {} 毫秒范围内",
+            field, range
+        )));
     }
     Ok(())
 }
@@ -4646,6 +4704,8 @@ fn normalize_sign_in_settings(settings: &mut GlobalConfig) {
         &mut settings.lightpanda.token,
         &mut settings.lightpanda.proxy,
         &mut settings.lightpanda.country,
+        &mut settings.browserless.address,
+        &mut settings.browserless.token,
     ] {
         *value = value
             .as_deref()
@@ -4682,6 +4742,15 @@ fn validate_settings(settings: &GlobalConfig) -> Result<(), ApiError> {
         if !endpoint.starts_with("ws://") && !endpoint.starts_with("wss://") {
             return Err(ApiError::bad_request(
                 "lightpanda.endpoint 必须以 ws:// 或 wss:// 开头",
+            ));
+        }
+    }
+    if let Some(address) = settings.browserless.address.as_deref() {
+        let parsed = reqwest::Url::parse(address)
+            .map_err(|_| ApiError::bad_request("browserless.address 不是有效地址"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(ApiError::bad_request(
+                "browserless.address 必须以 http:// 或 https:// 开头",
             ));
         }
     }

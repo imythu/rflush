@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import {
+  AlertTriangle,
   CalendarCheck,
+  ChevronDown,
+  Cloud,
   ClipboardList,
   Edit,
   FlaskConical,
@@ -41,6 +44,22 @@ import type {
 const SIGN_IN_INTERVAL_HOURS = [6, 8, 12, 16, 20, 24] as const;
 type SignInIntervalHours = (typeof SIGN_IN_INTERVAL_HOURS)[number];
 type SignInView = "tasks" | "records";
+type SignInBrowser = "lightpanda" | "browserless";
+
+const DEFAULT_BROWSERLESS_TASK = {
+  selector: "input[type='submit']",
+  cf_mode: "auto" as const,
+  wait_ms: null,
+  solve_timeout: null,
+  action_timeout: null,
+  post_click_wait_ms: null,
+};
+
+const BROWSERLESS_DEFAULTS = {
+  auto: { wait_ms: 5000, solve_timeout: 60000, action_timeout: 30000, post_click_wait_ms: 5000 },
+  page: { wait_ms: 1000, solve_timeout: 30000, action_timeout: 30000, post_click_wait_ms: 3000 },
+  turnstile: { wait_ms: 5000, solve_timeout: 60000, action_timeout: 30000, post_click_wait_ms: 5000 },
+} as const;
 
 const emptyForm: SignInTaskRequest = {
   name: "",
@@ -48,6 +67,7 @@ const emptyForm: SignInTaskRequest = {
   cron_expression: intervalToCron(8),
   browser: "lightpanda",
   sign_in_method: "open_page",
+  browserless: { ...DEFAULT_BROWSERLESS_TASK },
 };
 
 function taskToForm(task: SignInTaskRecord): SignInTaskRequest {
@@ -55,8 +75,9 @@ function taskToForm(task: SignInTaskRecord): SignInTaskRequest {
     name: task.name,
     site_id: task.site_id,
     cron_expression: task.cron_expression,
-    browser: "lightpanda",
+    browser: task.browser === "browserless" ? "browserless" : "lightpanda",
     sign_in_method: task.sign_in_method,
+    browserless: { ...task.browserless },
   };
 }
 
@@ -77,6 +98,24 @@ function signInMethodLabel(method: string | null | undefined) {
   if (method === "cloudflare") return "CF 签到";
   if (method === "ocr_captcha") return "OCR 验证码签到";
   return "打开页面签到";
+}
+
+function browserLabel(browser: string | null | undefined) {
+  return browser === "browserless" ? "Browserless" : "Lightpanda";
+}
+
+function browserlessCfModeLabel(mode: string | null | undefined) {
+  if (mode === "page") return "页面挑战";
+  if (mode === "turnstile") return "Turnstile";
+  return "自动";
+}
+
+function isBrowserConfigured(settings: GlobalConfig | null, browser: SignInBrowser) {
+  if (!settings) return false;
+  if (browser === "lightpanda") {
+    return Boolean(settings.lightpanda.endpoint?.trim() || settings.lightpanda.token?.trim());
+  }
+  return Boolean(settings.browserless.address?.trim() && settings.browserless.token?.trim());
 }
 
 function intervalToCron(hours: SignInIntervalHours) {
@@ -103,12 +142,14 @@ export function SignInPage() {
   const [searchTerm, setSearchTerm] = useState("");
   const [siteFilter, setSiteFilter] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsBrowser, setSettingsBrowser] = useState<SignInBrowser>("lightpanda");
   const [configFeedback, setConfigFeedback] = useState<{ tone: "success" | "error"; text: string } | null>(null);
   const [savingBrowser, setSavingBrowser] = useState(false);
   const [probingBrowser, setProbingBrowser] = useState(false);
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [form, setForm] = useState<SignInTaskRequest>({ ...emptyForm });
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [intervalHours, setIntervalHours] = useState<SignInIntervalHours>(8);
   const [submitError, setSubmitError] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -160,6 +201,8 @@ export function SignInPage() {
   const suggestedTaskName = editingId === null
     ? nexusSites.find((site) => site.id === form.site_id)?.name.trim() ?? ""
     : "";
+  const browserlessTask = form.browserless ?? DEFAULT_BROWSERLESS_TASK;
+  const browserlessDefaults = BROWSERLESS_DEFAULTS[browserlessTask.cf_mode];
 
   function loadData() {
     setLoading(true);
@@ -197,9 +240,36 @@ export function SignInPage() {
     setConfigFeedback(null);
   }
 
+  function setBrowserlessSettingField<K extends keyof GlobalConfig["browserless"]>(
+    key: K,
+    value: GlobalConfig["browserless"][K],
+  ) {
+    setSettingsDraft((current) =>
+      current ? { ...current, browserless: { ...current.browserless, [key]: value } } : current,
+    );
+    setConfigFeedback(null);
+  }
+
+  function setBrowserlessTaskField<K extends keyof NonNullable<SignInTaskRequest["browserless"]>>(
+    key: K,
+    value: NonNullable<SignInTaskRequest["browserless"]>[K],
+  ) {
+    setForm((current) => ({
+      ...current,
+      browserless: {
+        ...(current.browserless ?? DEFAULT_BROWSERLESS_TASK),
+        [key]: value,
+      },
+    }));
+  }
+
   function openSettings() {
     if (!settings) return;
-    setSettingsDraft({ ...settings, lightpanda: { ...settings.lightpanda } });
+    setSettingsDraft({
+      ...settings,
+      lightpanda: { ...settings.lightpanda },
+      browserless: { ...settings.browserless },
+    });
     setConfigFeedback(null);
     setSettingsOpen(true);
   }
@@ -227,9 +297,19 @@ export function SignInPage() {
   }
 
   function openAdd() {
+    const defaultBrowser: SignInBrowser =
+      !isBrowserConfigured(settings, "lightpanda") && isBrowserConfigured(settings, "browserless")
+        ? "browserless"
+        : "lightpanda";
     setEditingId(null);
-    setForm({ ...emptyForm, site_id: nexusSites[0]?.id ?? 0 });
+    setForm({
+      ...emptyForm,
+      site_id: nexusSites[0]?.id ?? 0,
+      browser: defaultBrowser,
+      browserless: { ...DEFAULT_BROWSERLESS_TASK },
+    });
     setIntervalHours(8);
+    setAdvancedOpen(false);
     setSubmitError("");
     setFormOpen(true);
   }
@@ -238,6 +318,7 @@ export function SignInPage() {
     setEditingId(task.id);
     setForm(taskToForm(task));
     setIntervalHours(cronToInterval(task.cron_expression));
+    setAdvancedOpen(false);
     setSubmitError("");
     setFormOpen(true);
   }
@@ -248,8 +329,9 @@ export function SignInPage() {
     setForm((current) => ({
       ...current,
       cron_expression: source.cron_expression,
-      browser: "lightpanda",
+      browser: source.browser === "browserless" ? "browserless" : "lightpanda",
       sign_in_method: source.sign_in_method,
+      browserless: { ...source.browserless },
     }));
     setIntervalHours(cronToInterval(source.cron_expression));
   }
@@ -257,13 +339,27 @@ export function SignInPage() {
   function closeForm() {
     setFormOpen(false);
     setEditingId(null);
+    setAdvancedOpen(false);
     setSubmitError("");
   }
 
   async function persistBrowserSettings(probe: boolean) {
     if (!settingsDraft) return;
-    if (probe && !settingsDraft.lightpanda.endpoint?.trim() && !settingsDraft.lightpanda.token?.trim()) {
+    if (
+      probe
+      && settingsBrowser === "lightpanda"
+      && !settingsDraft.lightpanda.endpoint?.trim()
+      && !settingsDraft.lightpanda.token?.trim()
+    ) {
       setConfigFeedback({ tone: "error", text: "Lightpanda endpoint 或 token 至少填写一个" });
+      return;
+    }
+    if (
+      probe
+      && settingsBrowser === "browserless"
+      && (!settingsDraft.browserless.address?.trim() || !settingsDraft.browserless.token?.trim())
+    ) {
+      setConfigFeedback({ tone: "error", text: "Browserless 地址和 Token 都不能为空" });
       return;
     }
 
@@ -276,15 +372,19 @@ export function SignInPage() {
         body: JSON.stringify(settingsDraft),
       });
       setSettings(saved);
-      setSettingsDraft({ ...saved, lightpanda: { ...saved.lightpanda } });
+      setSettingsDraft({
+        ...saved,
+        lightpanda: { ...saved.lightpanda },
+        browserless: { ...saved.browserless },
+      });
       if (!probe) {
-        setConfigFeedback({ tone: "success", text: "Lightpanda 公共配置已保存" });
+        setConfigFeedback({ tone: "success", text: `${browserLabel(settingsBrowser)} 公共配置已保存` });
         return;
       }
 
       const result = await api<BrowserProbeResult>("/api/sign-in-probe-1-1-1-1", {
         method: "POST",
-        body: JSON.stringify({ browser: "lightpanda" }),
+        body: JSON.stringify({ browser: settingsBrowser }),
       });
       if (!result.success) throw new Error(result.message);
       setConfigFeedback({
@@ -294,7 +394,7 @@ export function SignInPage() {
     } catch (error) {
       setConfigFeedback({
         tone: "error",
-        text: (error as Error).message || "Lightpanda 配置保存失败",
+        text: (error as Error).message || `${browserLabel(settingsBrowser)} 配置保存失败`,
       });
     } finally {
       setSavingBrowser(false);
@@ -311,6 +411,10 @@ export function SignInPage() {
       setSubmitError("请选择 NexusPHP 站点");
       return;
     }
+    if (form.browser === "browserless" && !form.browserless?.selector.trim()) {
+      setSubmitError("Browserless selector 不能为空");
+      return;
+    }
 
     const body: SignInTaskRequest = {
       ...form,
@@ -318,6 +422,10 @@ export function SignInPage() {
       cron_expression: intervalToCron(intervalHours),
       browser: form.browser ?? "lightpanda",
       sign_in_method: form.sign_in_method ?? "open_page",
+      browserless: {
+        ...(form.browserless ?? DEFAULT_BROWSERLESS_TASK),
+        selector: (form.browserless?.selector ?? DEFAULT_BROWSERLESS_TASK.selector).trim(),
+      },
     };
 
     setSubmitting(true);
@@ -556,9 +664,9 @@ export function SignInPage() {
 
                       <div className="mt-2.5 grid gap-1.5 text-[11px] text-muted sm:grid-cols-2 xl:grid-cols-5">
                         <div className="truncate"><span className="font-medium text-foreground">站点: </span>{siteNameById.get(task.site_id) ?? `#${task.site_id}`}</div>
-                        <div className="truncate"><span className="font-medium text-foreground">浏览器: </span>Lightpanda</div>
+                        <div className="truncate"><span className="font-medium text-foreground">浏览器: </span>{browserLabel(task.browser)}</div>
                         <div className="truncate"><span className="font-medium text-foreground">间隔: </span>每 {cronToInterval(task.cron_expression)} 小时</div>
-                        <div className="truncate"><span className="font-medium text-foreground">方式: </span>{signInMethodLabel(task.sign_in_method)}</div>
+                        <div className="truncate"><span className="font-medium text-foreground">方式: </span>{task.browser === "browserless" ? `CF ${browserlessCfModeLabel(task.browserless.cf_mode)}` : signInMethodLabel(task.sign_in_method)}</div>
                         <div className="truncate"><span className="font-medium text-foreground">最近时间: </span>{formatDate(task.last_run_at)}</div>
                         <div className="truncate sm:col-span-2 xl:col-span-5"><span className="font-medium text-foreground">最近消息: </span>{task.last_message || "-"}</div>
                       </div>
@@ -621,89 +729,163 @@ export function SignInPage() {
       <Dialog
         open={settingsOpen}
         onClose={closeSettings}
-        title="Lightpanda 浏览器配置"
-        description="所有自动签到任务共用这组连接与代理设置。"
+        title="签到浏览器配置"
+        description="所有自动签到任务共用以下浏览器连接配置。"
         escMode="double"
         panelClassName="max-w-3xl"
       >
         <div className="space-y-5 p-4 sm:p-6">
           {settingsDraft ? (
-            <div className="grid grid-cols-2 gap-3 sm:gap-4">
-              <div className="col-span-2 space-y-2">
-                <Label htmlFor="lightpanda-endpoint">Endpoint</Label>
-                <Input
-                  id="lightpanda-endpoint"
-                  value={settingsDraft.lightpanda.endpoint ?? ""}
-                  onChange={(event) => setLightpandaField("endpoint", event.target.value || null)}
-                  placeholder="wss://euwest.cloud.lightpanda.io/ws?token=..."
-                />
+            <>
+              <div
+                className="grid h-11 w-full grid-cols-2 rounded-2xl border border-border bg-surface-container p-1 sm:w-[360px]"
+                role="tablist"
+                aria-label="签到浏览器配置"
+              >
+                {(["lightpanda", "browserless"] as const).map((browser) => {
+                  const selected = settingsBrowser === browser;
+                  const configured = isBrowserConfigured(settingsDraft, browser);
+                  return (
+                    <button
+                      key={browser}
+                      id={`sign-in-browser-settings-tab-${browser}`}
+                      type="button"
+                      role="tab"
+                      aria-selected={selected}
+                      aria-controls={`sign-in-browser-settings-panel-${browser}`}
+                      onClick={() => {
+                        setSettingsBrowser(browser);
+                        setConfigFeedback(null);
+                      }}
+                      className={cn(
+                        "flex min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-xl px-2 text-xs font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:text-sm",
+                        selected ? "bg-card text-foreground shadow-sm" : "text-muted hover:text-foreground",
+                      )}
+                    >
+                      {browser === "lightpanda" ? <Zap className="h-4 w-4 shrink-0" /> : <Cloud className="h-4 w-4 shrink-0" />}
+                      <span className="truncate">{browserLabel(browser)}</span>
+                      <span className={cn("hidden text-[10px] sm:inline", configured ? "text-emerald-600 dark:text-emerald-400" : "text-muted")}>
+                        {configured ? "已配置" : "未配置"}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="lightpanda-token">Token</Label>
-                <Input
-                  id="lightpanda-token"
-                  type="password"
-                  autoComplete="off"
-                  value={settingsDraft.lightpanda.token ?? ""}
-                  onChange={(event) => setLightpandaField("token", event.target.value || null)}
-                  placeholder="Lightpanda token"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="lightpanda-region">区域</Label>
-                <Select
-                  id="lightpanda-region"
-                  value={settingsDraft.lightpanda.region}
-                  onChange={(value) => setLightpandaField("region", value)}
-                  options={[
-                    { value: "euwest", label: "EU West" },
-                    { value: "uswest", label: "US West" },
-                  ]}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="lightpanda-browser">云端浏览器类型</Label>
-                <Input
-                  id="lightpanda-browser"
-                  value={settingsDraft.lightpanda.browser}
-                  onChange={(event) => setLightpandaField("browser", event.target.value)}
-                  placeholder="lightpanda"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="lightpanda-proxy">代理策略</Label>
-                <Input
-                  id="lightpanda-proxy"
-                  value={settingsDraft.lightpanda.proxy ?? ""}
-                  disabled={!settingsDraft.use_proxy_for_lightpanda}
-                  onChange={(event) => setLightpandaField("proxy", event.target.value || null)}
-                  placeholder="fast_dc"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="lightpanda-country">国家代码</Label>
-                <Input
-                  id="lightpanda-country"
-                  value={settingsDraft.lightpanda.country ?? ""}
-                  onChange={(event) => setLightpandaField("country", event.target.value || null)}
-                  placeholder="US"
-                />
-              </div>
-              <label className="flex min-h-11 cursor-pointer items-center gap-3 self-end text-sm font-medium">
-                <input
-                  type="checkbox"
-                  className="size-4 accent-primary"
-                  checked={settingsDraft.use_proxy_for_lightpanda}
-                  onChange={(event) => {
-                    setSettingsDraft((current) => current
-                      ? { ...current, use_proxy_for_lightpanda: event.target.checked }
-                      : current);
-                    setConfigFeedback(null);
-                  }}
-                />
-                使用 Lightpanda 代理
-              </label>
-            </div>
+
+              {settingsBrowser === "lightpanda" ? (
+                <div
+                  id="sign-in-browser-settings-panel-lightpanda"
+                  role="tabpanel"
+                  aria-labelledby="sign-in-browser-settings-tab-lightpanda"
+                  className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4"
+                >
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="lightpanda-endpoint">Endpoint</Label>
+                    <Input
+                      id="lightpanda-endpoint"
+                      value={settingsDraft.lightpanda.endpoint ?? ""}
+                      onChange={(event) => setLightpandaField("endpoint", event.target.value || null)}
+                      placeholder="wss://euwest.cloud.lightpanda.io/ws?token=..."
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lightpanda-token">Token</Label>
+                    <Input
+                      id="lightpanda-token"
+                      type="password"
+                      autoComplete="off"
+                      value={settingsDraft.lightpanda.token ?? ""}
+                      onChange={(event) => setLightpandaField("token", event.target.value || null)}
+                      placeholder="Lightpanda token"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lightpanda-region">区域</Label>
+                    <Select
+                      id="lightpanda-region"
+                      value={settingsDraft.lightpanda.region}
+                      onChange={(value) => setLightpandaField("region", value)}
+                      options={[
+                        { value: "euwest", label: "EU West" },
+                        { value: "uswest", label: "US West" },
+                      ]}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lightpanda-browser">云端浏览器类型</Label>
+                    <Input
+                      id="lightpanda-browser"
+                      value={settingsDraft.lightpanda.browser}
+                      onChange={(event) => setLightpandaField("browser", event.target.value)}
+                      placeholder="lightpanda"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lightpanda-proxy">代理策略</Label>
+                    <Input
+                      id="lightpanda-proxy"
+                      value={settingsDraft.lightpanda.proxy ?? ""}
+                      disabled={!settingsDraft.use_proxy_for_lightpanda}
+                      onChange={(event) => setLightpandaField("proxy", event.target.value || null)}
+                      placeholder="fast_dc"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="lightpanda-country">国家代码</Label>
+                    <Input
+                      id="lightpanda-country"
+                      value={settingsDraft.lightpanda.country ?? ""}
+                      onChange={(event) => setLightpandaField("country", event.target.value || null)}
+                      placeholder="US"
+                    />
+                  </div>
+                  <label className="flex min-h-11 cursor-pointer items-center gap-3 self-end text-sm font-medium">
+                    <input
+                      type="checkbox"
+                      className="size-4 accent-primary"
+                      checked={settingsDraft.use_proxy_for_lightpanda}
+                      onChange={(event) => {
+                        setSettingsDraft((current) => current
+                          ? { ...current, use_proxy_for_lightpanda: event.target.checked }
+                          : current);
+                        setConfigFeedback(null);
+                      }}
+                    />
+                    使用 Lightpanda 代理
+                  </label>
+                </div>
+              ) : (
+                <div
+                  id="sign-in-browser-settings-panel-browserless"
+                  role="tabpanel"
+                  aria-labelledby="sign-in-browser-settings-tab-browserless"
+                  className="mt-5 grid gap-4 sm:grid-cols-2"
+                >
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="browserless-address">地址</Label>
+                    <Input
+                      id="browserless-address"
+                      type="url"
+                      value={settingsDraft.browserless.address ?? ""}
+                      onChange={(event) => setBrowserlessSettingField("address", event.target.value || null)}
+                      placeholder="https://production-sfo.browserless.io"
+                    />
+                    <p className="text-xs text-muted">支持服务根地址或完整的 /stealth/bql 地址。</p>
+                  </div>
+                  <div className="space-y-2 sm:col-span-2">
+                    <Label htmlFor="browserless-token">Token</Label>
+                    <Input
+                      id="browserless-token"
+                      type="password"
+                      autoComplete="off"
+                      value={settingsDraft.browserless.token ?? ""}
+                      onChange={(event) => setBrowserlessSettingField("token", event.target.value || null)}
+                      placeholder="Browserless token"
+                    />
+                  </div>
+                </div>
+              )}
+            </>
           ) : (
             <div className="flex items-center justify-center py-8 text-sm text-muted">
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
@@ -746,8 +928,9 @@ export function SignInPage() {
         open={formOpen}
         onClose={closeForm}
         title={editingId !== null ? "编辑自动签到任务" : "添加自动签到任务"}
-        description="配置 NexusPHP 站点、执行间隔和签到方式。"
+        description="配置 NexusPHP 站点、执行间隔和浏览器签到方式。"
         escMode="double"
+        panelClassName="max-w-3xl"
       >
         <div className="space-y-6 p-4 sm:p-6">
           {submitError ? (
@@ -811,19 +994,148 @@ export function SignInPage() {
                 options={SIGN_IN_INTERVAL_HOURS.map((hours) => ({ value: String(hours), label: `每 ${hours} 小时` }))}
               />
             </div>
-            <div className="space-y-2 sm:col-span-2">
-              <Label htmlFor="sign-in-method">签到方式</Label>
+            <div className="space-y-2">
+              <Label htmlFor="sign-in-browser">浏览器</Label>
               <Select
-                id="sign-in-method"
-                value={form.sign_in_method ?? "open_page"}
-                onChange={(value) => setField("sign_in_method", value)}
+                id="sign-in-browser"
+                value={form.browser ?? "lightpanda"}
+                onChange={(value) => setField("browser", value as SignInBrowser)}
                 options={[
-                  { value: "open_page", label: "打开页面签到" },
-                  { value: "cloudflare", label: "CF 签到" },
-                  { value: "ocr_captcha", label: "OCR 验证码签到" },
+                  { value: "lightpanda", label: "Lightpanda" },
+                  { value: "browserless", label: "Browserless" },
                 ]}
               />
             </div>
+
+            {form.browser === "browserless" ? (
+              <>
+                <div className="space-y-2 sm:col-span-2">
+                  <Label htmlFor="browserless-selector">Selector</Label>
+                  <Input
+                    id="browserless-selector"
+                    value={browserlessTask.selector}
+                    onChange={(event) => setBrowserlessTaskField("selector", event.target.value)}
+                    placeholder="input[type='submit']"
+                    spellCheck={false}
+                  />
+                </div>
+                <div className="space-y-2 sm:col-span-2">
+                  <Label htmlFor="browserless-cf-mode">CF 模式</Label>
+                  <Select
+                    id="browserless-cf-mode"
+                    value={browserlessTask.cf_mode}
+                    onChange={(value) => setBrowserlessTaskField("cf_mode", value as typeof browserlessTask.cf_mode)}
+                    options={[
+                      { value: "auto", label: "自动" },
+                      { value: "page", label: "页面挑战" },
+                      { value: "turnstile", label: "Turnstile" },
+                    ]}
+                  />
+                </div>
+
+                <div className="overflow-hidden rounded-2xl border border-border sm:col-span-2">
+                  <button
+                    type="button"
+                    aria-expanded={advancedOpen}
+                    aria-controls="browserless-advanced-settings"
+                    className="flex w-full cursor-pointer items-center justify-between gap-3 bg-surface-container/45 px-4 py-3 text-left transition-colors duration-200 hover:bg-surface-container focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/40"
+                    onClick={() => setAdvancedOpen((open) => !open)}
+                  >
+                    <span className="flex min-w-0 items-center gap-2 text-sm font-semibold">
+                      <Settings2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                      高级设置
+                      <span className="truncate text-xs font-medium text-destructive">请勿随意填写</span>
+                    </span>
+                    <ChevronDown className={cn("h-4 w-4 shrink-0 transition-transform duration-200", advancedOpen && "rotate-180")} aria-hidden="true" />
+                  </button>
+
+                  {advancedOpen ? (
+                    <div id="browserless-advanced-settings" className="space-y-4 border-t border-border px-4 py-4">
+                      <p id="browserless-advanced-warning" className="flex items-start gap-2 text-sm font-medium text-destructive" role="alert">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                        不要随意修改。填写任一项后，该值将替代当前 CF 模式的默认值；留空则继续使用默认值。
+                      </p>
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div className="space-y-2">
+                          <Label htmlFor="browserless-wait-ms">waitMs</Label>
+                          <Input
+                            id="browserless-wait-ms"
+                            type="number"
+                            inputMode="numeric"
+                            min={0}
+                            max={3600000}
+                            step={100}
+                            aria-describedby="browserless-advanced-warning"
+                            value={browserlessTask.wait_ms ?? ""}
+                            onChange={(event) => setBrowserlessTaskField("wait_ms", event.target.value === "" ? null : Number(event.target.value))}
+                            placeholder={`默认 ${browserlessDefaults.wait_ms}`}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="browserless-solve-timeout">solveTimeout</Label>
+                          <Input
+                            id="browserless-solve-timeout"
+                            type="number"
+                            inputMode="numeric"
+                            min={1}
+                            max={3600000}
+                            step={100}
+                            aria-describedby="browserless-advanced-warning"
+                            value={browserlessTask.solve_timeout ?? ""}
+                            onChange={(event) => setBrowserlessTaskField("solve_timeout", event.target.value === "" ? null : Number(event.target.value))}
+                            placeholder={`默认 ${browserlessDefaults.solve_timeout}`}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="browserless-action-timeout">actionTimeout</Label>
+                          <Input
+                            id="browserless-action-timeout"
+                            type="number"
+                            inputMode="numeric"
+                            min={1}
+                            max={3600000}
+                            step={100}
+                            aria-describedby="browserless-advanced-warning"
+                            value={browserlessTask.action_timeout ?? ""}
+                            onChange={(event) => setBrowserlessTaskField("action_timeout", event.target.value === "" ? null : Number(event.target.value))}
+                            placeholder={`默认 ${browserlessDefaults.action_timeout}`}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="browserless-post-click-wait-ms">postClickWaitMs</Label>
+                          <Input
+                            id="browserless-post-click-wait-ms"
+                            type="number"
+                            inputMode="numeric"
+                            min={0}
+                            max={3600000}
+                            step={100}
+                            aria-describedby="browserless-advanced-warning"
+                            value={browserlessTask.post_click_wait_ms ?? ""}
+                            onChange={(event) => setBrowserlessTaskField("post_click_wait_ms", event.target.value === "" ? null : Number(event.target.value))}
+                            placeholder={`默认 ${browserlessDefaults.post_click_wait_ms}`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </>
+            ) : (
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="sign-in-method">签到方式</Label>
+                <Select
+                  id="sign-in-method"
+                  value={form.sign_in_method ?? "open_page"}
+                  onChange={(value) => setField("sign_in_method", value)}
+                  options={[
+                    { value: "open_page", label: "打开页面签到" },
+                    { value: "cloudflare", label: "CF 签到" },
+                    { value: "ocr_captcha", label: "OCR 验证码签到" },
+                  ]}
+                />
+              </div>
+            )}
           </div>
 
           <div className="flex flex-wrap gap-3 border-t border-border pt-4">

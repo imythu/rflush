@@ -10,6 +10,10 @@ export type GlobalConfig = {
     proxy: string | null;
     country: string | null;
   };
+  browserless: {
+    address: string | null;
+    token: string | null;
+  };
   tag_rule_scan_interval_mins?: number;
   ocr_api_key: string | null;
 };
@@ -247,6 +251,7 @@ export type SignInTaskRecord = {
   cron_expression: string;
   browser: string;
   sign_in_method: string;
+  browserless: BrowserlessTaskConfig;
   enabled: boolean;
   last_status: string | null;
   last_message: string | null;
@@ -259,8 +264,18 @@ export type SignInTaskRequest = {
   name: string;
   site_id: number;
   cron_expression: string;
-  browser?: "lightpanda" | null;
+  browser?: "lightpanda" | "browserless" | null;
   sign_in_method?: string | null;
+  browserless?: BrowserlessTaskConfig | null;
+};
+
+export type BrowserlessTaskConfig = {
+  selector: string;
+  cf_mode: "auto" | "page" | "turnstile";
+  wait_ms: number | null;
+  solve_timeout: number | null;
+  action_timeout: number | null;
+  post_click_wait_ms: number | null;
 };
 
 export type SignInRecord = {
