@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use chrono::Utc;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -15,7 +13,6 @@ pub struct PtdBackupConfig {
     pub password: String,
     pub use_proxy: bool,
     pub backup_interval_hours: u64,
-    pub site_mappings: BTreeMap<i64, String>,
     pub last_backup_at: Option<String>,
     pub last_backup_filename: Option<String>,
     pub last_error: Option<String>,
@@ -29,12 +26,11 @@ impl Database {
             let conn = open_connection(&path)?;
             conn.query_row(
                 "SELECT enabled, webdav_url, username, password, use_proxy,
-                        backup_interval_hours, site_mappings_json, last_backup_at,
+                        backup_interval_hours, last_backup_at,
                         last_backup_filename, last_error, updated_at
                  FROM ptd_backup_settings WHERE id = 1",
                 [],
                 |row| {
-                    let site_mappings_json: String = row.get(6)?;
                     Ok(PtdBackupConfig {
                         enabled: row.get::<_, i32>(0).unwrap_or_default() != 0,
                         webdav_url: row.get(1)?,
@@ -42,12 +38,10 @@ impl Database {
                         password: row.get(3)?,
                         use_proxy: row.get::<_, i32>(4).unwrap_or_default() != 0,
                         backup_interval_hours: row.get::<_, i64>(5).unwrap_or(24).max(1) as u64,
-                        site_mappings: serde_json::from_str(&site_mappings_json)
-                            .unwrap_or_default(),
-                        last_backup_at: row.get(7)?,
-                        last_backup_filename: row.get(8)?,
-                        last_error: row.get(9)?,
-                        updated_at: row.get(10)?,
+                        last_backup_at: row.get(6)?,
+                        last_backup_filename: row.get(7)?,
+                        last_error: row.get(8)?,
+                        updated_at: row.get(9)?,
                     })
                 },
             )
@@ -62,16 +56,10 @@ impl Database {
         let config = config.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
-            let site_mappings_json =
-                serde_json::to_string(&config.site_mappings).map_err(|error| {
-                    AppError::Database {
-                        message: format!("failed to serialize PTD site mappings: {error}"),
-                    }
-                })?;
             conn.execute(
                 "UPDATE ptd_backup_settings SET
                     enabled = ?, webdav_url = ?, username = ?, password = ?, use_proxy = ?,
-                    backup_interval_hours = ?, site_mappings_json = ?, last_error = NULL,
+                    backup_interval_hours = ?, site_mappings_json = '{}', last_error = NULL,
                     updated_at = ?
                  WHERE id = 1",
                 params![
@@ -81,7 +69,6 @@ impl Database {
                     config.password,
                     config.use_proxy as i32,
                     config.backup_interval_hours.min(i64::MAX as u64) as i64,
-                    site_mappings_json,
                     Utc::now().to_rfc3339(),
                 ],
             )
@@ -148,7 +135,6 @@ mod tests {
         config.webdav_url = "https://dav.example/ptd".to_string();
         config.username = "alice".to_string();
         config.password = "secret".to_string();
-        config.site_mappings.insert(7, "mteam".to_string());
         db.update_ptd_backup_config(&config).await.unwrap();
         db.record_ptd_backup_success("PTD_backup_20260904T1200.zip", "2026-09-04T12:00:00Z")
             .await
@@ -157,10 +143,6 @@ mod tests {
         let saved = db.get_ptd_backup_config().await.unwrap();
         assert!(saved.enabled);
         assert_eq!(saved.password, "secret");
-        assert_eq!(
-            saved.site_mappings.get(&7).map(String::as_str),
-            Some("mteam")
-        );
         assert_eq!(
             saved.last_backup_filename.as_deref(),
             Some("PTD_backup_20260904T1200.zip")

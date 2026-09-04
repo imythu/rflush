@@ -44,7 +44,7 @@ use crate::media::tmdb::{TmdbDetails, TmdbError, TmdbMedia, TmdbMediaType, TmdbS
 use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
 use crate::openlist::{OpenListClient, OpenListTask, openlist_identity_key};
-use crate::ptd_backup::{PtdBackupRunResult, suggested_ptd_site_id};
+use crate::ptd_backup::{PtdBackupRunResult, ptd_site_id};
 use crate::relocation::{
     RelocationScheduler, archive_relative_directory, is_path_prefix, join_path, normalize_path,
     torrent_is_complete, validate_torrent_files_complete,
@@ -2542,7 +2542,7 @@ struct PtdBackupConfigResponse {
     password_configured: bool,
     use_proxy: bool,
     backup_interval_hours: u64,
-    site_mappings: BTreeMap<i64, String>,
+    site_identifiers: BTreeMap<i64, Option<String>>,
     configured: bool,
     last_backup_at: Option<String>,
     last_backup_filename: Option<String>,
@@ -2564,8 +2564,6 @@ struct UpdatePtdBackupConfigRequest {
     #[serde(default)]
     use_proxy: bool,
     backup_interval_hours: u64,
-    #[serde(default)]
-    site_mappings: BTreeMap<i64, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2597,17 +2595,11 @@ impl From<SiteWithStats> for SiteResponse {
 }
 
 impl PtdBackupConfigResponse {
-    fn new(mut config: crate::db::PtdBackupConfig, sites: &[SiteWithStats]) -> Self {
-        let site_ids = sites.iter().map(|site| site.id).collect::<HashSet<_>>();
-        config
-            .site_mappings
-            .retain(|site_id, _| site_ids.contains(site_id));
-        for site in sites {
-            config
-                .site_mappings
-                .entry(site.id)
-                .or_insert_with(|| suggested_ptd_site_id(site));
-        }
+    fn new(config: crate::db::PtdBackupConfig, sites: &[SiteWithStats]) -> Self {
+        let site_identifiers = sites
+            .iter()
+            .map(|site| (site.id, ptd_site_id(site).map(str::to_string)))
+            .collect();
         Self {
             enabled: config.enabled,
             configured: !config.webdav_url.trim().is_empty(),
@@ -2616,7 +2608,7 @@ impl PtdBackupConfigResponse {
             password_configured: !config.password.is_empty(),
             use_proxy: config.use_proxy,
             backup_interval_hours: config.backup_interval_hours,
-            site_mappings: config.site_mappings,
+            site_identifiers,
             last_backup_at: config.last_backup_at,
             last_backup_filename: config.last_backup_filename,
             last_error: config.last_error,
@@ -2865,7 +2857,6 @@ fn resolve_ptd_backup_config_update(
         password,
         use_proxy: body.use_proxy,
         backup_interval_hours: body.backup_interval_hours,
-        site_mappings: body.site_mappings,
         last_backup_at: current.last_backup_at,
         last_backup_filename: current.last_backup_filename,
         last_error: current.last_error,
@@ -2888,7 +2879,7 @@ async fn update_ptd_backup_config(
     let current = state.db.get_ptd_backup_config().await?;
     let mut config = resolve_ptd_backup_config_update(current, body)?;
     let sites = state.db.list_sites_with_stats().await?;
-    crate::ptd_backup::validate_config(&mut config, &sites).map_err(ApiError::bad_request)?;
+    crate::ptd_backup::validate_config(&mut config).map_err(ApiError::bad_request)?;
     state.db.update_ptd_backup_config(&config).await?;
     let saved = state.db.get_ptd_backup_config().await?;
     Ok(Json(PtdBackupConfigResponse::new(saved, &sites)))
@@ -2900,8 +2891,7 @@ async fn test_ptd_backup(
 ) -> Result<Json<PtdBackupTestResponse>, ApiError> {
     let current = state.db.get_ptd_backup_config().await?;
     let mut config = resolve_ptd_backup_config_update(current, body)?;
-    let sites = state.db.list_sites_with_stats().await?;
-    if let Err(message) = crate::ptd_backup::validate_config(&mut config, &sites) {
+    if let Err(message) = crate::ptd_backup::validate_config(&mut config) {
         return Ok(Json(PtdBackupTestResponse {
             success: false,
             message,
@@ -6045,7 +6035,6 @@ mod security_boundary_tests {
                 password: "dummy-webdav-secret".to_string(),
                 use_proxy: false,
                 backup_interval_hours: 24,
-                site_mappings: BTreeMap::new(),
                 last_backup_at: None,
                 last_backup_filename: None,
                 last_error: None,
@@ -6141,7 +6130,6 @@ mod security_boundary_tests {
                 password: "saved-secret".to_string(),
                 use_proxy: false,
                 backup_interval_hours: 24,
-                site_mappings: BTreeMap::new(),
                 last_backup_at: None,
                 last_backup_filename: None,
                 last_error: None,
@@ -6157,7 +6145,6 @@ mod security_boundary_tests {
             clear_password,
             use_proxy: false,
             backup_interval_hours: 24,
-            site_mappings: BTreeMap::new(),
         };
         assert_eq!(
             resolve_ptd_backup_config_update(current(), request(false))
@@ -6171,6 +6158,18 @@ mod security_boundary_tests {
                 .password
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn ptd_backup_rejects_user_supplied_site_identifiers() {
+        let request = serde_json::json!({
+            "enabled": false,
+            "webdav_url": "https://dav.example/ptd/",
+            "username": "alice",
+            "backup_interval_hours": 24,
+            "site_mappings": { "1": "madeup" }
+        });
+        assert!(serde_json::from_value::<UpdatePtdBackupConfigRequest>(request).is_err());
     }
 
     #[test]

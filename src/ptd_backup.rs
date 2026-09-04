@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use chrono::{DateTime, Duration, Utc};
@@ -40,10 +40,7 @@ struct PtdManifest {
     files: BTreeMap<&'static str, PtdManifestFile>,
 }
 
-pub fn validate_config(
-    config: &mut PtdBackupConfig,
-    sites: &[SiteWithStats],
-) -> Result<(), String> {
+pub fn validate_config(config: &mut PtdBackupConfig) -> Result<(), String> {
     if config.webdav_url.trim().is_empty() {
         if config.enabled {
             return Err("启用蜂巢 PTD 备份前必须填写 WebDAV 地址".to_string());
@@ -61,44 +58,18 @@ pub fn validate_config(
         ));
     }
 
-    let existing_site_ids = sites.iter().map(|site| site.id).collect::<HashSet<_>>();
-    config
-        .site_mappings
-        .retain(|site_id, _| existing_site_ids.contains(site_id));
-
-    let mut used = HashSet::new();
-    for site in sites {
-        let site_id = resolved_ptd_site_id(site, &config.site_mappings)?;
-        if !used.insert(site_id.clone()) {
-            return Err(format!("PTD 站点标识不能重复: {site_id}"));
-        }
-    }
     Ok(())
 }
 
-pub fn suggested_ptd_site_id(site: &SiteWithStats) -> String {
+pub fn ptd_site_id(site: &SiteWithStats) -> Option<&'static str> {
     if matches!(site.site_type.as_str(), "mteam" | "m_team") {
-        return "mteam".to_string();
-    }
-
-    let name_slug = ptd_site_id_slug(&site.name);
-    if !name_slug.is_empty() && site.name.is_ascii() {
-        return name_slug;
+        return Some("mteam");
     }
 
     Url::parse(&site.base_url)
         .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .map(|host| {
-            let first_label = host
-                .trim_start_matches("www.")
-                .split('.')
-                .next()
-                .unwrap_or_default();
-            ptd_site_id_slug(first_label)
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("site{}", site.id))
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .and_then(|host| crate::ptd_sites::site_id_for_host(&host))
 }
 
 pub async fn test_webdav(config: &PtdBackupConfig, proxy: Option<&str>) -> Result<(), String> {
@@ -172,17 +143,15 @@ async fn perform_backup(db: &Database) -> Result<PtdBackupRunResult, String> {
         .list_sites_with_stats()
         .await
         .map_err(|error| error.to_string())?;
-    if let Err(error) = validate_config(&mut config, &sites) {
-        return Err(error);
-    }
+    validate_config(&mut config)?;
     if config.webdav_url.is_empty() {
         return Err("请先配置 WebDAV 地址".to_string());
     }
 
     let now = Utc::now();
-    let (archive, site_count) = build_ptd_archive(&sites, &config.site_mappings, now)?;
+    let (archive, site_count) = build_ptd_archive(&sites, now)?;
     if site_count == 0 {
-        return Err("没有可备份的站点用户信息，请先刷新站点统计".to_string());
+        return Err("没有可备份的已识别 PTD 站点用户信息，请检查站点域名并刷新统计".to_string());
     }
 
     let filename = format!("PTD_backup_{}.zip", now.format("%Y%m%dT%H%M"));
@@ -222,7 +191,6 @@ async fn perform_backup(db: &Database) -> Result<PtdBackupRunResult, String> {
 
 fn build_ptd_archive(
     sites: &[SiteWithStats],
-    mappings: &BTreeMap<i64, String>,
     now: DateTime<Utc>,
 ) -> Result<(Vec<u8>, usize), String> {
     let mut user_info = Map::new();
@@ -230,20 +198,23 @@ fn build_ptd_archive(
         let Some(stats) = site.stats.as_ref().filter(|stats| has_user_stats(stats)) else {
             continue;
         };
-        let ptd_site_id = resolved_ptd_site_id(site, mappings)?;
+        let Some(ptd_site_id) = ptd_site_id(site) else {
+            continue;
+        };
         let update_at = stats
             .updated_at
             .as_deref()
             .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc))
             .unwrap_or(now);
-        let snapshot = ptd_user_snapshot(&ptd_site_id, stats, update_at.timestamp_millis());
+        let snapshot = ptd_user_snapshot(ptd_site_id, stats, update_at.timestamp_millis());
         user_info.insert(
-            ptd_site_id,
+            ptd_site_id.to_string(),
             json!({ update_at.format("%Y-%m-%d").to_string(): snapshot }),
         );
     }
 
+    let site_count = user_info.len();
     let user_info_bytes = serde_json::to_vec(&Value::Object(user_info))
         .map_err(|error| format!("生成 userInfo.json 失败: {error}"))?;
     let user_info_hash = format!("{:x}", md5::compute(&user_info_bytes));
@@ -278,13 +249,7 @@ fn build_ptd_archive(
         .finish()
         .map_err(|error| format!("完成 PTD ZIP 失败: {error}"))?
         .into_inner();
-    Ok((
-        archive,
-        sites
-            .iter()
-            .filter(|site| site.stats.as_ref().is_some_and(has_user_stats))
-            .count(),
-    ))
+    Ok((archive, site_count))
 }
 
 fn ptd_user_snapshot(site_id: &str, stats: &SiteStatsRecord, update_at: i64) -> Value {
@@ -331,38 +296,6 @@ fn has_user_stats(stats: &SiteStatsRecord) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
         && stats.uploaded.is_some()
         && stats.downloaded.is_some()
-}
-
-fn resolved_ptd_site_id(
-    site: &SiteWithStats,
-    mappings: &BTreeMap<i64, String>,
-) -> Result<String, String> {
-    let value = mappings
-        .get(&site.id)
-        .cloned()
-        .unwrap_or_else(|| suggested_ptd_site_id(site));
-    let value = value.trim().to_ascii_lowercase();
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
-    {
-        return Err(format!(
-            "{} 的 PTD 站点标识必须由 1-64 位小写字母或数字组成",
-            site.name
-        ));
-    }
-    Ok(value)
-}
-
-fn ptd_site_id_slug(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .take(64)
-        .collect()
 }
 
 fn normalize_webdav_url(value: &str) -> Result<String, String> {
@@ -456,7 +389,7 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-09-04T13:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let (archive, count) = build_ptd_archive(&[sample_site()], &BTreeMap::new(), now).unwrap();
+        let (archive, count) = build_ptd_archive(&[sample_site()], now).unwrap();
         assert_eq!(count, 1);
 
         let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
@@ -486,26 +419,25 @@ mod tests {
     }
 
     #[test]
-    fn config_rejects_duplicate_site_ids() {
-        let first = sample_site();
-        let mut second = sample_site();
-        second.id = 10;
-        second.name = "Other".to_string();
-        second.site_type = "nexusphp".to_string();
-        let mut config = PtdBackupConfig {
-            enabled: true,
-            webdav_url: "https://dav.example/ptd".to_string(),
-            username: String::new(),
-            password: String::new(),
-            use_proxy: false,
-            backup_interval_hours: 24,
-            site_mappings: BTreeMap::from([(9, "mteam".to_string()), (10, "mteam".to_string())]),
-            last_backup_at: None,
-            last_backup_filename: None,
-            last_error: None,
-            updated_at: String::new(),
-        };
-        assert!(validate_config(&mut config, &[first, second]).is_err());
+    fn ptd_site_id_comes_from_the_official_catalog() {
+        let mut site = sample_site();
+        assert_eq!(ptd_site_id(&site), Some("mteam"));
+
+        site.site_type = "nexusphp".to_string();
+        site.base_url = "https://chdbits.co/".to_string();
+        assert_eq!(ptd_site_id(&site), Some("chdbits"));
+
+        site.base_url = "https://tracker.invalid/".to_string();
+        assert_eq!(ptd_site_id(&site), None);
+    }
+
+    #[test]
+    fn archive_skips_sites_that_ptd_does_not_recognize() {
+        let mut site = sample_site();
+        site.site_type = "nexusphp".to_string();
+        site.base_url = "https://tracker.invalid/".to_string();
+        let (_, count) = build_ptd_archive(&[site], Utc::now()).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -598,7 +530,6 @@ mod tests {
         config.webdav_url = format!("http://{address}/dav");
         config.username = "alice".to_string();
         config.password = "secret".to_string();
-        config.site_mappings.insert(site_id, "mteam".to_string());
         db.update_ptd_backup_config(&config).await.unwrap();
 
         let result = backup_now(&db).await.unwrap();

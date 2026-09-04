@@ -94,7 +94,7 @@ export type PtdBackupConfig = {
   password_configured: boolean;
   use_proxy: boolean;
   backup_interval_hours: number;
-  site_mappings: Record<string, string>;
+  site_identifiers: Record<string, string | null>;
   configured: boolean;
   last_backup_at: string | null;
   last_backup_filename: string | null;

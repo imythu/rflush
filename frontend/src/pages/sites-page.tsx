@@ -172,7 +172,6 @@ interface PtdBackupForm {
   clear_password: boolean;
   use_proxy: boolean;
   backup_interval_hours: number;
-  site_mappings: Record<string, string>;
 }
 
 const emptyPtdBackupForm: PtdBackupForm = {
@@ -183,7 +182,6 @@ const emptyPtdBackupForm: PtdBackupForm = {
   clear_password: false,
   use_proxy: false,
   backup_interval_hours: 24,
-  site_mappings: {},
 };
 
 const defaultRequestHeaders: ReadonlyArray<Readonly<SiteRequestHeader>> = [
@@ -772,10 +770,10 @@ export function SitesPage() {
         site.site_type,
         site.stats?.username,
         site.stats?.uid,
-        ptdConfig?.site_mappings[String(site.id)],
+        ptdConfig?.site_identifiers[String(site.id)],
       ].some((value) => value?.toLocaleLowerCase().includes(query));
     });
-  }, [ptdConfig?.site_mappings, siteQuery, siteStatusFilter, siteTypeFilter, sites]);
+  }, [ptdConfig?.site_identifiers, siteQuery, siteStatusFilter, siteTypeFilter, sites]);
   const sitePageCount = Math.max(1, Math.ceil(filteredSites.length / SITE_PAGE_SIZE));
   const pagedSites = filteredSites.slice(
     (sitePage - 1) * SITE_PAGE_SIZE,
@@ -1259,9 +1257,8 @@ export function SitesPage() {
             clear_password: false,
             use_proxy: config.use_proxy,
             backup_interval_hours: config.backup_interval_hours,
-            site_mappings: { ...config.site_mappings },
           }
-        : { ...emptyPtdBackupForm, site_mappings: {} },
+        : { ...emptyPtdBackupForm },
     );
     setPtdFormError("");
     setPtdTestResult(null);
@@ -1272,12 +1269,6 @@ export function SitesPage() {
     return {
       ...ptdForm,
       backup_interval_hours: Number(ptdForm.backup_interval_hours),
-      site_mappings: Object.fromEntries(
-        Object.entries(ptdForm.site_mappings).map(([siteId, value]) => [
-          siteId,
-          value.trim().toLowerCase(),
-        ]),
-      ),
     };
   }
 
@@ -1644,7 +1635,7 @@ export function SitesPage() {
                               {site.base_url}
                             </div>
                             <div className="mt-1 font-mono text-[10px] text-primary">
-                              PTD: {ptdConfig?.site_mappings[String(site.id)] ?? "未映射"}
+                              PTD: {ptdConfig?.site_identifiers[String(site.id)] ?? "未识别"}
                             </div>
                           </div>
                         </TableCell>
@@ -1909,33 +1900,32 @@ export function SitesPage() {
           <section className="min-w-0 space-y-3" aria-labelledby="ptd-mappings-heading">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <h4 id="ptd-mappings-heading" className="font-black">PTD 站点标识</h4>
-                <p className="mt-1 text-xs leading-5 text-muted">必须与 PT-Depiler 的站点 ID 一致，仅允许小写字母和数字。</p>
+                <h4 id="ptd-mappings-heading" className="font-black">PTD 站点识别</h4>
+                <p className="mt-1 text-xs leading-5 text-muted">根据站点类型和域名自动匹配 PT-Depiler 官方站点 ID，无需手动填写。</p>
               </div>
-              <span className="shrink-0 rounded-full bg-secondary px-2.5 py-1 text-[10px] font-bold text-primary">{sites.length} 个站点</span>
+              <span className="shrink-0 rounded-full bg-secondary px-2.5 py-1 text-[10px] font-bold text-primary">
+                {Object.values(ptdConfig?.site_identifiers ?? {}).filter(Boolean).length} / {sites.length} 已识别
+              </span>
             </div>
             <div className="max-h-[min(50dvh,32rem)] space-y-2 overflow-y-auto rounded-2xl border border-border bg-surface-container/40 p-2.5">
               {sites.length === 0 ? (
                 <p className="py-10 text-center text-sm text-muted">请先添加站点</p>
-              ) : sites.map((site) => (
-                <div key={site.id} className="grid gap-2 rounded-xl border border-border/70 bg-card/80 p-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,0.8fr)] sm:items-center">
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-bold">{site.name}</div>
-                    <div className="mt-0.5 truncate text-[10px] text-muted">{site.base_url}</div>
+              ) : sites.map((site) => {
+                const identifier = ptdConfig?.site_identifiers[String(site.id)];
+                return (
+                  <div key={site.id} className="flex items-center justify-between gap-3 rounded-xl border border-border/70 bg-card/80 p-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-bold">{site.name}</div>
+                      <div className="mt-0.5 truncate text-[10px] text-muted">{site.base_url}</div>
+                    </div>
+                    {identifier ? (
+                      <span className="shrink-0 rounded-lg bg-primary/10 px-2.5 py-1 font-mono text-xs font-bold text-primary">{identifier}</span>
+                    ) : (
+                      <span className="shrink-0 rounded-lg bg-amber-100 px-2.5 py-1 text-[10px] font-bold text-amber-800">未识别，不备份</span>
+                    )}
                   </div>
-                  <Input
-                    value={ptdForm.site_mappings[String(site.id)] ?? ""}
-                    onChange={(event) => setPtdForm((current) => ({
-                      ...current,
-                      site_mappings: { ...current.site_mappings, [String(site.id)]: event.target.value.toLowerCase().replace(/[^a-z0-9]/g, "") },
-                    }))}
-                    className="h-9 rounded-xl font-mono text-xs"
-                    placeholder="例如 mteam"
-                    aria-label={`${site.name} 的 PTD 站点标识`}
-                    spellCheck={false}
-                  />
-                </div>
-              ))}
+                );
+              })}
             </div>
             {ptdTestResult ? (
               <div className={`flex items-start gap-2 rounded-2xl border px-3 py-2.5 text-sm ${ptdTestResult.success ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-red-200 bg-red-50 text-red-700"}`} role="status">

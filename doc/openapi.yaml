@@ -896,8 +896,8 @@ components:
 
     PtdBackupConfigResponse:
       type: object
-      description: Hive PTD-compatible WebDAV configuration with its password redacted.
-      required: [enabled, webdav_url, username, password_configured, use_proxy, backup_interval_hours, site_mappings, configured, last_backup_at, last_backup_filename, last_error, updated_at]
+      description: Hive PTD-compatible WebDAV configuration with its password redacted and PT-Depiler site IDs resolved automatically from site hosts.
+      required: [enabled, webdav_url, username, password_configured, use_proxy, backup_interval_hours, site_identifiers, configured, last_backup_at, last_backup_filename, last_error, updated_at]
       properties:
         enabled: {type: boolean}
         webdav_url: {type: string, format: uri}
@@ -905,10 +905,11 @@ components:
         password_configured: {type: boolean, readOnly: true}
         use_proxy: {type: boolean}
         backup_interval_hours: {type: integer, format: int64, minimum: 1, maximum: 720}
-        site_mappings:
+        site_identifiers:
           type: object
-          description: Map of local numeric site IDs to PT-Depiler site IDs.
-          additionalProperties: {type: string, pattern: '^[0-9a-z]{1,64}$'}
+          readOnly: true
+          description: Map of local numeric site IDs to automatically resolved PT-Depiler site IDs; null means the host is unsupported and will not be backed up.
+          additionalProperties: {type: string, nullable: true}
         configured: {type: boolean, readOnly: true}
         last_backup_at: {type: string, format: date-time, nullable: true, readOnly: true}
         last_backup_filename: {type: string, nullable: true, readOnly: true}
@@ -927,10 +928,6 @@ components:
         clear_password: {type: boolean, default: false}
         use_proxy: {type: boolean, default: false}
         backup_interval_hours: {type: integer, format: int64, minimum: 1, maximum: 720}
-        site_mappings:
-          type: object
-          additionalProperties: {type: string, pattern: '^[0-9a-z]{1,64}$'}
-
     PtdBackupTestResponse:
       type: object
       required: [success, message]
