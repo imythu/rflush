@@ -106,6 +106,39 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/IdResponse'}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/sites/ptd-backup:
+    get:
+      summary: Read Hive PTD-compatible WebDAV backup configuration
+      description: The stored WebDAV password is never returned.
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/PtdBackupConfigResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+    put:
+      summary: Update Hive PTD-compatible WebDAV backup configuration
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdatePtdBackupConfigRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/PtdBackupConfigResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sites/ptd-backup/test:
+    post:
+      summary: Test an unsaved or stored WebDAV configuration with PROPFIND
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdatePtdBackupConfigRequest'}}}
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/PtdBackupTestResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
+  /api/sites/ptd-backup/run:
+    post:
+      summary: Generate and upload a PT-Depiler-compatible user information ZIP now
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/PtdBackupRunResponse'}}}}
+        default: {$ref: '#/components/responses/Error'}
+
   /api/sites/{id}:
     put:
       parameters: [{$ref: '#/components/parameters/IdPath'}]
@@ -860,6 +893,59 @@ components:
       required: [refreshing]
       properties:
         refreshing: {type: boolean}
+
+    PtdBackupConfigResponse:
+      type: object
+      description: Hive PTD-compatible WebDAV configuration with its password redacted.
+      required: [enabled, webdav_url, username, password_configured, use_proxy, backup_interval_hours, site_mappings, configured, last_backup_at, last_backup_filename, last_error, updated_at]
+      properties:
+        enabled: {type: boolean}
+        webdav_url: {type: string, format: uri}
+        username: {type: string}
+        password_configured: {type: boolean, readOnly: true}
+        use_proxy: {type: boolean}
+        backup_interval_hours: {type: integer, format: int64, minimum: 1, maximum: 720}
+        site_mappings:
+          type: object
+          description: Map of local numeric site IDs to PT-Depiler site IDs.
+          additionalProperties: {type: string, pattern: '^[0-9a-z]{1,64}$'}
+        configured: {type: boolean, readOnly: true}
+        last_backup_at: {type: string, format: date-time, nullable: true, readOnly: true}
+        last_backup_filename: {type: string, nullable: true, readOnly: true}
+        last_error: {type: string, nullable: true, readOnly: true}
+        updated_at: {type: string, format: date-time, readOnly: true}
+
+    UpdatePtdBackupConfigRequest:
+      type: object
+      additionalProperties: false
+      required: [webdav_url, backup_interval_hours]
+      properties:
+        enabled: {type: boolean, default: false}
+        webdav_url: {type: string}
+        username: {type: string, default: ''}
+        password: {type: string, nullable: true, description: Omit or send an empty string to preserve the stored password.}
+        clear_password: {type: boolean, default: false}
+        use_proxy: {type: boolean, default: false}
+        backup_interval_hours: {type: integer, format: int64, minimum: 1, maximum: 720}
+        site_mappings:
+          type: object
+          additionalProperties: {type: string, pattern: '^[0-9a-z]{1,64}$'}
+
+    PtdBackupTestResponse:
+      type: object
+      required: [success, message]
+      properties:
+        success: {type: boolean}
+        message: {type: string}
+
+    PtdBackupRunResponse:
+      type: object
+      required: [filename, site_count, size, backed_up_at]
+      properties:
+        filename: {type: string, example: PTD_backup_20260904T1200.zip}
+        site_count: {type: integer, minimum: 1}
+        size: {type: integer, minimum: 1, description: ZIP size in bytes.}
+        backed_up_at: {type: string, format: date-time}
 
     SiteCredentialsResponse:
       type: object

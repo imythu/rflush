@@ -16,11 +16,13 @@ use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
 mod media;
 mod openlist;
+mod ptd_backup;
 
 pub use openlist::{
     ManualMediaRelocationTarget, MediaRelocationJob, OpenListConfig, OpenListPathMapping,
     OpenListTargetDirectory,
 };
+pub use ptd_backup::PtdBackupConfig;
 
 #[derive(Clone)]
 pub struct Database {
@@ -2198,6 +2200,26 @@ impl Database {
                     last_checked_at TEXT NOT NULL,
                     last_error TEXT
                 );
+
+                CREATE TABLE IF NOT EXISTS ptd_backup_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    webdav_url TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    use_proxy INTEGER NOT NULL DEFAULT 0,
+                    backup_interval_hours INTEGER NOT NULL DEFAULT 24,
+                    site_mappings_json TEXT NOT NULL DEFAULT '{}',
+                    last_backup_at TEXT,
+                    last_backup_filename TEXT,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                INSERT OR IGNORE INTO ptd_backup_settings
+                    (id, enabled, webdav_url, username, password, use_proxy,
+                     backup_interval_hours, site_mappings_json, updated_at)
+                VALUES (1, 0, '', '', '', 0, 24, '{}', CURRENT_TIMESTAMP);
 
                 CREATE TABLE IF NOT EXISTS downloaders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,

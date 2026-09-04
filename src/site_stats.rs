@@ -109,7 +109,9 @@ impl SiteStatsRefresher {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
 
-        self.db.list_sites_with_stats().await
+        let sites = self.db.list_sites_with_stats().await?;
+        crate::ptd_backup::backup_if_due(&self.db).await;
+        Ok(sites)
     }
 }
 

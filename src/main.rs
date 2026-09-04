@@ -11,6 +11,7 @@ mod media;
 mod monitor;
 mod net;
 mod openlist;
+mod ptd_backup;
 mod relocation;
 mod rss;
 mod sign_in;

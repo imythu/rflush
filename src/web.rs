@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -44,6 +44,7 @@ use crate::media::tmdb::{TmdbDetails, TmdbError, TmdbMedia, TmdbMediaType, TmdbS
 use crate::monitor::{SystemMonitor, SystemSnapshot, SystemSnapshotRecord};
 use crate::net::client_factory;
 use crate::openlist::{OpenListClient, OpenListTask, openlist_identity_key};
+use crate::ptd_backup::{PtdBackupRunResult, suggested_ptd_site_id};
 use crate::relocation::{
     RelocationScheduler, archive_relative_directory, is_path_prefix, join_path, normalize_path,
     torrent_is_complete, validate_torrent_files_complete,
@@ -189,6 +190,12 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         .route("/api/settings", get(get_settings).put(update_settings))
         // 站点管理
         .route("/api/sites", get(list_sites).post(create_site))
+        .route(
+            "/api/sites/ptd-backup",
+            get(get_ptd_backup_config).put(update_ptd_backup_config),
+        )
+        .route("/api/sites/ptd-backup/test", post(test_ptd_backup))
+        .route("/api/sites/ptd-backup/run", post(run_ptd_backup))
         .route("/api/sites/stats-overview", get(get_sites_stats_overview))
         .route(
             "/api/sites/refresh-all",
@@ -2527,6 +2534,46 @@ struct SiteStatsRefreshStatusResponse {
     refreshing: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct PtdBackupConfigResponse {
+    enabled: bool,
+    webdav_url: String,
+    username: String,
+    password_configured: bool,
+    use_proxy: bool,
+    backup_interval_hours: u64,
+    site_mappings: BTreeMap<i64, String>,
+    configured: bool,
+    last_backup_at: Option<String>,
+    last_backup_filename: Option<String>,
+    last_error: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdatePtdBackupConfigRequest {
+    #[serde(default)]
+    enabled: bool,
+    webdav_url: String,
+    #[serde(default)]
+    username: String,
+    password: Option<String>,
+    #[serde(default)]
+    clear_password: bool,
+    #[serde(default)]
+    use_proxy: bool,
+    backup_interval_hours: u64,
+    #[serde(default)]
+    site_mappings: BTreeMap<i64, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PtdBackupTestResponse {
+    success: bool,
+    message: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2545,6 +2592,35 @@ impl From<SiteWithStats> for SiteResponse {
             created_at: site.created_at,
             updated_at: site.updated_at,
             stats: site.stats,
+        }
+    }
+}
+
+impl PtdBackupConfigResponse {
+    fn new(mut config: crate::db::PtdBackupConfig, sites: &[SiteWithStats]) -> Self {
+        let site_ids = sites.iter().map(|site| site.id).collect::<HashSet<_>>();
+        config
+            .site_mappings
+            .retain(|site_id, _| site_ids.contains(site_id));
+        for site in sites {
+            config
+                .site_mappings
+                .entry(site.id)
+                .or_insert_with(|| suggested_ptd_site_id(site));
+        }
+        Self {
+            enabled: config.enabled,
+            configured: !config.webdav_url.trim().is_empty(),
+            webdav_url: config.webdav_url,
+            username: config.username,
+            password_configured: !config.password.is_empty(),
+            use_proxy: config.use_proxy,
+            backup_interval_hours: config.backup_interval_hours,
+            site_mappings: config.site_mappings,
+            last_backup_at: config.last_backup_at,
+            last_backup_filename: config.last_backup_filename,
+            last_error: config.last_error,
+            updated_at: config.updated_at,
         }
     }
 }
@@ -2759,6 +2835,108 @@ fn resolve_site_auth_update(
         Some(auth) => merge_site_auth(existing_auth, auth),
         None => Ok(existing_auth),
     }
+}
+
+fn resolve_ptd_backup_config_update(
+    current: crate::db::PtdBackupConfig,
+    body: UpdatePtdBackupConfigRequest,
+) -> Result<crate::db::PtdBackupConfig, ApiError> {
+    if body.clear_password
+        && body
+            .password
+            .as_deref()
+            .is_some_and(|password| !password.is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "WebDAV 密码和 clear_password 不能同时提交",
+        ));
+    }
+    let password = if body.clear_password {
+        String::new()
+    } else {
+        body.password
+            .filter(|password| !password.is_empty())
+            .unwrap_or(current.password)
+    };
+    Ok(crate::db::PtdBackupConfig {
+        enabled: body.enabled,
+        webdav_url: body.webdav_url,
+        username: body.username,
+        password,
+        use_proxy: body.use_proxy,
+        backup_interval_hours: body.backup_interval_hours,
+        site_mappings: body.site_mappings,
+        last_backup_at: current.last_backup_at,
+        last_backup_filename: current.last_backup_filename,
+        last_error: current.last_error,
+        updated_at: current.updated_at,
+    })
+}
+
+async fn get_ptd_backup_config(
+    State(state): State<AppState>,
+) -> Result<Json<PtdBackupConfigResponse>, ApiError> {
+    let config = state.db.get_ptd_backup_config().await?;
+    let sites = state.db.list_sites_with_stats().await?;
+    Ok(Json(PtdBackupConfigResponse::new(config, &sites)))
+}
+
+async fn update_ptd_backup_config(
+    State(state): State<AppState>,
+    Json(body): Json<UpdatePtdBackupConfigRequest>,
+) -> Result<Json<PtdBackupConfigResponse>, ApiError> {
+    let current = state.db.get_ptd_backup_config().await?;
+    let mut config = resolve_ptd_backup_config_update(current, body)?;
+    let sites = state.db.list_sites_with_stats().await?;
+    crate::ptd_backup::validate_config(&mut config, &sites).map_err(ApiError::bad_request)?;
+    state.db.update_ptd_backup_config(&config).await?;
+    let saved = state.db.get_ptd_backup_config().await?;
+    Ok(Json(PtdBackupConfigResponse::new(saved, &sites)))
+}
+
+async fn test_ptd_backup(
+    State(state): State<AppState>,
+    Json(body): Json<UpdatePtdBackupConfigRequest>,
+) -> Result<Json<PtdBackupTestResponse>, ApiError> {
+    let current = state.db.get_ptd_backup_config().await?;
+    let mut config = resolve_ptd_backup_config_update(current, body)?;
+    let sites = state.db.list_sites_with_stats().await?;
+    if let Err(message) = crate::ptd_backup::validate_config(&mut config, &sites) {
+        return Ok(Json(PtdBackupTestResponse {
+            success: false,
+            message,
+        }));
+    }
+    if config.webdav_url.is_empty() {
+        return Ok(Json(PtdBackupTestResponse {
+            success: false,
+            message: "请填写 WebDAV 地址".to_string(),
+        }));
+    }
+    let settings = state.db.get_settings().await?;
+    let proxy = config
+        .use_proxy
+        .then_some(settings.proxy.as_deref())
+        .flatten();
+    match crate::ptd_backup::test_webdav(&config, proxy).await {
+        Ok(()) => Ok(Json(PtdBackupTestResponse {
+            success: true,
+            message: "WebDAV 认证成功，目标目录可以访问".to_string(),
+        })),
+        Err(message) => Ok(Json(PtdBackupTestResponse {
+            success: false,
+            message,
+        })),
+    }
+}
+
+async fn run_ptd_backup(
+    State(state): State<AppState>,
+) -> Result<Json<PtdBackupRunResult>, ApiError> {
+    crate::ptd_backup::backup_now(&state.db)
+        .await
+        .map(Json)
+        .map_err(ApiError::bad_gateway)
 }
 
 async fn list_sites(State(state): State<AppState>) -> Result<Json<Vec<SiteResponse>>, ApiError> {
@@ -5858,6 +6036,27 @@ mod security_boundary_tests {
                 .to_string()
                 .contains("dummy-downloader-secret")
         );
+
+        let ptd = PtdBackupConfigResponse::new(
+            crate::db::PtdBackupConfig {
+                enabled: true,
+                webdav_url: "https://dav.example/ptd/".to_string(),
+                username: "operator".to_string(),
+                password: "dummy-webdav-secret".to_string(),
+                use_proxy: false,
+                backup_interval_hours: 24,
+                site_mappings: BTreeMap::new(),
+                last_backup_at: None,
+                last_backup_filename: None,
+                last_error: None,
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+            &[],
+        );
+        let ptd_json = serde_json::to_value(ptd).unwrap();
+        assert_eq!(ptd_json["password_configured"], true);
+        assert!(ptd_json.get("password").is_none());
+        assert!(!ptd_json.to_string().contains("dummy-webdav-secret"));
     }
 
     #[test]
@@ -5929,6 +6128,48 @@ mod security_boundary_tests {
                 false,
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn ptd_backup_update_preserves_or_explicitly_clears_password() {
+        fn current() -> crate::db::PtdBackupConfig {
+            crate::db::PtdBackupConfig {
+                enabled: false,
+                webdav_url: "https://dav.example/ptd/".to_string(),
+                username: "alice".to_string(),
+                password: "saved-secret".to_string(),
+                use_proxy: false,
+                backup_interval_hours: 24,
+                site_mappings: BTreeMap::new(),
+                last_backup_at: None,
+                last_backup_filename: None,
+                last_error: None,
+                updated_at: String::new(),
+            }
+        }
+
+        let request = |clear_password| UpdatePtdBackupConfigRequest {
+            enabled: false,
+            webdav_url: "https://dav.example/ptd/".to_string(),
+            username: "alice".to_string(),
+            password: Some(String::new()),
+            clear_password,
+            use_proxy: false,
+            backup_interval_hours: 24,
+            site_mappings: BTreeMap::new(),
+        };
+        assert_eq!(
+            resolve_ptd_backup_config_update(current(), request(false))
+                .unwrap()
+                .password,
+            "saved-secret"
+        );
+        assert!(
+            resolve_ptd_backup_config_update(current(), request(true))
+                .unwrap()
+                .password
+                .is_empty()
         );
     }
 

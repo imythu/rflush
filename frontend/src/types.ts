@@ -87,6 +87,33 @@ export type SiteStatsRefreshStatusResponse = {
   refreshing: boolean;
 };
 
+export type PtdBackupConfig = {
+  enabled: boolean;
+  webdav_url: string;
+  username: string;
+  password_configured: boolean;
+  use_proxy: boolean;
+  backup_interval_hours: number;
+  site_mappings: Record<string, string>;
+  configured: boolean;
+  last_backup_at: string | null;
+  last_backup_filename: string | null;
+  last_error: string | null;
+  updated_at: string;
+};
+
+export type PtdBackupTestResult = {
+  success: boolean;
+  message: string;
+};
+
+export type PtdBackupRunResult = {
+  filename: string;
+  site_count: number;
+  size: number;
+  backed_up_at: string;
+};
+
 export type UserStats = {
   uid: string | null;
   username: string;
