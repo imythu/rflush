@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
@@ -13,6 +13,9 @@ use crate::site::SiteWithStats;
 use crate::site::factory as site_factory;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+// PT-Depiler 使用队列限制用户信息刷新并发。这里也限制同时访问的站点数，
+// 避免大量站点经同一代理请求时触发限流或连接资源耗尽。
+const REFRESH_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct SiteStatsRefresher {
@@ -76,7 +79,7 @@ impl SiteStatsRefresher {
         let settings = self.db.get_settings().await?;
         let proxy = settings.proxy.as_deref();
         let db = self.db.clone();
-        join_all(sites.into_iter().map(|site| {
+        stream::iter(sites.into_iter().map(|site| {
             let db = db.clone();
             async move {
                 let checked_at = Utc::now().to_rfc3339();
@@ -100,6 +103,8 @@ impl SiteStatsRefresher {
                 }
             }
         }))
+        .buffer_unordered(REFRESH_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;

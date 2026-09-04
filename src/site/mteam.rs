@@ -74,16 +74,18 @@ impl MTeamAdapter {
         let json: Value =
             serde_json::from_str(&text).map_err(|_| "响应不是有效JSON".to_string())?;
 
-        let code = json
-            .get("code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        if code != "0" && code != "SUCCESS" {
+        let code = json.get("code");
+        if !api_response_succeeded(&json) {
             let msg = json
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            return Err(format!("API错误 code={}: {}", code, msg));
+            return Err(format!(
+                "API错误 code={}: {}",
+                code.map(Value::to_string)
+                    .unwrap_or_else(|| "missing".to_string()),
+                msg
+            ));
         }
 
         Ok(json)
@@ -119,16 +121,18 @@ impl MTeamAdapter {
         let json: Value =
             serde_json::from_str(&text).map_err(|_| "响应不是有效JSON".to_string())?;
 
-        let code = json
-            .get("code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        if code != "0" && code != "SUCCESS" {
+        let code = json.get("code");
+        if !api_response_succeeded(&json) {
             let msg = json
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            return Err(format!("API错误 code={}: {}", code, msg));
+            return Err(format!(
+                "API错误 code={}: {}",
+                code.map(Value::to_string)
+                    .unwrap_or_else(|| "missing".to_string()),
+                msg
+            ));
         }
 
         Ok(json)
@@ -204,12 +208,14 @@ impl SiteAdapter for MTeamAdapter {
             let username = data
                 .get("username")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
+                .ok_or_else(|| "响应缺少用户名".to_string())?
                 .to_string();
 
             let uid = data
-                .get("uid")
-                .or_else(|| data.get("id"))
+                .get("id")
+                .or_else(|| data.get("uid"))
                 .or_else(|| data.get("userId"))
                 .or_else(|| data.get("memberId"))
                 .and_then(json_value_to_string);
@@ -218,45 +224,45 @@ impl SiteAdapter for MTeamAdapter {
 
             let uploaded = member_count
                 .get("uploaded")
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .or_else(|| v.as_u64())
-                })
-                .unwrap_or(0);
+                .and_then(json_value_to_u64)
+                .ok_or_else(|| "响应缺少上传量".to_string())?;
 
             let downloaded = member_count
                 .get("downloaded")
-                .and_then(|v| {
-                    v.as_str()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .or_else(|| v.as_u64())
-                })
-                .unwrap_or(0);
+                .and_then(json_value_to_u64)
+                .ok_or_else(|| "响应缺少下载量".to_string())?;
 
-            let ratio = member_count.get("shareRate").and_then(|v| {
-                v.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| v.as_f64())
-            });
+            let ratio = member_count
+                .get("shareRate")
+                .or_else(|| member_count.get("ratio"))
+                .and_then(json_value_to_f64)
+                .or_else(|| (downloaded > 0).then(|| uploaded as f64 / downloaded as f64));
 
-            let bonus = data.get("bonus").and_then(|v| {
-                v.as_str()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| v.as_f64())
-            });
+            // PT-Depiler 当前定义使用 data.memberCount.bonus；旧响应也可能放在 data.bonus。
+            let bonus = member_count
+                .get("bonus")
+                .or_else(|| data.get("bonus"))
+                .and_then(json_value_to_f64);
 
-            let seeding_count = member_count.get("seeding").and_then(|v| {
-                v.as_str()
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .or_else(|| v.as_u64().map(|n| n as u32))
-            });
+            let mut seeding_count = member_count
+                .get("seeding")
+                .or_else(|| member_count.get("seederCount"))
+                .and_then(json_value_to_u32);
 
-            let leeching_count = member_count.get("leeching").and_then(|v| {
-                v.as_str()
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .or_else(|| v.as_u64().map(|n| n as u32))
-            });
+            let leeching_count = member_count
+                .get("leeching")
+                .or_else(|| member_count.get("leecherCount"))
+                .and_then(json_value_to_u32);
+
+            // 新版 M-Team 把活动做种统计拆到了独立接口。
+            if seeding_count.is_none()
+                && let Ok(peer_json) = self.api_post("/api/tracker/myPeerStatistics", None).await
+            {
+                seeding_count = peer_json
+                    .get("data")
+                    .and_then(|peer_data| peer_data.get("seederCount"))
+                    .and_then(json_value_to_u32);
+            }
 
             Ok(UserStats {
                 uid,
@@ -358,6 +364,32 @@ fn json_value_to_string(value: &Value) -> Option<String> {
         .or_else(|| value.as_i64().map(|n| n.to_string()))
 }
 
+fn api_response_succeeded(value: &Value) -> bool {
+    value.get("code").is_some_and(|code| {
+        code.as_i64() == Some(0)
+            || code
+                .as_str()
+                .is_some_and(|code| code == "0" || code.eq_ignore_ascii_case("SUCCESS"))
+    })
+}
+
+fn json_value_to_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<u64>().ok())
+}
+
+fn json_value_to_u32(value: &Value) -> Option<u32> {
+    json_value_to_u64(value).and_then(|number| u32::try_from(number).ok())
+}
+
+fn json_value_to_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<f64>().ok())
+}
+
 fn parse_mteam_datetime(value: &str) -> Option<i64> {
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()?;
     let tz = FixedOffset::east_opt(8 * 3600)?;
@@ -370,8 +402,9 @@ fn parse_mteam_datetime(value: &str) -> Option<i64> {
 mod tests {
     use reqwest::Client;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use serde_json::json;
 
-    use super::{MTeamAdapter, SiteAuth};
+    use super::{MTeamAdapter, SiteAuth, api_response_succeeded};
 
     #[test]
     fn custom_headers_are_applied_without_overriding_api_key() {
@@ -437,5 +470,14 @@ mod tests {
             MTeamAdapter::extract_torrent_id("https://kp.m-team.cc/detail/1165802"),
             Some("1165802".to_string())
         );
+    }
+
+    #[test]
+    fn accepts_string_numeric_and_named_success_codes() {
+        assert!(api_response_succeeded(&json!({ "code": "0" })));
+        assert!(api_response_succeeded(&json!({ "code": 0 })));
+        assert!(api_response_succeeded(&json!({ "code": "SUCCESS" })));
+        assert!(!api_response_succeeded(&json!({ "code": "1" })));
+        assert!(!api_response_succeeded(&json!({ "data": {} })));
     }
 }
