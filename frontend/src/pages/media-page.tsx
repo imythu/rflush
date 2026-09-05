@@ -1,3 +1,4 @@
+import { useHashChoice, updateHashParams, readQueryDraft, writeQueryDraft } from "@/lib/navigation-state";
 import {
   type Dispatch,
   type FormEvent,
@@ -59,7 +60,10 @@ import {
 } from "@/lib/media-release-scope";
 import { cn } from "@/lib/utils";
 
-type MediaMode = "subscriptions" | "tmdb" | "resources" | "settings";
+const MEDIA_MODES = ["subscriptions", "tmdb", "resources", "settings"] as const;
+type MediaMode = typeof MEDIA_MODES[number];
+const SETTINGS_SECTIONS = ["media", "quality", "openlist"] as const;
+const SETTINGS_LABELS = { media: "媒体设置", quality: "质量配置", openlist: "OpenList" };
 type MediaType = "tv" | "movie";
 
 type MediaSettings = {
@@ -1051,7 +1055,7 @@ function extractSiteErrors(payload: unknown): string[] {
 }
 
 export function MediaPage() {
-  const [mode, setMode] = useState<MediaMode>("subscriptions");
+  const [mode, setMode] = useHashChoice<MediaMode>("mode", MEDIA_MODES, "subscriptions");
   const [settings, setSettings] = useState<MediaSettings>(DEFAULT_SETTINGS);
   const [clearTmdbToken, setClearTmdbToken] = useState(false);
   const [profiles, setProfiles] = useState<QualityProfile[]>([]);
@@ -1071,7 +1075,8 @@ export function MediaPage() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [busyKey, setBusyKey] = useState("");
 
-  const [tmdbQuery, setTmdbQuery] = useState("");
+  const [tmdbQuery, setTmdbQuery] = useState(() => readQueryDraft("tmdb"));
+  useEffect(() => writeQueryDraft("tmdb", tmdbQuery), [tmdbQuery]);
   const [tmdbType, setTmdbType] = useState<"multi" | MediaType>("multi");
   const [tmdbResults, setTmdbResults] = useState<TmdbMedia[]>([]);
   const [tmdbLoading, setTmdbLoading] = useState(false);
@@ -1105,9 +1110,11 @@ export function MediaPage() {
     rememberedResourceSiteIds.current = storedResourceSiteIds();
     return {
       ...EMPTY_RESOURCE_FORM,
+      query: readQueryDraft("resources"),
       siteIds: rememberedResourceSiteIds.current ?? [],
     };
   });
+  useEffect(() => writeQueryDraft("resources", resourceForm.query), [resourceForm.query]);
   const [resourceCandidates, setResourceCandidates] = useState<ResourceCandidate[]>([]);
   const [resourceErrors, setResourceErrors] = useState<string[]>([]);
   const [resourceTmdbResults, setResourceTmdbResults] = useState<TmdbMedia[]>([]);
@@ -2180,7 +2187,7 @@ export function MediaPage() {
             {prerequisites.map((item) => <li key={item.label}>
               {item.ready ? <span className="inline-flex min-h-11 items-center gap-2 text-sm"><CheckCircle2 className="size-4" />{item.label}已配置</span>
                 : item.href ? <a className="inline-flex min-h-11 items-center rounded-lg border border-border px-3 text-sm underline underline-offset-4" href={item.href} target="_blank" rel="noreferrer">配置{item.label}（新标签页）</a>
-                : <Button variant="outline" onClick={() => setMode("settings")}>配置{item.label}</Button>}
+                : <Button variant="outline" onClick={() => updateHashParams({ mode: "settings", section: item.label === "质量配置" ? "quality" : "media" })}>配置{item.label}</Button>}
             </li>)}
           </ul>
         </section>
@@ -4540,8 +4547,25 @@ function SettingsPanel({
   onEditQuality: (profile: QualityProfile) => void;
   onDeleteQuality: (profile: QualityProfile) => void;
 }) {
+  const [section, setSection] = useHashChoice("section", SETTINGS_SECTIONS, "media");
   return (
     <div className="flex flex-col gap-6">
+      <div role="tablist" aria-label="设置分区" className="flex flex-wrap gap-2 border-b border-border pb-3">
+        {SETTINGS_SECTIONS.map((key, index) => <button key={key} type="button" role="tab"
+          id={`settings-tab-${key}`} aria-controls={`settings-panel-${key}`} aria-selected={section === key}
+          tabIndex={section === key ? 0 : -1}
+          onClick={() => setSection(key)}
+          onKeyDown={(event) => {
+            const next = event.key === "ArrowRight" ? (index + 1) % 3 : event.key === "ArrowLeft" ? (index + 2) % 3 : event.key === "Home" ? 0 : event.key === "End" ? 2 : -1;
+            if (next < 0) return;
+            event.preventDefault(); setSection(SETTINGS_SECTIONS[next]);
+            document.getElementById(`settings-tab-${SETTINGS_SECTIONS[next]}`)?.focus();
+          }}
+          className={cn("min-h-11 rounded-lg px-4 text-sm font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary", section === key ? "bg-primary text-primary-foreground" : "text-muted hover:bg-accent")}>
+          {SETTINGS_LABELS[key]}
+        </button>)}
+      </div>
+      <div id="settings-panel-media" role="tabpanel" aria-labelledby="settings-tab-media" hidden={section !== "media"}>
       {settingsUnavailable ? <EmptyState icon={AlertCircle} title="媒体设置无法读取，暂不能编辑" action={{ label: "重新读取", onClick: onRetry }} /> : <Card>
         <CardHeader>
           <CardTitle>媒体设置</CardTitle>
@@ -4600,6 +4624,8 @@ function SettingsPanel({
         </CardContent>
       </Card>}
 
+      </div>
+      <div id="settings-panel-openlist" role="tabpanel" aria-labelledby="settings-tab-openlist" hidden={section !== "openlist"}>
       {openListSettings ? (
         <OpenListAutomationPanel
           settings={openListSettings}
@@ -4611,8 +4637,10 @@ function SettingsPanel({
           saving={busyKey === "save-openlist"}
           onSave={onSaveOpenList}
         />
-      ) : null}
+      ) : <EmptyState icon={AlertCircle} title="OpenList 设置暂不可用" action={{ label: "重新读取", onClick: onRetry }} />}
+      </div>
 
+      <div id="settings-panel-quality" role="tabpanel" aria-labelledby="settings-tab-quality" hidden={section !== "quality"}>
       {profilesUnavailable ? <EmptyState icon={AlertCircle} title="质量配置无法读取，暂不能编辑" action={{ label: "重新读取", onClick: onRetry }} /> : <Card>
         <CardHeader className="flex-row items-center justify-between gap-4">
           <div>
@@ -4697,6 +4725,7 @@ function SettingsPanel({
           )}
         </CardContent>
       </Card>}
+      </div>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useRef, useState, type SVGProps } from "react";
+import { Suspense, lazy, useEffect, useId, useRef, useState, type SVGProps } from "react";
 import {
   BarChart3,
   ChevronDown,
@@ -15,8 +15,9 @@ import {
   Tv,
   X,
 } from "lucide-react";
+import { createPortal } from "react-dom";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui/dialog";
+import { Dialog, getFocusableElements } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
@@ -48,7 +49,13 @@ type AppPage =
   | "stats"
   | "system-settings";
 
-type NavGroup = "brush" | "system";
+type NavGroup = "resources" | "connections" | "automation" | "system";
+const navGroups: Array<{ key: NavGroup; label: string }> = [
+  { key: "resources", label: "资源与订阅" },
+  { key: "connections", label: "连接配置" },
+  { key: "automation", label: "自动任务" },
+  { key: "system", label: "系统与监控" },
+];
 
 const SitesPage = lazy(() => import("@/pages/sites-page").then((module) => ({ default: module.SitesPage })));
 const DownloadersPage = lazy(() => import("@/pages/downloaders-page").then((module) => ({ default: module.DownloadersPage })));
@@ -72,61 +79,62 @@ const navItems: Array<{
   icon: typeof LayoutDashboard;
   group: NavGroup;
 }> = [
+  { key: "system-overview", label: "系统总览", description: "CPU、内存使用率与历史趋势", icon: LayoutDashboard, group: "system" },
   {
     key: "media",
     label: "自动追剧",
     description: "TMDB 订阅、PT 聚合搜索与自动下载",
     icon: Tv,
-    group: "brush",
+    group: "resources",
   },
   {
     key: "sites",
     label: "站点管理",
     description: "PT站点配置、连接测试与上传下载统计",
     icon: Database,
-    group: "brush",
+    group: "connections",
   },
   {
     key: "downloaders",
     label: "下载器",
     description: "管理下载客户端与空间状态",
     icon: HardDrive,
-    group: "brush",
+    group: "connections",
   },
   {
     key: "torrent-transfer",
     label: "种子转移",
     description: "选择 qBittorrent 种子并跟踪 OpenList 转移进度",
     icon: FolderInput,
-    group: "brush",
+    group: "resources",
   },
   {
     key: "brush-tasks",
     label: "刷流任务",
     description: "自动刷流任务配置、选种与删种规则",
     icon: Download,
-    group: "brush",
+    group: "automation",
   },
   {
     key: "sign-in",
     label: "自动签到",
     description: "NexusPHP 站点自动签到任务与执行记录",
     icon: CalendarCheck,
-    group: "brush",
+    group: "automation",
   },
   {
     key: "tag-rules",
     label: "标签规则",
     description: "根据 Tracker URL 自动匹配并管理种子标签",
     icon: Tag,
-    group: "brush",
+    group: "automation",
   },
   {
     key: "stats",
     label: "数据统计",
     description: "上传下载量、种子数与下载器趋势",
     icon: BarChart3,
-    group: "brush",
+    group: "system",
   },
   {
     key: "system-settings",
@@ -138,7 +146,7 @@ const navItems: Array<{
 ];
 
 function readPageFromHash(): AppPage {
-  const raw = window.location.hash.replace(/^#\/?/, "");
+  const raw = window.location.hash.replace(/^#\/?/, "").split("?")[0];
   const valid: AppPage[] = [
     "system-overview",
     "media",
@@ -157,8 +165,8 @@ function readPageFromHash(): AppPage {
   return raw === "" ? "system-overview" : "brush-tasks";
 }
 
-function setHash(page: AppPage) {
-  const next = page === "system-overview" ? "#/" : `#/${page}`;
+function setHash(page: AppPage, remembered?: string) {
+  const next = remembered || (page === "system-overview" ? "#/" : `#/${page}`);
   if (window.location.hash !== next) {
     window.location.hash = next;
   }
@@ -188,13 +196,15 @@ function getEffectiveLogLevel(settings: GlobalConfig): LogLevel {
 
 export default function App() {
   const [page, setPage] = useState<AppPage>(readPageFromHash());
+  const lastVisited = useRef(new Map<AppPage, string>());
   const [menuOpen, setMenuOpen] = useState(false);
   const [settings, setSettings] = useState<GlobalConfig>(defaultSettings);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
   const [currentTime, setCurrentTime] = useState(() => new Date());
-  const [automationOpen, setAutomationOpen] = useState(true);
+  const [closedGroups, setClosedGroups] = useState<NavGroup[]>([]);
+  const menuPanelRef = useRef<HTMLDivElement>(null);
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsConnected, setLogsConnected] = useState(false);
@@ -223,7 +233,11 @@ export default function App() {
   }
 
   useEffect(() => {
-    const onHashChange = () => setPage(readPageFromHash());
+    const onHashChange = () => {
+      const nextPage = readPageFromHash();
+      lastVisited.current.set(nextPage, window.location.hash);
+      setPage(nextPage);
+    };
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
@@ -242,10 +256,28 @@ export default function App() {
   useEffect(() => {
     if (!menuOpen) return;
 
+    const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusFrame = requestAnimationFrame(() => {
+      (menuPanelRef.current?.querySelector<HTMLElement>('[aria-label="关闭菜单"]') ?? menuPanelRef.current)?.focus();
+    });
+    const keepFocusInside = (event: FocusEvent) => {
+      if (!menuPanelRef.current?.contains(event.target as Node)) {
+        (getFocusableElements(menuPanelRef.current)[0] ?? menuPanelRef.current)?.focus();
+      }
+    };
     const previousBodyOverflow = document.body.style.overflow;
     const previousHtmlOverflow = document.documentElement.style.overflow;
     const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key === "Tab") {
+        const items = getFocusableElements(menuPanelRef.current);
+        const first = items[0], last = items[items.length - 1];
+        if (!first) { event.preventDefault(); menuPanelRef.current?.focus(); }
+        else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
       if (event.key === "Escape") {
+        event.preventDefault();
         setMenuOpen(false);
       }
     };
@@ -257,10 +289,15 @@ export default function App() {
 
     document.body.style.overflow = "hidden";
     document.documentElement.style.overflow = "hidden";
+    document.addEventListener("focusin", keepFocusInside);
     window.addEventListener("keydown", closeOnEscape);
     window.addEventListener("resize", closeOnDesktop);
+    closeOnDesktop();
 
     return () => {
+      cancelAnimationFrame(focusFrame);
+      document.removeEventListener("focusin", keepFocusInside);
+      if (previouslyFocused?.isConnected) previouslyFocused.focus();
       document.body.style.overflow = previousBodyOverflow;
       document.documentElement.style.overflow = previousHtmlOverflow;
       window.removeEventListener("keydown", closeOnEscape);
@@ -355,8 +392,9 @@ export default function App() {
   }, [logs, logsOpen]);
 
   function navigate(nextPage: AppPage) {
+    lastVisited.current.set(readPageFromHash(), window.location.hash);
     setPage(nextPage);
-    setHash(nextPage);
+    setHash(nextPage, lastVisited.current.get(nextPage));
     setMenuOpen(false);
   }
 
@@ -426,57 +464,21 @@ export default function App() {
 
       <div className="sidebar-scroll relative min-h-0 flex-1">
         <div className="flex flex-col gap-4 pb-1 pr-1">
-          <NavSection
-            index="01."
-            title="PT 自动化"
-            open={automationOpen}
-            onToggle={() => setAutomationOpen((open) => !open)}
-            items={navItems.filter((item) => item.group === "brush")}
-            page={page}
-            navigate={navigate}
-          />
-
-          <div className="rounded-[24px] border border-border bg-surface-container/70 p-2 lg:p-1.5">
-            <div className="mb-2 flex items-center justify-between px-2">
-              <span className="whitespace-nowrap text-[10px] font-black tracking-[0.18em] text-primary">02. 系统</span>
-              <span className="ml-3 h-px flex-1 bg-border" />
-            </div>
-            <div className="space-y-1.5">
-              {navItems
-                .filter((item) => item.group === "system")
-                .map((item) => {
-                  const Icon = item.icon;
-                  const active = item.key === page;
-                  return (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={() => navigate(item.key)}
-                      title={item.label}
-                      className={cn(
-                        "group/item relative flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-200",
-                        active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
-                      )}
-                    >
-                      <Icon className={cn("h-5 w-5 shrink-0", active ? "text-primary-foreground" : "text-primary")} />
-                      <div className="min-w-0">
-                        <span className="block whitespace-nowrap text-sm font-semibold">{item.label}</span>
-                        <span className={cn("mt-1 block line-clamp-1 text-[11px] leading-relaxed", active ? "text-primary-foreground/85" : "text-muted")}>
-                          {item.description}
-                        </span>
-                      </div>
-                    </button>
-                  );
-                })}
-            </div>
-          </div>
+          {navGroups.map((group) => (
+            <NavSection key={group.key} title={group.label}
+              open={!closedGroups.includes(group.key)}
+              onToggle={() => setClosedGroups((current) => current.includes(group.key)
+                ? current.filter((key) => key !== group.key) : [...current, group.key])}
+              items={navItems.filter((item) => item.group === group.key)}
+              page={page} navigate={navigate} />
+          ))}
         </div>
       </div>
     </aside>
   );
 
   return (
-    <main className="min-h-[100dvh] bg-background pb-24 text-foreground sm:px-4 sm:py-4 lg:px-6 lg:py-6 lg:pb-0">
+    <main inert={menuOpen} className="min-h-[100dvh] bg-background pb-24 text-foreground sm:px-4 sm:py-4 lg:px-6 lg:py-6 lg:pb-0">
       {/* Mobile Floating Dock */}
       <div className="mobile-dock fixed left-1/2 z-50 w-[92%] max-w-[440px] -translate-x-1/2 lg:hidden">
         <div className="rounded-[26px] border border-white/20 bg-card/80 p-2 shadow-2xl backdrop-blur-2xl flex items-center justify-between">
@@ -487,12 +489,12 @@ export default function App() {
           <button
             type="button"
             onClick={() => setMenuOpen(true)}
-            className="flex h-12 w-12 items-center justify-center rounded-2xl text-muted hover:bg-accent transition-colors"
+            className="flex min-h-14 flex-1 flex-col items-center justify-center gap-1 rounded-xl text-muted hover:bg-accent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             aria-label="打开全部菜单"
             aria-expanded={menuOpen}
             aria-controls="mobile-navigation"
           >
-            <Menu className="h-6 w-6" />
+            <Menu className="h-5 w-5" aria-hidden="true" /><span className="text-xs font-medium">菜单</span>
           </button>
         </div>
       </div>
@@ -502,12 +504,14 @@ export default function App() {
           {sidebar}
         </div>
 
-        {menuOpen ? (
+        {menuOpen ? createPortal(
           <div
             className="mobile-viewport fixed inset-0 z-[60] overflow-hidden bg-black/40 backdrop-blur-sm lg:hidden"
             onClick={() => setMenuOpen(false)}
           >
             <div
+              ref={menuPanelRef}
+              tabIndex={-1}
               id="mobile-navigation"
               className="mobile-menu-frame h-full w-[85vw] max-w-[320px]"
               role="dialog"
@@ -519,7 +523,7 @@ export default function App() {
                 {sidebar}
               </div>
             </div>
-          </div>
+          </div>, document.body
         ) : null}
 
         <section className="min-h-0 min-w-0 overflow-y-auto no-scrollbar">
@@ -539,13 +543,8 @@ export default function App() {
                   <Menu className="h-4 w-4" />
                 </Button>
                 <div className="min-w-0">
-                  <div className={cn("hidden flex-wrap items-center gap-2 lg:flex", (page === "media" || page === "sites") && "lg:hidden")}>
-                    <span className="rounded-full border border-primary/15 bg-secondary px-3 py-1 text-xs font-bold text-secondary-foreground">
-                      {currentNav.label}
-                    </span>
-                  </div>
-                  <h2 className={cn("truncate text-base font-black tracking-tight sm:text-lg lg:mt-2 lg:text-3xl", (page === "media" || page === "sites") && "lg:mt-0 lg:text-xl")}>{page === "media" || page === "sites" ? currentNav.label : currentNav.description}</h2>
-                  {page !== "media" && page !== "sites" ? <p className="mt-1 hidden text-sm leading-6 text-muted lg:block">实时后端日志、系统时间和当前模块状态集中在右侧，页面主体保持高密度操作。</p> : null}
+                  <h2 className="text-base font-bold leading-snug sm:text-xl">{currentNav.label}</h2>
+                  <p className="mt-1 hidden text-sm leading-6 text-muted lg:block">{currentNav.description}</p>
                 </div>
               </div>
 
@@ -553,7 +552,7 @@ export default function App() {
                 <div className="hidden rounded-full border border-border bg-surface-container/80 px-3 py-2 text-sm font-medium text-muted lg:block">
                   {currentTime.toLocaleString()}
                 </div>
-                <Button variant="outline" className="h-9 px-3 lg:h-10 lg:px-5" onClick={() => setLogsOpen(true)}>
+                <Button variant="outline" className="h-9 px-3 lg:h-10 lg:px-5" onClick={() => setLogsOpen(true)} aria-label="实时日志">
                   <FileText className="h-4 w-4 lg:mr-2" />
                   <span className="hidden lg:inline">实时日志</span>
                 </Button>
@@ -670,73 +669,31 @@ export default function App() {
   );
 }
 
-function NavSection({
-  index,
-  title,
-  open,
-  onToggle,
-  items,
-  page,
-  navigate,
-}: {
-  index: string;
-  title: string;
-  open: boolean;
-  onToggle: () => void;
-  items: Array<{
-    key: AppPage;
-    label: string;
-    description: string;
-    icon: typeof LayoutDashboard;
-  }>;
-  page: AppPage;
-  navigate: (page: AppPage) => void;
+function NavSection({ title, open, onToggle, items, page, navigate }: {
+  title: string; open: boolean; onToggle: () => void;
+  items: typeof navItems; page: AppPage; navigate: (page: AppPage) => void;
 }) {
+  const id = useId();
+  const current = items.find((item) => item.key === page);
   return (
-    <div className="rounded-[24px] border border-border bg-surface-container/70 p-2 lg:p-1.5 overflow-hidden">
-      <button type="button" onClick={onToggle} className="flex w-full items-center justify-between rounded-2xl px-2 py-1.5 text-left transition-colors hover:bg-accent/30">
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] font-black tracking-[0.18em] text-primary">{index}</span>
-          <span className="text-[10px] font-black tracking-[0.18em] text-primary whitespace-nowrap">{title}</span>
-        </div>
-        <ChevronDown className={cn("h-3.5 w-3.5 text-primary transition-transform", open ? "rotate-180" : "")} />
+    <div>
+      <button type="button" onClick={onToggle} aria-expanded={open} aria-controls={id}
+        className="flex min-h-11 w-full items-center justify-between gap-2 rounded-lg px-3 text-left text-sm font-medium text-muted hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+        <span>{title}{!open && current ? <span className="mt-1 block text-primary">当前：{current.label}</span> : null}</span>
+        <ChevronDown aria-hidden="true" className={cn("h-4 w-4 shrink-0 transition-transform", open && "rotate-180")} />
       </button>
-      {open ? (
-        <nav className="mt-2 flex flex-col gap-1.5">
-          {items.map((item) => {
-            const Icon = item.icon;
-            const active = item.key === page;
-            return (
-              <button
-                key={item.key}
-                type="button"
-                onClick={() => navigate(item.key)}
-                className={cn(
-                  "group/item relative flex w-full items-center gap-3 rounded-2xl px-2.5 py-2.5 text-left transition-all duration-200",
-                  active ? "bg-primary text-primary-foreground shadow-glow" : "hover:bg-accent",
-                )}
-              >
-                <span
-                  className={cn(
-                    "flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl border transition-colors",
-                    active
-                      ? "border-white/20 bg-white/15 text-primary-foreground"
-                      : "border-primary/10 bg-card/70 text-primary group-hover/item:border-primary/30",
-                  )}
-                >
-                  <Icon className="h-4 w-4" />
-                </span>
-                <div className="min-w-0">
-                  <span className="block text-sm font-semibold whitespace-nowrap">{item.label}</span>
-                  <span className={cn("mt-1 block text-[11px] leading-relaxed line-clamp-1", active ? "text-primary-foreground/85" : "text-muted")}>
-                    {item.description}
-                  </span>
-                </div>
-              </button>
-            );
-          })}
-        </nav>
-      ) : null}
+      <nav id={id} aria-label={title} hidden={!open} className="space-y-1">
+        {items.map((item) => {
+          const Icon = item.icon;
+          const active = item.key === page;
+          return <button key={item.key} type="button" onClick={() => navigate(item.key)}
+            aria-current={active ? "page" : undefined} title={item.description}
+            className={cn("flex min-h-11 w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2",
+              active ? "bg-primary text-primary-foreground" : "hover:bg-accent")}>
+            <Icon aria-hidden="true" className="h-5 w-5 shrink-0" /><span>{item.label}</span>
+          </button>;
+        })}
+      </nav>
     </div>
   );
 }
@@ -756,13 +713,15 @@ function DockItem({
     <button
       type="button"
       onClick={onClick}
+      aria-label={label}
+      aria-current={active ? "page" : undefined}
       className={cn(
-        "flex flex-col items-center justify-center h-12 w-12 rounded-2xl transition-all duration-300",
-        active ? "bg-primary text-primary-foreground shadow-glow scale-110" : "text-muted hover:bg-accent/50"
+        "flex flex-1 flex-col items-center justify-center min-h-14 gap-1 rounded-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+        active ? "bg-primary text-primary-foreground" : "text-muted hover:bg-accent/50"
       )}
     >
-      <Icon className="h-5 w-5" />
-      <span className={cn("text-[9px] font-bold mt-1", active ? "block" : "hidden")}>{label}</span>
+      <Icon className="h-5 w-5" aria-hidden="true" />
+      <span className="text-xs font-medium">{label}</span>
     </button>
   );
 }

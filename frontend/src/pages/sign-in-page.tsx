@@ -1,3 +1,4 @@
+import { useHashChoice } from "@/lib/navigation-state";
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import {
   AlertTriangle,
@@ -43,6 +44,7 @@ import type {
 
 const SIGN_IN_INTERVAL_HOURS = [6, 8, 12, 16, 20, 24] as const;
 type SignInIntervalHours = (typeof SIGN_IN_INTERVAL_HOURS)[number];
+const SIGN_IN_VIEWS = ["tasks", "records"] as const;
 type SignInView = "tasks" | "records";
 type SignInBrowser = "lightpanda" | "browserless";
 
@@ -138,7 +140,7 @@ export function SignInPage() {
   const [settingsDraft, setSettingsDraft] = useState<GlobalConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
-  const [activeView, setActiveView] = useState<SignInView>("tasks");
+  const [activeView, setActiveView] = useHashChoice<SignInView>("view", SIGN_IN_VIEWS, "tasks");
   const [searchTerm, setSearchTerm] = useState("");
   const [siteFilter, setSiteFilter] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
