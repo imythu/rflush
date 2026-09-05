@@ -16,6 +16,34 @@ pub struct PtdSitePreset {
 
 pub const SITE_PRESETS: &[PtdSitePreset] = &[
     PtdSitePreset {
+        ptd_id: "redacted",
+        name: "Redacted",
+        site_type: "gazelle",
+        base_url: "https://redacted.sh",
+        aliases: &["RED", "红种"],
+    },
+    PtdSitePreset {
+        ptd_id: "orpheus",
+        name: "Orpheus",
+        site_type: "gazelle",
+        base_url: "https://orpheus.network",
+        aliases: &["OPS"],
+    },
+    PtdSitePreset {
+        ptd_id: "dicmusic",
+        name: "DICMusic",
+        site_type: "gazelle",
+        base_url: "https://dicmusic.com",
+        aliases: &["DIC", "海豚"],
+    },
+    PtdSitePreset {
+        ptd_id: "greatposterwall",
+        name: "GreatPosterWall",
+        site_type: "gazelle",
+        base_url: "https://greatposterwall.com",
+        aliases: &["GPW", "海豹"],
+    },
+    PtdSitePreset {
         ptd_id: "13city",
         name: "13city",
         site_type: "nexusphp",
@@ -1171,11 +1199,11 @@ mod tests {
 
     #[test]
     fn exposes_only_site_types_supported_by_rflush() {
-        assert_eq!(SITE_PRESETS.len(), 164);
+        assert_eq!(SITE_PRESETS.len(), 168);
         assert!(
             SITE_PRESETS
                 .iter()
-                .all(|site| matches!(site.site_type, "nexusphp" | "mteam"))
+                .all(|site| matches!(site.site_type, "nexusphp" | "mteam" | "gazelle"))
         );
         let mteam = SITE_PRESETS
             .iter()

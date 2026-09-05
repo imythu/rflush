@@ -1,6 +1,8 @@
 pub mod factory;
 pub mod mteam;
 pub mod nexusphp;
+mod nexusphp_levels;
+pub mod gazelle;
 pub mod u2_shoutbox;
 
 use serde::{Deserialize, Serialize};
@@ -189,6 +191,7 @@ pub enum SiteAuth {
 pub enum SiteType {
     NexusPhp,
     MTeam,
+    Gazelle,
 }
 
 impl SiteType {
@@ -196,6 +199,7 @@ impl SiteType {
         match s {
             "nexusphp" | "nexus_php" => Some(SiteType::NexusPhp),
             "mteam" | "m_team" => Some(SiteType::MTeam),
+            "gazelle" => Some(SiteType::Gazelle),
             _ => None,
         }
     }
@@ -203,6 +207,9 @@ impl SiteType {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserStatsDetails {
+    /// PTD may identify an account by UUID while its AJAX endpoints require a numeric UID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptd_user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_donor: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,6 +374,36 @@ pub struct SiteWithStats {
     pub stats: Option<SiteStatsRecord>,
 }
 
+impl SiteWithStats {
+    pub fn site_record(&self) -> SiteRecord {
+        SiteRecord {
+            id: self.id,
+            name: self.name.clone(),
+            site_type: self.site_type.clone(),
+            base_url: self.base_url.clone(),
+            auth_config: self.auth_config.clone(),
+            request_headers: self.request_headers.clone(),
+            use_proxy: self.use_proxy,
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+
+    /// Reuse a stable user id only when it was refreshed after the latest site configuration
+    /// change. A changed Cookie or base URL must rediscover the account identity first.
+    pub fn reusable_user_id(&self) -> Option<&str> {
+        let stats = self.stats.as_ref()?;
+        let user_id = stats.uid.as_deref()?.trim();
+        if user_id.is_empty() {
+            return None;
+        }
+        let site_updated_at = chrono::DateTime::parse_from_rfc3339(&self.updated_at).ok()?;
+        let stats_updated_at =
+            chrono::DateTime::parse_from_rfc3339(stats.updated_at.as_deref()?).ok()?;
+        (stats_updated_at >= site_updated_at).then_some(user_id)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TorrentAttributes {
     /// 是否为免费种。
@@ -413,8 +450,9 @@ pub trait SiteAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        SiteRequestHeader, UserStats, UserStatsDetails, browser_request_header_map,
-        default_site_request_headers, normalize_site_request_headers, site_request_header_map,
+        SiteRequestHeader, SiteStatsRecord, SiteWithStats, UserStats, UserStatsDetails,
+        browser_request_header_map, default_site_request_headers, normalize_site_request_headers,
+        site_request_header_map,
     };
 
     fn header(name: &str, value: &str) -> SiteRequestHeader {
@@ -497,5 +535,29 @@ mod tests {
 
         let round_trip: UserStats = serde_json::from_value(value).unwrap();
         assert_eq!(round_trip.details.message_count, Some(3));
+    }
+
+    #[test]
+    fn cached_user_id_is_invalidated_by_a_later_site_configuration_change() {
+        let mut site = SiteWithStats {
+            id: 1,
+            name: "tracker".to_string(),
+            site_type: "nexusphp".to_string(),
+            base_url: "https://tracker.example".to_string(),
+            auth_config: "{}".to_string(),
+            request_headers: "[]".to_string(),
+            use_proxy: false,
+            created_at: "2026-09-05T00:00:00Z".to_string(),
+            updated_at: "2026-09-05T02:00:00Z".to_string(),
+            stats: Some(SiteStatsRecord {
+                uid: Some("42".to_string()),
+                updated_at: Some("2026-09-05T01:00:00Z".to_string()),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(site.reusable_user_id(), None);
+
+        site.stats.as_mut().unwrap().updated_at = Some("2026-09-05T03:00:00Z".to_string());
+        assert_eq!(site.reusable_user_id(), Some("42"));
     }
 }

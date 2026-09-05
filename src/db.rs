@@ -220,22 +220,31 @@ impl Database {
     }
 
     pub async fn list_sites_with_stats(&self) -> Result<Vec<SiteWithStats>, AppError> {
+        self.query_sites_with_stats(None).await
+    }
+
+    async fn query_sites_with_stats(
+        &self,
+        id: Option<i64>,
+    ) -> Result<Vec<SiteWithStats>, AppError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = open_connection(&path)?;
+            let filter = if id.is_some() { "WHERE s.id = ?1" } else { "" };
             let mut stmt = conn
                 .prepare(
-                    "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.request_headers, s.use_proxy, s.created_at, s.updated_at,
+                    &format!("SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.request_headers, s.use_proxy, s.created_at, s.updated_at,
                             st.site_id, st.uid, st.username, st.uploaded, st.downloaded, st.ratio, st.bonus,
                             st.seeding_count, st.leeching_count, st.updated_at, st.last_checked_at, st.last_error,
                             st.details_json
                      FROM sites s
                      LEFT JOIN site_stats st ON st.site_id = s.id
-                     ORDER BY s.id",
+                     {filter}
+                     ORDER BY s.id"),
                 )
                 .map_err(sql_error)?;
             let rows = stmt
-                .query_map([], |row| {
+                .query_map(rusqlite::params_from_iter(id), |row| {
                     let stats_site_id: Option<i64> = row.get(9)?;
                     Ok(SiteWithStats {
                         id: row.get(0)?,
@@ -286,6 +295,14 @@ impl Database {
         })
         .await
         .map_err(join_error)?
+    }
+
+    pub async fn get_site_with_stats(&self, id: i64) -> Result<Option<SiteWithStats>, AppError> {
+        Ok(self
+            .query_sites_with_stats(Some(id))
+            .await?
+            .into_iter()
+            .next())
     }
 
     pub async fn get_site(&self, id: i64) -> Result<Option<SiteRecord>, AppError> {

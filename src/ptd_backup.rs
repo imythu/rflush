@@ -289,7 +289,12 @@ fn ptd_user_snapshot(site_id: &str, stats: &UserStats, update_at: i64) -> Value 
         ("uploaded".to_string(), json!(stats.uploaded)),
         ("downloaded".to_string(), json!(stats.downloaded)),
     ]);
-    if let Some(uid) = stats.uid.as_deref() {
+    if let Some(uid) = stats
+        .details
+        .ptd_user_id
+        .as_deref()
+        .or(stats.uid.as_deref())
+    {
         snapshot.insert("id".to_string(), json!(uid));
     }
     if let Some(ratio) = stats.ratio.filter(|value| value.is_finite()) {
@@ -497,6 +502,7 @@ mod tests {
             seeding_count: Some(2),
             leeching_count: Some(1),
             details: UserStatsDetails {
+                ptd_user_id: Some("account-uuid".to_string()),
                 is_donor: Some(true),
                 level_id: Some(3),
                 level_name: Some("Elite User".to_string()),
@@ -526,6 +532,8 @@ mod tests {
         };
 
         let snapshot = ptd_user_snapshot("mteam", &stats, 1_800_000_000_000);
+        assert_eq!(snapshot["id"], "account-uuid");
+        assert_eq!(stats.uid.as_deref(), Some("42"));
         for field in [
             "isDonor",
             "levelId",

@@ -1020,11 +1020,11 @@ mod tests {
         let rebuilt = pool.get_or_create_access_gate(&key).await;
 
         assert!(Arc::ptr_eq(&original, &rebuilt));
+        // Measure the cooldown gate, not the HTTP client's one-time TLS setup.
+        let blocked_request = reqwest::Client::new().get("http://127.0.0.1:1/blocked");
         let fail_fast_started = Instant::now();
         assert!(matches!(
-            rebuilt
-                .send(reqwest::Client::new().get("http://127.0.0.1:1/blocked"))
-                .await,
+            rebuilt.send(blocked_request).await,
             Err(IndexerError::RateLimited(_))
         ));
         assert!(fail_fast_started.elapsed() < Duration::from_millis(20));

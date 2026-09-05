@@ -27,7 +27,6 @@ import {
   Clock3,
   CircleCheck,
   CircleX,
-  Settings2,
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
@@ -156,7 +155,7 @@ async function writeClipboardText(value: string): Promise<void> {
 
 interface SiteForm {
   name: string;
-  site_type: "nexusphp" | "mteam";
+  site_type: "nexusphp" | "mteam" | "gazelle";
   base_url: string;
   use_proxy: boolean;
   auth_type: AuthType;
@@ -711,6 +710,8 @@ export function SitesPage() {
   const [ptdDialogOpen, setPtdDialogOpen] = useState(false);
   const [ptdForm, setPtdForm] = useState<PtdBackupForm>(emptyPtdBackupForm);
   const [ptdFormError, setPtdFormError] = useState("");
+  const [ptdConfigError, setPtdConfigError] = useState("");
+  const [ptdBackupMessage, setPtdBackupMessage] = useState("");
   const [ptdSaving, setPtdSaving] = useState(false);
   const [ptdTesting, setPtdTesting] = useState(false);
   const [ptdTestResult, setPtdTestResult] = useState<PtdBackupTestResult | null>(null);
@@ -775,8 +776,8 @@ export function SitesPage() {
       ...sitePresets.map((preset) => ({
         value: preset.ptd_id,
         label: preset.name,
-        description: `${preset.aliases.join("、") || preset.ptd_id} · ${preset.base_url.replace(/^https?:\/\//, "")}`,
-        keywords: [preset.ptd_id, preset.base_url, ...preset.aliases],
+        description: `${preset.site_type === "gazelle" ? "Gazelle · " : ""}${preset.aliases.join("、") || preset.ptd_id} · ${preset.base_url.replace(/^https?:\/\//, "")}`,
+        keywords: [preset.ptd_id, preset.base_url, preset.site_type, ...preset.aliases],
       })),
     ],
     [sitePresets],
@@ -833,9 +834,10 @@ export function SitesPage() {
 
   function loadPtdConfig() {
     setPtdConfigLoading(true);
+    setPtdConfigError("");
     api<PtdBackupConfig>("/api/sites/ptd-backup")
       .then(setPtdConfig)
-      .catch((error: Error) => setMessage(error.message || "加载蜂巢 PTD 配置失败"))
+      .catch((error: Error) => setPtdConfigError(error.message || "加载备份配置失败"))
       .finally(() => setPtdConfigLoading(false));
   }
 
@@ -1332,6 +1334,7 @@ export function SitesPage() {
     );
     setPtdFormError("");
     setPtdTestResult(null);
+    setPtdBackupMessage("");
     setPtdDialogOpen(true);
   }
 
@@ -1382,16 +1385,24 @@ export function SitesPage() {
 
   async function handlePtdBackupNow() {
     setPtdBackingUp(true);
+    setPtdFormError("");
+    setPtdBackupMessage("");
     try {
+      const saved = await api<PtdBackupConfig>("/api/sites/ptd-backup", {
+        method: "PUT",
+        body: JSON.stringify(ptdRequestBody()),
+      });
+      setPtdConfig(saved);
+      setPtdForm((current) => ({ ...current, password: "", clear_password: false }));
       const result = await api<PtdBackupRunResult>("/api/sites/ptd-backup/run", {
         method: "POST",
       });
-      setMessage(
+      setPtdBackupMessage(
         `已上传 ${result.filename}，包含 ${result.site_count} 个站点（${formatBytes(result.size)}）`,
       );
       loadPtdConfig();
     } catch (error) {
-      setMessage((error as Error).message || "蜂巢 PTD 备份失败");
+      setPtdFormError((error as Error).message || "蜂巢 PTD 备份失败");
       loadPtdConfig();
     } finally {
       setPtdBackingUp(false);
@@ -1440,9 +1451,9 @@ export function SitesPage() {
             }}
           >
             <option value="cookie">Cookie</option>
-            <option value="passkey">Passkey</option>
+            {form.site_type !== "gazelle" ? <option value="passkey">Passkey</option> : null}
             <option value="cookie_passkey">Cookie + Passkey</option>
-            <option value="api_key">API Key</option>
+            {form.site_type !== "gazelle" ? <option value="api_key">API Key</option> : null}
           </select>
         </div>
 
@@ -1510,7 +1521,7 @@ export function SitesPage() {
                 </span>
                 站点管理
               </CardTitle>
-              <CardDescription className="mt-2">集中管理连接、账户数据与蜂巢 PTD 同步</CardDescription>
+              <CardDescription className="mt-2">管理站点连接，查看账户数据与刷新状态</CardDescription>
             </div>
             <div className="flex flex-wrap gap-2 lg:justify-end">
               <Button
@@ -1526,6 +1537,11 @@ export function SitesPage() {
               <Button variant="outline" onClick={handleOverview} disabled={loading || sites.length === 0}>
                 <ListChecks className="mr-2 size-4" />
                 数据总览
+              </Button>
+              <Button variant="outline" onClick={openPtdConfig} disabled={ptdConfigLoading}>
+                <CloudCog className="mr-2 size-4" />
+                备份与同步
+                {ptdConfig?.last_error || ptdConfigError ? <span className="ml-2 text-xs text-destructive">异常</span> : null}
               </Button>
               <Button onClick={openAdd}>
                 <Plus className="mr-2 size-4" />
@@ -1580,50 +1596,6 @@ export function SitesPage() {
             })}
           </section>
 
-          <section className="relative overflow-hidden rounded-[24px] border border-primary/15 bg-gradient-to-br from-primary/10 via-card to-blossom/10 p-4 sm:p-5" aria-labelledby="ptd-backup-heading">
-            <div className="pointer-events-none absolute -right-12 -top-16 size-48 rounded-full bg-primary/10 blur-3xl" />
-            <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex min-w-0 items-start gap-3">
-                <span className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-sm">
-                  <CloudCog className="size-5" />
-                </span>
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 id="ptd-backup-heading" className="font-black">蜂巢 PTD</h3>
-                    {ptdConfigLoading ? (
-                      <span className="text-xs text-muted">读取配置中…</span>
-                    ) : (
-                      <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold ${ptdConfig?.enabled ? "bg-emerald-100 text-emerald-700" : "bg-surface-container text-muted"}`}>
-                        {ptdConfig?.enabled ? "自动备份已启用" : ptdConfig?.configured ? "已配置" : "未配置"}
-                      </span>
-                    )}
-                  </div>
-                  <p className="mt-1 text-xs leading-5 text-muted">
-                    按 PT-Depiler 格式将用户信息打包为 ZIP，并通过 WebDAV 发往蜂巢。
-                  </p>
-                  <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted">
-                    <span>上次备份：{formatDateTime(ptdConfig?.last_backup_at)}</span>
-                    {ptdConfig?.last_backup_filename ? <span className="max-w-[20rem] truncate font-mono">{ptdConfig.last_backup_filename}</span> : null}
-                    {ptdConfig?.last_error ? <span className="max-w-full truncate text-red-600" title={ptdConfig.last_error}>错误：{ptdConfig.last_error}</span> : null}
-                  </div>
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap gap-2">
-                <Button variant="outline" onClick={openPtdConfig} disabled={ptdConfigLoading}>
-                  <Settings2 className="mr-2 size-4" />
-                  配置
-                </Button>
-                <Button
-                  onClick={() => void handlePtdBackupNow()}
-                  disabled={!ptdConfig?.configured || ptdBackingUp || sites.length === 0}
-                >
-                  {ptdBackingUp ? <Loader2 className="mr-2 size-4 motion-safe:animate-spin" /> : <UploadCloud className="mr-2 size-4" />}
-                  {ptdBackingUp ? "上传中" : "立即备份"}
-                </Button>
-              </div>
-            </div>
-          </section>
-
           <section className="flex flex-col gap-3 rounded-[22px] border border-border bg-surface-container/40 p-3 md:flex-row md:items-center" aria-label="筛选站点">
             <div className="relative min-w-0 flex-1">
               <Label htmlFor="site-search" className="sr-only">搜索站点</Label>
@@ -1644,6 +1616,7 @@ export function SitesPage() {
                 { value: "all", label: "全部类型" },
                 { value: "nexusphp", label: "NexusPHP" },
                 { value: "mteam", label: "M-Team" },
+                { value: "gazelle", label: "Gazelle" },
               ]}
             />
             <Select
@@ -1669,7 +1642,7 @@ export function SitesPage() {
             <div className="rounded-[24px] border border-dashed border-border py-14 text-center">
               <Globe className="mx-auto size-8 text-muted" />
               <p className="mt-3 font-semibold">还没有配置 PT 站点</p>
-              <p className="mt-1 text-sm text-muted">添加首个站点后即可刷新用户数据并同步到蜂巢。</p>
+              <p className="mt-1 text-sm text-muted">添加首个站点后即可测试连接并刷新账户数据。</p>
               <Button className="mt-4" onClick={openAdd}><Plus className="mr-2 size-4" />添加站点</Button>
             </div>
           ) : filteredSites.length === 0 ? (
@@ -1698,7 +1671,7 @@ export function SitesPage() {
                             <div className="flex min-w-0 items-center gap-2">
                               <span className="min-w-0 truncate font-semibold">{site.name}</span>
                               <span className="shrink-0 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">
-                                {site.site_type}
+                                {site.site_type === "gazelle" ? "Gazelle" : site.site_type}
                               </span>
                             </div>
                             <div className="mt-1 truncate text-xs text-muted" title={site.base_url}>
@@ -1866,12 +1839,30 @@ export function SitesPage() {
       <Dialog
         open={ptdDialogOpen}
         onClose={() => setPtdDialogOpen(false)}
-        title="蜂巢 PTD 备份"
-        description="模拟 PT-Depiler 的用户信息备份，通过 WebDAV 上传兼容 ZIP。"
-        panelClassName="max-w-6xl"
+        title="备份与同步"
+        description="将站点账户数据备份到蜂巢或其他 WebDAV 服务，兼容 PT-Depiler。"
+        panelClassName="max-w-3xl"
         escMode="double"
       >
-        <div className="grid gap-5 p-4 sm:p-6 lg:grid-cols-[minmax(18rem,0.8fr)_minmax(24rem,1.2fr)]">
+        <div className="space-y-5 p-4 sm:p-6">
+          <section className="space-y-3 rounded-2xl border border-border bg-surface-container/40 p-4" aria-label="备份状态">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-bold">蜂巢 PTD 备份</p>
+                <p className="mt-1 text-xs text-muted">{ptdConfig?.enabled ? `每 ${ptdConfig.backup_interval_hours} 小时自动备份` : ptdConfig?.configured ? "手动备份" : "填写下方连接信息后开始备份"}</p>
+              </div>
+              <Button variant="outline" onClick={() => void handlePtdBackupNow()} disabled={!ptdForm.webdav_url.trim() || ptdBackingUp || ptdSaving || ptdTesting || sites.length === 0}>
+                {ptdBackingUp ? <Loader2 className="mr-2 size-4 motion-safe:animate-spin" /> : <UploadCloud className="mr-2 size-4" />}
+                {ptdBackingUp ? "备份中" : "保存并备份"}
+              </Button>
+            </div>
+            <p className="text-xs text-muted">上次备份：{formatDateTime(ptdConfig?.last_backup_at)}</p>
+            {ptdConfig?.last_backup_filename ? <p className="break-all font-mono text-xs text-muted">{ptdConfig.last_backup_filename}</p> : null}
+            {ptdConfig?.last_error ? <p className="break-words text-xs text-destructive">上次备份失败：{ptdConfig.last_error}</p> : null}
+            {ptdBackupMessage ? <p className="break-words text-sm" role="status">{ptdBackupMessage}</p> : null}
+            {ptdConfigError ? <p className="text-sm text-destructive" role="alert">{ptdConfigError} <button type="button" className="underline underline-offset-2" onClick={loadPtdConfig}>重试</button></p> : null}
+          </section>
+
           {ptdFormError ? (
             <div role="alert" className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive lg:col-span-2">
               {ptdFormError}
@@ -1881,7 +1872,7 @@ export function SitesPage() {
           <section className="space-y-4" aria-labelledby="ptd-webdav-heading">
             <div>
               <h4 id="ptd-webdav-heading" className="flex items-center gap-2 font-black"><Server className="size-4 text-primary" />WebDAV 连接</h4>
-              <p className="mt-1 text-xs leading-5 text-muted">地址应指向蜂巢提供的目标目录，备份文件会直接写入该目录。</p>
+              <p className="mt-1 text-xs leading-5 text-muted">填写服务提供的备份地址及登录凭据。</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="ptd-webdav-url">WebDAV 地址</Label>
@@ -1893,7 +1884,7 @@ export function SitesPage() {
                 spellCheck={false}
               />
             </div>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+            <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="ptd-webdav-username">用户名</Label>
                 <Input
@@ -1967,16 +1958,15 @@ export function SitesPage() {
             </div>
           </section>
 
-          <section className="min-w-0 space-y-3" aria-labelledby="ptd-mappings-heading">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h4 id="ptd-mappings-heading" className="font-black">PTD 站点识别</h4>
-                <p className="mt-1 text-xs leading-5 text-muted">根据站点类型和域名自动匹配 PT-Depiler 官方站点 ID，无需手动填写。</p>
-              </div>
-              <span className="shrink-0 rounded-full bg-secondary px-2.5 py-1 text-[10px] font-bold text-primary">
-                {Object.values(ptdConfig?.site_identifiers ?? {}).filter(Boolean).length} / {sites.length} 已识别
+          <details className="group rounded-2xl border border-border p-4">
+            <summary className="flex cursor-pointer items-center justify-between gap-3 text-sm font-bold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              <span>备份范围</span>
+              <span className="flex items-center gap-2 text-xs font-normal text-muted">
+                {Object.values(ptdConfig?.site_identifiers ?? {}).filter(Boolean).length} / {sites.length} 个站点已识别
+                <ChevronRight className="size-4 transition-transform group-open:rotate-90" />
               </span>
-            </div>
+            </summary>
+            <p className="my-3 text-xs text-muted">根据域名自动识别，展开查看可备份的站点。</p>
             <div className="max-h-[min(50dvh,32rem)] space-y-2 overflow-y-auto rounded-2xl border border-border bg-surface-container/40 p-2.5">
               {sites.length === 0 ? (
                 <p className="py-10 text-center text-sm text-muted">请先添加站点</p>
@@ -1997,21 +1987,21 @@ export function SitesPage() {
                 );
               })}
             </div>
-            {ptdTestResult ? (
+          </details>
+          {ptdTestResult ? (
               <div className={`flex items-start gap-2 rounded-2xl border px-3 py-2.5 text-sm ${ptdTestResult.success ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-red-200 bg-red-50 text-red-700"}`} role="status">
                 {ptdTestResult.success ? <CircleCheck className="mt-0.5 size-4 shrink-0" /> : <CircleX className="mt-0.5 size-4 shrink-0" />}
                 <span>{ptdTestResult.message}</span>
               </div>
             ) : null}
-          </section>
 
           <div className="flex flex-col-reverse gap-2 border-t border-border pt-4 sm:flex-row sm:justify-end lg:col-span-2">
             <Button variant="secondary" onClick={() => setPtdDialogOpen(false)}>取消</Button>
-            <Button variant="outline" onClick={() => void handleTestPtdConfig()} disabled={ptdTesting || ptdSaving}>
+            <Button variant="outline" onClick={() => void handleTestPtdConfig()} disabled={ptdTesting || ptdSaving || ptdBackingUp}>
               {ptdTesting ? <Loader2 className="mr-2 size-4 motion-safe:animate-spin" /> : <Activity className="mr-2 size-4" />}
               {ptdTesting ? "测试中" : "测试连接"}
             </Button>
-            <Button onClick={() => void handleSavePtdConfig()} disabled={ptdSaving || ptdTesting}>
+            <Button onClick={() => void handleSavePtdConfig()} disabled={ptdSaving || ptdTesting || ptdBackingUp}>
               {ptdSaving ? <Loader2 className="mr-2 size-4 motion-safe:animate-spin" /> : null}
               {ptdSaving ? "保存中" : "保存配置"}
             </Button>
@@ -2125,9 +2115,12 @@ export function SitesPage() {
                 options={[
                   { value: "nexusphp", label: "NexusPHP" },
                   { value: "mteam", label: "M-Team" },
+                { value: "gazelle", label: "Gazelle" },
                 ]}
               />
             </div>
+
+            {form.site_type === "gazelle" ? <p className="text-xs leading-5 text-muted">支持 GPW 等 Gazelle JSON API 站点的连接测试和账户统计；使用 Cookie 登录，暂不支持种子搜索。</p> : null}
 
             <div className="space-y-2">
               <Label htmlFor="site-base-url">基础 URL</Label>

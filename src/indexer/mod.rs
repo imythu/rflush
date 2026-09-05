@@ -253,6 +253,9 @@ pub(crate) fn create_indexer(
         .map_err(IndexerError::Configuration)?;
 
     match site_type {
+        SiteType::Gazelle => Err(IndexerError::Configuration(
+            "Gazelle 当前仅支持用户统计，尚未支持种子搜索".to_string(),
+        )),
         SiteType::NexusPhp => Ok(Arc::new(nexusphp::NexusPhpIndexer::new(
             record.id,
             record.name.clone(),

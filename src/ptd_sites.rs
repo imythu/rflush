@@ -222,7 +222,7 @@ pub fn site_id_for_host(host: &str) -> Option<&'static str> {
         "okpt.net" => Some("okpt"),
         "oldtoons.world" => Some("oldtoonsworld"),
         "onlyencodes.cc" => Some("onlyencodes"),
-        "open.cd" => Some("opencd"),
+        "open.cd" | "check.open.cd" => Some("opencd"),
         "oppaiti.me" => Some("oppaiti"),
         "orpheus.network" => Some("orpheus"),
         "oshen.win" => Some("oshenpt"),

@@ -48,7 +48,7 @@ export type SiteRecord = {
 export type PtdSitePreset = {
   ptd_id: string;
   name: string;
-  site_type: "nexusphp" | "mteam";
+  site_type: "nexusphp" | "mteam" | "gazelle";
   base_url: string;
   aliases: string[];
 };

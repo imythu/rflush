@@ -2714,6 +2714,9 @@ fn validate_site_auth_type(site_type: SiteType, auth: &SiteAuth) -> Result<(), A
     if site_type == SiteType::MTeam && !matches!(auth, SiteAuth::ApiKey { .. }) {
         return Err(ApiError::bad_request("M-Team 站点必须使用 API Key 认证"));
     }
+    if site_type == SiteType::Gazelle && !matches!(auth, SiteAuth::Cookie { .. } | SiteAuth::CookiePasskey { .. }) {
+        return Err(ApiError::bad_request("Gazelle 账户统计需要 Cookie 认证"));
+    }
     Ok(())
 }
 
@@ -3064,15 +3067,18 @@ async fn test_site(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<crate::site::SiteTestResult>, ApiError> {
-    let site = state
+    let site_with_stats = state
         .db
-        .get_site(id)
+        .get_site_with_stats(id)
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
+    let cached_user_id = site_with_stats.reusable_user_id();
+    let site = site_with_stats.site_record();
     let settings = state.db.get_settings().await?;
     let client = client_factory::resolve_site_client(settings.proxy.as_deref(), site.use_proxy)
         .map_err(|e| ApiError::internal(format!("创建 HTTP 客户端失败: {}", e)))?;
-    let adapter = site_factory::create_adapter(&site, client).map_err(ApiError::bad_request)?;
+    let adapter = site_factory::create_adapter_with_cached_user_id(&site, client, cached_user_id)
+        .map_err(ApiError::bad_request)?;
     let result = adapter
         .test_connection()
         .await
@@ -3084,15 +3090,18 @@ async fn get_site_stats(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<crate::site::UserStats>, ApiError> {
-    let site = state
+    let site_with_stats = state
         .db
-        .get_site(id)
+        .get_site_with_stats(id)
         .await?
         .ok_or_else(|| ApiError::not_found("站点不存在"))?;
+    let cached_user_id = site_with_stats.reusable_user_id();
+    let site = site_with_stats.site_record();
     let settings = state.db.get_settings().await?;
     let client = client_factory::resolve_site_client(settings.proxy.as_deref(), site.use_proxy)
         .map_err(|e| ApiError::internal(format!("创建 HTTP 客户端失败: {}", e)))?;
-    let adapter = site_factory::create_adapter(&site, client).map_err(ApiError::bad_request)?;
+    let adapter = site_factory::create_adapter_with_cached_user_id(&site, client, cached_user_id)
+        .map_err(ApiError::bad_request)?;
     let stats = adapter
         .get_user_stats()
         .await

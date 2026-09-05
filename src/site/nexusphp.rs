@@ -4,13 +4,14 @@ use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use regex::{Regex, escape};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use reqwest::{Client, Url};
-use scraper::{Html, Selector};
+use scraper::{Element, Html, Selector};
 use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::{
     SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats, UserStatsDetails,
 };
+use std::error::Error as _;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,6 +20,7 @@ pub struct NexusPhpAdapter {
     auth: SiteAuth,
     request_headers: HeaderMap,
     client: Client,
+    cached_user_id: Option<String>,
 }
 
 impl NexusPhpAdapter {
@@ -33,7 +35,16 @@ impl NexusPhpAdapter {
             auth,
             request_headers,
             client,
+            cached_user_id: None,
         }
+    }
+
+    /// PT-Depiler keeps the stable NexusPHP user id from the previous successful refresh.
+    /// Supplying it here lets subsequent refreshes go straight to the profile page instead of
+    /// depending on every site's homepage layout and availability.
+    pub fn with_cached_user_id(mut self, user_id: Option<&str>) -> Self {
+        self.cached_user_id = user_id.and_then(normalize_user_id);
+        self
     }
 
     fn cookie_value(&self) -> Option<&str> {
@@ -54,280 +65,155 @@ impl NexusPhpAdapter {
         headers
     }
 
-    async fn fetch_user_info_api(&self) -> Result<UserStats, String> {
-        let url = format!("{}/api/user", self.base_url);
-        debug!("NexusPHP API request: {}", url);
-
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.build_headers())
-            .send()
-            .await
-            .map_err(|e| format!("请求失败: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("读取响应失败: {}", e))?;
-        let json: Value =
-            serde_json::from_str(&text).map_err(|_| "响应不是有效JSON".to_string())?;
-
-        if json.get("success").and_then(Value::as_bool) == Some(false) {
-            return Err(json_error_message(&json).unwrap_or_else(|| "API 返回失败".to_string()));
-        }
-
-        let response_data = json.get("data").unwrap_or(&json);
-        let data = response_data.get("user").unwrap_or(response_data);
-        let counters = data
-            .get("memberCount")
-            .or_else(|| data.get("stats"))
-            .or_else(|| response_data.get("memberCount"))
-            .or_else(|| response_data.get("stats"))
-            .unwrap_or(data);
-
-        let username = data
-            .get("username")
-            .or_else(|| data.get("name"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unknown"))
-            .ok_or_else(|| "API 响应缺少用户名".to_string())?
-            .to_string();
-
-        let uid = data
-            .get("uid")
-            .or_else(|| data.get("id"))
-            .or_else(|| data.get("user_id"))
-            .and_then(json_value_to_string);
-
-        let uploaded = counters
-            .get("uploaded")
-            .or_else(|| counters.get("upload"))
-            .or_else(|| data.get("upload"))
-            .and_then(json_value_to_bytes);
-
-        let downloaded = counters
-            .get("downloaded")
-            .or_else(|| counters.get("download"))
-            .or_else(|| data.get("download"))
-            .and_then(json_value_to_bytes);
-
-        let uploaded = uploaded.ok_or_else(|| "API 响应缺少上传量".to_string())?;
-        let downloaded = downloaded.ok_or_else(|| "API 响应缺少下载量".to_string())?;
-
-        let ratio = counters
-            .get("ratio")
-            .or_else(|| data.get("ratio"))
-            .and_then(json_value_to_f64);
-        let bonus = data
-            .get("bonus")
-            .or_else(|| data.get("seedbonus"))
-            .or_else(|| counters.get("bonus"))
-            .and_then(json_value_to_f64);
-
-        let roots = [data, counters, response_data, &json];
-        let status_root = data.get("memberStatus").unwrap_or(data);
-        let details = UserStatsDetails {
-            is_donor: first_json_value(&roots, &["isDonor", "is_donor", "donor"])
-                .and_then(json_value_to_bool),
-            level_id: first_json_value(&roots, &["levelId", "level_id", "class_id"])
-                .and_then(json_value_to_i64),
-            level_name: first_json_value(
-                &roots,
-                &[
-                    "levelName",
-                    "level_name",
-                    "className",
-                    "class_name",
-                    "class",
-                ],
-            )
-            .and_then(json_value_to_nonempty_string),
-            join_time: first_json_value(
-                &roots,
-                &[
-                    "joinTime",
-                    "join_time",
-                    "joinedAt",
-                    "joined_at",
-                    "createdAt",
-                    "created_at",
-                ],
-            )
-            .and_then(json_value_to_timestamp_millis),
-            last_access_at: first_json_value(
-                &[status_root, data, response_data, &json],
-                &[
-                    "lastAccessAt",
-                    "last_access_at",
-                    "lastBrowse",
-                    "last_access",
-                    "lastSeen",
-                ],
-            )
-            .and_then(json_value_to_timestamp_millis),
-            message_count: first_json_value(
-                &roots,
-                &[
-                    "messageCount",
-                    "message_count",
-                    "unreadMessages",
-                    "unread_messages",
-                ],
-            )
-            .and_then(json_value_to_u64),
-            invites: first_json_value(&roots, &["invites", "invite_count"])
-                .and_then(json_value_to_u64),
-            avatar: first_json_value(&roots, &["avatar", "avatarUrl", "avatar_url"])
-                .and_then(json_value_to_nonempty_string),
-            total_traffic: first_json_value(&roots, &["totalTraffic", "total_traffic"])
-                .and_then(json_value_to_bytes),
-            true_downloaded: first_json_value(
-                &roots,
-                &["trueDownloaded", "true_downloaded", "actualDownloaded"],
-            )
-            .and_then(json_value_to_bytes),
-            true_uploaded: first_json_value(
-                &roots,
-                &["trueUploaded", "true_uploaded", "actualUploaded"],
-            )
-            .and_then(json_value_to_bytes),
-            true_ratio: first_json_value(&roots, &["trueRatio", "true_ratio"])
-                .and_then(json_value_to_f64),
-            seeding_size: first_json_value(&roots, &["seedingSize", "seeding_size"])
-                .and_then(json_value_to_bytes),
-            seeding_time: first_json_value(&roots, &["seedingTime", "seeding_time"])
-                .and_then(json_value_to_u64),
-            average_seeding_time: first_json_value(
-                &roots,
-                &[
-                    "averageSeedingTime",
-                    "average_seeding_time",
-                    "averageSeedtime",
-                ],
-            )
-            .and_then(json_value_to_u64),
-            seeding_bonus: first_json_value(
-                &roots,
-                &["seedingBonus", "seeding_bonus", "seedingPoints"],
-            )
-            .and_then(json_value_to_f64),
-            bonus_per_hour: first_json_value(&roots, &["bonusPerHour", "bonus_per_hour"])
-                .and_then(json_value_to_f64),
-            seeding_bonus_per_hour: first_json_value(
-                &roots,
-                &["seedingBonusPerHour", "seeding_bonus_per_hour"],
-            )
-            .and_then(json_value_to_f64),
-            uploads: first_json_value(&roots, &["uploads", "upload_count"])
-                .and_then(json_value_to_u64),
-            snatches: first_json_value(&roots, &["snatches", "snatched"])
-                .and_then(json_value_to_u64),
-            posts: first_json_value(&roots, &["posts", "post_count"]).and_then(json_value_to_u64),
-            adoptions: first_json_value(&roots, &["adoptions", "adoption_count"])
-                .and_then(json_value_to_u64),
-            hnr_unsatisfied: first_json_value(
-                &roots,
-                &["hnrUnsatisfied", "hnr_unsatisfied", "unsatisfieds"],
-            )
-            .and_then(json_value_to_u64),
-            hnr_pre_warning: first_json_value(
-                &roots,
-                &["hnrPreWarning", "hnr_pre_warning", "prewarn"],
-            )
-            .and_then(json_value_to_u64),
-            ..Default::default()
-        };
-
-        let mut stats = UserStats {
-            uid,
-            username,
-            uploaded,
-            downloaded,
-            ratio: ratio.or_else(|| ratio_from_totals(Some(uploaded), Some(downloaded))),
-            bonus,
-            seeding_count: counters
-                .get("seeding")
-                .or_else(|| counters.get("seeding_count"))
-                .or_else(|| counters.get("seederCount"))
-                .and_then(json_value_to_u32),
-            leeching_count: counters
-                .get("leeching")
-                .or_else(|| counters.get("leeching_count"))
-                .or_else(|| counters.get("leecherCount"))
-                .and_then(json_value_to_u32),
-            details,
-        };
-        stats.fill_derived();
-        Ok(stats)
-    }
-
     async fn fetch_user_info_html(&self) -> Result<UserStats, String> {
-        let url = format!("{}/index.php", self.base_url);
-        debug!("NexusPHP HTML request: {}", url);
+        if self
+            .cookie_value()
+            .is_some_and(|cookie| HeaderValue::from_str(cookie).is_err())
+        {
+            return Err("Cookie 格式无效，请检查是否包含换行等非法字符".to_string());
+        }
+        if self
+            .build_headers()
+            .get(COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(
+                "NexusPHP 通用用户统计需要 Cookie，单独的 Passkey 或 API Key 不能用于此 HTML 流程"
+                    .to_string(),
+            );
+        }
+        // Match PT-Depiler's generic NexusPHP process: reuse the stable id first and only visit
+        // /index.php when no id is known (or when the profile cannot supply complete totals). Cookie-derived
+        // ids take precedence over cached ids so changing accounts cannot silently reuse stale data.
+        let mut identity = self
+            .cookie_value()
+            .and_then(extract_current_user_from_cookie)
+            .or_else(|| {
+                self.cached_user_id
+                    .as_deref()
+                    .and_then(current_user_from_id)
+            });
+        let mut index_html = None;
+        let mut detail_html = None;
+        let mut page_errors = Vec::new();
+        let mut attempted_detail_url = None;
 
-        let index_html = self.fetch_html_page(&url, "首页").await?;
-        // Some NexusPHP themes do not render the current-user anchor in the raw homepage HTML.
-        // The old implementation could still read the transfer totals from that page, so making
-        // the anchor mandatory caused otherwise valid sessions to regress. Prefer the page link,
-        // then recover the stable user id from the NexusPHP login cookie; if neither is available,
-        // keep parsing the homepage instead of treating the missing optional link as auth failure.
-        let identity = extract_current_user(&index_html).or_else(|| {
-            self.cookie_value()
-                .and_then(extract_current_user_from_cookie)
-        });
-        let (detail_html, detail_page_loaded) = if let Some(identity) = identity.as_ref() {
-            let detail_url = self.resolve_same_origin_url(&identity.href)?;
-            match self.fetch_html_page(&detail_url, "用户详情页").await {
-                Ok(html) => (html, true),
+        if let Some(current_user) = identity.as_ref() {
+            let detail_url = self.resolve_same_origin_url(&current_user.href)?;
+            attempted_detail_url = Some(detail_url.clone());
+            match self
+                .fetch_user_profile(&detail_url, &current_user.uid)
+                .await
+            {
+                Ok(html) => {
+                    if !has_transfer_totals(&html) {
+                        page_errors.push("用户详情页没有完整的上传量和下载量".to_string());
+                    }
+                    detail_html = Some(html);
+                }
                 Err(error) => {
-                    debug!(%error, "NexusPHP 用户详情页获取失败，回退首页统计");
-                    (index_html.clone(), false)
+                    debug!(%error, "NexusPHP 用户详情页获取失败，回退首页");
+                    page_errors.push(error);
+                    // A cached/cookie id is a hint, not proof that this account is still active.
+                    identity = None;
                 }
             }
-        } else {
-            (index_html.clone(), false)
-        };
+        }
 
-        let detail_identity = extract_current_user(&detail_html);
-        let uid = detail_identity
+        if detail_html
+            .as_deref()
+            .is_none_or(|html| !has_transfer_totals(html))
+        {
+            let index_url = format!("{}/index.php", self.base_url);
+            debug!("NexusPHP HTML request: {}", index_url);
+            let homepage = match self.fetch_html_page(&index_url, "首页").await {
+                Ok(homepage) => homepage,
+                Err(homepage_error) => {
+                    page_errors.push(homepage_error);
+                    return Err(page_errors.join("；"));
+                }
+            };
+            let homepage_identity = extract_current_user(&homepage);
+            if let Some(found) = homepage_identity {
+                if identity
+                    .as_ref()
+                    .is_some_and(|known| known.uid != found.uid)
+                {
+                    // Never combine another member's profile with the logged-in user's overview.
+                    detail_html = None;
+                }
+                identity = Some(found);
+            }
+            index_html = Some(homepage);
+
+            if let Some(current_user) = identity.as_ref() {
+                let detail_url = self.resolve_same_origin_url(&current_user.href)?;
+                // Some installations use user.php for the same id. Compare URLs, not just ids,
+                // and do not immediately retry the exact request that already failed.
+                if attempted_detail_url.as_deref() != Some(detail_url.as_str()) {
+                    match self
+                        .fetch_user_profile(&detail_url, &current_user.uid)
+                        .await
+                    {
+                        Ok(html) => detail_html = Some(html),
+                        Err(error) => {
+                            debug!(%error, "NexusPHP 用户详情页获取失败，使用首页统计");
+                            page_errors.push(error);
+                        }
+                    }
+                }
+            }
+        }
+
+        let detail_page_loaded = detail_html.is_some();
+        let homepage_loaded = index_html.is_some();
+        let detail_html = detail_html
+            .as_deref()
+            .or(index_html.as_deref())
+            .ok_or_else(|| "没有可解析的用户信息页面".to_string())?;
+        // When the profile page was loaded directly it also contains the shared info block, so it
+        // can provide homepage-only fields without another request.
+        let index_html = index_html.as_deref().unwrap_or(detail_html);
+
+        let detail_identity = extract_current_user(detail_html);
+        let uid = identity
             .as_ref()
             .map(|value| value.uid.clone())
-            .or_else(|| identity.as_ref().map(|value| value.uid.clone()));
+            .or_else(|| detail_identity.as_ref().map(|value| value.uid.clone()));
         let username = detail_identity
             .as_ref()
             .and_then(|value| value.username.clone())
             .or_else(|| identity.as_ref().and_then(|value| value.username.clone()))
-            .or_else(|| extract_username(&detail_html))
-            .or_else(|| extract_username(&index_html))
+            .or_else(|| extract_username(detail_html))
+            .or_else(|| extract_username(index_html))
             .unwrap_or_else(|| uid.clone().unwrap_or_else(|| "unknown".to_string()));
 
-        let detail_text = extract_visible_text(&detail_html);
-        let index_text = extract_visible_text(&index_html);
+        let detail_text = extract_visible_text(detail_html);
+        let index_text = extract_visible_text(index_html);
         let uploaded = parse_labeled_size(&detail_text, &["上传量", "上傳量", "Uploaded"])
             .or_else(|| parse_labeled_size(&index_text, &["上传量", "上傳量", "Uploaded"]));
         let downloaded = parse_labeled_size(&detail_text, &["下载量", "下載量", "Downloaded"])
             .or_else(|| parse_labeled_size(&index_text, &["下载量", "下載量", "Downloaded"]));
 
-        let page_label = if detail_page_loaded {
-            "用户详情页和首页"
-        } else {
-            "首页"
+        let page_label = match (detail_page_loaded, homepage_loaded) {
+            (true, true) => "用户详情页和首页",
+            (true, false) => "用户详情页",
+            _ => "首页",
         };
-        let uploaded = uploaded
-            .ok_or_else(|| format!("{page_label}没有找到上传量，站点页面结构可能需要单独适配"))?;
-        let downloaded = downloaded
-            .ok_or_else(|| format!("{page_label}没有找到下载量，站点页面结构可能需要单独适配"))?;
+        let missing_field = |field: &str| {
+            let mut errors = page_errors.clone();
+            errors.push(format!(
+                "{page_label}没有找到{field}，站点页面结构可能需要单独适配"
+            ));
+            errors.join("；")
+        };
+        let uploaded = uploaded.ok_or_else(|| missing_field("上传量"))?;
+        let downloaded = downloaded.ok_or_else(|| missing_field("下载量"))?;
 
-        let ratio = parse_labeled_number(&detail_text, &["分享率", "Ratio"])
-            .or_else(|| ratio_from_totals(Some(uploaded), Some(downloaded)));
-        let bonus = parse_labeled_number(
-            &detail_text,
+        let ratio = ratio_from_totals(Some(uploaded), Some(downloaded));
+        let bonus = parse_profile_number(
+            detail_html,
             &[
                 "魔力值",
                 "Karma Points",
@@ -336,6 +222,11 @@ impl NexusPhpAdapter {
                 "沙粒",
                 "魔力",
                 "Bonus",
+                "蝌蚪",
+                "U币",
+                "UBits Coin",
+                "UCoin",
+                "憨豆",
             ],
         );
         let mut seeding_count = parse_labeled_integer(
@@ -347,25 +238,25 @@ impl NexusPhpAdapter {
             &["当前下载", "當前下載", "下载数", "下載數", "Leeching"],
         );
 
-        let (hnr_pre_warning, hnr_unsatisfied) = parse_hnr_counts(&index_text);
+        let (hnr_pre_warning, hnr_unsatisfied) = parse_hnr_counts(index_html);
         let mut details = UserStatsDetails {
-            is_donor: Some(detect_donor(&detail_html)),
-            level_name: parse_table_labeled_value(&detail_html, &["等级", "等級", "Class"]),
-            join_time: parse_table_labeled_value(
-                &detail_html,
+            is_donor: detail_page_loaded.then(|| detect_donor(detail_html)),
+            level_name: parse_profile_level(detail_html),
+            join_time: parse_profile_value(
+                detail_html,
                 &["加入日期", "加入時間", "Join date", "Joined"],
             )
             .as_deref()
             .and_then(parse_user_datetime_millis),
-            last_access_at: parse_table_labeled_value(
-                &detail_html,
+            last_access_at: parse_profile_value(
+                detail_html,
                 &["最近动向", "最近動向", "Last Action", "Last access"],
             )
             .as_deref()
             .and_then(parse_user_datetime_millis),
-            message_count: parse_message_count(&index_html),
+            message_count: parse_message_count(index_html),
             invites: parse_labeled_u64(&detail_text, &["邀请", "邀請", "Invites", "Invitations"]),
-            avatar: extract_avatar(&detail_html)
+            avatar: extract_avatar(detail_html)
                 .and_then(|avatar| self.resolve_same_origin_url(&avatar).ok().or(Some(avatar))),
             true_downloaded: parse_labeled_size(
                 &detail_text,
@@ -403,8 +294,8 @@ impl NexusPhpAdapter {
                     "Average Seed Time",
                 ],
             ),
-            seeding_bonus: parse_labeled_number(
-                &detail_text,
+            seeding_bonus: parse_profile_number(
+                detail_html,
                 &["做种积分", "做種積分", "Seeding Points", "保种积分"],
             ),
             uploads: parse_labeled_u64(
@@ -433,30 +324,45 @@ impl NexusPhpAdapter {
             }
         }
 
-        let bonus_url = format!("{}/mybonus.php", self.base_url);
+        let ptd_site = Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().and_then(crate::ptd_sites::site_id_for_host));
+        let is_u2 = ptd_site == Some("u2");
+        details.level_id = details
+            .level_name
+            .as_deref()
+            .and_then(|name| super::nexusphp_levels::level_id(ptd_site?, name))
+            .or_else(|| {
+                profile_class_level(detail_html)
+                    .and_then(|name| super::nexusphp_levels::level_id(ptd_site?, &name))
+            });
+        if ptd_site == Some("ilolicon") {
+            details.ptd_user_id = profile_uuid(detail_html);
+        }
+        let bonus_url = if is_u2 {
+            format!(
+                "{}/mprecent.php?user={}",
+                self.base_url,
+                uid.as_deref().unwrap_or("")
+            )
+        } else {
+            format!("{}/mybonus.php", self.base_url)
+        };
         match self.fetch_html_page(&bonus_url, "魔力值页面").await {
             Ok(bonus_html) => {
-                let bonus_text = extract_visible_text(&bonus_html);
-                details.bonus_per_hour = parse_labeled_number(
-                    &bonus_text,
-                    &[
-                        "你当前每小时能获取",
-                        "你當前每小時能獲取",
-                        "每小时魔力值",
-                        "每小時魔力值",
-                        "Bonus per hour",
-                        "You are currently getting",
-                    ],
-                );
-                details.seeding_bonus_per_hour = parse_labeled_number(
-                    &bonus_text,
-                    &[
-                        "每小时做种积分",
-                        "每小時做種積分",
-                        "每小时保种积分",
-                        "Seeding points per hour",
-                    ],
-                );
+                let (bonus_per_hour, seeding_bonus_per_hour) =
+                    parse_bonus_rates(&bonus_html, is_u2);
+                details.bonus_per_hour = bonus_per_hour;
+                details.seeding_bonus_per_hour = seeding_bonus_per_hour;
+                if ptd_site == Some("hhanclub") {
+                    if let (Some(user_id), Some(base)) = (uid.as_deref(), seeding_bonus_per_hour) {
+                        // A missing settlement page must not masquerade as a complete rate.
+                        details.seeding_bonus_per_hour = self
+                            .fetch_rescue_daily_bonus(user_id)
+                            .await
+                            .map(|daily| base + daily / 24.0);
+                    }
+                }
             }
             Err(error) => debug!(%error, "NexusPHP 魔力值页面获取失败"),
         }
@@ -476,6 +382,41 @@ impl NexusPhpAdapter {
         Ok(stats)
     }
 
+    async fn fetch_rescue_daily_bonus(&self, user_id: &str) -> Option<f64> {
+        let url = format!("{}/rescuesettleinfo.php?id={user_id}", self.base_url);
+        let mut html = self.fetch_html_page(&url, "保种结算记录").await.ok()?;
+        let page = {
+            let document = Html::parse_document(&html);
+            let selector = Selector::parse("table + div b").ok()?;
+            document
+                .select(&selector)
+                .next_back()
+                .and_then(|element| first_integer(&element.text().collect::<String>()))
+                .unwrap_or(1)
+                .saturating_sub(1)
+        };
+        if page > 0 {
+            html = self
+                .fetch_html_page(&format!("{url}&page={page}"), "保种结算记录末页")
+                .await
+                .ok()?;
+        }
+        let document = Html::parse_document(&html);
+        let selector = Selector::parse("table tbody tr:last-child > td:nth-of-type(6)").ok()?;
+        document
+            .select(&selector)
+            .next()
+            .and_then(|element| first_number(&element.text().collect::<String>()))
+    }
+
+    async fn fetch_user_profile(&self, url: &str, user_id: &str) -> Result<String, String> {
+        let html = self.fetch_html_page(url, "用户详情页").await?;
+        if extract_current_user(&html).is_some_and(|current| current.uid != user_id) {
+            return Err("用户详情页的登录用户与请求的 UID 不一致，已拒绝使用该页统计".to_string());
+        }
+        Ok(html)
+    }
+
     async fn fetch_html_page(&self, url: &str, label: &str) -> Result<String, String> {
         let response = self
             .client
@@ -483,22 +424,22 @@ impl NexusPhpAdapter {
             .headers(self.build_headers())
             .send()
             .await
-            .map_err(|error| format!("{label}请求失败: {error}"))?;
+            .map_err(|error| format!("{label}请求失败: {}", describe_reqwest_error(error)))?;
         let status = response.status();
         let final_url = response.url().clone();
-        if !status.is_success() {
-            return Err(format!("{label}返回 HTTP {status}"));
-        }
         let html = response
             .text()
             .await
-            .map_err(|error| format!("读取{label}响应失败: {error}"))?;
+            .map_err(|error| format!("读取{label}响应失败: {}", describe_reqwest_error(error)))?;
 
         if looks_like_cloudflare_challenge(&html) {
             return Err(format!("{label}被 Cloudflare 验证页拦截"));
         }
         if looks_like_login_page(&html, &final_url) {
             return Err("Cookie 无效或已过期，站点返回了登录页".to_string());
+        }
+        if !status.is_success() {
+            return Err(format!("{label}返回 HTTP {status}"));
         }
         Ok(html)
     }
@@ -527,17 +468,10 @@ impl NexusPhpAdapter {
         url.query_pairs_mut()
             .append_pair("userid", user_id)
             .append_pair("type", torrent_type);
-        let response = self
-            .client
-            .get(url)
-            .headers(self.build_headers())
-            .send()
+        let html = self
+            .fetch_html_page(url.as_str(), "用户种子列表")
             .await
             .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        let html = response.text().await.ok()?;
         let summary = parse_user_torrent_ajax_summary(&html);
         if summary.is_none() {
             warn!(
@@ -557,7 +491,7 @@ impl NexusPhpAdapter {
             .headers(self.build_headers())
             .send()
             .await
-            .map_err(|e| format!("请求失败: {}", e))?;
+            .map_err(|error| format!("请求失败: {}", describe_reqwest_error(error)))?;
 
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
@@ -566,7 +500,7 @@ impl NexusPhpAdapter {
         let html = resp
             .text()
             .await
-            .map_err(|e| format!("读取响应失败: {}", e))?;
+            .map_err(|error| format!("读取响应失败: {}", describe_reqwest_error(error)))?;
         if html.contains("login.php") && !html.contains("details") {
             return Err("Cookie 无效或已过期".to_string());
         }
@@ -709,19 +643,7 @@ impl SiteAdapter for NexusPhpAdapter {
     fn get_user_stats(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<UserStats, String>> + Send + '_>> {
-        Box::pin(async move {
-            // Cookie-authenticated NexusPHP sites are HTML-first. This matches PT-Depiler's
-            // NexusPHP flow and avoids probing a non-existent /api/user endpoint on every refresh.
-            match self.fetch_user_info_html().await {
-                Ok(stats) => Ok(stats),
-                Err(html_error) => match self.fetch_user_info_api().await {
-                    Ok(stats) => Ok(stats),
-                    Err(api_error) => Err(format!(
-                        "HTML 获取失败（{html_error}）；API /api/user 回退失败（{api_error}）"
-                    )),
-                },
-            }
-        })
+        Box::pin(self.fetch_user_info_html())
     }
 
     fn get_torrent_attributes(
@@ -743,127 +665,51 @@ struct CurrentUser {
     href: String,
 }
 
+fn describe_reqwest_error(error: reqwest::Error) -> String {
+    // Request URLs can contain passkeys or signed query parameters. Keep the source chain for
+    // TLS/DNS/connection diagnostics without echoing credentials into stored errors and backups.
+    let error = error.without_url();
+    let category = if error.is_timeout() {
+        "请求超时"
+    } else if error.is_connect() {
+        "连接失败"
+    } else if error.is_redirect() {
+        "重定向失败"
+    } else if error.is_body() || error.is_decode() {
+        "响应传输失败"
+    } else {
+        "HTTP 请求失败"
+    };
+    let top_level = error.to_string();
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !message.is_empty()
+            && message != top_level
+            && causes.last().is_none_or(|previous| previous != &message)
+        {
+            causes.push(message);
+        }
+        if causes.len() >= 4 {
+            break;
+        }
+        source = cause.source();
+    }
+
+    if causes.is_empty() {
+        format!("{category}: {top_level}")
+    } else {
+        format!("{category}: {top_level}；底层原因: {}", causes.join(" -> "))
+    }
+}
+
 fn json_value_to_string(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::to_string)
         .or_else(|| value.as_u64().map(|n| n.to_string()))
         .or_else(|| value.as_i64().map(|n| n.to_string()))
-}
-
-fn json_value_to_nonempty_string(value: &Value) -> Option<String> {
-    json_value_to_string(value)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn first_json_value<'a>(roots: &[&'a Value], keys: &[&str]) -> Option<&'a Value> {
-    roots
-        .iter()
-        .find_map(|root| keys.iter().find_map(|key| root.get(key)))
-}
-
-fn json_value_to_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
-        .or_else(|| {
-            value
-                .as_f64()
-                .filter(|number| number.is_finite() && *number >= 0.0)
-                .map(|number| number as u64)
-        })
-        .or_else(|| {
-            let value = value.as_str()?.trim().replace(',', "");
-            value.parse::<u64>().ok().or_else(|| {
-                value
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|number| number.is_finite() && *number >= 0.0)
-                    .map(|number| number.min(u64::MAX as f64) as u64)
-            })
-        })
-}
-
-fn json_value_to_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
-        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<i64>().ok())
-}
-
-fn json_value_to_bool(value: &Value) -> Option<bool> {
-    value
-        .as_bool()
-        .or_else(|| value.as_i64().map(|number| number != 0))
-        .or_else(|| {
-            value
-                .as_str()
-                .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
-                    "true" | "yes" | "1" => Some(true),
-                    "false" | "no" | "0" => Some(false),
-                    _ => None,
-                })
-        })
-}
-
-fn json_value_to_timestamp_millis(value: &Value) -> Option<i64> {
-    if let Some(timestamp) = json_value_to_i64(value) {
-        return normalize_timestamp_millis(timestamp);
-    }
-    value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(parse_user_datetime_millis)
-}
-
-fn normalize_timestamp_millis(timestamp: i64) -> Option<i64> {
-    if timestamp.unsigned_abs() < 100_000_000_000 {
-        timestamp.checked_mul(1000)
-    } else {
-        Some(timestamp)
-    }
-}
-
-fn json_value_to_bytes(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
-        .or_else(|| {
-            value
-                .as_f64()
-                .filter(|number| *number >= 0.0)
-                .map(|number| number as u64)
-        })
-        .or_else(|| {
-            let value = value.as_str()?.trim().replace(',', "");
-            value
-                .parse::<u64>()
-                .ok()
-                .or_else(|| extract_size_value(&value))
-        })
-}
-
-fn json_value_to_f64(value: &Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<f64>().ok())
-}
-
-fn json_value_to_u32(value: &Value) -> Option<u32> {
-    value
-        .as_u64()
-        .and_then(|number| u32::try_from(number).ok())
-        .or_else(|| value.as_i64().and_then(|number| u32::try_from(number).ok()))
-        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<u32>().ok())
-}
-
-fn json_error_message(value: &Value) -> Option<String> {
-    ["message", "msg", "error"]
-        .iter()
-        .find_map(|key| value.get(key).and_then(Value::as_str))
-        .map(str::to_string)
 }
 
 fn ratio_from_totals(uploaded: Option<u64>, downloaded: Option<u64>) -> Option<f64> {
@@ -880,11 +726,12 @@ fn extract_current_user(html: &str) -> Option<CurrentUser> {
     let selectors = [
         "#info_block a[href*='userdetails.php'][href*='id=']",
         "#info_block a[href*='user.php'][href*='id=']",
-        "a[href*='userdetails.php'][class*='Name']",
-        "a[href*='userdetails.php'][href*='id=']",
-        "a[href*='user.php'][href*='id=']",
+        "#userinfo a[href*='userdetails.php'], #userinfo a[href*='user.php']",
+        "#user_info a[href*='userdetails.php'], #user_info a[href*='user.php']",
+        "#header a.User_Name[href*='userdetails.php'], #header a.username[href*='userdetails.php']",
     ];
 
+    let mut fallback: Option<CurrentUser> = None;
     for selector in selectors {
         let Ok(selector) = Selector::parse(selector) else {
             continue;
@@ -898,23 +745,44 @@ fn extract_current_user(html: &str) -> Option<CurrentUser> {
             };
             let username =
                 normalize_text(element.text()).filter(|name| !name.eq_ignore_ascii_case("details"));
-            return Some(CurrentUser {
+            let current = CurrentUser {
                 uid,
                 username,
                 href: href.to_string(),
-            });
+            };
+            if fallback
+                .as_ref()
+                .is_some_and(|first| first.uid != current.uid)
+            {
+                continue;
+            }
+            if current.username.is_some() {
+                return Some(current);
+            }
+            fallback = fallback.or(Some(current));
         }
     }
-    None
+    fallback
 }
 
 fn extract_current_user_from_cookie(cookie: &str) -> Option<CurrentUser> {
     let uid = extract_user_id_from_cookie(cookie)?;
+    current_user_from_id(&uid)
+}
+
+fn current_user_from_id(user_id: &str) -> Option<CurrentUser> {
+    let uid = normalize_user_id(user_id)?;
     Some(CurrentUser {
-        href: format!("/userdetails.php?id={uid}"),
+        href: format!("userdetails.php?id={uid}"),
         uid,
         username: None,
     })
+}
+
+fn normalize_user_id(user_id: &str) -> Option<String> {
+    let user_id = user_id.trim();
+    (!user_id.is_empty() && user_id.chars().all(|ch| ch.is_ascii_digit()))
+        .then(|| user_id.to_string())
 }
 
 fn extract_user_id_from_cookie(cookie: &str) -> Option<String> {
@@ -929,7 +797,7 @@ fn extract_user_id_from_cookie(cookie: &str) -> Option<String> {
     // Older NexusPHP installations expose a dedicated uid cookie.
     for (name, value) in &pairs {
         if (name == "c_secure_uid" || name.ends_with("_secure_uid"))
-            && let Some(uid) = decode_cookie_user_id(value)
+            && let Some(uid) = decode_cookie_user_id(value, true)
         {
             return Some(uid);
         }
@@ -939,7 +807,7 @@ fn extract_user_id_from_cookie(cookie: &str) -> Option<String> {
     // a base64 encoded c_secure_pass cookie.
     for (name, value) in &pairs {
         if (name == "c_secure_pass" || name.ends_with("_secure_pass"))
-            && let Some(uid) = decode_cookie_user_id(value)
+            && let Some(uid) = decode_cookie_user_id(value, false)
         {
             return Some(uid);
         }
@@ -947,10 +815,10 @@ fn extract_user_id_from_cookie(cookie: &str) -> Option<String> {
     None
 }
 
-fn decode_cookie_user_id(value: &str) -> Option<String> {
+fn decode_cookie_user_id(value: &str, allow_plain_uid: bool) -> Option<String> {
     let value = value.trim();
-    if !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit()) {
-        return Some(value.to_string());
+    if allow_plain_uid && let Some(uid) = normalize_user_id(value) {
+        return Some(uid);
     }
 
     for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
@@ -963,8 +831,8 @@ fn decode_cookie_user_id(value: &str) -> Option<String> {
         let payload = decoded
             .split_once('.')
             .map_or(decoded.as_str(), |(json, _)| json);
-        if !payload.is_empty() && payload.chars().all(|ch| ch.is_ascii_digit()) {
-            return Some(payload.to_string());
+        if allow_plain_uid && let Some(uid) = normalize_user_id(payload) {
+            return Some(uid);
         }
         let Ok(json) = serde_json::from_str::<Value>(payload) else {
             continue;
@@ -1006,8 +874,7 @@ fn extract_user_id_from_href(href: &str) -> Option<String> {
     let url = base.join(href).ok()?;
     url.query_pairs()
         .find(|(key, _)| key == "id" || key == "userid" || key == "user_id")
-        .map(|(_, value)| value.into_owned())
-        .filter(|value| !value.is_empty())
+        .and_then(|(_, value)| normalize_user_id(&value))
 }
 
 fn normalize_text<'a>(parts: impl Iterator<Item = &'a str>) -> Option<String> {
@@ -1023,7 +890,13 @@ fn extract_visible_text(html: &str) -> String {
     normalize_text(document.root_element().text()).unwrap_or_default()
 }
 
-fn parse_labeled_size(text: &str, labels: &[&str]) -> Option<u64> {
+fn has_transfer_totals(html: &str) -> bool {
+    let text = extract_visible_text(html);
+    parse_labeled_size(&text, &["上传量", "上傳量", "Uploaded"]).is_some()
+        && parse_labeled_size(&text, &["下载量", "下載量", "Downloaded"]).is_some()
+}
+
+pub(super) fn parse_labeled_size(text: &str, labels: &[&str]) -> Option<u64> {
     labels.iter().find_map(|label| {
         let expression = format!(
             r"(?i){}\s*[^0-9]{{0,48}}([0-9][0-9,.]*)\s*(bytes?|[kmgtpez]i?b)",
@@ -1101,7 +974,7 @@ fn parse_labeled_duration_seconds(text: &str, labels: &[&str]) -> Option<u64> {
 fn parse_table_labeled_value(html: &str, labels: &[&str]) -> Option<String> {
     let document = Html::parse_document(html);
     let row_selector = Selector::parse("tr").ok()?;
-    let cell_selector = Selector::parse("th, td").ok()?;
+    let cell_selector = Selector::parse(":scope > th, :scope > td").ok()?;
     let image_selector = Selector::parse("img[title], img[alt]").ok()?;
 
     let mut fallback = None;
@@ -1143,6 +1016,167 @@ fn parse_table_labeled_value(html: &str, labels: &[&str]) -> Option<String> {
     fallback
 }
 
+fn parse_profile_value(html: &str, labels: &[&str]) -> Option<String> {
+    parse_table_labeled_value(html, labels).or_else(|| {
+        let document = Html::parse_document(html);
+        let selector = Selector::parse("span").ok()?;
+        document.select(&selector).find_map(|element| {
+            let label = normalize_text(element.text())?;
+            if !labels.iter().any(|expected| {
+                label
+                    .trim_end_matches([':', '：'])
+                    .trim()
+                    .eq_ignore_ascii_case(expected)
+            }) {
+                return None;
+            }
+            normalize_text(element.next_sibling_element()?.text())
+        })
+    })
+}
+
+fn first_number(text: &str) -> Option<f64> {
+    Regex::new(r"[0-9][0-9,.]*")
+        .ok()?
+        .find(text)?
+        .as_str()
+        .replace(',', "")
+        .parse()
+        .ok()
+}
+
+fn parse_profile_number(html: &str, labels: &[&str]) -> Option<f64> {
+    // U2's rounded visible UCoin amount has its precise balance in the span title.
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("td.rowhead").ok()?;
+    for label in document.select(&selector) {
+        if label.text().collect::<String>().contains("UCoin") && labels.contains(&"UCoin") {
+            let title_selector = Selector::parse("span[title]").ok()?;
+            if let Some(number) = label
+                .next_sibling_element()?
+                .select(&title_selector)
+                .find_map(|span| span.value().attr("title").and_then(first_number))
+            {
+                return Some(number);
+            }
+        }
+    }
+    parse_profile_value(html, labels)
+        .as_deref()
+        .and_then(first_number)
+}
+
+fn parse_profile_level(html: &str) -> Option<String> {
+    parse_table_labeled_value(html, &["等级", "等級", "Class"])
+        .or_else(|| profile_class_level(html))
+}
+
+fn profile_class_level(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a[href*='userdetails.php'][class*='_Name']").ok()?;
+    document.select(&selector).find_map(|element| {
+        element
+            .value()
+            .classes()
+            .find_map(|class| class.strip_suffix("_Name").map(str::to_string))
+    })
+}
+
+fn profile_uuid(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("a[href*='userdetails.php'][class*='Name']").ok()?;
+    let link = document.select(&selector).next()?.value().attr("href")?;
+    Url::parse("https://tracker.invalid/")
+        .ok()?
+        .join(link)
+        .ok()?
+        .query_pairs()
+        .find(|(key, value)| key == "uuid" && !value.is_empty())
+        .map(|(_, value)| value.into_owned())
+}
+
+fn parse_bonus_rates(html: &str, is_u2: bool) -> (Option<f64>, Option<f64>) {
+    let document = Html::parse_document(html);
+    let text = extract_visible_text(html);
+    if is_u2 {
+        let rate = Regex::new(r"UCoin([0-9][0-9,.]*)")
+            .unwrap()
+            .captures(&text)
+            .and_then(|capture| first_number(&capture[1]))
+            .map(|daily| daily / 24.0);
+        return (rate, None);
+    }
+    // Qingwa publishes the final hourly amount and seeding points in a summary table.
+    let heading_selector = Selector::parse("h1").unwrap();
+    for heading in document.select(&heading_selector) {
+        if heading
+            .text()
+            .collect::<String>()
+            .contains("每小时获得的合计蝌蚪")
+        {
+            if let Some(container) = heading.next_sibling_element() {
+                let rows = Selector::parse("tr").unwrap();
+                let cells = Selector::parse("td").unwrap();
+                if let Some(row) = container.select(&rows).last() {
+                    let values: Vec<_> = row
+                        .select(&cells)
+                        .map(|cell| first_number(&cell.text().collect::<String>()))
+                        .collect();
+                    return (
+                        values.last().copied().flatten(),
+                        values.get(16).copied().flatten(),
+                    );
+                }
+            }
+        }
+    }
+    let hhan_selector = Selector::parse(".grid .row-span-4").unwrap();
+    if let Some(total) = document
+        .select(&hhan_selector)
+        .next()
+        .and_then(|element| first_number(&element.text().collect::<String>()))
+    {
+        let seed = parse_hourly_amounts(&text).first().copied();
+        return (Some(total), seed);
+    }
+    let summary_selector = Selector::parse("#outer td[rowspan]").unwrap();
+    if let Some(total) = document
+        .select(&summary_selector)
+        .next()
+        .and_then(|element| first_number(&element.text().collect::<String>()))
+    {
+        return (Some(total), None);
+    }
+    // UB and HDHome can show multiple additive rewards. Exclude the separate
+    // seeding-points paragraph, which is not spendable bonus.
+    let selector = Selector::parse("div").unwrap();
+    let mut amounts = Vec::new();
+    for element in document.select(&selector) {
+        if element
+            .select(&selector)
+            .any(|child| !parse_hourly_amounts(&child.text().collect::<String>()).is_empty())
+        {
+            continue;
+        }
+        let text = normalize_text(element.text()).unwrap_or_default();
+        if text.contains("对于做种积分") {
+            continue;
+        }
+        amounts.extend(parse_hourly_amounts(&text));
+    }
+    let total = if amounts.is_empty() {
+        parse_hourly_amounts(&text).first().copied()
+    } else {
+        Some(amounts.into_iter().sum())
+    };
+    (total, None)
+}
+
+fn parse_hourly_amounts(text: &str) -> Vec<f64> {
+    Regex::new(r"(?i)(?:你当前每小时能获取|你當前每小時能獲取|You are currently getting)\s*([0-9][0-9,.]*)")
+        .unwrap().captures_iter(text).filter_map(|capture| first_number(&capture[1])).collect()
+}
+
 fn parse_user_datetime_millis(value: &str) -> Option<i64> {
     let value = value.trim();
     if let Ok(timestamp) = value.parse::<i64>() {
@@ -1162,12 +1196,20 @@ fn parse_user_datetime_millis(value: &str) -> Option<i64> {
         .map(|datetime| datetime.timestamp_millis())
 }
 
+fn normalize_timestamp_millis(timestamp: i64) -> Option<i64> {
+    if timestamp.unsigned_abs() < 100_000_000_000 {
+        timestamp.checked_mul(1000)
+    } else {
+        Some(timestamp)
+    }
+}
+
 fn parse_message_count(html: &str) -> Option<u64> {
     let document = Html::parse_document(html);
     let selectors = [
         "td[style*='background: red'] a[href*='messages.php']",
         "td[style*='background:red'] a[href*='messages.php']",
-        "a[href*='messages.php']",
+        "div.relative:has(#display-message-alert) a.flex[href*='messages.php']",
     ];
     for selector in selectors {
         let Ok(selector) = Selector::parse(selector) else {
@@ -1177,12 +1219,16 @@ fn parse_message_count(html: &str) -> Option<u64> {
             let Some(text) = normalize_text(element.text()) else {
                 continue;
             };
+            // Assessment notifications also link to messages.php, and contain dates/targets.
+            if text.contains("考核") || text.contains("指标") || text.contains("Assessment") {
+                continue;
+            }
             if let Some(value) = first_integer(&text) {
                 return Some(value);
             }
         }
     }
-    None
+    Some(0)
 }
 
 fn first_integer(value: &str) -> Option<u64> {
@@ -1216,7 +1262,7 @@ fn extract_avatar(html: &str) -> Option<String> {
 
 fn detect_donor(html: &str) -> bool {
     let document = Html::parse_document(html);
-    let Ok(selector) = Selector::parse("img[alt], img[title]") else {
+    let Ok(selector) = Selector::parse("h1 img[alt], h1 img[title]") else {
         return false;
     };
     document.select(&selector).any(|image| {
@@ -1230,49 +1276,27 @@ fn detect_donor(html: &str) -> bool {
     })
 }
 
-fn parse_hnr_counts(text: &str) -> (Option<u64>, Option<u64>) {
-    let marker = Regex::new(r"(?i)(?:H\s*&\s*R|HNR|Hit\s*(?:and|&)\s*Run)")
-        .ok()
-        .and_then(|expression| expression.find(text));
-    if let Some(marker) = marker {
-        let relevant = text[marker.end()..].chars().take(256).collect::<String>();
-        if let Ok(expression) = Regex::new(r"([0-9,]+)\s*/\s*([0-9,]+)(?:\s*/\s*[0-9,]+)?") {
-            let mut found = false;
-            let mut pre_warning = 0u64;
-            let mut unsatisfied = 0u64;
-            for captures in expression.captures_iter(&relevant) {
-                let Some(pre) = captures
-                    .get(1)
-                    .and_then(|value| value.as_str().replace(',', "").parse::<u64>().ok())
-                else {
-                    continue;
-                };
-                let Some(unsatisfied_count) = captures
-                    .get(2)
-                    .and_then(|value| value.as_str().replace(',', "").parse::<u64>().ok())
-                else {
-                    continue;
-                };
-                pre_warning = pre_warning.saturating_add(pre);
-                unsatisfied = unsatisfied.saturating_add(unsatisfied_count);
-                found = true;
-            }
-            if found {
-                return (Some(pre_warning), Some(unsatisfied));
-            }
-        }
+fn parse_hnr_counts(html: &str) -> (Option<u64>, Option<u64>) {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse("#info_block a[href*='myhr.php']").unwrap();
+    let text = document
+        .select(&selector)
+        .next_back()
+        .and_then(|element| normalize_text(element.text()))
+        .unwrap_or_default();
+    let expression = Regex::new(r"([0-9,]+)\s*/\s*([0-9,]+)(?:\s*/\s*[0-9,]+)?").unwrap();
+    let (mut pre, mut unsatisfied) = (0u64, 0u64);
+    for captures in expression.captures_iter(&text) {
+        pre = pre.saturating_add(captures[1].replace(',', "").parse().unwrap_or(0));
+        unsatisfied = unsatisfied.saturating_add(captures[2].replace(',', "").parse().unwrap_or(0));
     }
-
-    (
-        parse_labeled_u64(text, &["H&R 预警", "H&R 預警", "HNR pre-warning"]),
-        parse_labeled_u64(text, &["H&R 未达标", "H&R 未達標", "HNR unsatisfied"]),
-    )
+    (Some(pre), Some(unsatisfied))
 }
 
 fn parse_user_torrent_ajax_summary(html: &str) -> Option<(u32, Option<u64>)> {
     let text = extract_visible_text(html);
     let summary_expression =
-        Regex::new(r"(?i)([0-9][0-9,]*)\s*\|\s*([0-9][0-9,.]*)\s*([kmgtpez]i?b|bytes?)").ok()?;
+        Regex::new(r"(?i)([0-9][0-9,]*)\s*(?:条记录|條記錄|records?)?\s*\|\s*(?:总大小|總大小|Total size)?\s*[:：]?\s*([0-9][0-9,.]*)\s*([kmgtpez]i?b|bytes?)").ok()?;
     if let Some(captures) = summary_expression.captures(&text) {
         let count = captures.get(1)?.as_str().replace(',', "").parse().ok()?;
         let size = size_from_parts(captures.get(2)?.as_str(), captures.get(3)?.as_str());
@@ -1287,24 +1311,39 @@ fn parse_user_torrent_ajax_summary(html: &str) -> Option<(u32, Option<u64>)> {
     }
 
     let record_expression = Regex::new(r"(?i)([0-9][0-9,]*)\s*(?:条记录|條記錄|records?)").ok()?;
+    let mut record_count = None;
     if let Some(captures) = record_expression.captures(&text) {
         let count = captures.get(1)?.as_str().replace(',', "").parse().ok()?;
-        return Some((count, None));
+        record_count = Some(count);
+        let size = parse_labeled_size(&text, &["总大小", "總大小", "大小", "Total size"]);
+        if size.is_some() || count == 0 {
+            return Some((count, size.or(Some(0))));
+        }
+        // A record count alone does not provide the total size; sum the table below.
     }
 
     let document = Html::parse_document(html);
     let table_selector = Selector::parse("table").ok()?;
     let row_selector = Selector::parse("tr").ok()?;
-    let table = document.select(&table_selector).next_back()?;
+    let Some(table) = document.select(&table_selector).next_back() else {
+        return record_count.map(|count| (count, None));
+    };
     let rows = table.select(&row_selector).skip(1).collect::<Vec<_>>();
     if rows.is_empty() {
-        return None;
+        return record_count.map(|count| (count, None));
     }
-    let size_expression = Regex::new(r"(?i)([0-9][0-9,.]*)\s*([kmgtpez]i?b|bytes?)").ok()?;
+    let size_expression = Regex::new(r"(?i)^([0-9][0-9,.]*)\s*([kmgtpez]i?b|bytes?)$").ok()?;
+    let cell_selector = Selector::parse(":scope > td").ok()?;
+    let size_column = rows[0].select(&cell_selector).position(|cell| {
+        size_expression.is_match(&normalize_text(cell.text()).unwrap_or_default())
+    });
     let mut total_size = 0u64;
     let mut has_size = false;
     for row in &rows {
-        let row_text = normalize_text(row.text()).unwrap_or_default();
+        let row_text = size_column
+            .and_then(|column| row.select(&cell_selector).nth(column))
+            .and_then(|cell| normalize_text(cell.text()))
+            .unwrap_or_default();
         if let Some(captures) = size_expression.captures(&row_text)
             && let Some(size) =
                 size_from_parts(captures.get(1)?.as_str(), captures.get(2)?.as_str())
@@ -1314,8 +1353,9 @@ fn parse_user_torrent_ajax_summary(html: &str) -> Option<(u32, Option<u64>)> {
         }
     }
     Some((
-        u32::try_from(rows.len()).unwrap_or(u32::MAX),
-        has_size.then_some(total_size),
+        record_count.unwrap_or_else(|| u32::try_from(rows.len()).unwrap_or(u32::MAX)),
+        (has_size && record_count.is_none_or(|count| count as usize == rows.len()))
+            .then_some(total_size),
     ))
 }
 
@@ -1450,29 +1490,6 @@ fn looks_like_datetime(value: &str) -> bool {
         })
 }
 
-fn extract_size_value(text: &str) -> Option<u64> {
-    let mut num_start = None;
-    let mut num_end = None;
-
-    for (i, ch) in text.char_indices() {
-        if num_start.is_none() {
-            if ch.is_ascii_digit() {
-                num_start = Some(i);
-            }
-        } else if !ch.is_ascii_digit() && ch != '.' {
-            num_end = Some(i);
-            break;
-        }
-    }
-
-    let start = num_start?;
-    let end = num_end.unwrap_or(text.len());
-    let number = text[start..end].trim();
-    let unit_text = text[end..].trim();
-
-    size_from_parts(number, unit_text)
-}
-
 fn size_from_parts(number: &str, unit: &str) -> Option<u64> {
     let number: f64 = number.replace(',', "").parse().ok()?;
     if !number.is_finite() || number < 0.0 {
@@ -1495,10 +1512,12 @@ fn size_from_parts(number: &str, unit: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::Router;
+    use axum::extract::Query;
     use axum::http::StatusCode;
     use axum::response::Html;
     use axum::routing::get;
@@ -1507,13 +1526,32 @@ mod tests {
     use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 
     use super::{
-        NexusPhpAdapter, SiteAuth, detect_donor, extract_avatar, extract_current_user,
-        extract_user_id_from_cookie, extract_username, extract_visible_text, looks_like_login_page,
-        parse_hnr_counts, parse_labeled_duration_seconds, parse_labeled_integer,
-        parse_labeled_number, parse_labeled_size, parse_message_count, parse_seeding_ajax_count,
-        parse_table_labeled_value, parse_user_datetime_millis, parse_user_torrent_ajax_summary,
+        NexusPhpAdapter, SiteAuth, describe_reqwest_error, detect_donor, extract_avatar,
+        extract_current_user, extract_user_id_from_cookie, extract_username, extract_visible_text,
+        looks_like_login_page, parse_hnr_counts, parse_labeled_duration_seconds,
+        parse_labeled_integer, parse_labeled_number, parse_labeled_size, parse_message_count,
+        parse_seeding_ajax_count, parse_table_labeled_value, parse_user_datetime_millis,
+        parse_user_torrent_ajax_summary,
     };
     use crate::site::SiteAdapter;
+
+    async fn serve_fixture(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), server)
+    }
+
+    fn fixture_adapter(base_url: String) -> NexusPhpAdapter {
+        NexusPhpAdapter::new(
+            base_url,
+            SiteAuth::Cookie {
+                cookie: "session=valid".to_string(),
+            },
+            HeaderMap::new(),
+            Client::builder().no_proxy().build().unwrap(),
+        )
+    }
 
     #[test]
     fn custom_headers_are_applied_without_overriding_authentication() {
@@ -1551,6 +1589,241 @@ mod tests {
                 .as_deref(),
             Some("314")
         );
+        // A legacy password/hash is not a uid, even if it happens to contain only digits.
+        assert_eq!(
+            extract_user_id_from_cookie("c_secure_pass=1234567890"),
+            None
+        );
+        assert_eq!(
+            extract_user_id_from_cookie(&format!("c_secure_pass={legacy_uid}")),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_member_links_are_not_treated_as_the_current_user() {
+        assert!(extract_current_user(
+            r#"<div id="news"><a class="User_Name" href="userdetails.php?id=99">Moderator</a></div>"#
+        ).is_none());
+        assert!(
+            extract_current_user(
+                r#"<div id="info_block"><a href="userdetails.php?id=invalid">Alice</a></div>"#
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_or_malformed_credentials_fail_before_sending_requests() {
+        let mut adapter = fixture_adapter("not-a-url".to_string());
+        for auth in [
+            SiteAuth::Passkey {
+                passkey: "secret".to_string(),
+            },
+            SiteAuth::ApiKey {
+                api_key: "secret".to_string(),
+            },
+        ] {
+            adapter.auth = auth;
+            let error = adapter.get_user_stats().await.unwrap_err();
+            assert!(error.contains("需要 Cookie"), "{error}");
+            assert!(!error.contains("secret"));
+        }
+        adapter.auth = SiteAuth::Cookie {
+            cookie: "session=secret\ninvalid".to_string(),
+        };
+        let error = adapter.get_user_stats().await.unwrap_err();
+        assert!(error.contains("Cookie 格式无效"), "{error}");
+        assert!(!error.contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_profile_falls_back_to_homepage_and_preserves_profile_fields() {
+        let profile_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&profile_hits);
+        let (base_url, server) = serve_fixture(
+            Router::new()
+                .route(
+                    "/userdetails.php",
+                    get(move || async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Html(
+                            r#"<div id="info_block"><a href="userdetails.php?id=42">Alice</a></div>
+                    <table><tr><td class="rowhead">等级</td><td>Elite User</td></tr></table>"#,
+                        )
+                    }),
+                )
+                .route(
+                    "/index.php",
+                    get(|| async {
+                        Html(
+                            r#"<div id="info_block"><a href="userdetails.php?id=42">Alice</a>
+                    上传量 2 GiB 下载量 1 GiB</div>"#,
+                        )
+                    }),
+                ),
+        )
+        .await;
+        let stats = fixture_adapter(base_url)
+            .with_cached_user_id(Some("42"))
+            .get_user_stats()
+            .await
+            .unwrap();
+        assert_eq!(stats.uid.as_deref(), Some("42"));
+        assert_eq!(stats.uploaded, 2_147_483_648);
+        assert_eq!(stats.downloaded, 1_073_741_824);
+        assert_eq!(stats.details.level_name.as_deref(), Some("Elite User"));
+        assert_eq!(profile_hits.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn homepage_can_supply_an_alternative_profile_path_for_the_same_id() {
+        let (base_url, server) = serve_fixture(
+            Router::new()
+                .route("/userdetails.php", get(|| async { StatusCode::NOT_FOUND }))
+                .route(
+                    "/index.php",
+                    get(|| async {
+                        Html(r#"<div id="info_block"><a href="user.php?id=42">Alice</a></div>"#)
+                    }),
+                )
+                .route(
+                    "/user.php",
+                    get(|Query(query): Query<HashMap<String, String>>| async move {
+                        assert_eq!(query.get("id").map(String::as_str), Some("42"));
+                        Html(
+                            r#"<div id="info_block"><a href="user.php?id=42">Alice</a></div>
+                    上传量 2 GiB 下载量 1 GiB"#,
+                        )
+                    }),
+                ),
+        )
+        .await;
+        let stats = fixture_adapter(base_url)
+            .with_cached_user_id(Some("42"))
+            .get_user_stats()
+            .await
+            .unwrap();
+        assert_eq!(stats.uid.as_deref(), Some("42"));
+        assert_eq!(stats.uploaded, 2_147_483_648);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_profile_identity_is_rediscovered_without_mixing_accounts() {
+        let profile_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&profile_hits);
+        let (base_url, server) = serve_fixture(Router::new()
+            .route("/userdetails.php", get(move |Query(query): Query<HashMap<String, String>>| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let totals = match query.get("id").map(String::as_str) {
+                    Some("42") => "上传量 99 GiB 下载量 99 GiB",
+                    Some("7") => "上传量 2 GiB 下载量 1 GiB",
+                    other => panic!("unexpected profile id: {other:?}"),
+                };
+                Html(format!(r#"<div id="info_block"><a href="userdetails.php?id=7">Bob</a></div>{totals}"#))
+            }))
+            .route("/index.php", get(|| async {
+                Html(r#"<div id="info_block"><a href="userdetails.php?id=7">Bob</a></div>"#)
+            }))).await;
+        let stats = fixture_adapter(base_url)
+            .with_cached_user_id(Some("42"))
+            .get_user_stats()
+            .await
+            .unwrap();
+        assert_eq!(stats.uid.as_deref(), Some("7"));
+        assert_eq!(stats.username, "Bob");
+        assert_eq!(stats.uploaded, 2_147_483_648);
+        assert_eq!(stats.downloaded, 1_073_741_824);
+        assert_eq!(profile_hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cookie_uid_overrides_cache_and_preserves_site_subdirectory() {
+        let (base_url, server) = serve_fixture(Router::new().route(
+            "/tracker/userdetails.php",
+            get(
+                |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                    assert_eq!(headers[COOKIE], "c_secure_uid=7; session=valid");
+                    assert_eq!(headers["x-browser-profile"], "desktop");
+                    assert_eq!(query.get("id").map(String::as_str), Some("7"));
+                    Html(
+                        r#"<div id="info_block"><a href="userdetails.php?id=7">Bob</a></div>
+                    上传量 2 GiB 下载量 1 GiB"#,
+                    )
+                },
+            ),
+        ))
+        .await;
+        let mut adapter =
+            fixture_adapter(format!("{base_url}/tracker/")).with_cached_user_id(Some("42"));
+        adapter.auth = SiteAuth::Cookie {
+            cookie: "c_secure_uid=7; session=valid".to_string(),
+        };
+        adapter
+            .request_headers
+            .insert("x-browser-profile", HeaderValue::from_static("desktop"));
+        let stats = adapter.get_user_stats().await.unwrap();
+        assert_eq!(stats.uid.as_deref(), Some("7"));
+        assert_eq!(stats.uploaded, 2_147_483_648);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn page_errors_distinguish_challenges_login_and_http_status() {
+        let (base_url, server) = serve_fixture(Router::new()
+            .route("/challenge", get(|| async {
+                (StatusCode::FORBIDDEN, Html("<title>Just a moment...</title><script src='/cdn-cgi/challenge-platform'></script>"))
+            }))
+            .route("/login.php", get(|| async {
+                Html(r#"<form id="form-login"><input type="password"></form>"#)
+            }))
+            .route("/unavailable", get(|| async { StatusCode::SERVICE_UNAVAILABLE }))).await;
+        let adapter = fixture_adapter(base_url.clone());
+        for (path, expected) in [
+            ("challenge", "Cloudflare"),
+            ("login.php", "登录页"),
+            ("unavailable", "HTTP 503"),
+        ] {
+            let error = adapter
+                .fetch_html_page(&format!("{base_url}/{path}"), "首页")
+                .await
+                .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = adapter
+            .client
+            .get(format!("{base_url}/unavailable?passkey=secret-token"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        let message = describe_reqwest_error(error);
+        assert!(message.contains("503"));
+        assert!(!message.contains("secret-token"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_profile_context_is_retained_when_homepage_has_no_totals() {
+        let (base_url, server) = serve_fixture(
+            Router::new()
+                .route("/userdetails.php", get(|| async { StatusCode::FORBIDDEN }))
+                .route("/index.php", get(|| async { Html("<html>Welcome</html>") })),
+        )
+        .await;
+        let error = fixture_adapter(base_url)
+            .with_cached_user_id(Some("42"))
+            .get_user_stats()
+            .await
+            .unwrap_err();
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(error.contains("没有找到上传量"), "{error}");
+        assert!(!error.contains("Cookie 无效"), "{error}");
+        server.abort();
     }
 
     #[test]
@@ -1616,6 +1889,102 @@ mod tests {
         assert_eq!(stats.username, "Alice");
         assert_eq!(stats.uploaded, 1_073_741_824);
         assert_eq!(stats.downloaded, 536_870_912);
+        assert_eq!(api_hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_user_id_skips_homepage_and_nonstandard_api() {
+        let homepage_hits = Arc::new(AtomicUsize::new(0));
+        let homepage_hits_for_route = Arc::clone(&homepage_hits);
+        let api_hits = Arc::new(AtomicUsize::new(0));
+        let api_hits_for_route = Arc::clone(&api_hits);
+        let app = Router::new()
+            .route(
+                "/index.php",
+                get(move || async move {
+                    homepage_hits_for_route.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }),
+            )
+            .route(
+                "/userdetails.php",
+                get(|| async {
+                    Html(
+                        r#"<html><body>
+                            <div id="info_block">
+                              <a class="User_Name" href="/userdetails.php?id=42">Alice</a>
+                            </div>
+                            <table><tr><td class="rowhead">传输</td>
+                              <td>上传量 2 GiB 下载量 1 GiB 分享率 2.0</td>
+                            </tr></table>
+                        </body></html>"#,
+                    )
+                }),
+            )
+            .route(
+                "/api/user",
+                get(move || async move {
+                    api_hits_for_route.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let adapter = NexusPhpAdapter::new(
+            format!("http://{address}"),
+            SiteAuth::Cookie {
+                cookie: "session=valid".to_string(),
+            },
+            HeaderMap::new(),
+            Client::new(),
+        )
+        .with_cached_user_id(Some("42"));
+        let stats = adapter.get_user_stats().await.unwrap();
+
+        assert_eq!(stats.uid.as_deref(), Some("42"));
+        assert_eq!(stats.username, "Alice");
+        assert_eq!(stats.uploaded, 2_147_483_648);
+        assert_eq!(stats.downloaded, 1_073_741_824);
+        assert_eq!(homepage_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(api_hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn homepage_failure_is_not_masked_by_nonstandard_api_probe() {
+        let api_hits = Arc::new(AtomicUsize::new(0));
+        let api_hits_for_route = Arc::clone(&api_hits);
+        let app = Router::new()
+            .route(
+                "/index.php",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route(
+                "/api/user",
+                get(move || async move {
+                    api_hits_for_route.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let adapter = NexusPhpAdapter::new(
+            format!("http://{address}"),
+            SiteAuth::Cookie {
+                cookie: "session=valid".to_string(),
+            },
+            HeaderMap::new(),
+            Client::new(),
+        );
+        let error = adapter.get_user_stats().await.unwrap_err();
+
+        assert!(error.contains("首页返回 HTTP 503 Service Unavailable"));
+        assert!(!error.contains("/api/user"));
         assert_eq!(api_hits.load(Ordering::SeqCst), 0);
         server.abort();
     }
@@ -1731,11 +2100,92 @@ mod tests {
     }
 
     #[test]
+    fn profile_numbers_ignore_navigation_and_preserve_precise_ucoin() {
+        let html = r#"<nav>魔力 100 邀请 4</nav><table>
+          <tr><td class="rowhead">U币</td><td>102,825.1</td></tr>
+          <tr><td class="rowhead">这是你的做种积分，多多做种，多多积分！</td><td>2,439.1 (2026-09-04)</td></tr>
+          <tr><td class="rowhead">UCoin[详情]</td><td><span title="122,217.24">122217</span></td></tr>
+        </table>"#;
+        assert_eq!(
+            super::parse_profile_number(html, &["魔力", "U币"]),
+            Some(102825.1)
+        );
+        assert_eq!(
+            super::parse_profile_number(html, &["做种积分"]),
+            Some(2439.1)
+        );
+        assert_eq!(
+            super::parse_profile_number(html, &["UCoin"]),
+            Some(122217.24)
+        );
+        assert_eq!(super::parse_profile_number(html, &["蝌蚪"]), None);
+        let hhan = "<span>憨豆：</span><div>23886.7</div><span>加入日期：</span><span>2026-08-20 10:16:35</span>";
+        assert_eq!(super::parse_profile_number(hhan, &["憨豆"]), Some(23886.7));
+        assert_eq!(
+            super::parse_profile_value(hhan, &["加入日期"]).as_deref(),
+            Some("2026-08-20 10:16:35")
+        );
+    }
+
+    #[test]
+    fn empty_profile_icon_does_not_hide_the_account_name() {
+        let html = r#"<div id="info_block"><a href="userdetails.php?id=42"><img src="avatar.png"></a><a class="PowerUser_Name" href="userdetails.php?id=42">alice</a><a href="userdetails.php?id=99">bob</a></div>"#;
+        let current = super::extract_current_user(html).unwrap();
+        assert_eq!(current.uid, "42");
+        assert_eq!(current.username.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn notices_and_neighboring_limits_are_not_message_or_hnr_counts() {
+        let html = r#"<div id="info_block"><a href="myhr.php">5/0/20</a> 魔力 0/1000</div>
+          <table><tr><td style="background: red"><a href="messages.php">新手考核 时间 2026-09-04 指标 500</a></td></tr></table>
+          <a href="messages.php">站点公告 2025-09-01</a><img alt="Donor" src="legend.gif">"#;
+        assert_eq!(parse_hnr_counts(html), (Some(5), Some(0)));
+        assert_eq!(parse_message_count(html), Some(0));
+        assert!(!detect_donor(html));
+    }
+
+    #[test]
+    fn seeding_summary_includes_total_size_with_record_labels() {
+        assert_eq!(
+            super::parse_user_torrent_ajax_summary(
+                "<div>13 条记录 | 总大小：379.45 GB | 官种数量: 3</div>"
+            ),
+            Some((13, Some((379.45 * 1073741824.0) as u64)))
+        );
+        assert_eq!(
+            super::parse_user_torrent_ajax_summary("<b>9</b>条记录 大小 119.091 GiB"),
+            Some((9, Some((119.091 * 1073741824.0) as u64)))
+        );
+    }
+
+    #[test]
+    fn hourly_bonus_sums_spendable_rewards_without_seeding_points() {
+        let html = "<div><div>对于非官奖励，你当前每小时能获取20.565个U币</div><div>对于官种奖励，你当前每小时能获取17.755个U币</div><div>对于做种积分，你当前每小时能获取18.598</div></div>";
+        let rates = super::parse_bonus_rates(html, false);
+        assert!((rates.0.unwrap() - 38.32).abs() < 0.00001);
+        assert_eq!(rates.1, None);
+        let nested = "<div><table><tr><td><div>你當前每小時能獲取3.822個魔力值; 如果你有捐贈標誌，你每小時將能獲取7.644個魔力值</div></td></tr></table></div>";
+        assert_eq!(super::parse_bonus_rates(nested, false), (Some(3.822), None));
+        assert_eq!(
+            super::parse_bonus_rates("最近24小时获得种子UCoin1296，计算次数82", true),
+            (Some(54.0), None)
+        );
+        assert_eq!(
+            super::parse_bonus_rates(
+                r#"<div id="outer"><table><tr><td rowspan="2">3.516</td></tr></table><div>你当前每小时能获取0个魔力值</div></div>"#,
+                false
+            ),
+            (Some(3.516), None)
+        );
+    }
+
+    #[test]
     fn parses_extended_pt_depiler_nexusphp_fields() {
         let html = r#"
             <html><body>
               <div id="info_block">
-                <a href="messages.php">消息 (3)</a>
+                <table><tr><td style="background: red"><a href="messages.php">消息 (3)</a></td></tr></table>
                 <a href="myhr.php">H&amp;R: 2/1/5</a>
               </div>
               <h1><img src="pic/flag/donor.gif" alt="Donor"></h1>
@@ -1752,12 +2202,11 @@ mod tests {
             Some("Elite User")
         );
         assert_eq!(parse_message_count(html), Some(3));
+        assert_eq!(parse_hnr_counts(html), (Some(2), Some(1)));
         assert_eq!(
-            parse_hnr_counts(&extract_visible_text(html)),
-            (Some(2), Some(1))
-        );
-        assert_eq!(
-            parse_hnr_counts("H&R: 电影区 2/1/5 剧集区 3/4/10"),
+            parse_hnr_counts(
+                r#"<div id="info_block"><a href="myhr.php">电影区 2/1/5 剧集区 3/4/10</a></div>"#
+            ),
             (Some(5), Some(5))
         );
         assert!(detect_donor(html));
