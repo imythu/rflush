@@ -325,9 +325,10 @@ function renderOverviewProofImage({
     .slice().sort((a, b) => (b.stats?.uploaded ?? 0) - (a.stats?.uploaded ?? 0))
     .slice(0, 4);
   const width = 1600;
-  const tableRowHeight = 58;
-  const height = Math.max(1050, 760 + rows.length * tableRowHeight);
-  const scale = 2;
+  const tableRowHeight = 76;
+  const height = 732 + 60 + rows.length * tableRowHeight + 100;
+  // Keep large exports within browser canvas dimension and memory limits.
+  const scale = Math.min(2, 16000 / height, Math.sqrt(24_000_000 / (width * height)));
   const canvas = document.createElement("canvas");
   canvas.width = width * scale;
   canvas.height = height * scale;
@@ -340,21 +341,6 @@ function renderOverviewProofImage({
   ctx.fillStyle = "#fbf7ff";
   ctx.fillRect(0, 0, width, height);
 
-  ctx.strokeStyle = "rgba(126, 96, 194, 0.08)";
-  ctx.lineWidth = 1;
-  for (let x = 0; x < width; x += 56) {
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, height);
-    ctx.stroke();
-  }
-  for (let y = 0; y < height; y += 56) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(width, y);
-    ctx.stroke();
-  }
-
   const heroGradient = ctx.createLinearGradient(48, 48, 1552, 280);
   heroGradient.addColorStop(0, "#fffaff");
   heroGradient.addColorStop(0.58, "#f1e8ff");
@@ -363,8 +349,9 @@ function renderOverviewProofImage({
 
   drawRoundRect(ctx, 88, 88, 92, 92, 26, "#7d5cff");
   drawText(ctx, "云", 111, 148, { font: "900 42px Inter, system-ui, sans-serif", color: "#ffffff" });
-  drawText(ctx, "YUNMU PT PROOF", 208, 108, { font: "900 22px Inter, system-ui, sans-serif", color: "#7d5cff" });
   drawText(ctx, "PT 账号数据", 208, 166, { font: "900 56px Inter, system-ui, sans-serif", color: "#20173d" });
+
+  drawText(ctx, "汇总包含历史数据；图片生成时间不代表账户数据刷新时间。", 88, 246, { font: "500 20px Inter, system-ui, sans-serif", color: "#5f5478" });
 
   const generatedText = `生成时间 ${generatedAt.toLocaleString()}`;
   drawRoundRect(ctx, 1120, 88, 360, 46, 23, "rgba(255,255,255,0.62)", "rgba(126, 96, 194, 0.16)");
@@ -375,33 +362,40 @@ function renderOverviewProofImage({
   drawText(ctx, `${failedRows.length} 个失败`, 1332, 181, { font: "800 18px Inter, system-ui, sans-serif", color: failedRows.length ? "#d83a57" : "#4a347f" });
 
   const metrics = [
-    ["总上传量", uploaded.value, uploaded.unit],
-    ["总下载量", downloaded.value, downloaded.unit],
-    ["综合分享率", formatRatio(totalUploaded, totalDownloaded), "ratio"],
-    ["可展示站点", `${successfulRows.length}`, `/ ${rows.length}`],
+    ["总上传量", successfulRows.length ? uploaded.value : "—", successfulRows.length ? uploaded.unit : ""],
+    ["总下载量", successfulRows.length ? downloaded.value : "—", successfulRows.length ? downloaded.unit : ""],
+    ["综合分享率", successfulRows.length ? formatRatio(totalUploaded, totalDownloaded) : "—", ""],
+    ["有账户数据", `${successfulRows.length}`, `/ ${rows.length}`],
   ];
   metrics.forEach(([label, value, unit], index) => {
     const x = 48 + index * 376;
     drawRoundRect(ctx, x, 320, 352, 150, 26, "rgba(255,255,255,0.82)", "rgba(126, 96, 194, 0.16)");
     drawText(ctx, label, x + 28, 362, { font: "800 20px Inter, system-ui, sans-serif", color: "#6d6289" });
-    drawText(ctx, value, x + 28, 430, { font: "900 48px Inter, system-ui, sans-serif", color: "#20173d", maxWidth: 210 });
+    const valueWidth = unit ? 205 : 296;
+    let valueSize = 48;
+    ctx.font = `900 ${valueSize}px Inter, system-ui, sans-serif`;
+    while (ctx.measureText(value).width > valueWidth && valueSize > 20) {
+      valueSize -= 1;
+      ctx.font = `900 ${valueSize}px Inter, system-ui, sans-serif`;
+    }
+    drawText(ctx, value, x + 28, 430, { font: ctx.font, color: "#20173d" });
     drawText(ctx, unit, x + 245, 430, { font: "900 22px Inter, system-ui, sans-serif", color: "#7d5cff", maxWidth: 80 });
   });
 
   drawRoundRect(ctx, 48, 510, 1504, 154, 28, "rgba(255,255,255,0.72)", "rgba(126, 96, 194, 0.16)");
   drawText(ctx, "上传量排行", 82, 554, { font: "900 26px Inter, system-ui, sans-serif", color: "#20173d" });
+  if (!topRows.length) drawText(ctx, "暂无账户数据，请先刷新站点统计", 82, 614, { font: "500 22px Inter, system-ui, sans-serif", color: "#6d6289" });
   topRows.forEach((row, index) => {
     const x = 82 + index * 360;
     const stats = row.stats;
     drawRoundRect(ctx, x, 584, 328, 54, 18, "rgba(245,238,255,0.78)", "rgba(126, 96, 194, 0.12)");
     drawRoundRect(ctx, x + 14, 597, 30, 30, 12, "#7d5cff");
     drawText(ctx, String(index + 1), x + 24, 619, { font: "900 16px Inter, system-ui, sans-serif", color: "#ffffff" });
-    drawText(ctx, row.site.name, x + 56, 609, { font: "900 18px Inter, system-ui, sans-serif", color: "#20173d", maxWidth: 130 });
+    drawText(ctx, row.site.name, x + 56, 609, { font: "900 18px Inter, system-ui, sans-serif", color: "#20173d", maxWidth: 255 });
     drawText(ctx, stats ? formatBytes(stats.uploaded) : "-", x + 56, 630, { font: "800 15px Inter, system-ui, sans-serif", color: "#6d6289", maxWidth: 130 });
-    drawText(ctx, stats?.username ?? "-", x + 204, 622, { font: "800 15px Inter, system-ui, sans-serif", color: "#4a347f", maxWidth: 90 });
   });
 
-  const tableY = 708;
+  const tableY = 732;
   drawText(ctx, "站点明细", 48, tableY - 24, { font: "900 26px Inter, system-ui, sans-serif", color: "#20173d" });
   const cols = [
     ["站点", 74, 190],
@@ -420,7 +414,7 @@ function renderOverviewProofImage({
   rows.forEach((row, index) => {
     const y = tableY + 60 + index * tableRowHeight;
     const stats = row.stats;
-    drawRoundRect(ctx, 48, y, 1504, 48, 18, index % 2 === 0 ? "rgba(255,255,255,0.78)" : "rgba(246,240,255,0.72)", "rgba(126, 96, 194, 0.12)");
+    drawRoundRect(ctx, 48, y, 1504, 66, 12, index % 2 === 0 ? "rgba(255,255,255,0.78)" : "rgba(246,240,255,0.72)", "rgba(126, 96, 194, 0.12)");
     const values = [
       row.site.name,
       stats?.uid ?? "-",
@@ -428,7 +422,7 @@ function renderOverviewProofImage({
       stats ? formatBytes(stats.uploaded) : "-",
       stats ? formatBytes(stats.downloaded) : "-",
       stats ? formatRatio(stats.uploaded, stats.downloaded) : "-",
-      row.error ?? (row.stats ? "最近拉取成功" : "等待刷新"),
+      row.error ? (row.stats ? "拉取失败 · 保留历史数据" : "拉取失败 · 暂无数据") : (row.stats ? "最近拉取成功" : "等待刷新"),
     ];
     cols.forEach(([, x, maxWidth], colIndex) =>
       drawText(ctx, values[colIndex], x, y + 31, {
@@ -437,6 +431,7 @@ function renderOverviewProofImage({
         maxWidth,
       }),
     );
+    drawText(ctx, row.site.stats?.last_checked_at ? `检查 ${formatDateTime(row.site.stats.last_checked_at)}` : "尚未检查", 1268, y + 53, { font: "500 13px Inter, system-ui, sans-serif", color: "#6d6289", maxWidth: 250 });
   });
 
   drawText(ctx, "Generated by 云母", 48, height - 38, { font: "800 18px Inter, system-ui, sans-serif", color: "#7d5cff" });
@@ -1324,6 +1319,7 @@ export function SitesPage() {
   }
 
   async function createOverviewImageBlob() {
+    await document.fonts.ready;
     const generatedAt = overviewGeneratedAt ?? new Date();
     return renderOverviewProofImage({ rows: overviewRows, generatedAt });
   }
@@ -1342,18 +1338,19 @@ export function SitesPage() {
 
   async function handleCopyOverviewImage() {
     setOverviewExporting("copy");
+    setOverviewMessage("");
     try {
-      const blob = await createOverviewImageBlob();
+      const blobPromise = createOverviewImageBlob();
       const ClipboardItemCtor = window.ClipboardItem;
       if (!navigator.clipboard || !ClipboardItemCtor) {
-        downloadOverviewBlob(blob);
+        downloadOverviewBlob(await blobPromise);
         setOverviewMessage("当前浏览器不支持图片剪切板，已改为下载 PNG");
         return;
       }
-      await navigator.clipboard.write([new ClipboardItemCtor({ "image/png": blob })]);
+      await navigator.clipboard.write([new ClipboardItemCtor({ "image/png": blobPromise })]);
       setOverviewMessage("PT 数据证明图已复制到剪切板");
     } catch (error) {
-      setOverviewMessage((error as Error).message || "复制图片失败");
+      setOverviewMessage(`复制图片失败，请使用“下载图片”保存。${(error as Error).message || ""}`);
     } finally {
       setOverviewExporting(null);
     }
@@ -1361,6 +1358,7 @@ export function SitesPage() {
 
   async function handleDownloadOverviewImage() {
     setOverviewExporting("download");
+    setOverviewMessage("");
     try {
       const blob = await createOverviewImageBlob();
       downloadOverviewBlob(blob);
@@ -2305,71 +2303,32 @@ export function SitesPage() {
           <p className="py-8 text-center text-muted">暂无站点统计数据</p>
         ) : (
           <div className="flex flex-col gap-5 p-4 sm:p-6">
-            <section className="relative overflow-hidden rounded-[32px] border border-primary/15 bg-gradient-to-br from-[#fff9ff] via-[#f2eaff] to-[#dfd2ff] p-5 shadow-card sm:p-7">
-              <div className="pointer-events-none absolute -right-10 -top-16 h-56 w-56 rounded-full bg-blossom/20 blur-3xl" />
-              <div className="pointer-events-none absolute bottom-0 right-10 h-px w-56 bg-gradient-to-r from-transparent via-primary/40 to-transparent" />
-
-              <div className="relative flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="rounded-full border border-primary/20 bg-white/70 px-3 py-1 text-xs font-black tracking-[0.18em] text-primary">
-                      YUNMU PT PROOF
-                    </span>
-                    <span className="rounded-full border border-blossom/20 bg-white/60 px-3 py-1 text-xs font-bold text-[#b43767]">
-                      {successfulOverviewRows.length} 个站点有账户数据
-                    </span>
-                  </div>
-                  <h3 className="mt-4 text-3xl font-black tracking-tight text-foreground sm:text-5xl">
-                    PT 账号数据
-                  </h3>
-                </div>
-
-                <div className="flex flex-col gap-3 lg:w-[380px]">
-                  <div className="self-start rounded-full border border-primary/15 bg-white/65 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.9)] backdrop-blur lg:self-end">
-                    <div className="flex items-center gap-1">
-                      <span className="px-3 text-xs font-black tracking-[0.14em] text-muted">导出 PNG</span>
-                      <button
-                        type="button"
-                        className="inline-flex h-9 w-9 items-center justify-center rounded-full text-primary transition hover:bg-secondary disabled:opacity-50"
-                        onClick={() => void handleCopyOverviewImage()}
-                        disabled={overviewExporting !== null}
-                        title="复制图片到剪切板"
-                        aria-label="复制图片到剪切板"
-                      >
-                        {overviewExporting === "copy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Copy className="h-4 w-4" />}
-                      </button>
-                      <button
-                        type="button"
-                        className="inline-flex h-9 w-9 items-center justify-center rounded-full text-primary transition hover:bg-secondary disabled:opacity-50"
-                        onClick={() => void handleDownloadOverviewImage()}
-                        disabled={overviewExporting !== null}
-                        title="下载图片"
-                        aria-label="下载图片"
-                      >
-                        {overviewExporting === "download" ? <Loader2 className="h-4 w-4 animate-spin" /> : <DownloadIcon className="h-4 w-4" />}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="grid gap-2 text-sm sm:grid-cols-2">
-                    <ProofInfo label="生成时间" value={overviewGeneratedAt?.toLocaleString() ?? "-"} />
-                    <ProofInfo label="配置站点" value={`${overviewRows.length} 个`} />
-                    <ProofInfo label="有账户数据" value={`${successfulOverviewRows.length} 个`} />
-                    <ProofInfo label="失败站点" value={`${failedOverviewRows.length} 个`} />
-                  </div>
-                </div>
+            <section className="flex flex-col gap-4 border-b border-border pb-5 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <h4 className="text-xl font-bold">PT 账号数据</h4>
+                <p className="mt-2 text-sm text-muted">共 {overviewRows.length} 个站点 · {failedOverviewRows.length} 个拉取失败 · {overviewRows.filter((row) => !row.stats && !row.error).length} 个待刷新</p>
+                <p className="mt-1 text-xs text-muted">生成时间：{overviewGeneratedAt?.toLocaleString() ?? "—"}</p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <Button variant="outline" className="h-11 flex-1 sm:flex-none" onClick={() => void handleCopyOverviewImage()} disabled={overviewExporting !== null}>
+                  {overviewExporting === "copy" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <Copy className="mr-2 size-4" />}复制图片
+                </Button>
+                <Button className={`h-11 flex-1 sm:flex-none ${sitePrimaryButtonClassName}`} onClick={() => void handleDownloadOverviewImage()} disabled={overviewExporting !== null}>
+                  {overviewExporting === "download" ? <Loader2 className="mr-2 size-4 animate-spin" /> : <DownloadIcon className="mr-2 size-4" />}下载图片
+                </Button>
               </div>
             </section>
 
             <p className="text-sm text-muted">汇总包含此前获取的账户数据；请结合各站点的最近检查时间和错误状态判断时效。</p>
-            <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              <OverviewMetricCard icon={UploadCloud} label="总上传量" value={totalUploadedCompact.value} unit={totalUploadedCompact.unit} />
-              <OverviewMetricCard icon={DownloadCloud} label="总下载量" value={totalDownloadedCompact.value} unit={totalDownloadedCompact.unit} />
-              <OverviewMetricCard icon={Gauge} label="综合分享率" value={formatRatio(totalUploaded, totalDownloaded)} unit="ratio" />
-              <OverviewMetricCard icon={ShieldCheck} label="可展示站点" value={`${successfulOverviewRows.length}`} unit={`/ ${overviewRows.length}`} />
+            <section className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+              <OverviewMetricCard icon={UploadCloud} label="总上传量" value={successfulOverviewRows.length ? totalUploadedCompact.value : "—"} unit={successfulOverviewRows.length ? totalUploadedCompact.unit : ""} />
+              <OverviewMetricCard icon={DownloadCloud} label="总下载量" value={successfulOverviewRows.length ? totalDownloadedCompact.value : "—"} unit={successfulOverviewRows.length ? totalDownloadedCompact.unit : ""} />
+              <OverviewMetricCard icon={Gauge} label="综合分享率" value={successfulOverviewRows.length ? formatRatio(totalUploaded, totalDownloaded) : "—"} unit="" />
+              <OverviewMetricCard icon={ShieldCheck} label="有账户数据" value={`${successfulOverviewRows.length}`} unit={`/ ${overviewRows.length}`} />
             </section>
 
             {topOverviewRows.length > 0 ? (
-              <section className="rounded-[28px] border border-border bg-card/85 p-4 shadow-card backdrop-blur sm:p-5">
+              <section className="rounded-2xl border border-border bg-card p-4 sm:p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h4 className="text-base font-black">上传量排行</h4>
@@ -2380,7 +2339,7 @@ export function SitesPage() {
                   </span>
                 </div>
 
-                <div className="mt-4 grid gap-2 lg:grid-cols-2 2xl:grid-cols-4">
+                <div className="mt-4 grid grid-cols-1 gap-2 lg:grid-cols-2 2xl:grid-cols-4">
                   {topOverviewRows.map((row, index) => (
                     <OverviewRankCard key={row.site.id} row={row} rank={index + 1} />
                   ))}
@@ -2398,15 +2357,15 @@ export function SitesPage() {
                     <TableHead>上传量</TableHead>
                     <TableHead>下载量</TableHead>
                     <TableHead>分享率</TableHead>
-                    <TableHead>状态</TableHead>
+                    <TableHead>状态 / 最近检查</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {overviewRows.map((row) => (
                     <TableRow key={row.site.id}>
-                      <TableCell className="font-bold">{row.site.name}</TableCell>
+                      <TableCell className="max-w-48 whitespace-normal break-words font-bold">{row.site.name}</TableCell>
                       <TableCell className="font-mono text-xs">{row.stats?.uid ?? "-"}</TableCell>
-                      <TableCell>{row.stats?.username ?? "-"}</TableCell>
+                      <TableCell className="max-w-40 whitespace-normal break-words">{row.stats?.username ?? "-"}</TableCell>
                       <TableCell className="font-semibold">
                         {row.stats ? formatBytes(row.stats.uploaded) : "-"}
                       </TableCell>
@@ -2417,7 +2376,7 @@ export function SitesPage() {
                         {row.stats ? formatRatio(row.stats.uploaded, row.stats.downloaded) : "-"}
                       </TableCell>
                       <TableCell className={row.error ? "text-red-600" : "text-muted"}>
-                        {row.error ?? (row.stats ? "最近拉取成功" : "等待刷新")}
+                        <div className="max-w-xs"><SiteStatusDetail site={row.site} /></div>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -2473,15 +2432,6 @@ function SiteHealthBadge({ site }: { site: SiteRecord }) {
   );
 }
 
-function ProofInfo({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-2xl border border-white/60 bg-white/55 px-4 py-3 backdrop-blur">
-      <div className="text-[11px] font-bold uppercase tracking-[0.16em] text-muted">{label}</div>
-      <div className="mt-1 truncate text-sm font-black text-foreground">{value}</div>
-    </div>
-  );
-}
-
 function OverviewMetricCard({
   icon: Icon,
   label,
@@ -2494,15 +2444,15 @@ function OverviewMetricCard({
   unit: string;
 }) {
   return (
-    <div className="rounded-[26px] border border-border bg-card/85 p-5 shadow-card backdrop-blur">
+    <div className="min-w-0 rounded-2xl border border-border bg-card p-4">
       <div className="flex items-center justify-between gap-3">
         <span className="text-sm font-bold text-muted">{label}</span>
-        <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-secondary text-primary">
+        <span className="hidden h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-secondary text-primary sm:flex">
           <Icon className="h-5 w-5" />
         </span>
       </div>
       <div className="mt-4 flex items-end gap-2">
-        <span className="text-4xl font-black tracking-tight text-foreground">{value}</span>
+        <span className="min-w-0 break-all text-2xl font-bold tabular-nums tracking-tight text-foreground sm:text-3xl">{value}</span>
         <span className="pb-1 text-sm font-bold text-muted">{unit}</span>
       </div>
     </div>
@@ -2512,7 +2462,7 @@ function OverviewMetricCard({
 function OverviewRankCard({ row, rank }: { row: SiteOverviewRow; rank: number }) {
   const stats = row.stats;
   return (
-    <div className="flex items-center gap-3 rounded-2xl border border-border bg-surface-container/70 p-3">
+    <div className="flex min-w-0 items-center gap-3 rounded-2xl border border-border bg-surface-container/70 p-3">
       <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary text-sm font-black text-primary-foreground">
         {rank}
       </span>
@@ -2534,31 +2484,29 @@ function OverviewRankCard({ row, rank }: { row: SiteOverviewRow; rank: number })
 function OverviewMobileCard({ row }: { row: SiteOverviewRow }) {
   const stats = row.stats;
   return (
-    <div className="rounded-[20px] border border-border bg-card/85 p-3.5 shadow-card">
+    <div className="min-w-0 rounded-2xl border border-border bg-card p-4">
       <div className="flex items-start justify-between gap-3">
-        <div>
-          <div className="text-base font-black">{row.site.name}</div>
+        <div className="min-w-0 break-words">
+          <div className="text-base font-bold">{row.site.name}</div>
           <div className="mt-0.5 text-[11px] text-muted">UID {stats?.uid ?? "-"} · {stats?.username ?? "-"}</div>
         </div>
-        <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold ${row.error ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"}`}>
-          {row.error ? "失败" : row.stats ? "拉取成功" : "待刷新"}
-        </span>
+        <SiteHealthBadge site={row.site} />
       </div>
       <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
         <div className="rounded-xl bg-surface-container/70 p-2.5">
-          <div className="text-[10px] font-bold text-muted">上:</div>
+          <div className="text-[10px] font-bold text-muted">上传量</div>
           <div className="mt-0.5 text-sm font-black truncate">{stats ? formatBytes(stats.uploaded) : "-"}</div>
         </div>
         <div className="rounded-xl bg-surface-container/70 p-2.5">
-          <div className="text-[10px] font-bold text-muted">下:</div>
+          <div className="text-[10px] font-bold text-muted">下载量</div>
           <div className="mt-0.5 text-sm font-black truncate">{stats ? formatBytes(stats.downloaded) : "-"}</div>
         </div>
         <div className="rounded-xl bg-surface-container/70 p-2.5">
-          <div className="text-[10px] font-bold text-muted">率:</div>
+          <div className="text-[10px] font-bold text-muted">分享率</div>
           <div className="mt-0.5 text-sm font-black truncate">{stats ? formatRatio(stats.uploaded, stats.downloaded) : "-"}</div>
         </div>
       </div>
-      {row.error ? <p className="mt-3 text-xs text-red-600">{row.error}</p> : null}
+      <div className="mt-3 border-t border-border pt-3"><SiteStatusDetail site={row.site} showBadge={false} /></div>
     </div>
   );
 }
