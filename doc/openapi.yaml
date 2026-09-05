@@ -106,6 +106,13 @@ paths:
         '200': {description: OK, content: {application/json: {schema: {$ref: '#/components/schemas/IdResponse'}}}}
         default: {$ref: '#/components/responses/Error'}
 
+  /api/sites/catalog:
+    get:
+      summary: List searchable PT-Depiler site presets supported by rflush
+      responses:
+        '200': {description: OK, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/SitePreset'}}}}}
+        default: {$ref: '#/components/responses/Error'}
+
   /api/sites/ptd-backup:
     get:
       summary: Read Hive PTD-compatible WebDAV backup configuration
@@ -881,6 +888,19 @@ components:
         updated_at: {type: string, format: date-time}
         stats: {allOf: [{$ref: '#/components/schemas/SiteStatsRecord'}], nullable: true}
 
+    SitePreset:
+      type: object
+      description: PT-Depiler site metadata filtered to adapters currently supported by rflush.
+      required: [ptd_id, name, site_type, base_url, aliases]
+      properties:
+        ptd_id: {type: string}
+        name: {type: string}
+        site_type: {type: string, enum: [nexusphp, mteam]}
+        base_url: {type: string, format: uri}
+        aliases:
+          type: array
+          items: {type: string}
+
     SiteStatsRefreshStartResponse:
       type: object
       required: [started, refreshing]
@@ -966,6 +986,30 @@ components:
         bonus: {type: number, format: double, nullable: true}
         seeding_count: {type: integer, format: int32, nullable: true}
         leeching_count: {type: integer, format: int32, nullable: true}
+        is_donor: {type: boolean, nullable: true}
+        level_id: {type: integer, format: int64, nullable: true}
+        level_name: {type: string, nullable: true}
+        join_time: {type: integer, format: int64, nullable: true, description: Unix timestamp in milliseconds.}
+        last_access_at: {type: integer, format: int64, nullable: true, description: Unix timestamp in milliseconds.}
+        message_count: {type: integer, format: int64, nullable: true}
+        invites: {type: integer, format: int64, nullable: true}
+        avatar: {type: string, nullable: true}
+        total_traffic: {type: integer, format: int64, nullable: true, description: Bytes.}
+        true_downloaded: {type: integer, format: int64, nullable: true, description: Bytes.}
+        true_uploaded: {type: integer, format: int64, nullable: true, description: Bytes.}
+        true_ratio: {type: number, format: double, nullable: true}
+        seeding_size: {type: integer, format: int64, nullable: true, description: Bytes.}
+        seeding_time: {type: integer, format: int64, nullable: true, description: Seconds.}
+        average_seeding_time: {type: integer, format: int64, nullable: true, description: Seconds.}
+        seeding_bonus: {type: number, format: double, nullable: true}
+        bonus_per_hour: {type: number, format: double, nullable: true}
+        seeding_bonus_per_hour: {type: number, format: double, nullable: true}
+        uploads: {type: integer, format: int64, nullable: true}
+        snatches: {type: integer, format: int64, nullable: true}
+        posts: {type: integer, format: int64, nullable: true}
+        adoptions: {type: integer, format: int64, nullable: true}
+        hnr_unsatisfied: {type: integer, format: int64, nullable: true}
+        hnr_pre_warning: {type: integer, format: int64, nullable: true}
         updated_at: {type: string, nullable: true}
         last_checked_at: {type: string}
         last_error: {type: string, nullable: true}
@@ -1040,6 +1084,30 @@ components:
         bonus: {type: number, format: double, nullable: true}
         seeding_count: {type: integer, format: int32, nullable: true}
         leeching_count: {type: integer, format: int32, nullable: true}
+        is_donor: {type: boolean, nullable: true}
+        level_id: {type: integer, format: int64, nullable: true}
+        level_name: {type: string, nullable: true}
+        join_time: {type: integer, format: int64, nullable: true, description: Unix timestamp in milliseconds.}
+        last_access_at: {type: integer, format: int64, nullable: true, description: Unix timestamp in milliseconds.}
+        message_count: {type: integer, format: int64, nullable: true}
+        invites: {type: integer, format: int64, nullable: true}
+        avatar: {type: string, nullable: true}
+        total_traffic: {type: integer, format: int64, nullable: true, description: Bytes.}
+        true_downloaded: {type: integer, format: int64, nullable: true, description: Bytes.}
+        true_uploaded: {type: integer, format: int64, nullable: true, description: Bytes.}
+        true_ratio: {type: number, format: double, nullable: true}
+        seeding_size: {type: integer, format: int64, nullable: true, description: Bytes.}
+        seeding_time: {type: integer, format: int64, nullable: true, description: Seconds.}
+        average_seeding_time: {type: integer, format: int64, nullable: true, description: Seconds.}
+        seeding_bonus: {type: number, format: double, nullable: true}
+        bonus_per_hour: {type: number, format: double, nullable: true}
+        seeding_bonus_per_hour: {type: number, format: double, nullable: true}
+        uploads: {type: integer, format: int64, nullable: true}
+        snatches: {type: integer, format: int64, nullable: true}
+        posts: {type: integer, format: int64, nullable: true}
+        adoptions: {type: integer, format: int64, nullable: true}
+        hnr_unsatisfied: {type: integer, format: int64, nullable: true}
+        hnr_pre_warning: {type: integer, format: int64, nullable: true}
 
     SiteTestResult:
       type: object

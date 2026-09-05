@@ -45,6 +45,14 @@ export type SiteRecord = {
   stats: SiteStatsRecord | null;
 };
 
+export type PtdSitePreset = {
+  ptd_id: string;
+  name: string;
+  site_type: "nexusphp" | "mteam";
+  base_url: string;
+  aliases: string[];
+};
+
 export type SiteRequestHeader = {
   name: string;
   value: string;
@@ -57,7 +65,34 @@ export type SiteCredentialsRecord = {
   api_key: string | null;
 };
 
-export type SiteStatsRecord = {
+export type UserStatsDetails = {
+  is_donor?: boolean | null;
+  level_id?: number | null;
+  level_name?: string | null;
+  join_time?: number | null;
+  last_access_at?: number | null;
+  message_count?: number | null;
+  invites?: number | null;
+  avatar?: string | null;
+  total_traffic?: number | null;
+  true_downloaded?: number | null;
+  true_uploaded?: number | null;
+  true_ratio?: number | null;
+  seeding_size?: number | null;
+  seeding_time?: number | null;
+  average_seeding_time?: number | null;
+  seeding_bonus?: number | null;
+  bonus_per_hour?: number | null;
+  seeding_bonus_per_hour?: number | null;
+  uploads?: number | null;
+  snatches?: number | null;
+  posts?: number | null;
+  adoptions?: number | null;
+  hnr_unsatisfied?: number | null;
+  hnr_pre_warning?: number | null;
+};
+
+export type SiteStatsRecord = UserStatsDetails & {
   site_id: number;
   uid: string | null;
   username: string | null;
@@ -114,7 +149,7 @@ export type PtdBackupRunResult = {
   backed_up_at: string;
 };
 
-export type UserStats = {
+export type UserStats = UserStatsDetails & {
   uid: string | null;
   username: string;
   uploaded: number;

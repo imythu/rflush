@@ -190,6 +190,7 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
         .route("/api/settings", get(get_settings).put(update_settings))
         // 站点管理
         .route("/api/sites", get(list_sites).post(create_site))
+        .route("/api/sites/catalog", get(list_site_presets))
         .route(
             "/api/sites/ptd-backup",
             get(get_ptd_backup_config).put(update_ptd_backup_config),
@@ -2939,6 +2940,10 @@ async fn list_sites(State(state): State<AppState>) -> Result<Json<Vec<SiteRespon
             .map(SiteResponse::from)
             .collect(),
     ))
+}
+
+async fn list_site_presets() -> Json<&'static [crate::ptd_site_catalog::PtdSitePreset]> {
+    Json(crate::ptd_site_catalog::SITE_PRESETS)
 }
 
 async fn get_site_credentials(

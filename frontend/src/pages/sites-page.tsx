@@ -56,6 +56,7 @@ import type {
   PtdBackupConfig,
   PtdBackupRunResult,
   PtdBackupTestResult,
+  PtdSitePreset,
   SiteCredentialsRecord,
   SiteRecord,
   SiteRequestHeader,
@@ -85,6 +86,7 @@ function formatDateTime(value: string | null | undefined): string {
 
 type SiteHealth = "healthy" | "failed" | "pending";
 const SITE_PAGE_SIZE = 20;
+const CUSTOM_SITE_PRESET = "__custom__";
 
 function getSiteHealth(site: SiteRecord): SiteHealth {
   if (site.stats?.last_error) return "failed";
@@ -698,6 +700,10 @@ export function SitesPage() {
   const [siteStatusFilter, setSiteStatusFilter] = useState<"all" | SiteHealth>("all");
   const [siteTypeFilter, setSiteTypeFilter] = useState("all");
   const [sitePage, setSitePage] = useState(1);
+  const [sitePresets, setSitePresets] = useState<PtdSitePreset[]>([]);
+  const [sitePresetsLoading, setSitePresetsLoading] = useState(true);
+  const [sitePresetsError, setSitePresetsError] = useState("");
+  const [selectedSitePreset, setSelectedSitePreset] = useState(CUSTOM_SITE_PRESET);
 
   // Hive PTD compatible WebDAV backup
   const [ptdConfig, setPtdConfig] = useState<PtdBackupConfig | null>(null);
@@ -758,6 +764,23 @@ export function SitesPage() {
     }),
     [sites],
   );
+  const sitePresetOptions = useMemo(
+    () => [
+      {
+        value: CUSTOM_SITE_PRESET,
+        label: "自定义站点",
+        description: "手动填写名称、类型和站点地址",
+        keywords: ["custom", "自定义", "手动"],
+      },
+      ...sitePresets.map((preset) => ({
+        value: preset.ptd_id,
+        label: preset.name,
+        description: `${preset.aliases.join("、") || preset.ptd_id} · ${preset.base_url.replace(/^https?:\/\//, "")}`,
+        keywords: [preset.ptd_id, preset.base_url, ...preset.aliases],
+      })),
+    ],
+    [sitePresets],
+  );
   const filteredSites = useMemo(() => {
     const query = siteQuery.trim().toLocaleLowerCase();
     return sites.filter((site) => {
@@ -816,9 +839,22 @@ export function SitesPage() {
       .finally(() => setPtdConfigLoading(false));
   }
 
+  function loadSitePresets() {
+    setSitePresetsLoading(true);
+    setSitePresetsError("");
+    api<PtdSitePreset[]>("/api/sites/catalog")
+      .then(setSitePresets)
+      .catch((error: Error) => {
+        setSitePresets([]);
+        setSitePresetsError(error.message || "加载 PTD 站点列表失败");
+      })
+      .finally(() => setSitePresetsLoading(false));
+  }
+
   useEffect(() => {
     loadSites();
     loadPtdConfig();
+    loadSitePresets();
     api<SiteStatsRefreshStatusResponse>("/api/sites/refresh-all")
       .then((status) => setRefreshingAll(status.refreshing))
       .catch(() => undefined);
@@ -1002,6 +1038,38 @@ export function SitesPage() {
     setForm((prev) => ({ ...prev, ...partial }));
   }
 
+  function applySitePreset(value: string) {
+    if (value === CUSTOM_SITE_PRESET) {
+      if (selectedSitePreset !== CUSTOM_SITE_PRESET) {
+        patch({
+          name: "",
+          site_type: "nexusphp",
+          base_url: "",
+          auth_type: "cookie",
+          cookie: "",
+          passkey: "",
+          api_key: "",
+        });
+      }
+      setSelectedSitePreset(value);
+      return;
+    }
+
+    const preset = sitePresets.find((site) => site.ptd_id === value);
+    if (!preset) return;
+    setSelectedSitePreset(value);
+    setClearAuthConfig(false);
+    patch({
+      name: preset.name,
+      site_type: preset.site_type,
+      base_url: preset.base_url,
+      auth_type: preset.site_type === "mteam" ? "api_key" : "cookie",
+      cookie: "",
+      passkey: "",
+      api_key: "",
+    });
+  }
+
   function closeForm() {
     requestHeadersLoadRef.current += 1;
     setRequestHeadersLoading(false);
@@ -1043,6 +1111,7 @@ export function SitesPage() {
   function openAdd() {
     requestHeadersLoadRef.current += 1;
     setEditingId(null);
+    setSelectedSitePreset(CUSTOM_SITE_PRESET);
     setForm({ ...emptySiteForm, request_headers: freshDefaultRequestHeaders() });
     setExistingAuth(null);
     setClearAuthConfig(false);
@@ -1055,6 +1124,7 @@ export function SitesPage() {
     const loadId = requestHeadersLoadRef.current + 1;
     requestHeadersLoadRef.current = loadId;
     setEditingId(site.id);
+    setSelectedSitePreset(CUSTOM_SITE_PRESET);
     const siteType = (site.site_type as SiteForm["site_type"]) || "nexusphp";
     const authType = site.auth_type ?? (siteType === "mteam" ? "api_key" : "cookie");
     setForm({
@@ -1867,7 +1937,7 @@ export function SitesPage() {
                 value={ptdForm.backup_interval_hours}
                 onChange={(event) => setPtdForm((current) => ({ ...current, backup_interval_hours: Number(event.target.value) }))}
               />
-              <p className="text-[11px] leading-5 text-muted">每次站点统计刷新完成后检查周期；只上传最新成功获取的用户信息。</p>
+              <p className="text-[11px] leading-5 text-muted">每次站点统计刷新完成后检查周期；成功数据按日留存，并上传完整历史用户信息。</p>
             </div>
             <div className="space-y-2 rounded-2xl border border-border bg-surface-container/55 p-3">
               <Label className="flex cursor-pointer items-center justify-between gap-3">
@@ -1983,7 +2053,7 @@ export function SitesPage() {
         description={
           editingId != null
             ? "修改站点连接配置"
-            : "填写站点信息以添加新的 PT 站点"
+            : "从 PT-Depiler 站点列表快速选择，或添加自定义站点"
         }
         escMode="double"
         panelClassName="max-w-6xl"
@@ -1998,9 +2068,41 @@ export function SitesPage() {
             </div>
           ) : null}
           <div className="min-w-0 space-y-4">
+            {editingId == null ? (
+              <div className="space-y-2 rounded-2xl border border-primary/20 bg-primary/5 p-3.5">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="site-preset">站点来源</Label>
+                  {sitePresetsLoading ? <span className="text-[11px] text-muted">加载 PTD 列表中…</span> : null}
+                </div>
+                <Select
+                  id="site-preset"
+                  value={selectedSitePreset}
+                  onChange={applySitePreset}
+                  options={sitePresetOptions}
+                  searchable
+                  searchPlaceholder="搜索站点名称、别名、域名或 PTD ID"
+                  emptyMessage="没有匹配的 PTD 站点，可选择自定义站点"
+                  aria-describedby="site-preset-help"
+                />
+                <div id="site-preset-help" className="text-[11px] leading-5 text-muted">
+                  {sitePresetsError ? (
+                    <span className="text-destructive">
+                      {sitePresetsError}。
+                      <button type="button" className="cursor-pointer font-bold underline underline-offset-2" onClick={loadSitePresets}>重新加载</button>
+                    </span>
+                  ) : selectedSitePreset === CUSTOM_SITE_PRESET ? (
+                    "自定义模式下可手动填写全部连接信息。"
+                  ) : (
+                    <>已按 PTD 预设自动填充，仍可按实际入口修改。PTD ID：<span className="font-mono font-bold text-primary">{selectedSitePreset}</span></>
+                  )}
+                </div>
+              </div>
+            ) : null}
+
             <div className="space-y-2">
-              <Label>名称</Label>
+              <Label htmlFor="site-name">名称</Label>
               <Input
+                id="site-name"
                 value={form.name}
                 onChange={(e) => patch({ name: e.target.value })}
                 placeholder="站点名称"
@@ -2008,8 +2110,9 @@ export function SitesPage() {
             </div>
 
             <div className="space-y-2">
-              <Label>站点类型</Label>
+              <Label htmlFor="site-type">站点类型</Label>
               <Select
+                id="site-type"
                 value={form.site_type}
                 onChange={(val) => {
                   const v = val as SiteForm["site_type"];
@@ -2027,8 +2130,9 @@ export function SitesPage() {
             </div>
 
             <div className="space-y-2">
-              <Label>基础 URL</Label>
+              <Label htmlFor="site-base-url">基础 URL</Label>
               <Input
+                id="site-base-url"
                 value={form.base_url}
                 onChange={(e) => patch({ base_url: e.target.value })}
                 placeholder="https://example.com"

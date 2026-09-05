@@ -1,10 +1,12 @@
-use chrono::{FixedOffset, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone};
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
-use super::{SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats};
+use super::{
+    SiteAdapter, SiteAuth, SiteTestResult, TorrentAttributes, UserStats, UserStatsDetails,
+};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -244,27 +246,72 @@ impl SiteAdapter for MTeamAdapter {
                 .or_else(|| data.get("bonus"))
                 .and_then(json_value_to_f64);
 
+            let mut details = UserStatsDetails {
+                level_id: data.get("role").and_then(json_value_to_i64),
+                level_name: data.get("role").and_then(mteam_level_name),
+                join_time: data
+                    .get("createdDate")
+                    .and_then(json_value_to_timestamp_millis),
+                last_access_at: data
+                    .get("memberStatus")
+                    .and_then(|status| status.get("lastBrowse"))
+                    .and_then(json_value_to_timestamp_millis),
+                ..Default::default()
+            };
+
             let mut seeding_count = member_count
                 .get("seeding")
                 .or_else(|| member_count.get("seederCount"))
                 .and_then(json_value_to_u32);
 
-            let leeching_count = member_count
+            let mut leeching_count = member_count
                 .get("leeching")
                 .or_else(|| member_count.get("leecherCount"))
                 .and_then(json_value_to_u32);
 
-            // 新版 M-Team 把活动做种统计拆到了独立接口。
-            if seeding_count.is_none()
-                && let Ok(peer_json) = self.api_post("/api/tracker/myPeerStatistics", None).await
-            {
-                seeding_count = peer_json
-                    .get("data")
-                    .and_then(|peer_data| peer_data.get("seederCount"))
-                    .and_then(json_value_to_u32);
+            // M-Team 将活动做种、时魔和未读消息拆到了独立接口。它们不是登录校验
+            // 的必要条件，因此单个附加接口失败时保留其余统计结果，等待下次定时同步。
+            match self.api_post("/api/tracker/myPeerStatistics", None).await {
+                Ok(peer_json) => {
+                    if let Some(peer_data) = peer_json.get("data") {
+                        seeding_count = peer_data
+                            .get("seederCount")
+                            .and_then(json_value_to_u32)
+                            .or(seeding_count);
+                        leeching_count = peer_data
+                            .get("leecherCount")
+                            .and_then(json_value_to_u32)
+                            .or(leeching_count);
+                        details.seeding_size =
+                            peer_data.get("seederSize").and_then(json_value_to_u64);
+                        details.uploads = peer_data.get("uploadCount").and_then(json_value_to_u64);
+                    }
+                }
+                Err(error) => warn!(%error, "M-Team 做种统计接口获取失败"),
             }
 
-            Ok(UserStats {
+            match self.api_post("/api/tracker/mybonus", None).await {
+                Ok(bonus_json) => {
+                    details.bonus_per_hour = bonus_json
+                        .get("data")
+                        .and_then(|bonus_data| bonus_data.get("formulaParams"))
+                        .and_then(|params| params.get("finalBs"))
+                        .and_then(json_value_to_f64);
+                }
+                Err(error) => warn!(%error, "M-Team 时魔接口获取失败"),
+            }
+
+            match self.api_post("/api/msg/notify/statistic", None).await {
+                Ok(message_json) => {
+                    details.message_count = message_json
+                        .get("data")
+                        .and_then(|message_data| message_data.get("unMake"))
+                        .and_then(json_value_to_u64);
+                }
+                Err(error) => warn!(%error, "M-Team 消息统计接口获取失败"),
+            }
+
+            let mut stats = UserStats {
                 uid,
                 username,
                 uploaded,
@@ -273,7 +320,10 @@ impl SiteAdapter for MTeamAdapter {
                 bonus,
                 seeding_count,
                 leeching_count,
-            })
+                details,
+            };
+            stats.fill_derived();
+            Ok(stats)
         })
     }
 
@@ -377,7 +427,23 @@ fn json_value_to_u64(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
-        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<u64>().ok())
+        .or_else(|| {
+            let value = value.as_str()?.trim().replace(',', "");
+            value.parse::<u64>().ok().or_else(|| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|number| number.is_finite() && *number >= 0.0)
+                    .map(|number| number.min(u64::MAX as f64) as u64)
+            })
+        })
+}
+
+fn json_value_to_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+        .or_else(|| value.as_str()?.trim().replace(',', "").parse::<i64>().ok())
 }
 
 fn json_value_to_u32(value: &Value) -> Option<u32> {
@@ -388,6 +454,52 @@ fn json_value_to_f64(value: &Value) -> Option<f64> {
     value
         .as_f64()
         .or_else(|| value.as_str()?.trim().replace(',', "").parse::<f64>().ok())
+}
+
+fn json_value_to_timestamp_millis(value: &Value) -> Option<i64> {
+    if let Some(timestamp) = json_value_to_i64(value) {
+        return normalize_timestamp_millis(timestamp);
+    }
+    let value = value.as_str()?.trim();
+    DateTime::parse_from_rfc3339(value)
+        .map(|datetime| datetime.timestamp_millis())
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .and_then(|naive| {
+                    FixedOffset::east_opt(8 * 3600)?
+                        .from_local_datetime(&naive)
+                        .single()
+                        .map(|datetime| datetime.timestamp_millis())
+                })
+        })
+}
+
+fn normalize_timestamp_millis(timestamp: i64) -> Option<i64> {
+    if timestamp.unsigned_abs() < 100_000_000_000 {
+        timestamp.checked_mul(1000)
+    } else {
+        Some(timestamp)
+    }
+}
+
+fn mteam_level_name(value: &Value) -> Option<String> {
+    let level_id = json_value_to_i64(value)?;
+    let name = match level_id {
+        1 => "User",
+        2 => "Power User",
+        3 => "Elite User",
+        4 => "Crazy User",
+        5 => "Insane User",
+        6 => "Veteran User",
+        7 => "Extreme User",
+        8 => "Ultimate User",
+        9 => "mTorrent Master",
+        10 => "VIP",
+        _ => return Some(value.to_string().trim_matches('"').to_string()),
+    };
+    Some(name.to_string())
 }
 
 fn parse_mteam_datetime(value: &str) -> Option<i64> {
@@ -404,7 +516,10 @@ mod tests {
     use reqwest::header::{HeaderMap, HeaderValue};
     use serde_json::json;
 
-    use super::{MTeamAdapter, SiteAuth, api_response_succeeded};
+    use super::{
+        MTeamAdapter, SiteAuth, api_response_succeeded, json_value_to_timestamp_millis,
+        mteam_level_name,
+    };
 
     #[test]
     fn custom_headers_are_applied_without_overriding_api_key() {
@@ -479,5 +594,22 @@ mod tests {
         assert!(api_response_succeeded(&json!({ "code": "SUCCESS" })));
         assert!(!api_response_succeeded(&json!({ "code": "1" })));
         assert!(!api_response_succeeded(&json!({ "data": {} })));
+    }
+
+    #[test]
+    fn parses_pt_depiler_mteam_profile_fields() {
+        assert_eq!(
+            mteam_level_name(&json!(9)).as_deref(),
+            Some("mTorrent Master")
+        );
+        assert_eq!(mteam_level_name(&json!(10)).as_deref(), Some("VIP"));
+        assert_eq!(
+            json_value_to_timestamp_millis(&json!("2026-09-05T12:00:00+08:00")),
+            Some(1_788_580_800_000)
+        );
+        assert_eq!(
+            json_value_to_timestamp_millis(&json!(1_788_580_800)),
+            Some(1_788_580_800_000)
+        );
     }
 }

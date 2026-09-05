@@ -1,11 +1,13 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
-import { ChevronDown, Check } from "lucide-react";
+import { ChevronDown, Check, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export interface SelectOption {
   value: string;
   label: string;
+  description?: string;
+  keywords?: readonly string[];
 }
 
 export function Select({
@@ -15,6 +17,9 @@ export function Select({
   className,
   id,
   disabled = false,
+  searchable = false,
+  searchPlaceholder = "搜索选项",
+  emptyMessage = "没有匹配的选项",
   "aria-describedby": ariaDescribedBy,
   "aria-invalid": ariaInvalid,
 }: {
@@ -24,20 +29,34 @@ export function Select({
   className?: string;
   id?: string;
   disabled?: boolean;
+  searchable?: boolean;
+  searchPlaceholder?: string;
+  emptyMessage?: string;
   "aria-describedby"?: string;
   "aria-invalid"?: React.AriaAttributes["aria-invalid"];
 }) {
   const [open, setOpen] = React.useState(false);
   const [activeIndex, setActiveIndex] = React.useState(0);
+  const [searchQuery, setSearchQuery] = React.useState("");
   const containerRef = React.useRef<HTMLDivElement>(null);
   const triggerRef = React.useRef<HTMLButtonElement>(null);
   const dropdownRef = React.useRef<HTMLDivElement>(null);
+  const searchRef = React.useRef<HTMLInputElement>(null);
   const optionRefs = React.useRef<Array<HTMLButtonElement | null>>([]);
   const [dropdownStyle, setDropdownStyle] = React.useState<React.CSSProperties>({});
   const generatedId = React.useId();
   const triggerId = id ?? generatedId;
   const listboxId = `${triggerId}-listbox`;
-  const matchedSelectedIndex = options.findIndex((option) => option.value === value);
+  const filteredOptions = React.useMemo(() => {
+    const query = searchQuery.trim().normalize("NFKC").toLocaleLowerCase();
+    if (!searchable || !query) return options;
+    return options.filter((option) =>
+      [option.label, option.value, option.description, ...(option.keywords ?? [])]
+        .filter(Boolean)
+        .some((item) => item?.normalize("NFKC").toLocaleLowerCase().includes(query)),
+    );
+  }, [options, searchQuery, searchable]);
+  const matchedSelectedIndex = filteredOptions.findIndex((option) => option.value === value);
   const selectedIndex = Math.max(0, matchedSelectedIndex);
 
   function updateDropdownPosition() {
@@ -68,20 +87,22 @@ export function Select({
   function openDropdown(index = selectedIndex) {
     if (disabled || options.length === 0) return;
     updateDropdownPosition();
+    setSearchQuery("");
     setActiveIndex(Math.min(Math.max(index, 0), options.length - 1));
     setOpen(true);
   }
 
   function closeDropdown({ restoreFocus = false } = {}) {
     setOpen(false);
+    setSearchQuery("");
     if (restoreFocus) {
       requestAnimationFrame(() => triggerRef.current?.focus());
     }
   }
 
   function focusOption(index: number) {
-    if (options.length === 0) return;
-    const nextIndex = (index + options.length) % options.length;
+    if (filteredOptions.length === 0) return;
+    const nextIndex = (index + filteredOptions.length) % filteredOptions.length;
     setActiveIndex(nextIndex);
     optionRefs.current[nextIndex]?.focus();
   }
@@ -140,9 +161,16 @@ export function Select({
 
   React.useEffect(() => {
     if (!open) return;
-    const frame = requestAnimationFrame(() => optionRefs.current[activeIndex]?.focus());
+    const frame = requestAnimationFrame(() => {
+      if (searchable) searchRef.current?.focus();
+      else optionRefs.current[activeIndex]?.focus();
+    });
     return () => cancelAnimationFrame(frame);
-  }, [activeIndex, open]);
+  }, [open, searchable]);
+
+  React.useEffect(() => {
+    setActiveIndex((current) => Math.min(current, Math.max(0, filteredOptions.length - 1)));
+  }, [filteredOptions.length]);
 
   const selectedOption = options.find((option) => option.value === value);
   const selectedLabel = selectedOption?.label ?? (value ? "当前选项不可用" : "请选择");
@@ -182,16 +210,57 @@ export function Select({
 
       {open && !disabled && typeof document !== "undefined" && createPortal(
         <div
-          id={listboxId}
           ref={dropdownRef}
-          role="listbox"
-          aria-labelledby={triggerId}
           data-dialog-focus-portal="true"
           style={dropdownStyle}
-          className="absolute z-[100] max-h-60 overflow-auto rounded-2xl border border-border bg-card p-1 shadow-card backdrop-blur-xl animate-in fade-in-0 zoom-in-95"
+          className="absolute z-[100] flex max-h-72 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-card backdrop-blur-xl animate-in fade-in-0 zoom-in-95"
           onClick={(event) => event.stopPropagation()}
         >
-          {options.map((opt, index) => {
+          {searchable ? (
+            <div className="border-b border-border p-2">
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" aria-hidden="true" />
+                <input
+                  ref={searchRef}
+                  type="search"
+                  value={searchQuery}
+                  onChange={(event) => {
+                    setSearchQuery(event.target.value);
+                    setActiveIndex(0);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      focusOption(0);
+                    } else if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      focusOption(filteredOptions.length - 1);
+                    } else if (event.key === "Enter" && filteredOptions.length === 1) {
+                      event.preventDefault();
+                      onChange(filteredOptions[0].value);
+                      closeDropdown({ restoreFocus: true });
+                    } else if (event.key === "Escape") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      closeDropdown({ restoreFocus: true });
+                    } else if (event.key === "Tab") {
+                      event.preventDefault();
+                      closeDropdown();
+                      requestAnimationFrame(() => focusAdjacentToTrigger(event.shiftKey));
+                    }
+                  }}
+                  placeholder={searchPlaceholder}
+                  aria-label={searchPlaceholder}
+                  aria-controls={listboxId}
+                  className="h-10 w-full rounded-xl border border-border bg-input pl-9 pr-3 text-sm outline-none transition-colors placeholder:text-muted focus:border-primary focus:ring-2 focus:ring-ring/30"
+                />
+              </div>
+            </div>
+          ) : null}
+          <div id={listboxId} role="listbox" aria-labelledby={triggerId} className="min-h-0 overflow-y-auto p-1">
+          {filteredOptions.length === 0 ? (
+            <p className="px-3 py-8 text-center text-sm text-muted">{emptyMessage}</p>
+          ) : filteredOptions.map((opt, index) => {
             const isSelected = value === opt.value;
             return (
               <button
@@ -225,7 +294,7 @@ export function Select({
                     focusOption(0);
                   } else if (event.key === "End") {
                     event.preventDefault();
-                    focusOption(options.length - 1);
+                    focusOption(filteredOptions.length - 1);
                   } else if (event.key === "Escape") {
                     event.preventDefault();
                     event.stopPropagation();
@@ -238,11 +307,15 @@ export function Select({
                   }
                 }}
               >
-                <span className="truncate">{opt.label}</span>
+                <span className="min-w-0 text-left">
+                  <span className="block truncate">{opt.label}</span>
+                  {opt.description ? <span className="mt-0.5 block truncate text-[11px] opacity-70">{opt.description}</span> : null}
+                </span>
                 {isSelected && <Check className="ml-2 h-4 w-4 shrink-0" />}
               </button>
             );
           })}
+          </div>
         </div>,
         document.body
       )}

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
@@ -10,7 +10,8 @@ use crate::downloader::DownloaderRecord;
 use crate::error::AppError;
 use crate::sign_in::{SignInRecord, SignInResult, SignInTaskRecord, SignInTaskRequest};
 use crate::site::{
-    SiteRecord, SiteStatsRecord, SiteWithStats, UserStats, default_site_request_headers,
+    SiteRecord, SiteStatsHistoryRecord, SiteStatsRecord, SiteWithStats, UserStats,
+    default_site_request_headers,
 };
 use crate::stats::{DownloaderSpeedSnapshot, TaskStatsSnapshot};
 
@@ -226,7 +227,8 @@ impl Database {
                 .prepare(
                     "SELECT s.id, s.name, s.site_type, s.base_url, s.auth_config, s.request_headers, s.use_proxy, s.created_at, s.updated_at,
                             st.site_id, st.uid, st.username, st.uploaded, st.downloaded, st.ratio, st.bonus,
-                            st.seeding_count, st.leeching_count, st.updated_at, st.last_checked_at, st.last_error
+                            st.seeding_count, st.leeching_count, st.updated_at, st.last_checked_at, st.last_error,
+                            st.details_json
                      FROM sites s
                      LEFT JOIN site_stats st ON st.site_id = s.id
                      ORDER BY s.id",
@@ -263,6 +265,12 @@ impl Database {
                                 .ok()
                                 .flatten()
                                 .map(|v| v as u32),
+                            details: row
+                                .get::<_, Option<String>>(21)
+                                .ok()
+                                .flatten()
+                                .and_then(|value| serde_json::from_str(&value).ok())
+                                .unwrap_or_default(),
                             updated_at: row.get(18).ok().flatten(),
                             last_checked_at: row.get(19).unwrap_or_default(),
                             last_error: row.get(20).ok().flatten(),
@@ -390,14 +398,27 @@ impl Database {
         checked_at: &str,
     ) -> Result<(), AppError> {
         let path = self.path.clone();
-        let stats = stats.clone();
+        let mut stats = stats.clone();
+        stats.fill_derived();
         let checked_at = checked_at.to_string();
         tokio::task::spawn_blocking(move || {
-            let conn = open_connection(&path)?;
-            conn.execute(
+            let mut conn = open_connection(&path)?;
+            let details_json =
+                serde_json::to_string(&stats.details).map_err(|error| AppError::Database {
+                    message: format!("failed to serialize extended site statistics: {error}"),
+                })?;
+            let stats_json = serde_json::to_string(&stats).map_err(|error| AppError::Database {
+                message: format!("failed to serialize site statistics snapshot: {error}"),
+            })?;
+            let snapshot_date = DateTime::parse_from_rfc3339(&checked_at)
+                .map(|value| value.with_timezone(&Utc).format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|_| checked_at.chars().take(10).collect());
+            let tx = conn.transaction().map_err(sql_error)?;
+            tx.execute(
                 "INSERT INTO site_stats
-                 (site_id, uid, username, uploaded, downloaded, ratio, bonus, seeding_count, leeching_count, updated_at, last_checked_at, last_error)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                 (site_id, uid, username, uploaded, downloaded, ratio, bonus, seeding_count,
+                  leeching_count, details_json, updated_at, last_checked_at, last_error)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                  ON CONFLICT(site_id) DO UPDATE SET
                    uid = excluded.uid,
                    username = excluded.username,
@@ -407,6 +428,7 @@ impl Database {
                    bonus = excluded.bonus,
                    seeding_count = excluded.seeding_count,
                    leeching_count = excluded.leeching_count,
+                   details_json = excluded.details_json,
                    updated_at = excluded.updated_at,
                    last_checked_at = excluded.last_checked_at,
                    last_error = NULL",
@@ -420,12 +442,69 @@ impl Database {
                     stats.bonus,
                     stats.seeding_count.map(|v| v as i64),
                     stats.leeching_count.map(|v| v as i64),
+                    details_json,
                     checked_at,
                     checked_at,
                 ],
             )
             .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO site_stats_history
+                 (site_id, snapshot_date, updated_at, stats_json)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(site_id, snapshot_date) DO UPDATE SET
+                   updated_at = excluded.updated_at,
+                   stats_json = excluded.stats_json",
+                params![site_id, snapshot_date, checked_at, stats_json],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
             Ok(())
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    pub async fn list_site_stats_history(&self) -> Result<Vec<SiteStatsHistoryRecord>, AppError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = open_connection(&path)?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT site_id, snapshot_date, updated_at, stats_json
+                     FROM site_stats_history
+                     ORDER BY site_id, snapshot_date",
+                )
+                .map_err(sql_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(sql_error)?;
+            let mut history = Vec::new();
+            for row in rows {
+                let (site_id, snapshot_date, updated_at, stats_json) = row.map_err(sql_error)?;
+                let mut stats = serde_json::from_str::<UserStats>(&stats_json).map_err(|error| {
+                    AppError::Database {
+                        message: format!(
+                            "invalid site statistics history for site {site_id} on {snapshot_date}: {error}"
+                        ),
+                    }
+                })?;
+                stats.fill_derived();
+                history.push(SiteStatsHistoryRecord {
+                    site_id,
+                    snapshot_date,
+                    updated_at,
+                    stats,
+                });
+            }
+            Ok(history)
         })
         .await
         .map_err(join_error)?
@@ -2196,9 +2275,18 @@ impl Database {
                     bonus REAL,
                     seeding_count INTEGER,
                     leeching_count INTEGER,
+                    details_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT,
                     last_checked_at TEXT NOT NULL,
                     last_error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS site_stats_history (
+                    site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+                    snapshot_date TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    stats_json TEXT NOT NULL,
+                    PRIMARY KEY (site_id, snapshot_date)
                 );
 
                 CREATE TABLE IF NOT EXISTS ptd_backup_settings (
@@ -2355,6 +2443,7 @@ impl Database {
 
                 CREATE INDEX IF NOT EXISTS idx_brush_task_torrents_task ON brush_task_torrents(task_id, status);
                 CREATE INDEX IF NOT EXISTS idx_site_stats_checked_at ON site_stats(last_checked_at);
+                CREATE INDEX IF NOT EXISTS idx_site_stats_history_updated_at ON site_stats_history(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_task_stats_task ON task_stats_snapshots(task_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_torrent_traffic_lookup ON torrent_traffic(task_id, torrent_hash, recorded_at);
                 CREATE TABLE IF NOT EXISTS system_snapshots (
@@ -2378,6 +2467,14 @@ impl Database {
                 ",
             )
             .map_err(sql_error)?;
+
+            ensure_column(
+                &conn,
+                "site_stats",
+                "details_json",
+                "ALTER TABLE site_stats ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}'",
+            )?;
+            backfill_site_stats_history(&conn)?;
 
             ensure_column(
                 &conn,
@@ -3525,6 +3622,97 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Res
         return Ok(());
     }
     conn.execute(sql, []).map_err(sql_error)?;
+    Ok(())
+}
+
+/// Preserve the last pre-upgrade site snapshot before the hourly refresher overwrites it.
+/// Subsequent successful refreshes maintain this table transactionally in
+/// `upsert_site_stats_success`.
+fn backfill_site_stats_history(conn: &Connection) -> Result<(), AppError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT site_id, uid, username, uploaded, downloaded, ratio, bonus,
+                    seeding_count, leeching_count, details_json, updated_at, last_checked_at
+             FROM site_stats",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut snapshots = Vec::new();
+    for row in rows {
+        let (
+            site_id,
+            uid,
+            username,
+            uploaded,
+            downloaded,
+            ratio,
+            bonus,
+            seeding_count,
+            leeching_count,
+            details_json,
+            updated_at,
+            last_checked_at,
+        ) = row.map_err(sql_error)?;
+        let Some(username) = username.filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+        let (Some(uploaded), Some(downloaded)) = (
+            uploaded.and_then(|value| u64::try_from(value).ok()),
+            downloaded.and_then(|value| u64::try_from(value).ok()),
+        ) else {
+            continue;
+        };
+        let recorded_at = updated_at.unwrap_or(last_checked_at);
+        let snapshot_date = DateTime::parse_from_rfc3339(&recorded_at)
+            .map(|value| value.with_timezone(&Utc).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|_| recorded_at.chars().take(10).collect());
+        if snapshot_date.len() != 10 {
+            continue;
+        }
+        let mut stats = UserStats {
+            uid,
+            username,
+            uploaded,
+            downloaded,
+            ratio,
+            bonus,
+            seeding_count: seeding_count.and_then(|value| u32::try_from(value).ok()),
+            leeching_count: leeching_count.and_then(|value| u32::try_from(value).ok()),
+            details: serde_json::from_str(&details_json).unwrap_or_default(),
+        };
+        stats.fill_derived();
+        let stats_json = serde_json::to_string(&stats).map_err(|error| AppError::Database {
+            message: format!("failed to migrate site statistics history: {error}"),
+        })?;
+        snapshots.push((site_id, snapshot_date, recorded_at, stats_json));
+    }
+    drop(statement);
+
+    for (site_id, snapshot_date, updated_at, stats_json) in snapshots {
+        conn.execute(
+            "INSERT OR IGNORE INTO site_stats_history
+             (site_id, snapshot_date, updated_at, stats_json) VALUES (?, ?, ?, ?)",
+            params![site_id, snapshot_date, updated_at, stats_json],
+        )
+        .map_err(sql_error)?;
+    }
     Ok(())
 }
 

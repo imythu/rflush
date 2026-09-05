@@ -11,7 +11,7 @@ use zip::write::SimpleFileOptions;
 
 use crate::db::{Database, PtdBackupConfig};
 use crate::net::client_factory;
-use crate::site::{SiteStatsRecord, SiteWithStats};
+use crate::site::{SiteStatsHistoryRecord, SiteWithStats, UserStats};
 
 const MIN_BACKUP_INTERVAL_HOURS: u64 = 1;
 const MAX_BACKUP_INTERVAL_HOURS: u64 = 24 * 30;
@@ -143,13 +143,17 @@ async fn perform_backup(db: &Database) -> Result<PtdBackupRunResult, String> {
         .list_sites_with_stats()
         .await
         .map_err(|error| error.to_string())?;
+    let history = db
+        .list_site_stats_history()
+        .await
+        .map_err(|error| error.to_string())?;
     validate_config(&mut config)?;
     if config.webdav_url.is_empty() {
         return Err("请先配置 WebDAV 地址".to_string());
     }
 
     let now = Utc::now();
-    let (archive, site_count) = build_ptd_archive(&sites, now)?;
+    let (archive, site_count) = build_ptd_archive(&sites, &history, now)?;
     if site_count == 0 {
         return Err("没有可备份的已识别 PTD 站点用户信息，请检查站点域名并刷新统计".to_string());
     }
@@ -191,31 +195,53 @@ async fn perform_backup(db: &Database) -> Result<PtdBackupRunResult, String> {
 
 fn build_ptd_archive(
     sites: &[SiteWithStats],
+    history: &[SiteStatsHistoryRecord],
     now: DateTime<Utc>,
 ) -> Result<(Vec<u8>, usize), String> {
-    let mut user_info = Map::new();
+    let mut user_info = BTreeMap::<String, BTreeMap<String, Value>>::new();
     for site in sites {
-        let Some(stats) = site.stats.as_ref().filter(|stats| has_user_stats(stats)) else {
-            continue;
-        };
         let Some(ptd_site_id) = ptd_site_id(site) else {
             continue;
         };
-        let update_at = stats
-            .updated_at
-            .as_deref()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc))
-            .unwrap_or(now);
-        let snapshot = ptd_user_snapshot(ptd_site_id, stats, update_at.timestamp_millis());
-        user_info.insert(
-            ptd_site_id.to_string(),
-            json!({ update_at.format("%Y-%m-%d").to_string(): snapshot }),
-        );
+        let snapshots = user_info.entry(ptd_site_id.to_string()).or_default();
+
+        for record in history.iter().filter(|record| record.site_id == site.id) {
+            if !has_user_stats(&record.stats) {
+                continue;
+            }
+            let update_at = DateTime::parse_from_rfc3339(&record.updated_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or(now);
+            snapshots.insert(
+                record.snapshot_date.clone(),
+                ptd_user_snapshot(ptd_site_id, &record.stats, update_at.timestamp_millis()),
+            );
+        }
+
+        // 兼容升级前仅有 site_stats、尚未生成首条历史记录的数据库；同日当前数据
+        // 也会覆盖较早的历史快照，与 PT-Depiler 每日保留最后一次成功刷新一致。
+        if let Some((stats_record, stats)) = site
+            .stats
+            .as_ref()
+            .and_then(|record| record.to_user_stats().map(|stats| (record, stats)))
+            .filter(|(_, stats)| has_user_stats(stats))
+        {
+            let update_at = stats_record
+                .updated_at
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or(now);
+            snapshots.insert(
+                update_at.format("%Y-%m-%d").to_string(),
+                ptd_user_snapshot(ptd_site_id, &stats, update_at.timestamp_millis()),
+            );
+        }
     }
+    user_info.retain(|_, snapshots| !snapshots.is_empty());
 
     let site_count = user_info.len();
-    let user_info_bytes = serde_json::to_vec(&Value::Object(user_info))
+    let user_info_bytes = serde_json::to_vec(&user_info)
         .map_err(|error| format!("生成 userInfo.json 失败: {error}"))?;
     let user_info_hash = format!("{:x}", md5::compute(&user_info_bytes));
     let manifest = PtdManifest {
@@ -252,24 +278,16 @@ fn build_ptd_archive(
     Ok((archive, site_count))
 }
 
-fn ptd_user_snapshot(site_id: &str, stats: &SiteStatsRecord, update_at: i64) -> Value {
-    let mut snapshot = Map::from_iter([
+fn ptd_user_snapshot(site_id: &str, stats: &UserStats, update_at: i64) -> Value {
+    // 自定义适配字段先写入，标准 PTD 字段随后覆盖，避免扩展数据破坏快照结构。
+    let mut snapshot = Map::from_iter(stats.details.extra.clone());
+    snapshot.extend([
         ("status".to_string(), json!(PTD_SUCCESS_STATUS)),
         ("updateAt".to_string(), json!(update_at)),
         ("site".to_string(), json!(site_id)),
-        (
-            "name".to_string(),
-            json!(stats.username.as_deref().unwrap_or_default()),
-        ),
-        (
-            "uploaded".to_string(),
-            json!(stats.uploaded.unwrap_or_default()),
-        ),
-        (
-            "downloaded".to_string(),
-            json!(stats.downloaded.unwrap_or_default()),
-        ),
-        ("messageCount".to_string(), json!(0)),
+        ("name".to_string(), json!(stats.username)),
+        ("uploaded".to_string(), json!(stats.uploaded)),
+        ("downloaded".to_string(), json!(stats.downloaded)),
     ]);
     if let Some(uid) = stats.uid.as_deref() {
         snapshot.insert("id".to_string(), json!(uid));
@@ -286,16 +304,52 @@ fn ptd_user_snapshot(site_id: &str, stats: &SiteStatsRecord, update_at: i64) -> 
     if let Some(leeching) = stats.leeching_count {
         snapshot.insert("leeching".to_string(), json!(leeching));
     }
+
+    macro_rules! insert_optional {
+        ($field:literal, $value:expr) => {
+            if let Some(value) = $value {
+                snapshot.insert($field.to_string(), json!(value));
+            }
+        };
+    }
+    macro_rules! insert_finite {
+        ($field:literal, $value:expr) => {
+            if let Some(value) = $value.filter(|value| value.is_finite()) {
+                snapshot.insert($field.to_string(), json!(value));
+            }
+        };
+    }
+
+    let details = &stats.details;
+    insert_optional!("isDonor", details.is_donor);
+    insert_optional!("levelId", details.level_id);
+    insert_optional!("levelName", details.level_name.as_deref());
+    insert_optional!("joinTime", details.join_time);
+    insert_optional!("lastAccessAt", details.last_access_at);
+    insert_optional!("messageCount", details.message_count);
+    insert_optional!("invites", details.invites);
+    insert_optional!("avatar", details.avatar.as_deref());
+    insert_optional!("totalTraffic", details.total_traffic);
+    insert_optional!("trueDownloaded", details.true_downloaded);
+    insert_optional!("trueUploaded", details.true_uploaded);
+    insert_finite!("trueRatio", details.true_ratio);
+    insert_optional!("seedingSize", details.seeding_size);
+    insert_optional!("seedingTime", details.seeding_time);
+    insert_optional!("averageSeedingTime", details.average_seeding_time);
+    insert_finite!("seedingBonus", details.seeding_bonus);
+    insert_finite!("bonusPerHour", details.bonus_per_hour);
+    insert_finite!("seedingBonusPerHour", details.seeding_bonus_per_hour);
+    insert_optional!("uploads", details.uploads);
+    insert_optional!("snatches", details.snatches);
+    insert_optional!("posts", details.posts);
+    insert_optional!("adoptions", details.adoptions);
+    insert_optional!("hnrUnsatisfied", details.hnr_unsatisfied);
+    insert_optional!("hnrPreWarning", details.hnr_pre_warning);
     Value::Object(snapshot)
 }
 
-fn has_user_stats(stats: &SiteStatsRecord) -> bool {
-    stats
-        .username
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-        && stats.uploaded.is_some()
-        && stats.downloaded.is_some()
+fn has_user_stats(stats: &UserStats) -> bool {
+    !stats.username.trim().is_empty()
 }
 
 fn normalize_webdav_url(value: &str) -> Result<String, String> {
@@ -354,7 +408,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::site::UserStats;
+    use crate::site::{SiteStatsRecord, UserStats, UserStatsDetails};
 
     fn sample_site() -> SiteWithStats {
         SiteWithStats {
@@ -377,6 +431,15 @@ mod tests {
                 bonus: Some(88.5),
                 seeding_count: Some(7),
                 leeching_count: Some(1),
+                details: UserStatsDetails {
+                    level_id: Some(9),
+                    level_name: Some("mTorrent Master".to_string()),
+                    join_time: Some(1_700_000_000_000),
+                    message_count: Some(2),
+                    seeding_size: Some(4096),
+                    bonus_per_hour: Some(12.5),
+                    ..Default::default()
+                },
                 updated_at: Some("2026-09-04T12:30:00Z".to_string()),
                 last_checked_at: "2026-09-04T12:30:00Z".to_string(),
                 last_error: None,
@@ -389,7 +452,7 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-09-04T13:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let (archive, count) = build_ptd_archive(&[sample_site()], now).unwrap();
+        let (archive, count) = build_ptd_archive(&[sample_site()], &[], now).unwrap();
         assert_eq!(count, 1);
 
         let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
@@ -402,6 +465,10 @@ mod tests {
         assert_eq!(user_info["mteam"]["2026-09-04"]["site"], "mteam");
         assert_eq!(user_info["mteam"]["2026-09-04"]["status"], 3);
         assert_eq!(user_info["mteam"]["2026-09-04"]["uploaded"], 1024);
+        assert_eq!(user_info["mteam"]["2026-09-04"]["totalTraffic"], 1536);
+        assert_eq!(user_info["mteam"]["2026-09-04"]["levelId"], 9);
+        assert_eq!(user_info["mteam"]["2026-09-04"]["messageCount"], 2);
+        assert_eq!(user_info["mteam"]["2026-09-04"]["seedingSize"], 4096);
 
         let user_info_bytes = serde_json::to_vec(&user_info).unwrap();
         let mut manifest = String::new();
@@ -416,6 +483,118 @@ mod tests {
             manifest["files"]["userInfo"]["hash"],
             format!("{:x}", md5::compute(user_info_bytes))
         );
+    }
+
+    #[test]
+    fn snapshot_exports_every_extended_field_with_ptd_names() {
+        let stats = UserStats {
+            uid: Some("42".to_string()),
+            username: "alice".to_string(),
+            uploaded: 100,
+            downloaded: 50,
+            ratio: Some(2.0),
+            bonus: Some(10.0),
+            seeding_count: Some(2),
+            leeching_count: Some(1),
+            details: UserStatsDetails {
+                is_donor: Some(true),
+                level_id: Some(3),
+                level_name: Some("Elite User".to_string()),
+                join_time: Some(1_700_000_000_000),
+                last_access_at: Some(1_800_000_000_000),
+                message_count: Some(4),
+                invites: Some(5),
+                avatar: Some("https://tracker.example/avatar.png".to_string()),
+                total_traffic: Some(150),
+                true_downloaded: Some(25),
+                true_uploaded: Some(75),
+                true_ratio: Some(3.0),
+                seeding_size: Some(1024),
+                seeding_time: Some(3600),
+                average_seeding_time: Some(1800),
+                seeding_bonus: Some(20.0),
+                bonus_per_hour: Some(1.5),
+                seeding_bonus_per_hour: Some(0.5),
+                uploads: Some(6),
+                snatches: Some(7),
+                posts: Some(8),
+                adoptions: Some(9),
+                hnr_unsatisfied: Some(1),
+                hnr_pre_warning: Some(2),
+                extra: BTreeMap::from([("customMetric".to_string(), json!(11))]),
+            },
+        };
+
+        let snapshot = ptd_user_snapshot("mteam", &stats, 1_800_000_000_000);
+        for field in [
+            "isDonor",
+            "levelId",
+            "levelName",
+            "joinTime",
+            "lastAccessAt",
+            "messageCount",
+            "invites",
+            "avatar",
+            "totalTraffic",
+            "trueDownloaded",
+            "trueUploaded",
+            "trueRatio",
+            "seedingSize",
+            "seedingTime",
+            "averageSeedingTime",
+            "seedingBonus",
+            "bonusPerHour",
+            "seedingBonusPerHour",
+            "uploads",
+            "snatches",
+            "posts",
+            "adoptions",
+            "hnrUnsatisfied",
+            "hnrPreWarning",
+            "customMetric",
+        ] {
+            assert!(snapshot.get(field).is_some(), "missing PTD field {field}");
+        }
+        assert!(snapshot.get("message_count").is_none());
+        assert_eq!(snapshot["trueRatio"], 3.0);
+    }
+
+    #[test]
+    fn archive_contains_all_daily_history_and_current_snapshot() {
+        let now = DateTime::parse_from_rfc3339("2026-09-05T13:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let history = vec![SiteStatsHistoryRecord {
+            site_id: 9,
+            snapshot_date: "2026-09-03".to_string(),
+            updated_at: "2026-09-03T09:00:00Z".to_string(),
+            stats: UserStats {
+                uid: Some("123".to_string()),
+                username: "alice".to_string(),
+                uploaded: 900,
+                downloaded: 450,
+                ratio: Some(2.0),
+                bonus: Some(80.0),
+                seeding_count: Some(5),
+                leeching_count: None,
+                details: UserStatsDetails {
+                    message_count: Some(1),
+                    ..Default::default()
+                },
+            },
+        }];
+
+        let (archive, count) = build_ptd_archive(&[sample_site()], &history, now).unwrap();
+        assert_eq!(count, 1);
+        let mut zip = zip::ZipArchive::new(Cursor::new(archive)).unwrap();
+        let mut user_info = String::new();
+        zip.by_name("userInfo.json")
+            .unwrap()
+            .read_to_string(&mut user_info)
+            .unwrap();
+        let user_info: Value = serde_json::from_str(&user_info).unwrap();
+        assert_eq!(user_info["mteam"]["2026-09-03"]["uploaded"], 900);
+        assert_eq!(user_info["mteam"]["2026-09-04"]["uploaded"], 1024);
     }
 
     #[test]
@@ -436,8 +615,111 @@ mod tests {
         let mut site = sample_site();
         site.site_type = "nexusphp".to_string();
         site.base_url = "https://tracker.invalid/".to_string();
-        let (_, count) = build_ptd_archive(&[site], Utc::now()).unwrap();
+        let (_, count) = build_ptd_archive(&[site], &[], Utc::now()).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_keeps_latest_snapshot_for_each_utc_day() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(temp.path()).await.unwrap();
+        let site_id = db
+            .create_site(
+                "M-Team history",
+                "mteam",
+                "https://api.m-team.cc",
+                r#"{"auth_type":"api_key","api_key":"test"}"#,
+                "[]",
+                false,
+            )
+            .await
+            .unwrap();
+        let mut stats = UserStats {
+            uid: Some("42".to_string()),
+            username: "alice".to_string(),
+            uploaded: 100,
+            downloaded: 50,
+            details: UserStatsDetails {
+                message_count: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        db.upsert_site_stats_success(site_id, &stats, "2026-09-04T01:00:00Z")
+            .await
+            .unwrap();
+        stats.uploaded = 200;
+        stats.details.message_count = Some(2);
+        db.upsert_site_stats_success(site_id, &stats, "2026-09-04T23:00:00Z")
+            .await
+            .unwrap();
+        stats.uploaded = 300;
+        db.upsert_site_stats_success(site_id, &stats, "2026-09-05T00:00:00Z")
+            .await
+            .unwrap();
+
+        let history = db.list_site_stats_history().await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].snapshot_date, "2026-09-04");
+        assert_eq!(history[0].stats.uploaded, 200);
+        assert_eq!(history[0].stats.details.message_count, Some(2));
+        assert_eq!(history[1].snapshot_date, "2026-09-05");
+        assert_eq!(history[1].stats.uploaded, 300);
+
+        let current = db.list_sites_with_stats().await.unwrap();
+        let current = current[0].stats.as_ref().unwrap();
+        assert_eq!(current.uploaded, Some(300));
+        assert_eq!(current.details.total_traffic, Some(350));
+    }
+
+    #[tokio::test]
+    async fn database_reopen_backfills_the_pre_history_current_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Database::open(temp.path()).await.unwrap();
+        let site_id = db
+            .create_site(
+                "M-Team legacy snapshot",
+                "mteam",
+                "https://api.m-team.cc",
+                r#"{"auth_type":"api_key","api_key":"test"}"#,
+                "[]",
+                false,
+            )
+            .await
+            .unwrap();
+        db.upsert_site_stats_success(
+            site_id,
+            &UserStats {
+                uid: Some("42".to_string()),
+                username: "alice".to_string(),
+                uploaded: 100,
+                downloaded: 50,
+                details: UserStatsDetails {
+                    level_name: Some("Power User".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "2026-09-03T12:00:00Z",
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let connection = rusqlite::Connection::open(temp.path().join("rflush.db")).unwrap();
+        connection
+            .execute("DELETE FROM site_stats_history", [])
+            .unwrap();
+        drop(connection);
+
+        let reopened = Database::open(temp.path()).await.unwrap();
+        let history = reopened.list_site_stats_history().await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].snapshot_date, "2026-09-03");
+        assert_eq!(
+            history[0].stats.details.level_name.as_deref(),
+            Some("Power User")
+        );
     }
 
     #[test]
@@ -521,11 +803,19 @@ mod tests {
                 bonus: Some(88.5),
                 seeding_count: Some(7),
                 leeching_count: Some(1),
+                details: UserStatsDetails {
+                    message_count: Some(3),
+                    ..Default::default()
+                },
             },
             "2026-09-04T12:30:00Z",
         )
         .await
         .unwrap();
+        let history = db.list_site_stats_history().await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].snapshot_date, "2026-09-04");
+        assert_eq!(history[0].stats.details.message_count, Some(3));
         let mut config = db.get_ptd_backup_config().await.unwrap();
         config.webdav_url = format!("http://{address}/dav");
         config.username = "alice".to_string();

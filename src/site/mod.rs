@@ -4,6 +4,8 @@ pub mod nexusphp;
 pub mod u2_shoutbox;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -199,7 +201,76 @@ impl SiteType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserStatsDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_donor: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_access_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invites: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_traffic: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub true_downloaded: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub true_uploaded: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub true_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeding_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeding_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_seeding_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeding_bonus: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bonus_per_hour: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeding_bonus_per_hour: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snatches: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoptions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hnr_unsatisfied: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hnr_pre_warning: Option<u64>,
+    /// PT-Depiler permits site-specific user information keys. Preserve those keys so a
+    /// scheduled refresh can round-trip data added by a specialized adapter later.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl UserStatsDetails {
+    fn fill_derived(&mut self, uploaded: u64, downloaded: u64) {
+        self.total_traffic
+            .get_or_insert_with(|| uploaded.saturating_add(downloaded));
+        if self.true_ratio.is_none()
+            && let (Some(uploaded), Some(downloaded)) = (self.true_uploaded, self.true_downloaded)
+            && downloaded > 0
+        {
+            self.true_ratio = Some(uploaded as f64 / downloaded as f64);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserStats {
     pub uid: Option<String>,
     pub username: String,
@@ -209,6 +280,14 @@ pub struct UserStats {
     pub bonus: Option<f64>,
     pub seeding_count: Option<u32>,
     pub leeching_count: Option<u32>,
+    #[serde(default, flatten)]
+    pub details: UserStatsDetails,
+}
+
+impl UserStats {
+    pub fn fill_derived(&mut self) {
+        self.details.fill_derived(self.uploaded, self.downloaded);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +303,7 @@ pub struct SiteRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SiteStatsRecord {
     pub site_id: i64,
     pub uid: Option<String>,
@@ -235,9 +314,43 @@ pub struct SiteStatsRecord {
     pub bonus: Option<f64>,
     pub seeding_count: Option<u32>,
     pub leeching_count: Option<u32>,
+    #[serde(default, flatten)]
+    pub details: UserStatsDetails,
     pub updated_at: Option<String>,
     pub last_checked_at: String,
     pub last_error: Option<String>,
+}
+
+impl SiteStatsRecord {
+    pub fn to_user_stats(&self) -> Option<UserStats> {
+        let username = self
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|username| !username.is_empty())?
+            .to_string();
+        let mut stats = UserStats {
+            uid: self.uid.clone(),
+            username,
+            uploaded: self.uploaded?,
+            downloaded: self.downloaded?,
+            ratio: self.ratio,
+            bonus: self.bonus,
+            seeding_count: self.seeding_count,
+            leeching_count: self.leeching_count,
+            details: self.details.clone(),
+        };
+        stats.fill_derived();
+        Some(stats)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SiteStatsHistoryRecord {
+    pub site_id: i64,
+    pub snapshot_date: String,
+    pub updated_at: String,
+    pub stats: UserStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,8 +413,8 @@ pub trait SiteAdapter: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        SiteRequestHeader, browser_request_header_map, default_site_request_headers,
-        normalize_site_request_headers, site_request_header_map,
+        SiteRequestHeader, UserStats, UserStatsDetails, browser_request_header_map,
+        default_site_request_headers, normalize_site_request_headers, site_request_header_map,
     };
 
     fn header(name: &str, value: &str) -> SiteRequestHeader {
@@ -357,5 +470,32 @@ mod tests {
         assert_eq!(filtered["user-agent"], "Configured Browser");
         assert_eq!(filtered["sec-ch-ua"], "Chromium");
         assert!(!filtered.contains_key("x-private-token"));
+    }
+
+    #[test]
+    fn extended_user_stats_are_flattened_and_derived() {
+        let mut stats = UserStats {
+            uid: Some("42".to_string()),
+            username: "alice".to_string(),
+            uploaded: 100,
+            downloaded: 50,
+            details: UserStatsDetails {
+                message_count: Some(3),
+                true_uploaded: Some(90),
+                true_downloaded: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        stats.fill_derived();
+
+        let value = serde_json::to_value(&stats).unwrap();
+        assert_eq!(value["message_count"], 3);
+        assert_eq!(value["total_traffic"], 150);
+        assert_eq!(value["true_ratio"], 3.0);
+        assert!(value.get("details").is_none());
+
+        let round_trip: UserStats = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.details.message_count, Some(3));
     }
 }

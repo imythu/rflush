@@ -12,6 +12,7 @@ mod monitor;
 mod net;
 mod openlist;
 mod ptd_backup;
+mod ptd_site_catalog;
 mod ptd_sites;
 mod relocation;
 mod rss;
