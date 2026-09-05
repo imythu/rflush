@@ -534,7 +534,7 @@ const QUALITY_PRESETS: Array<{
 
 const MODES: Array<{ value: MediaMode; label: string; icon: typeof Tv }> = [
   { value: "subscriptions", label: "订阅", icon: Tv },
-  { value: "tmdb", label: "TMDB 添加", icon: Plus },
+  { value: "tmdb", label: "添加影视", icon: Plus },
   { value: "resources", label: "资源搜索", icon: Search },
   { value: "settings", label: "质量与设置", icon: SlidersHorizontal },
 ];
@@ -1065,6 +1065,9 @@ export function MediaPage() {
   const [openListSettings, setOpenListSettings] = useState<OpenListAutomationSettings | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [failedSections, setFailedSections] = useState<string[]>([]);
+  const [createError, setCreateError] = useState("");
+  const [qualityError, setQualityError] = useState("");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [busyKey, setBusyKey] = useState("");
 
@@ -1073,6 +1076,7 @@ export function MediaPage() {
   const [tmdbResults, setTmdbResults] = useState<TmdbMedia[]>([]);
   const [tmdbLoading, setTmdbLoading] = useState(false);
   const [tmdbSearched, setTmdbSearched] = useState(false);
+  const [pendingMedia, setPendingMedia] = useState<TmdbMedia | null>(null);
   const [selectedMedia, setSelectedMedia] = useState<TmdbMedia | null>(null);
   const [selectedDetails, setSelectedDetails] = useState<TmdbDetails | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
@@ -1146,6 +1150,7 @@ export function MediaPage() {
       api<unknown>(`/api/media/downloads?page=1&page_size=${DOWNLOAD_PAGE_SIZE}`),
       api<unknown>("/api/sites"),
       api<unknown>("/api/downloaders"),
+      api<unknown>("/api/media/openlist/settings"),
     ]);
     const errors: string[] = [];
 
@@ -1197,12 +1202,21 @@ export function MediaPage() {
       ...current,
       qualityProfileId: current.qualityProfileId || String(profileRows[0]?.id ?? ""),
       downloaderId: current.downloaderId || String(downloaderRows[0]?.id ?? ""),
-      siteIds: rememberedResourceSiteIds.current === null
+      siteIds: results[4].status === "rejected" ? current.siteIds : rememberedResourceSiteIds.current === null
         ? siteRows.map((site) => site.id)
         : current.siteIds.filter((id) => siteRows.some((site) => site.id === id)),
     }));
 
-    setLoadError(errors.join("；"));
+    const openListResult = results[6];
+    if (openListResult.status === "fulfilled") {
+      const loaded = readObject<OpenListAutomationSettings>(openListResult.value, ["settings", "data"]);
+      setOpenListSettings({ ...DEFAULT_OPENLIST_SETTINGS, ...loaded, api_key: null, clear_api_key: false });
+    } else {
+      setOpenListSettings(null);
+      if (!(openListResult.reason instanceof ApiError && openListResult.reason.status === 404)) errors.push("OpenList 设置：无法读取");
+    }
+    setFailedSections(results.flatMap((result, index) => result.status === "rejected" ? [["settings", "profiles", "subscriptions", "downloads", "sites", "downloaders", "openlist"][index]] : []));
+    setLoadError(errors.length ? `部分数据无法读取：${errors.map((error) => error.split("：")[0]).join("、")}。请检查服务连接后重试。` : "");
     setInitialLoading(false);
   }, []);
 
@@ -1291,20 +1305,6 @@ export function MediaPage() {
     rememberedResourceSiteIds.current = resourceForm.siteIds;
   }, [initialLoading, resourceForm.siteIds]);
 
-  useEffect(() => {
-    let active = true;
-    void api<unknown>("/api/media/openlist/settings")
-      .then((payload) => {
-        if (!active) return;
-        const loaded = readObject<OpenListAutomationSettings>(payload, ["settings", "data"]);
-        setOpenListSettings({ ...DEFAULT_OPENLIST_SETTINGS, ...loaded, api_key: null, clear_api_key: false });
-      })
-      .catch((error) => {
-        if (!active || (error instanceof ApiError && error.status === 404)) return;
-        setLoadError((current) => [current, `OpenList 设置：${describeUnknown(error)}`].filter(Boolean).join("；"));
-      });
-    return () => { active = false; };
-  }, []);
 
   useEffect(
     () => () => {
@@ -1779,6 +1779,7 @@ export function MediaPage() {
   }
 
   function openSubscriptionDialog(media: TmdbMedia) {
+    setCreateError("");
     createDetailsGeneration.current += 1;
     createSeasonGeneration.current += 1;
     setSelectedMedia(media);
@@ -1817,12 +1818,13 @@ export function MediaPage() {
 
   async function createSubscription() {
     if (!selectedMedia) return;
+    setCreateError("");
     if (!createTargetMetadataValid) {
-      setNotice({ tone: "error", text: "请等待季集元数据加载完成，并选择有效的季与集" });
+      setCreateError("请等待季集元数据加载完成，并选择有效的季与集");
       return;
     }
     if (!subscriptionForm.qualityProfileId || !subscriptionForm.downloaderId || subscriptionForm.siteIds.length === 0) {
-      setNotice({ tone: "error", text: "请选择质量配置、站点和下载器" });
+      setCreateError("请选择质量配置、站点和下载器");
       return;
     }
     setBusyKey("create-subscription");
@@ -1856,7 +1858,7 @@ export function MediaPage() {
       setMode("subscriptions");
       setNotice({ tone: "success", text: `已订阅「${details.title}」` });
     } catch (error) {
-      setNotice({ tone: "error", text: describeUnknown(error) });
+      setCreateError(`订阅未能创建：${describeUnknown(error)}。输入已保留，请重试。`);
     } finally {
       setBusyKey("");
     }
@@ -2008,6 +2010,7 @@ export function MediaPage() {
   }
 
   function openQualityEditor(profile?: QualityProfile) {
+    setQualityError("");
     setEditingQuality(profile ?? null);
     setQualityForm(
       profile
@@ -2052,6 +2055,7 @@ export function MediaPage() {
       minimum_score: qualityForm.minimumScore,
       min_seeders: qualityForm.minSeeders,
     };
+    setQualityError("");
     try {
       await api(editingQuality ? `/api/media/quality-profiles/${editingQuality.id}` : "/api/media/quality-profiles", {
         method: editingQuality ? "PUT" : "POST",
@@ -2061,7 +2065,7 @@ export function MediaPage() {
       await reloadProfiles();
       setNotice({ tone: "success", text: editingQuality ? "质量配置已更新" : "质量配置已创建" });
     } catch (error) {
-      setNotice({ tone: "error", text: describeUnknown(error) });
+      setQualityError(`质量配置未能保存：${describeUnknown(error)}。输入已保留，请重试。`);
     } finally {
       setBusyKey("");
     }
@@ -2100,13 +2104,21 @@ export function MediaPage() {
     }
   }
 
+  const configurationUnavailable = initialLoading || ["settings", "profiles", "sites", "downloaders"].some((key) => failedSections.includes(key));
+  const prerequisites = [
+    { label: "PT 站点", ready: sites.length > 0, href: "#/sites" },
+    { label: "下载器", ready: downloaders.length > 0, href: "#/downloaders" },
+    { label: "TMDB 密钥", ready: settings.tmdb_token_configured, href: null },
+    { label: "质量配置", ready: profiles.length > 0, href: null },
+  ];
+  const missingPrerequisites = prerequisites.filter((item) => !item.ready);
+
   return (
     <div className="flex flex-col gap-6">
-      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <header className="flex items-center justify-between gap-3">
         <div>
-          <h2 className="text-xl font-semibold">自动追剧</h2>
           <p className="mt-1 text-sm text-muted">
-            {subscriptions.length} 个订阅 · 已加载 {downloads.length} 条下载记录
+            {initialLoading ? "正在读取订阅" : failedSections.includes("subscriptions") ? "订阅暂时无法读取" : `${subscriptions.length} 个订阅`}
           </p>
         </div>
         <Button variant="outline" disabled={initialLoading} onClick={() => void loadData()}>
@@ -2124,7 +2136,17 @@ export function MediaPage() {
               key={item.value}
               type="button"
               role="tab"
+              id={`media-tab-${item.value}`}
+              aria-controls="media-panel"
               aria-selected={active}
+              tabIndex={active ? 0 : -1}
+              onKeyDown={(event) => {
+                const index = MODES.findIndex((entry) => entry.value === mode);
+                const next = event.key === "ArrowRight" ? (index + 1) % MODES.length : event.key === "ArrowLeft" ? (index + MODES.length - 1) % MODES.length : event.key === "Home" ? 0 : event.key === "End" ? MODES.length - 1 : -1;
+                if (next < 0) return;
+                event.preventDefault(); setMode(MODES[next].value);
+                document.getElementById(`media-tab-${MODES[next].value}`)?.focus();
+              }}
               className={cn(
                 "flex min-h-11 items-center justify-center gap-2 rounded-2xl px-3 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40",
                 active ? "bg-card text-foreground shadow-sm" : "text-muted hover:bg-accent hover:text-foreground",
@@ -2140,13 +2162,39 @@ export function MediaPage() {
 
       {notice ? <NoticeBanner notice={notice} onClose={() => setNotice(null)} /> : null}
       {loadError ? (
-        <NoticeBanner notice={{ tone: "error", text: loadError }} onClose={() => setLoadError("")} />
+        <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm">
+          <p>{loadError}</p>
+          <Button variant="outline" disabled={initialLoading} onClick={() => void loadData()}>重新读取</Button>
+        </div>
       ) : null}
 
+      {pendingMedia ? <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border p-4 text-sm">
+        <span>已保留「{pendingMedia.title}」，完成配置后可继续订阅。</span>
+        <Button variant="outline" onClick={() => { openSubscriptionDialog(pendingMedia); setPendingMedia(null); }}>继续订阅</Button>
+      </div> : null}
+      {!configurationUnavailable && missingPrerequisites.length > 0 && mode !== "settings" ? (
+        <section aria-label="订阅准备" className="rounded-xl border border-border p-4">
+          <h3 className="font-semibold">开始订阅前，先完成配置</h3>
+          <p className="mt-1 text-sm text-muted">完成必需配置后，即可查找影视并创建订阅。</p>
+          <ul className="mt-3 flex flex-wrap gap-3">
+            {prerequisites.map((item) => <li key={item.label}>
+              {item.ready ? <span className="inline-flex min-h-11 items-center gap-2 text-sm"><CheckCircle2 className="size-4" />{item.label}已配置</span>
+                : item.href ? <a className="inline-flex min-h-11 items-center rounded-lg border border-border px-3 text-sm underline underline-offset-4" href={item.href} target="_blank" rel="noreferrer">配置{item.label}（新标签页）</a>
+                : <Button variant="outline" onClick={() => setMode("settings")}>配置{item.label}</Button>}
+            </li>)}
+          </ul>
+        </section>
+      ) : null}
+
+      <div id="media-panel" role="tabpanel" aria-labelledby={`media-tab-${mode}`}>
       {initialLoading ? (
         <LoadingState label="正在加载自动追剧数据" />
       ) : mode === "subscriptions" ? (
         <SubscriptionsPanel
+          subscriptionsUnavailable={failedSections.includes("subscriptions")}
+          downloadsUnavailable={failedSections.includes("downloads")}
+          configurationUnavailable={configurationUnavailable}
+          onRetry={() => void loadData()}
           subscriptions={subscriptions}
           downloads={downloads}
           profiles={profiles}
@@ -2207,6 +2255,9 @@ export function MediaPage() {
         />
       ) : (
         <SettingsPanel
+          settingsUnavailable={failedSections.includes("settings")}
+          profilesUnavailable={failedSections.includes("profiles")}
+          onRetry={() => void loadData()}
           settings={settings}
           setSettings={setSettings}
           clearTmdbToken={clearTmdbToken}
@@ -2225,6 +2276,7 @@ export function MediaPage() {
         />
       )}
 
+      </div>
       <Dialog
         open={runDetailsSubscription !== null}
         onClose={closeRunDetails}
@@ -2317,10 +2369,17 @@ export function MediaPage() {
               />
             </div>
 
+            {createError ? <p role="alert" className="rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{createError}</p> : null}
+            {configurationUnavailable || missingPrerequisites.length > 0 ? <p role="status" className="text-sm text-muted">{configurationUnavailable ? "配置读取失败，请关闭弹窗后重新读取。" : `还需配置：${missingPrerequisites.map((item) => item.label).join("、")}。可先完成配置，已选影视会保留。`}</p> : null}
+            {!configurationUnavailable && missingPrerequisites.length > 0 ? <div className="flex flex-wrap gap-2">
+              {missingPrerequisites.map((item) => item.href ? <a key={item.label} className="inline-flex min-h-11 items-center rounded-lg border border-border px-3 text-sm underline" href={item.href} target="_blank" rel="noreferrer">配置{item.label}（新标签页）</a> : <Button key={item.label} variant="outline" onClick={() => { setPendingMedia(selectedMedia); closeSubscriptionDialog(); setMode("settings"); }}>配置{item.label}</Button>)}
+              <Button variant="outline" onClick={() => void loadData()}>已配置，重新读取</Button>
+            </div> : null}
             <div className="flex flex-wrap justify-end gap-2 border-t border-border pt-4">
               <Button variant="outline" onClick={closeSubscriptionDialog}>取消</Button>
               <Button
                 disabled={
+                  configurationUnavailable || missingPrerequisites.length > 0 ||
                   busyKey === "create-subscription" ||
                   !createTargetMetadataValid ||
                   profiles.length === 0 ||
@@ -2556,6 +2615,7 @@ export function MediaPage() {
             ) : null}
           </div>
           <div className="flex flex-wrap justify-end gap-2 border-t border-border pt-4">
+            {qualityError ? <p role="alert" className="w-full rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{qualityError}</p> : null}
             <Button variant="outline" onClick={() => setQualityDialogOpen(false)}>取消</Button>
             <Button disabled={!qualityForm.name.trim() || busyKey === "save-quality"} onClick={() => void saveQualityProfile()}>
               {busyKey === "save-quality" ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : null}
@@ -3205,6 +3265,7 @@ function SitePicker({
 }
 
 function SubscriptionsPanel({
+  subscriptionsUnavailable, downloadsUnavailable, configurationUnavailable, onRetry,
   subscriptions,
   downloads,
   profiles,
@@ -3226,6 +3287,10 @@ function SubscriptionsPanel({
   onDeleteDownload,
   onLoadMoreDownloads,
 }: {
+  subscriptionsUnavailable: boolean;
+  downloadsUnavailable: boolean;
+  configurationUnavailable: boolean;
+  onRetry: () => void;
   subscriptions: Subscription[];
   downloads: MediaDownload[];
   profiles: QualityProfile[];
@@ -3247,6 +3312,32 @@ function SubscriptionsPanel({
   onDeleteDownload: (download: MediaDownload) => void;
   onLoadMoreDownloads: () => void;
 }) {
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const visibleSubscriptions = subscriptions.filter((item) => {
+    const matchesQuery = `${item.title} ${item.original_title ?? ""}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
+    const completed = subscriptionIsCompleted(item);
+    return matchesQuery && (statusFilter === "all" || (statusFilter === "attention" && Boolean(item.last_error) && !completed)
+      || (statusFilter === "active" && item.enabled && !completed) || (statusFilter === "paused" && !item.enabled && !completed)
+      || (statusFilter === "completed" && completed));
+  });
+  function actions(subscription: Subscription) {
+    const completed = subscriptionIsCompleted(subscription);
+    return <div className="flex flex-wrap items-start gap-2 lg:justify-end">
+      {subscription.last_run_at ? <Button variant="outline" className="h-11 px-3" onClick={() => onViewRun(subscription)}>详情</Button> : null}
+      {!completed ? <Button variant="outline" className="h-11 px-3" disabled={busyKey === `run:${subscription.id}`} onClick={() => onAction(subscription, "run")}>
+        {busyKey === `run:${subscription.id}` ? <LoaderCircle className="size-4 animate-spin" /> : <Play className="size-4" />}扫描
+      </Button> : null}
+      <details className="max-w-full rounded-lg border border-border">
+        <summary className="flex min-h-11 cursor-pointer items-center gap-1 px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">更多<span className="sr-only">：{subscription.title}</span><ChevronDown className="size-4" /></summary>
+        <div className="flex flex-col gap-2 border-t border-border p-2">
+          {!completed || subscription.media_type === "tv" ? <Button variant="outline" className="h-11 px-3" onClick={() => onEdit(subscription)}>编辑规则</Button> : null}
+          {!completed ? <Button variant="outline" className="h-11 px-3" disabled={busyKey === `${subscription.enabled ? "pause" : "resume"}:${subscription.id}`} onClick={() => onAction(subscription, subscription.enabled ? "pause" : "resume")}>{subscription.enabled ? "暂停" : "恢复"}</Button> : null}
+          <Button variant="outline" className="h-11 px-3 text-destructive" onClick={() => onDelete(subscription)}>删除订阅</Button>
+        </div>
+      </details>
+    </div>;
+  }
   const activeCount = subscriptions.filter((item) => item.enabled && !subscriptionIsCompleted(item)).length;
   const pausedCount = subscriptions.filter((item) => !item.enabled && !subscriptionIsCompleted(item)).length;
   const attentionCount = subscriptions.filter((item) => item.last_error && !subscriptionIsCompleted(item)).length;
@@ -3256,25 +3347,18 @@ function SubscriptionsPanel({
 
   return (
     <div className="flex flex-col gap-6">
-      <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-[24px] border border-border bg-border lg:grid-cols-4">
-        {[
-          ["运行中", activeCount],
-          ["已暂停", pausedCount],
-          ["需处理", attentionCount],
-          ["已加载记录", downloads.length],
-        ].map(([label, value]) => (
-          <div key={label} className="bg-card px-4 py-4 sm:px-5">
-            <dt className="text-xs font-medium text-muted">{label}</dt>
-            <dd className="mt-1 text-2xl font-semibold tabular-nums">{value}</dd>
-          </div>
-        ))}
-      </dl>
+      <div className="flex flex-wrap items-center gap-2 text-sm" aria-label="订阅状态概览">
+        {subscriptionsUnavailable ? <span className="text-muted">订阅状态暂不可用</span> : <>
+          <span className="mr-2 text-muted">追更中 {activeCount} · 已暂停 {pausedCount}</span>
+          <Button variant="outline" className="h-11" aria-pressed={statusFilter === "attention"} onClick={() => setStatusFilter(statusFilter === "attention" ? "all" : "attention")}>需处理 {attentionCount}</Button>
+        </>}
+      </div>
 
       <Card>
         <CardHeader className="flex-row items-center justify-between gap-4">
           <div>
             <CardTitle>追剧订阅</CardTitle>
-            <CardDescription>{profiles.length} 套质量配置 · {sites.length} 个站点 · {downloaders.length} 个下载器</CardDescription>
+            <CardDescription>{configurationUnavailable ? "配置暂时无法读取" : `${profiles.length} 套质量配置 · ${sites.length} 个站点 · ${downloaders.length} 个下载器`}</CardDescription>
           </div>
           <Button onClick={onAdd}>
             <Plus data-icon="inline-start" />
@@ -3282,8 +3366,17 @@ function SubscriptionsPanel({
           </Button>
         </CardHeader>
         <CardContent>
-          {subscriptions.length === 0 ? (
+          {!subscriptionsUnavailable && subscriptions.length > 0 ? <div className="mb-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_180px]">
+            <div><Label htmlFor="subscription-query">查找订阅</Label><Input id="subscription-query" className="mt-2 min-h-11" placeholder="输入影视名称或原名" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
+            <div><Label htmlFor="subscription-status">状态筛选</Label><Select id="subscription-status" className="mt-2 min-h-11" value={statusFilter} onChange={setStatusFilter} options={[
+              { value: "all", label: "全部状态" }, { value: "attention", label: "需处理" }, { value: "active", label: "追更中" }, { value: "paused", label: "已暂停" }, { value: "completed", label: "已完成" },
+            ]} /></div>
+            <p role="status" className="text-sm text-muted sm:col-span-2">显示 {visibleSubscriptions.length} / {subscriptions.length} 个订阅</p>
+          </div> : null}
+          {subscriptionsUnavailable ? <EmptyState icon={AlertCircle} title="订阅无法读取" action={{ label: "重新读取", onClick: onRetry }} /> : subscriptions.length === 0 ? (
             <EmptyState icon={Tv} title="暂无订阅" action={{ label: "添加影视", onClick: onAdd }} />
+          ) : visibleSubscriptions.length === 0 ? (
+            <EmptyState icon={Search} title="没有符合筛选条件的订阅" action={{ label: "清除筛选", onClick: () => { setQuery(""); setStatusFilter("all"); } }} />
           ) : (
             <>
               <div className="hidden lg:block">
@@ -3299,10 +3392,9 @@ function SubscriptionsPanel({
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {subscriptions.map((subscription) => {
+                    {visibleSubscriptions.map((subscription) => {
                       const status = subscriptionStatus(subscription);
                       const completed = subscriptionIsCompleted(subscription);
-                      const canEdit = !completed || subscription.media_type === "tv";
                       return (
                         <TableRow key={subscription.id}>
                           <TableCell>
@@ -3338,57 +3430,7 @@ function SubscriptionsPanel({
                             </div>
                           </TableCell>
                           <TableCell>
-                            <div className="flex items-center justify-end gap-2">
-                              {subscription.last_run_at ? (
-                                 <Button
-                                   variant="outline"
-                                   className="size-8 p-0"
-                                  title="查看最后一次运行详情"
-                                  aria-label={`查看${subscription.title}最后一次运行详情`}
-                                  onClick={() => onViewRun(subscription)}
-                                 >
-                                   <FileSearch2 />
-                                </Button>
-                              ) : null}
-                              {canEdit ? (
-                                 <Button
-                                   variant="outline"
-                                   className="size-8 p-0"
-                                  title="编辑订阅规则"
-                                  aria-label={`编辑${subscription.title}订阅规则`}
-                                  onClick={() => onEdit(subscription)}
-                                 >
-                                   <Pencil />
-                                </Button>
-                              ) : null}
-                              {!completed ? (
-                                <>
-                                  <Button variant="outline" className="h-8 px-3" disabled={busyKey === `run:${subscription.id}`} onClick={() => onAction(subscription, "run")}>
-                                    {busyKey === `run:${subscription.id}` ? <LoaderCircle className="animate-spin" data-icon="inline-start" /> : <Play data-icon="inline-start" />}
-                                    扫描
-                                  </Button>
-                                  <Button
-                                    variant="outline"
-                                    className="size-8 p-0"
-                                    title={subscription.enabled ? "暂停订阅" : "恢复订阅"}
-                                    aria-label={`${subscription.enabled ? "暂停" : "恢复"}${subscription.title}订阅`}
-                                    disabled={busyKey === `${subscription.enabled ? "pause" : "resume"}:${subscription.id}`}
-                                    onClick={() => onAction(subscription, subscription.enabled ? "pause" : "resume")}
-                                  >
-                                    {subscription.enabled ? <Pause /> : <Play />}
-                                  </Button>
-                                </>
-                              ) : null}
-                              <Button
-                                variant="destructive"
-                                className="size-8 p-0"
-                                title="删除订阅"
-                                aria-label={`删除${subscription.title}订阅`}
-                                onClick={() => onDelete(subscription)}
-                              >
-                                <Trash2 />
-                              </Button>
-                            </div>
+                            {actions(subscription)}
                           </TableCell>
                         </TableRow>
                       );
@@ -3398,10 +3440,9 @@ function SubscriptionsPanel({
               </div>
 
               <div className="grid gap-3 lg:hidden">
-                {subscriptions.map((subscription) => {
+                {visibleSubscriptions.map((subscription) => {
                   const status = subscriptionStatus(subscription);
                   const completed = subscriptionIsCompleted(subscription);
-                  const canEdit = !completed || subscription.media_type === "tv";
                   return (
                     <article key={subscription.id} className="rounded-[20px] border border-border bg-surface-container/45 p-4">
                       <div className="flex gap-3">
@@ -3427,32 +3468,7 @@ function SubscriptionsPanel({
                         </div>
                       </div>
                       {subscription.last_error ? <p className="mt-3 break-words text-xs text-destructive">{subscription.last_error}</p> : null}
-                      <div className="mt-4 flex flex-wrap gap-2">
-                        {subscription.last_run_at ? (
-                          <Button variant="outline" className="h-8 px-3" onClick={() => onViewRun(subscription)}>
-                            <FileSearch2 data-icon="inline-start" />详情
-                          </Button>
-                        ) : null}
-                        {canEdit ? (
-                          <Button variant="outline" className="h-8 px-3" onClick={() => onEdit(subscription)}>
-                            <Pencil data-icon="inline-start" />编辑
-                          </Button>
-                        ) : null}
-                        {!completed ? (
-                          <>
-                            <Button variant="outline" className="h-8 px-3" disabled={busyKey === `run:${subscription.id}`} onClick={() => onAction(subscription, "run")}>
-                              <Play data-icon="inline-start" />扫描
-                            </Button>
-                            <Button variant="outline" className="h-8 px-3" disabled={busyKey === `${subscription.enabled ? "pause" : "resume"}:${subscription.id}`} onClick={() => onAction(subscription, subscription.enabled ? "pause" : "resume")}>
-                              {subscription.enabled ? <Pause data-icon="inline-start" /> : <Play data-icon="inline-start" />}
-                              {subscription.enabled ? "暂停" : "恢复"}
-                            </Button>
-                          </>
-                        ) : null}
-                        <Button variant="destructive" className="h-8 px-3" onClick={() => onDelete(subscription)}>
-                          <Trash2 data-icon="inline-start" />删除
-                        </Button>
-                      </div>
+                      <div className="mt-4">{actions(subscription)}</div>
                     </article>
                   );
                 })}
@@ -3468,14 +3484,14 @@ function SubscriptionsPanel({
             <CardTitle>下载记录</CardTitle>
             <CardDescription>显示的是任务提交状态；“已提交下载器”不代表文件已经下载完成。状态统计仅针对已加载记录。</CardDescription>
           </div>
-          <div className="hidden shrink-0 flex-wrap justify-end gap-2 sm:flex">
+          <div className={cn("hidden shrink-0 flex-wrap justify-end gap-2 sm:flex", downloadsUnavailable && "!hidden")}>
             <StatusPill label={`${submittedDownloadCount} 已提交`} tone="positive" />
             <StatusPill label={`${queuedCount} 处理中`} />
             {failedDownloadCount > 0 ? <StatusPill label={`${failedDownloadCount} 失败`} tone="negative" /> : null}
           </div>
         </CardHeader>
         <CardContent>
-          {downloads.length === 0 ? (
+          {downloadsUnavailable ? <EmptyState icon={AlertCircle} title="下载记录无法读取" action={{ label: "重新读取", onClick: onRetry }} /> : downloads.length === 0 ? (
             <EmptyState icon={HardDriveDownload} title="暂无下载任务" />
           ) : (
             <div className="grid gap-2">
@@ -4488,6 +4504,7 @@ function decisionBreakdownLabel(name: string): string {
 }
 
 function SettingsPanel({
+  settingsUnavailable, profilesUnavailable, onRetry,
   settings,
   setSettings,
   clearTmdbToken,
@@ -4504,6 +4521,9 @@ function SettingsPanel({
   onEditQuality,
   onDeleteQuality,
 }: {
+  settingsUnavailable: boolean;
+  profilesUnavailable: boolean;
+  onRetry: () => void;
   settings: MediaSettings;
   setSettings: Dispatch<SetStateAction<MediaSettings>>;
   clearTmdbToken: boolean;
@@ -4522,7 +4542,7 @@ function SettingsPanel({
 }) {
   return (
     <div className="flex flex-col gap-6">
-      <Card>
+      {settingsUnavailable ? <EmptyState icon={AlertCircle} title="媒体设置无法读取，暂不能编辑" action={{ label: "重新读取", onClick: onRetry }} /> : <Card>
         <CardHeader>
           <CardTitle>媒体设置</CardTitle>
           <CardDescription>TMDB 与自动扫描</CardDescription>
@@ -4578,7 +4598,7 @@ function SettingsPanel({
             </Button>
           </div>
         </CardContent>
-      </Card>
+      </Card>}
 
       {openListSettings ? (
         <OpenListAutomationPanel
@@ -4593,7 +4613,7 @@ function SettingsPanel({
         />
       ) : null}
 
-      <Card>
+      {profilesUnavailable ? <EmptyState icon={AlertCircle} title="质量配置无法读取，暂不能编辑" action={{ label: "重新读取", onClick: onRetry }} /> : <Card>
         <CardHeader className="flex-row items-center justify-between gap-4">
           <div>
             <CardTitle>质量配置</CardTitle>
@@ -4676,7 +4696,7 @@ function SettingsPanel({
             </>
           )}
         </CardContent>
-      </Card>
+      </Card>}
     </div>
   );
 }
