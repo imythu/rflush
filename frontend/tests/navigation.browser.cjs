@@ -85,7 +85,39 @@ const fs = require('node:fs');
     assert.equal(await page.locator('main').getAttribute('inert'), null);
     await page.setViewportSize({ width: 320, height: 640 });
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    // Runtime SELF_USE gates desktop, mobile, and direct hash navigation. Fail closed.
+    for (const flag of [true, false, undefined, 'true', 'unavailable']) {
+      const gated = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+      const transferRequests = [];
+      gated.on('pageerror', e => errors.push(e.message));
+      await gated.route('**/api/**', async route => {
+        const path = new URL(route.request().url()).pathname;
+        if (path === '/api/features') {
+          if (flag === 'unavailable') return route.fulfill({ status: 503, json: {} });
+          return route.fulfill({ json: { self_use: flag } });
+        }
+        if (path === '/api/settings') return route.fulfill({ json: { log_level: 'info', proxy: null, lightpanda: {}, browserless: {} } });
+        if (path.includes('/openlist/') || path.endsWith('/torrents')) transferRequests.push(path);
+        return route.fulfill({ status: 503, json: { error: '模拟服务不可用' } });
+      });
+      await gated.goto(`${url}/#/system-settings`);
+      await gated.getByRole('heading', { name: '系统设置', exact: true }).first().waitFor();
+      assert.equal(await gated.getByRole('button', { name: '种子转移', exact: true }).count(), flag === true ? 1 : 0);
+      await gated.setViewportSize({ width: 390, height: 844 });
+      await gated.getByRole('button', { name: '打开全部菜单', exact: true }).click();
+      assert.equal(await gated.getByRole('dialog', { name: '主菜单' }).getByRole('button', { name: '种子转移', exact: true }).count(), flag === true ? 1 : 0);
+      await gated.goto(`${url}/#/torrent-transfer`);
+      if (flag === true) {
+        await gated.getByRole('heading', { name: '种子转移', exact: true }).first().waitFor();
+        assert.match(gated.url(), /#\/torrent-transfer$/);
+      } else {
+        await gated.waitForURL('**/#/');
+        assert.equal(await gated.getByRole('heading', { name: '种子转移', exact: true }).count(), 0);
+        assert.deepEqual(transferRequests, [], 'disabled transfer route must never mount or request APIs');
+      }
+      await gated.close();
+    }
     assert.deepEqual(errors, []);
-    console.log('Navigation checks passed: history, refresh, query drafts, settings targeting, tab keyboard navigation, mobile labels, modal focus, resize, overflow.');
+    console.log('Navigation checks passed: history, refresh, query drafts, settings targeting, tab keyboard navigation, mobile labels, modal focus, resize, overflow, SELF_USE on/off/missing/invalid/unavailable.');
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exit(1); });

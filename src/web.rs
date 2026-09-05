@@ -187,6 +187,7 @@ fn app_router(state: AppState, relocation_scheduler: Arc<RelocationScheduler>) -
     let media_scheduler = Arc::clone(&state.media_scheduler);
     let self_use = state.self_use;
     Router::new()
+        .route("/api/features", get(get_features))
         .route("/api/settings", get(get_settings).put(update_settings))
         // 站点管理
         .route("/api/sites", get(list_sites).post(create_site))
@@ -2420,6 +2421,10 @@ fn validate_download_cursor(
         return Err(ApiError::bad_request("before_id must be greater than zero"));
     }
     Ok(before_id)
+}
+
+async fn get_features(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "self_use": state.self_use }))
 }
 
 async fn get_settings(State(state): State<AppState>) -> Result<Json<GlobalConfig>, ApiError> {

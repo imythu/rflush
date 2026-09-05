@@ -198,6 +198,7 @@ export default function App() {
   const [page, setPage] = useState<AppPage>(readPageFromHash());
   const lastVisited = useRef(new Map<AppPage, string>());
   const [menuOpen, setMenuOpen] = useState(false);
+  const [selfUse, setSelfUse] = useState(false);
   const [settings, setSettings] = useState<GlobalConfig>(defaultSettings);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -243,10 +244,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    loadSettings()
+    Promise.all([
+      loadSettings().catch((error: Error) => setMessage(error.message)),
+      api<{ self_use?: boolean }>("/api/features")
+        .then((features) => setSelfUse(features.self_use === true))
+        .catch(() => setSelfUse(false)),
+    ])
       .catch((error: Error) => setMessage(error.message))
       .finally(() => setLoading(false));
   }, [page]);
+
+  useEffect(() => {
+    if (!loading && !selfUse && page === "torrent-transfer") {
+      lastVisited.current.delete("torrent-transfer");
+      setPage("system-overview");
+      window.history.replaceState(null, "", "#/");
+    }
+  }, [loading, selfUse, page]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setCurrentTime(new Date()), 1000);
@@ -392,6 +406,7 @@ export default function App() {
   }, [logs, logsOpen]);
 
   function navigate(nextPage: AppPage) {
+    if (nextPage === "torrent-transfer" && !selfUse) return;
     lastVisited.current.set(readPageFromHash(), window.location.hash);
     setPage(nextPage);
     setHash(nextPage, lastVisited.current.get(nextPage));
@@ -469,7 +484,7 @@ export default function App() {
               open={!closedGroups.includes(group.key)}
               onToggle={() => setClosedGroups((current) => current.includes(group.key)
                 ? current.filter((key) => key !== group.key) : [...current, group.key])}
-              items={navItems.filter((item) => item.group === group.key)}
+              items={navItems.filter((item) => item.group === group.key && (item.key !== "torrent-transfer" || selfUse))}
               page={page} navigate={navigate} />
           ))}
         </div>
@@ -581,7 +596,7 @@ export default function App() {
               {page === "media" ? <MediaPage /> : null}
               {page === "sites" ? <SitesPage /> : null}
               {page === "downloaders" ? <DownloadersPage /> : null}
-              {page === "torrent-transfer" ? <TorrentTransferPage /> : null}
+              {page === "torrent-transfer" && selfUse ? <TorrentTransferPage /> : null}
               {page === "brush-tasks" ? <BrushTasksPage /> : null}
               {page === "sign-in" ? <SignInPage /> : null}
               {page === "tag-rules" ? <TagRulesPage /> : null}
