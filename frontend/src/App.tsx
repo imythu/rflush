@@ -539,13 +539,13 @@ export default function App() {
                   <Menu className="h-4 w-4" />
                 </Button>
                 <div className="min-w-0">
-                  <div className={cn("hidden flex-wrap items-center gap-2 lg:flex", page === "media" && "lg:hidden")}>
+                  <div className={cn("hidden flex-wrap items-center gap-2 lg:flex", (page === "media" || page === "sites") && "lg:hidden")}>
                     <span className="rounded-full border border-primary/15 bg-secondary px-3 py-1 text-xs font-bold text-secondary-foreground">
                       {currentNav.label}
                     </span>
                   </div>
-                  <h2 className={cn("truncate text-base font-black tracking-tight sm:text-lg lg:mt-2 lg:text-3xl", page === "media" && "lg:mt-0 lg:text-xl")}>{page === "media" ? "自动追剧" : currentNav.description}</h2>
-                  {page !== "media" ? <p className="mt-1 hidden text-sm leading-6 text-muted lg:block">实时后端日志、系统时间和当前模块状态集中在右侧，页面主体保持高密度操作。</p> : null}
+                  <h2 className={cn("truncate text-base font-black tracking-tight sm:text-lg lg:mt-2 lg:text-3xl", (page === "media" || page === "sites") && "lg:mt-0 lg:text-xl")}>{page === "media" || page === "sites" ? currentNav.label : currentNav.description}</h2>
+                  {page !== "media" && page !== "sites" ? <p className="mt-1 hidden text-sm leading-6 text-muted lg:block">实时后端日志、系统时间和当前模块状态集中在右侧，页面主体保持高密度操作。</p> : null}
                 </div>
               </div>
 

@@ -8,6 +8,7 @@ export function Dialog({
   title,
   description,
   children,
+  footer,
   escMode = "single",
   panelClassName,
 }: {
@@ -16,6 +17,7 @@ export function Dialog({
   title: string;
   description?: string;
   children: React.ReactNode;
+  footer?: React.ReactNode;
   escMode?: "single" | "double";
   panelClassName?: string;
 }) {
@@ -134,6 +136,7 @@ export function Dialog({
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-auto">{children}</div>
+        {footer ? <div className="shrink-0 border-t border-border bg-card px-4 py-3 sm:px-6">{footer}</div> : null}
       </div>
     </div>
   );

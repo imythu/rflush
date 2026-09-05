@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Globe,
   Plus,
-  Pencil,
   Trash2,
   Activity,
   ListChecks,
@@ -29,13 +28,14 @@ import {
   CircleX,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
+  MoreHorizontal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
   CardContent,
   CardHeader,
-  CardTitle,
   CardDescription,
 } from "@/components/ui/card";
 import { Dialog } from "@/components/ui/dialog";
@@ -86,6 +86,7 @@ function formatDateTime(value: string | null | undefined): string {
 type SiteHealth = "healthy" | "failed" | "pending";
 const SITE_PAGE_SIZE = 20;
 const CUSTOM_SITE_PRESET = "__custom__";
+const sitePrimaryButtonClassName = "h-11 bg-none bg-secondary-foreground shadow-none";
 
 function getSiteHealth(site: SiteRecord): SiteHealth {
   if (site.stats?.last_error) return "failed";
@@ -315,13 +316,13 @@ function renderOverviewProofImage({
   generatedAt: Date;
 }): Promise<Blob> {
   const successfulRows = rows.filter((row) => row.stats);
-  const failedRows = rows.filter((row) => !row.stats);
+  const failedRows = rows.filter((row) => row.error);
   const totalUploaded = successfulRows.reduce((sum, row) => sum + (row.stats?.uploaded ?? 0), 0);
   const totalDownloaded = successfulRows.reduce((sum, row) => sum + (row.stats?.downloaded ?? 0), 0);
   const uploaded = formatBytesCompact(totalUploaded);
   const downloaded = formatBytesCompact(totalDownloaded);
   const topRows = successfulRows
-    .toSorted((a, b) => (b.stats?.uploaded ?? 0) - (a.stats?.uploaded ?? 0))
+    .slice().sort((a, b) => (b.stats?.uploaded ?? 0) - (a.stats?.uploaded ?? 0))
     .slice(0, 4);
   const width = 1600;
   const tableRowHeight = 58;
@@ -369,7 +370,7 @@ function renderOverviewProofImage({
   drawRoundRect(ctx, 1120, 88, 360, 46, 23, "rgba(255,255,255,0.62)", "rgba(126, 96, 194, 0.16)");
   drawText(ctx, generatedText, 1142, 119, { font: "800 18px Inter, system-ui, sans-serif", color: "#4a347f", maxWidth: 316 });
   drawRoundRect(ctx, 1120, 150, 170, 46, 23, "rgba(255,255,255,0.62)", "rgba(126, 96, 194, 0.16)");
-  drawText(ctx, `${successfulRows.length} 个站点已验证`, 1142, 181, { font: "800 18px Inter, system-ui, sans-serif", color: "#4a347f" });
+  drawText(ctx, `${successfulRows.length} 个有数据`, 1142, 181, { font: "800 18px Inter, system-ui, sans-serif", color: "#4a347f" });
   drawRoundRect(ctx, 1310, 150, 170, 46, 23, "rgba(255,255,255,0.62)", "rgba(126, 96, 194, 0.16)");
   drawText(ctx, `${failedRows.length} 个失败`, 1332, 181, { font: "800 18px Inter, system-ui, sans-serif", color: failedRows.length ? "#d83a57" : "#4a347f" });
 
@@ -427,7 +428,7 @@ function renderOverviewProofImage({
       stats ? formatBytes(stats.uploaded) : "-",
       stats ? formatBytes(stats.downloaded) : "-",
       stats ? formatRatio(stats.uploaded, stats.downloaded) : "-",
-      row.error ?? "正常",
+      row.error ?? (row.stats ? "最近拉取成功" : "等待刷新"),
     ];
     cols.forEach(([, x, maxWidth], colIndex) =>
       drawText(ctx, values[colIndex], x, y + 31, {
@@ -453,7 +454,7 @@ function renderOverviewProofImage({
 
 type SiteOverviewRow = {
   site: SiteRecord;
-  stats: SiteStatsRecord | null;
+  stats: (SiteStatsRecord & { uploaded: number; downloaded: number }) | null;
   error: string | null;
 };
 
@@ -604,7 +605,7 @@ function SiteRequestHeadersEditor({
           <Button
             type="button"
             variant="outline"
-            className="h-8 px-3 text-xs"
+            className="h-11 px-3 text-sm"
             onClick={onRestore}
             disabled={loading}
           >
@@ -614,7 +615,7 @@ function SiteRequestHeadersEditor({
           <Button
             type="button"
             variant="secondary"
-            className="h-8 px-3 text-xs"
+            className="h-11 px-3 text-sm"
             onClick={onAdd}
             disabled={loading || headers.length >= 64}
           >
@@ -625,7 +626,7 @@ function SiteRequestHeadersEditor({
       </div>
 
       <div className="overflow-hidden rounded-2xl border border-border bg-surface-container/45">
-        <div className="hidden grid-cols-[minmax(8rem,0.7fr)_minmax(12rem,1.3fr)_2.25rem] gap-2 border-b border-border bg-card/65 px-3 py-2 text-xs font-semibold text-muted sm:grid">
+        <div className="hidden grid-cols-[minmax(8rem,0.7fr)_minmax(12rem,1.3fr)_2.75rem] gap-2 border-b border-border bg-card/65 px-3 py-2 text-xs font-semibold text-muted sm:grid">
           <span>名称</span>
           <span>值</span>
           <span className="sr-only">操作</span>
@@ -640,14 +641,14 @@ function SiteRequestHeadersEditor({
             未配置请求头
           </div>
         ) : (
-          <div className="max-h-[min(44dvh,28rem)] space-y-2 overflow-y-auto p-2.5">
+          <div className="space-y-3 p-2.5">
             {headers.map((header, index) => (
               <div
                 key={index}
-                className="grid grid-cols-[minmax(0,1fr)_2.25rem] gap-2 rounded-xl border border-border/70 bg-card/75 p-2 sm:grid-cols-[minmax(8rem,0.7fr)_minmax(12rem,1.3fr)_2.25rem]"
+                className="grid grid-cols-[minmax(0,1fr)_2.75rem] gap-2 rounded-xl border border-border/70 bg-card/75 p-2 sm:grid-cols-[minmax(8rem,0.7fr)_minmax(12rem,1.3fr)_2.75rem]"
               >
                 <Input
-                  className="h-9 min-w-0 rounded-xl px-3 font-mono text-xs"
+                  className="h-11 min-w-0 rounded-xl px-3 font-mono text-base"
                   value={header.name}
                   onChange={(event) => onChange(index, "name", event.target.value)}
                   placeholder="请求头名称"
@@ -655,7 +656,7 @@ function SiteRequestHeadersEditor({
                   spellCheck={false}
                 />
                 <Input
-                  className="col-start-1 row-start-2 h-9 min-w-0 rounded-xl px-3 font-mono text-xs sm:col-start-2 sm:row-start-1"
+                  className="col-start-1 row-start-2 h-11 min-w-0 rounded-xl px-3 font-mono text-base sm:col-start-2 sm:row-start-1"
                   value={header.value}
                   onChange={(event) => onChange(index, "value", event.target.value)}
                   placeholder="请求头值"
@@ -664,7 +665,7 @@ function SiteRequestHeadersEditor({
                 />
                 <button
                   type="button"
-                  className="col-start-2 row-span-2 row-start-1 flex size-9 cursor-pointer items-center justify-center self-center rounded-xl text-muted transition-colors duration-200 hover:bg-destructive/10 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:col-start-3 sm:row-span-1"
+                  className="col-start-2 row-span-2 row-start-1 flex size-11 cursor-pointer items-center justify-center self-center rounded-xl text-muted transition-colors duration-200 hover:bg-destructive/10 hover:text-red-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:col-start-3 sm:row-span-1"
                   onClick={() => onRemove(index)}
                   aria-label={`删除第 ${index + 1} 个请求头`}
                   title="删除请求头"
@@ -688,6 +689,9 @@ export function SitesPage() {
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
+  const [sitesError, setSitesError] = useState("");
+  const [actionsTarget, setActionsTarget] = useState<SiteRecord | null>(null);
+  const [credentialMessage, setCredentialMessage] = useState("");
   const [refreshAllSubmitting, setRefreshAllSubmitting] = useState(false);
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [siteCredentials, setSiteCredentials] = useState<Record<number, SiteCredentialsRecord>>({});
@@ -729,33 +733,42 @@ export function SitesPage() {
   const [clearAuthConfig, setClearAuthConfig] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<{ name?: string; base_url?: string }>({});
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [visibleAuthFields, setVisibleAuthFields] = useState<Set<CredentialField>>(() => new Set());
+  const [requestHeadersError, setRequestHeadersError] = useState("");
   const [requestHeadersLoading, setRequestHeadersLoading] = useState(false);
   const requestHeadersLoadRef = useRef(0);
 
   // delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<SiteRecord | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
 
   // test connection
   const [testResult, setTestResult] = useState<SiteTestResult | null>(null);
   const [testOpen, setTestOpen] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [testTarget, setTestTarget] = useState<SiteRecord | null>(null);
+  const testRequestRef = useRef(0);
 
   // overview
   const [overviewRows, setOverviewRows] = useState<SiteOverviewRow[]>([]);
   const [overviewOpen, setOverviewOpen] = useState(false);
   const [overviewLoading, setOverviewLoading] = useState(false);
+  const [overviewError, setOverviewError] = useState("");
+  const [overviewMessage, setOverviewMessage] = useState("");
   const [overviewGeneratedAt, setOverviewGeneratedAt] = useState<Date | null>(null);
   const [overviewExporting, setOverviewExporting] = useState<"copy" | "download" | null>(null);
 
   const successfulOverviewRows = overviewRows.filter((row) => row.stats);
-  const failedOverviewRows = overviewRows.filter((row) => !row.stats);
+  const failedOverviewRows = overviewRows.filter((row) => row.error);
   const totalUploaded = successfulOverviewRows.reduce((sum, row) => sum + (row.stats?.uploaded ?? 0), 0);
   const totalDownloaded = successfulOverviewRows.reduce((sum, row) => sum + (row.stats?.downloaded ?? 0), 0);
   const totalUploadedCompact = formatBytesCompact(totalUploaded);
   const totalDownloadedCompact = formatBytesCompact(totalDownloaded);
   const topOverviewRows = successfulOverviewRows
-    .toSorted((a, b) => (b.stats?.uploaded ?? 0) - (a.stats?.uploaded ?? 0))
+    .slice().sort((a, b) => (b.stats?.uploaded ?? 0) - (a.stats?.uploaded ?? 0))
     .slice(0, 4);
   const siteCounts = useMemo(
     () => ({
@@ -816,6 +829,7 @@ export function SitesPage() {
 
   function loadSites() {
     setLoading(true);
+    setSitesError("");
     setSiteCredentials({});
     setRevealedCredentialKeys(new Set());
     setLoadingCredentialKeys(new Set());
@@ -823,11 +837,9 @@ export function SitesPage() {
     api<SiteRecord[]>("/api/sites")
       .then((data) => {
         setSites(data);
-        setMessage("");
       })
       .catch((error: Error) => {
-        setSites([]);
-        setMessage(error.message || "加载站点失败");
+        setSitesError(error.message || "无法连接服务，请稍后重试");
       })
       .finally(() => setLoading(false));
   }
@@ -886,11 +898,12 @@ export function SitesPage() {
         const refreshedSites = await api<SiteRecord[]>("/api/sites");
         if (cancelled) return;
         setSites(refreshedSites);
+        setSitesError("");
         setRefreshingAll(false);
         const failedCount = refreshedSites.filter((site) => site.stats?.last_error).length;
         setMessage(
           failedCount > 0
-            ? `刷新完成，${failedCount} 个站点失败，可在总览中查看详情`
+            ? `刷新完成，${failedCount} 个站点失败，可筛选“拉取失败”查看原因`
             : "全部站点刷新完成",
         );
       } catch (error) {
@@ -972,7 +985,7 @@ export function SitesPage() {
       }
       setRevealedCredentialKeys((current) => new Set(current).add(stateKey));
     } catch (error) {
-      setMessage((error as Error).message || "读取站点凭据失败");
+      setCredentialMessage((error as Error).message || "读取站点凭据失败");
     } finally {
       setCredentialLoading(loadingKey, false);
     }
@@ -990,12 +1003,12 @@ export function SitesPage() {
       }
       await writeClipboardText(value);
       setCopiedCredentialKey(stateKey);
-      setMessage(`${site.name} 的 ${credentialFieldLabels[field]} 已复制`);
+      setCredentialMessage(`${site.name} 的 ${credentialFieldLabels[field]} 已复制`);
       window.setTimeout(() => {
         setCopiedCredentialKey((current) => (current === stateKey ? null : current));
       }, 2000);
     } catch (error) {
-      setMessage((error as Error).message || "复制站点凭据失败");
+      setCredentialMessage((error as Error).message || "复制站点凭据失败");
     } finally {
       setCredentialLoading(loadingKey, false);
     }
@@ -1014,6 +1027,7 @@ export function SitesPage() {
       ));
     }
     setCredentialsTarget(null);
+    setCredentialMessage("");
   }
 
   function handleOpenSite(site: SiteRecord) {
@@ -1030,6 +1044,7 @@ export function SitesPage() {
       }
       window.open(url.href, "_blank", "noopener,noreferrer");
     } catch {
+      setActionsTarget(null);
       setMessage(`${site.name} 的站点地址无效，仅支持 HTTP 或 HTTPS`);
     }
   }
@@ -1073,6 +1088,8 @@ export function SitesPage() {
   }
 
   function closeForm() {
+    if (submitting) return;
+    setVisibleAuthFields(new Set());
     requestHeadersLoadRef.current += 1;
     setRequestHeadersLoading(false);
     setFormError("");
@@ -1118,6 +1135,10 @@ export function SitesPage() {
     setExistingAuth(null);
     setClearAuthConfig(false);
     setFormError("");
+    setFieldErrors({});
+    setAdvancedOpen(false);
+    setVisibleAuthFields(new Set());
+    setRequestHeadersError("");
     setRequestHeadersLoading(false);
     setFormOpen(true);
   }
@@ -1141,17 +1162,24 @@ export function SitesPage() {
     setExistingAuth({ siteType, authType, configured: site.auth_configured });
     setClearAuthConfig(false);
     setFormError("");
-    setRequestHeadersLoading(true);
+    setFieldErrors({});
+    setAdvancedOpen(false);
+    setVisibleAuthFields(new Set());
     setFormOpen(true);
-    api<SiteRequestHeader[]>(`/api/sites/${site.id}/request-headers`)
+    loadRequestHeaders(site.id, loadId);
+  }
+
+  function loadRequestHeaders(siteId: number, loadId = requestHeadersLoadRef.current) {
+    setRequestHeadersLoading(true);
+    setRequestHeadersError("");
+    api<SiteRequestHeader[]>(`/api/sites/${siteId}/request-headers`)
       .then((requestHeaders) => {
         if (requestHeadersLoadRef.current !== loadId) return;
         patch({ request_headers: requestHeaders });
       })
       .catch((error: Error) => {
         if (requestHeadersLoadRef.current !== loadId) return;
-        setMessage(error.message || "加载站点请求头失败");
-        closeForm();
+        setRequestHeadersError(error.message || "加载站点请求头失败");
       })
       .finally(() => {
         if (requestHeadersLoadRef.current === loadId) {
@@ -1161,11 +1189,26 @@ export function SitesPage() {
   }
 
   function handleSubmit() {
+    if (submitting || requestHeadersLoading || requestHeadersError) return;
+    const errors: { name?: string; base_url?: string } = {};
+    if (!form.name.trim()) errors.name = "请填写站点名称";
+    try {
+      const url = new URL(form.base_url.trim());
+      if (!["http:", "https:"].includes(url.protocol)) throw new Error();
+    } catch {
+      errors.base_url = "请输入以 http:// 或 https:// 开头的完整站点地址";
+    }
+    setFieldErrors(errors);
+    if (Object.keys(errors).length) {
+      document.getElementById(errors.name ? "site-name" : "site-base-url")?.focus();
+      return;
+    }
     const requestHeaders = form.request_headers.filter(
       (header) => header.name.trim() || header.value.trim(),
     );
     const missingNameIndex = requestHeaders.findIndex((header) => !header.name.trim());
     if (missingNameIndex >= 0) {
+      setAdvancedOpen(true);
       setFormError(`第 ${missingNameIndex + 1} 个请求头名称不能为空`);
       return;
     }
@@ -1173,6 +1216,7 @@ export function SitesPage() {
     for (const header of requestHeaders) {
       const normalizedName = header.name.trim().toLowerCase();
       if (seenHeaderNames.has(normalizedName)) {
+        setAdvancedOpen(true);
         setFormError(`请求头名称不能重复：${header.name.trim()}`);
         return;
       }
@@ -1181,9 +1225,9 @@ export function SitesPage() {
     setFormError("");
     setSubmitting(true);
     const body = {
-      name: form.name,
+      name: form.name.trim(),
       site_type: form.site_type,
-      base_url: form.base_url,
+      base_url: form.base_url.trim(),
       use_proxy: form.use_proxy,
       auth_config: buildAuthConfig(form),
       request_headers: requestHeaders,
@@ -1201,8 +1245,10 @@ export function SitesPage() {
           });
     req
       .then(() => {
-        closeForm();
-        setMessage(editingId != null ? "站点已更新" : "站点已创建");
+        requestHeadersLoadRef.current += 1;
+        setFormOpen(false);
+        setVisibleAuthFields(new Set());
+        setMessage(editingId != null ? "站点已更新，可测试连接或刷新账户数据" : "站点已创建，可测试连接或刷新账户数据");
         loadSites();
         loadPtdConfig();
       })
@@ -1213,7 +1259,8 @@ export function SitesPage() {
   /* ---- delete ---- */
 
   function confirmDelete() {
-    if (!deleteTarget) return;
+    if (!deleteTarget || deleting) return;
+    setDeleteError("");
     setDeleting(true);
     api<{ ok: true }>(`/api/sites/${deleteTarget.id}`, { method: "DELETE" })
       .then(() => {
@@ -1222,48 +1269,56 @@ export function SitesPage() {
         loadSites();
         loadPtdConfig();
       })
-      .catch((error: Error) => setMessage(error.message || "删除站点失败"))
+      .catch((error: Error) => setDeleteError(error.message || "删除站点失败，请重试"))
       .finally(() => setDeleting(false));
   }
 
   /* ---- test connection ---- */
 
   function handleTest(site: SiteRecord) {
+    const requestId = ++testRequestRef.current;
+    setTestTarget(site);
     setTesting(true);
     setTestResult(null);
     setTestOpen(true);
     api<SiteTestResult>(`/api/sites/${site.id}/test`, { method: "POST" })
-      .then(setTestResult)
-      .catch((err) =>
-        setTestResult({ success: false, message: String(err), user_stats: null }),
-      )
-      .finally(() => setTesting(false));
+      .then((result) => { if (testRequestRef.current === requestId) setTestResult(result); })
+      .catch((error: Error) => {
+        if (testRequestRef.current === requestId) {
+          setTestResult({ success: false, message: error.message || "连接测试失败，请重试", user_stats: null });
+        }
+      })
+      .finally(() => { if (testRequestRef.current === requestId) setTesting(false); });
   }
 
   function handleOverview() {
     setOverviewOpen(true);
+    setOverviewError("");
+    setOverviewMessage("");
     setOverviewLoading(true);
     setOverviewRows([]);
     setOverviewGeneratedAt(null);
     api<SiteRecord[]>("/api/sites/stats-overview")
       .then((data) => {
         setSites(data);
-        return data.map((site) => ({
+        setSitesError("");
+        return data.map((site): SiteOverviewRow => ({
           site,
-          stats: site.stats?.uploaded != null && site.stats?.downloaded != null ? site.stats : null,
+          stats: site.stats?.uploaded != null && site.stats.downloaded != null
+            ? { ...site.stats, uploaded: site.stats.uploaded, downloaded: site.stats.downloaded } : null,
           error: site.stats?.last_error ?? null,
         }));
       })
       .then((rows) => {
         setOverviewRows(
-          rows.toSorted((a, b) => {
+          rows.slice().sort((a, b) => {
             if (a.error && !b.error) return 1;
             if (!a.error && b.error) return -1;
             return a.site.id - b.site.id;
           }),
         );
       })
-      .catch((error: Error) => setMessage(error.message || "加载站点总览失败"))
+      .catch((error: Error) => setOverviewError(error.message || "加载站点总览失败"))
       .then(() => setOverviewGeneratedAt(new Date()))
       .finally(() => setOverviewLoading(false));
   }
@@ -1292,13 +1347,13 @@ export function SitesPage() {
       const ClipboardItemCtor = window.ClipboardItem;
       if (!navigator.clipboard || !ClipboardItemCtor) {
         downloadOverviewBlob(blob);
-        setMessage("当前浏览器不支持图片剪切板，已改为下载 PNG");
+        setOverviewMessage("当前浏览器不支持图片剪切板，已改为下载 PNG");
         return;
       }
       await navigator.clipboard.write([new ClipboardItemCtor({ "image/png": blob })]);
-      setMessage("PT 数据证明图已复制到剪切板");
+      setOverviewMessage("PT 数据证明图已复制到剪切板");
     } catch (error) {
-      setMessage((error as Error).message || "复制图片失败");
+      setOverviewMessage((error as Error).message || "复制图片失败");
     } finally {
       setOverviewExporting(null);
     }
@@ -1309,9 +1364,9 @@ export function SitesPage() {
     try {
       const blob = await createOverviewImageBlob();
       downloadOverviewBlob(blob);
-      setMessage("PT 数据证明图已下载");
+      setOverviewMessage("PT 数据证明图已下载");
     } catch (error) {
-      setMessage((error as Error).message || "下载图片失败");
+      setOverviewMessage((error as Error).message || "下载图片失败");
     } finally {
       setOverviewExporting(null);
     }
@@ -1421,89 +1476,87 @@ export function SitesPage() {
     : "输入新的认证凭据";
 
   function renderAuthFields() {
-    if (form.site_type === "mteam") {
-      return (
-        <div className="space-y-2">
-          <Label>API Key</Label>
-          <Input
-            value={form.api_key}
-            onChange={(e) => {
-              patch({ api_key: e.target.value });
-              if (e.target.value) setClearAuthConfig(false);
-            }}
-            placeholder={credentialPlaceholder}
-            disabled={clearAuthConfig}
-          />
-        </div>
-      );
-    }
-
+    const fields = credentialFieldsFor(form.site_type === "mteam" ? "api_key" : form.auth_type);
     return (
-      <>
-        <div className="space-y-2">
-          <Label>认证方式</Label>
-          <select
-            className="h-10 w-full rounded-full border border-border bg-card px-4 text-sm"
-            value={form.auth_type}
-            onChange={(e) => {
-              patch({ auth_type: e.target.value as AuthType });
-              setClearAuthConfig(false);
-            }}
-          >
-            <option value="cookie">Cookie</option>
-            {form.site_type !== "gazelle" ? <option value="passkey">Passkey</option> : null}
-            <option value="cookie_passkey">Cookie + Passkey</option>
-            {form.site_type !== "gazelle" ? <option value="api_key">API Key</option> : null}
-          </select>
-        </div>
-
-        {form.auth_type === "api_key" && (
+      <div className="space-y-4">
+        {form.site_type !== "mteam" ? (
           <div className="space-y-2">
-            <Label>API Key</Label>
-            <Input
-              value={form.api_key}
-              onChange={(e) => {
-                patch({ api_key: e.target.value });
-                if (e.target.value) setClearAuthConfig(false);
+            <Label htmlFor="site-auth-type">认证方式</Label>
+            <Select
+              id="site-auth-type"
+              value={form.auth_type}
+              onChange={(value) => {
+                patch({ auth_type: value as AuthType });
+                setVisibleAuthFields(new Set());
+                setClearAuthConfig(false);
               }}
-              placeholder={credentialPlaceholder}
-              disabled={clearAuthConfig}
+              options={[
+                { value: "cookie", label: "Cookie" },
+                ...(form.site_type !== "gazelle" ? [{ value: "passkey", label: "Passkey" }] : []),
+                { value: "cookie_passkey", label: "Cookie + Passkey" },
+                ...(form.site_type !== "gazelle" ? [{ value: "api_key", label: "API Key" }] : []),
+              ]}
             />
           </div>
-        )}
+        ) : null}
+        {fields.map((field) => {
+          const revealed = visibleAuthFields.has(field);
+          const label = credentialFieldLabels[field];
+          const id = `site-auth-${field}`;
+          return (
+            <div key={field} className="space-y-2">
+              <Label htmlFor={id}>{label}</Label>
+              <div className="relative">
+                <Input
+                  id={id}
+                  type={revealed ? "text" : "password"}
+                  className="pr-14 text-base"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  value={form[field]}
+                  onChange={(event) => {
+                    patch({ [field]: event.target.value });
+                    if (event.target.value) setClearAuthConfig(false);
+                  }}
+                  placeholder={credentialPlaceholder}
+                  aria-describedby={`${id}-help`}
+                  disabled={clearAuthConfig}
+                />
+                <button
+                  type="button"
+                  className="absolute inset-y-0 right-0 flex w-12 items-center justify-center rounded-r-xl text-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-50"
+                  disabled={clearAuthConfig}
+                  aria-label={`${revealed ? "隐藏" : "显示"}${label}`}
+                  aria-pressed={revealed}
+                  onClick={() => setVisibleAuthFields((current) => {
+                    const next = new Set(current);
+                    if (next.has(field)) next.delete(field); else next.add(field);
+                    return next;
+                  })}
+                >
+                  {revealed ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                </button>
+              </div>
+              <p id={`${id}-help`} className="text-sm leading-6 text-muted">
+                {field === "cookie" ? "登录站点后，从浏览器开发者工具的网络请求中复制 Cookie 值。"
+                  : field === "passkey" ? "从站点个人设置中获取 Passkey；请勿分享给他人。"
+                  : "从站点提供的 API 设置中获取密钥；请勿分享给他人。"}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
 
-        {(form.auth_type === "cookie" ||
-          form.auth_type === "cookie_passkey") && (
-          <div className="space-y-2">
-            <Label>Cookie</Label>
-            <Input
-              value={form.cookie}
-              onChange={(e) => {
-                patch({ cookie: e.target.value });
-                if (e.target.value) setClearAuthConfig(false);
-              }}
-              placeholder={credentialPlaceholder}
-              disabled={clearAuthConfig}
-            />
-          </div>
-        )}
-
-        {(form.auth_type === "passkey" ||
-          form.auth_type === "cookie_passkey") && (
-          <div className="space-y-2">
-            <Label>Passkey</Label>
-            <Input
-              value={form.passkey}
-              onChange={(e) => {
-                patch({ passkey: e.target.value });
-                if (e.target.value) setClearAuthConfig(false);
-              }}
-              placeholder={credentialPlaceholder}
-              disabled={clearAuthConfig}
-            />
-          </div>
-        )}
-      </>
+  function renderSiteActions(site: SiteRecord) {
+    return (
+      <div className="flex flex-wrap justify-end gap-1.5">
+        <Button variant="outline" className="h-11 px-3 shadow-none" onClick={() => handleTest(site)} aria-label={`测试${site.name}连接`}>测试</Button>
+        <Button variant="secondary" className="h-11 px-3 shadow-none" onClick={() => openEdit(site)} aria-label={`编辑${site.name}`}>编辑</Button>
+        <Button variant="outline" className="h-11 px-3 shadow-none" onClick={() => setActionsTarget(site)} aria-label={`${site.name}的更多操作`}><MoreHorizontal className="size-4" /><span className="sr-only">更多</span></Button>
+      </div>
     );
   }
 
@@ -1511,21 +1564,16 @@ export function SitesPage() {
 
   return (
     <div className="space-y-6">
-      <Card className="overflow-hidden rounded-[28px]">
-        <CardHeader className="border-b border-border bg-surface-container/35">
+      <Card className="overflow-hidden rounded-2xl border-border bg-card shadow-none">
+        <CardHeader className="border-0 p-4 pb-0 sm:p-6 sm:pb-0">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div className="min-w-0">
-              <CardTitle className="flex items-center gap-2.5 text-xl">
-                <span className="flex size-10 items-center justify-center rounded-2xl bg-primary text-primary-foreground">
-                  <Globe className="size-5" />
-                </span>
-                站点管理
-              </CardTitle>
-              <CardDescription className="mt-2">管理站点连接，查看账户数据与刷新状态</CardDescription>
+              <CardDescription>管理站点连接，查看账户数据与刷新状态</CardDescription>
             </div>
             <div className="flex flex-wrap gap-2 lg:justify-end">
               <Button
                 variant="outline"
+                className="h-11"
                 onClick={() => void handleRefreshAll()}
                 disabled={loading || sites.length === 0 || refreshAllSubmitting || refreshingAll}
                 aria-busy={refreshAllSubmitting || refreshingAll}
@@ -1534,16 +1582,16 @@ export function SitesPage() {
                 <RefreshCw className={`mr-2 size-4 ${refreshAllSubmitting || refreshingAll ? "motion-safe:animate-spin" : ""}`} />
                 {refreshAllSubmitting ? "提交中" : refreshingAll ? "刷新中" : "刷新所有"}
               </Button>
-              <Button variant="outline" onClick={handleOverview} disabled={loading || sites.length === 0}>
+              <Button variant="outline" className="h-11" onClick={handleOverview} disabled={loading || sites.length === 0}>
                 <ListChecks className="mr-2 size-4" />
                 数据总览
               </Button>
-              <Button variant="outline" onClick={openPtdConfig} disabled={ptdConfigLoading}>
+              <Button variant="outline" className="h-11" onClick={openPtdConfig} disabled={ptdConfigLoading}>
                 <CloudCog className="mr-2 size-4" />
                 备份与同步
-                {ptdConfig?.last_error || ptdConfigError ? <span className="ml-2 text-xs text-destructive">异常</span> : null}
+                {ptdConfig?.last_error || ptdConfigError ? <span className="ml-2 text-xs text-red-700">异常</span> : null}
               </Button>
-              <Button onClick={openAdd}>
+              <Button className={sitePrimaryButtonClassName} onClick={openAdd}>
                 <Plus className="mr-2 size-4" />
                 添加站点
               </Button>
@@ -1567,10 +1615,10 @@ export function SitesPage() {
             </div>
           ) : null}
 
-          <section className="grid grid-cols-2 gap-3 lg:grid-cols-4" aria-label="站点状态概览">
+          <section className="flex flex-wrap gap-2" aria-label="站点状态概览">
             {([
               { key: "all", label: "全部站点", value: sites.length, icon: Server, tone: "text-primary bg-primary/10" },
-              { key: "healthy", label: "数据正常", value: siteCounts.healthy, icon: CircleCheck, tone: "text-emerald-700 bg-emerald-100" },
+              { key: "healthy", label: "最近拉取成功", value: siteCounts.healthy, icon: CircleCheck, tone: "text-emerald-700 bg-emerald-100" },
               { key: "failed", label: "拉取失败", value: siteCounts.failed, icon: CircleX, tone: "text-red-700 bg-red-100" },
               { key: "pending", label: "等待刷新", value: siteCounts.pending, icon: Clock3, tone: "text-amber-700 bg-amber-100" },
             ] as const).map((metric) => {
@@ -1580,24 +1628,24 @@ export function SitesPage() {
                 <button
                   key={metric.key}
                   type="button"
-                  className={`flex min-w-0 items-center gap-3 rounded-2xl border p-3 text-left transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 sm:p-4 ${selected ? "border-primary bg-primary/5" : "border-border bg-card hover:bg-accent/45"}`}
+                  className={`flex min-h-11 min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${selected ? "bg-secondary text-secondary-foreground" : "text-muted hover:bg-accent/45"}`}
                   aria-pressed={selected}
                   onClick={() => setSiteStatusFilter(metric.key)}
                 >
-                  <span className={`flex size-9 shrink-0 items-center justify-center rounded-xl ${metric.tone}`}>
+                  <span className={`flex size-6 shrink-0 items-center justify-center rounded-full ${metric.tone}`}>
                     <MetricIcon className="size-4" />
                   </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-[11px] font-semibold text-muted">{metric.label}</span>
-                    <span className="mt-0.5 block text-xl font-black tracking-tight">{metric.value}</span>
+                  <span className="flex items-center gap-2 text-sm">
+                    <span>{metric.label}</span>
+                    <span className="font-semibold tabular-nums">{sitesError && sites.length === 0 ? "—" : metric.value}</span>
                   </span>
                 </button>
               );
             })}
           </section>
 
-          <section className="flex flex-col gap-3 rounded-[22px] border border-border bg-surface-container/40 p-3 md:flex-row md:items-center" aria-label="筛选站点">
-            <div className="relative min-w-0 flex-1">
+          <section className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center" aria-label="筛选站点">
+            <div className="relative min-w-0 flex-1 sm:basis-64">
               <Label htmlFor="site-search" className="sr-only">搜索站点</Label>
               <Search className="pointer-events-none absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted" />
               <Input
@@ -1605,13 +1653,16 @@ export function SitesPage() {
                 value={siteQuery}
                 onChange={(event) => setSiteQuery(event.target.value)}
                 className="h-11 rounded-2xl pl-10"
-                placeholder="搜索站点、域名、用户名、UID 或 PTD 标识"
+                placeholder="搜索站点或账户"
+                title="支持站点、域名、用户名、UID 和 PTD 标识"
               />
             </div>
+            <Label htmlFor="site-type-filter" className="sr-only">筛选站点类型</Label>
             <Select
+              id="site-type-filter"
               value={siteTypeFilter}
               onChange={setSiteTypeFilter}
-              className="w-full md:w-40"
+              className="w-full sm:w-40"
               options={[
                 { value: "all", label: "全部类型" },
                 { value: "nexusphp", label: "NexusPHP" },
@@ -1619,13 +1670,15 @@ export function SitesPage() {
                 { value: "gazelle", label: "Gazelle" },
               ]}
             />
+            <Label htmlFor="site-status-filter" className="sr-only">筛选刷新状态</Label>
             <Select
+              id="site-status-filter"
               value={siteStatusFilter}
               onChange={(value) => setSiteStatusFilter(value as "all" | SiteHealth)}
-              className="w-full md:w-40"
+              className="w-full sm:w-40"
               options={[
                 { value: "all", label: "全部状态" },
-                { value: "healthy", label: "数据正常" },
+                { value: "healthy", label: "最近拉取成功" },
                 { value: "failed", label: "拉取失败" },
                 { value: "pending", label: "等待刷新" },
               ]}
@@ -1633,177 +1686,92 @@ export function SitesPage() {
             <span className="shrink-0 px-1 text-xs font-semibold text-muted">显示 {filteredSites.length} / {sites.length}</span>
           </section>
 
+          {sitesError ? (
+            <div role="alert" className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-destructive/25 bg-destructive/5 p-4">
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold text-red-700">站点列表加载失败</p>
+                <p className="mt-1 break-words text-sm">{sitesError}</p>
+                {sites.length > 0 ? <p className="mt-1 text-sm text-muted">以下保留上次加载的数据，状态可能已变化。</p> : null}
+              </div>
+              <Button variant="outline" className="h-11" onClick={loadSites} disabled={loading}>重新加载</Button>
+            </div>
+          ) : null}
           {loading ? (
-            <div className="flex items-center justify-center py-12 text-muted">
+            <div role="status" className="flex items-center justify-center py-12 text-muted">
               <Loader2 className="mr-2 h-5 w-5 animate-spin" />
               加载中…
             </div>
-          ) : sites.length === 0 ? (
+          ) : sitesError && sites.length === 0 ? null : sites.length === 0 ? (
             <div className="rounded-[24px] border border-dashed border-border py-14 text-center">
               <Globe className="mx-auto size-8 text-muted" />
               <p className="mt-3 font-semibold">还没有配置 PT 站点</p>
               <p className="mt-1 text-sm text-muted">添加首个站点后即可测试连接并刷新账户数据。</p>
-              <Button className="mt-4" onClick={openAdd}><Plus className="mr-2 size-4" />添加站点</Button>
+              <Button className={`mt-4 ${sitePrimaryButtonClassName}`} onClick={openAdd}><Plus className="mr-2 size-4" />添加站点</Button>
             </div>
           ) : filteredSites.length === 0 ? (
             <div className="rounded-[24px] border border-dashed border-border py-12 text-center text-sm text-muted">
-              没有符合当前筛选条件的站点
+              <p>没有符合当前筛选条件的站点</p>
+              <Button variant="outline" className="mt-4 h-11" onClick={() => {
+                setSiteQuery(""); setSiteTypeFilter("all"); setSiteStatusFilter("all");
+              }}>清除筛选</Button>
             </div>
           ) : (
             <>
-              <div className="hidden md:block">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>站点</TableHead>
-                      <TableHead>账户</TableHead>
-                      <TableHead>上传 / 下载</TableHead>
-                      <TableHead>分享率 / 魔力</TableHead>
-                      <TableHead>状态</TableHead>
-                      <TableHead className="text-right">操作</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
+              <div className="hidden xl:block">
+                <table className="w-full table-fixed border-collapse text-left text-sm">
+                  <caption className="sr-only">站点账户数据、刷新状态与管理操作</caption>
+                  <thead className="border-b border-border text-muted">
+                    <tr>
+                      <th scope="col" className="w-[25%] px-2 py-3 font-medium">站点 / 账户</th>
+                      <th scope="col" className="w-[24%] px-2 py-3 font-medium">账户数据</th>
+                      <th scope="col" className="px-2 py-3 font-medium">刷新状态</th>
+                      <th scope="col" className="w-[190px] px-2 py-3 text-right font-medium">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
                     {pagedSites.map((site) => (
-                      <TableRow key={site.id}>
-                        <TableCell className="px-3 py-3">
-                          <div className="min-w-[180px] max-w-[250px]">
-                            <div className="flex min-w-0 items-center gap-2">
-                              <span className="min-w-0 truncate font-semibold">{site.name}</span>
-                              <span className="shrink-0 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] text-violet-700">
-                                {site.site_type === "gazelle" ? "Gazelle" : site.site_type}
-                              </span>
-                            </div>
-                            <div className="mt-1 truncate text-xs text-muted" title={site.base_url}>
-                              {site.base_url}
-                            </div>
-                            <div className="mt-1 font-mono text-[10px] text-primary">
-                              PTD: {ptdConfig?.site_identifiers[String(site.id)] ?? "未识别"}
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="px-3 py-3">
-                          <div className="min-w-[110px]">
-                            <div className="truncate text-sm font-semibold">{site.stats?.username ?? "待获取"}</div>
-                            <div className="mt-1 font-mono text-[11px] text-muted">UID {site.stats?.uid ?? "-"}</div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="px-3 py-3">
-                          <div className="min-w-[150px] space-y-1.5 text-xs">
-                            <div className="flex items-center gap-2">
-                              <UploadCloud className="size-4 shrink-0 text-primary" />
-                              <span className="font-semibold tabular-nums">
-                                {site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "待刷新"}
-                              </span>
-                            </div>
-                            <div className="flex items-center gap-2">
-                              <DownloadCloud className="size-4 shrink-0 text-jade" />
-                              <span className="font-semibold tabular-nums text-muted">
-                                {site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "待刷新"}
-                              </span>
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="px-3 py-3">
-                          <div className="min-w-[100px] text-xs">
-                            <div className="font-black tabular-nums">
-                              {site.stats?.uploaded != null && site.stats.downloaded != null ? formatRatio(site.stats.uploaded, site.stats.downloaded) : "-"}
-                            </div>
-                            <div className="mt-1 text-muted">魔力 {site.stats?.bonus != null ? site.stats.bonus.toFixed(1) : "-"}</div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="px-3 py-3">
-                          <div className="max-w-[180px]">
-                            <SiteHealthBadge site={site} />
-                            <div className="mt-1.5 truncate text-[10px] text-muted" title={site.stats?.last_error ?? undefined}>
-                              {site.stats?.last_error ?? formatDateTime(site.stats?.last_checked_at)}
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell className="px-3 py-3">
-                          <div className="flex justify-end gap-1.5">
-                            <Button variant="outline" className="size-8 p-0" onClick={() => setCredentialsTarget(site)} aria-label={`查看${site.name}凭据`} title="查看凭据">
-                              <KeyRound className="size-3.5" />
-                            </Button>
-                            <Button
-                              variant="outline"
-                              className="size-8 p-0"
-                              onClick={() => handleOpenSite(site)}
-                              aria-label={`打开${site.name}主页`}
-                              title="在新标签页打开站点主页"
-                            >
-                              <ExternalLink className="size-4" />
-                            </Button>
-                            <Button
-                              variant="outline"
-                              className="size-8 p-0"
-                              onClick={() => handleTest(site)}
-                              aria-label={`测试${site.name}连接`}
-                              title="测试连接"
-                            >
-                              <Activity className="size-4" />
-                            </Button>
-                            <Button
-                              variant="secondary"
-                              className="size-8 p-0"
-                              onClick={() => openEdit(site)}
-                              aria-label={`编辑${site.name}`}
-                              title="编辑站点"
-                            >
-                              <Pencil className="size-4" />
-                            </Button>
-                            <Button
-                              variant="destructive"
-                              className="size-8 p-0"
-                              onClick={() => setDeleteTarget(site)}
-                              aria-label={`删除${site.name}`}
-                              title="删除站点"
-                            >
-                              <Trash2 className="size-4" />
-                            </Button>
-                          </div>
-                        </TableCell>
-                      </TableRow>
+                      <tr key={site.id} className="align-top hover:bg-accent/25">
+                        <td className="px-2 py-4">
+                          <p className="break-words font-semibold">{site.name}</p>
+                          <p className="mt-1 truncate text-sm text-muted" title={site.base_url}>{site.base_url}</p>
+                          <p className="mt-2 break-words text-sm">{site.stats?.username ?? "账户待获取"}</p>
+                          <p className="mt-1 break-words text-xs text-muted">UID {site.stats?.uid ?? "—"} · {site.site_type === "gazelle" ? "Gazelle" : site.site_type}</p>
+                        </td>
+                        <td className="px-2 py-4">
+                          <dl className="space-y-1.5 tabular-nums">
+                            <div className="flex flex-wrap gap-x-2"><dt className="text-muted">上传</dt><dd className="font-medium">{site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "待刷新"}</dd></div>
+                            <div className="flex flex-wrap gap-x-2"><dt className="text-muted">下载</dt><dd>{site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "待刷新"}</dd></div>
+                            <div className="flex flex-wrap gap-x-2"><dt className="text-muted">分享率</dt><dd>{site.stats?.uploaded != null && site.stats.downloaded != null ? formatRatio(site.stats.uploaded, site.stats.downloaded) : "—"}</dd></div>
+                            <div className="flex flex-wrap gap-x-2 text-xs text-muted"><dt>魔力</dt><dd>{site.stats?.bonus != null ? site.stats.bonus.toFixed(1) : "—"}</dd></div>
+                          </dl>
+                        </td>
+                        <td className="px-2 py-4"><SiteStatusDetail site={site} /></td>
+                        <td className="px-2 py-4">{renderSiteActions(site)}</td>
+                      </tr>
                     ))}
-                  </TableBody>
-                </Table>
+                  </tbody>
+                </table>
               </div>
 
-              <div className="grid gap-3 md:hidden">
+              <div className="grid gap-4 xl:hidden">
                 {pagedSites.map((site) => (
-                  <div
-                    key={site.id}
-                    className="rounded-[20px] border border-border bg-surface-container/70 p-3.5"
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <span className="block truncate text-sm font-semibold">{site.name}</span>
-                        <p className="mt-1 truncate text-[11px] text-muted">{site.base_url}</p>
+                  <article key={site.id} aria-label={site.name} className="min-w-0 rounded-xl border border-border p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <h3 className="break-words text-base font-semibold">{site.name}</h3>
+                        <p className="mt-1 break-all text-sm text-muted">{site.base_url}</p>
+                        <p className="mt-1 break-words text-sm text-muted">{site.stats?.username ?? "账户待获取"}</p>
                       </div>
                       <SiteHealthBadge site={site} />
                     </div>
-                    <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
-                      <div className="rounded-xl bg-card/70 p-2">
-                        <div className="text-[10px] font-bold text-muted">上传</div>
-                        <div className="mt-1 truncate text-xs font-black">{site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "-"}</div>
-                      </div>
-                      <div className="rounded-xl bg-card/70 p-2">
-                        <div className="text-[10px] font-bold text-muted">下载</div>
-                        <div className="mt-1 truncate text-xs font-black">{site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "-"}</div>
-                      </div>
-                      <div className="rounded-xl bg-card/70 p-2">
-                        <div className="text-[10px] font-bold text-muted">分享率</div>
-                        <div className="mt-1 truncate text-xs font-black">{site.stats?.uploaded != null && site.stats.downloaded != null ? formatRatio(site.stats.uploaded, site.stats.downloaded) : "-"}</div>
-                      </div>
-                    </div>
-                    <div className="mt-2.5 flex justify-end gap-1.5 border-t border-border/70 pt-2.5">
-                      <Button variant="outline" className="size-8 p-0" onClick={() => setCredentialsTarget(site)} aria-label="查看凭据"><KeyRound className="size-3.5" /></Button>
-                      <Button variant="outline" className="size-8 p-0" onClick={() => handleOpenSite(site)} aria-label="打开站点"><ExternalLink className="size-3.5" /></Button>
-                      <Button variant="outline" className="size-8 p-0" onClick={() => handleTest(site)} aria-label="测试连接"><Activity className="size-3.5" /></Button>
-                      <Button variant="secondary" className="size-8 p-0" onClick={() => openEdit(site)} aria-label="编辑站点"><Pencil className="size-3.5" /></Button>
-                      <Button variant="destructive" className="size-8 p-0" onClick={() => setDeleteTarget(site)} aria-label="删除站点"><Trash2 className="size-3.5" /></Button>
-                    </div>
-                  </div>
+                    <dl className="my-4 grid grid-cols-3 gap-2 text-sm tabular-nums">
+                      <div><dt className="text-muted">上传</dt><dd className="mt-1 break-all font-medium">{site.stats?.uploaded != null ? formatBytes(site.stats.uploaded) : "—"}</dd></div>
+                      <div><dt className="text-muted">下载</dt><dd className="mt-1 break-all font-medium">{site.stats?.downloaded != null ? formatBytes(site.stats.downloaded) : "—"}</dd></div>
+                      <div><dt className="text-muted">分享率</dt><dd className="mt-1 break-all font-medium">{site.stats?.uploaded != null && site.stats.downloaded != null ? formatRatio(site.stats.uploaded, site.stats.downloaded) : "—"}</dd></div>
+                    </dl>
+                    <SiteStatusDetail site={site} showBadge={false} />
+                    <div className="mt-4 border-t border-border pt-3">{renderSiteActions(site)}</div>
+                  </article>
                 ))}
               </div>
               {sitePageCount > 1 ? (
@@ -1814,7 +1782,7 @@ export function SitesPage() {
                   <div className="flex gap-2">
                     <Button
                       variant="outline"
-                      className="h-8 px-3 text-xs"
+                      className="h-11 px-3 text-sm"
                       onClick={() => setSitePage((current) => Math.max(1, current - 1))}
                       disabled={sitePage <= 1}
                     >
@@ -1822,7 +1790,7 @@ export function SitesPage() {
                     </Button>
                     <Button
                       variant="outline"
-                      className="h-8 px-3 text-xs"
+                      className="h-11 px-3 text-sm"
                       onClick={() => setSitePage((current) => Math.min(sitePageCount, current + 1))}
                       disabled={sitePage >= sitePageCount}
                     >
@@ -1842,7 +1810,6 @@ export function SitesPage() {
         title="备份与同步"
         description="将站点账户数据备份到蜂巢或其他 WebDAV 服务，兼容 PT-Depiler。"
         panelClassName="max-w-3xl"
-        escMode="double"
       >
         <div className="space-y-5 p-4 sm:p-6">
           <section className="space-y-3 rounded-2xl border border-border bg-surface-container/40 p-4" aria-label="备份状态">
@@ -1858,13 +1825,13 @@ export function SitesPage() {
             </div>
             <p className="text-xs text-muted">上次备份：{formatDateTime(ptdConfig?.last_backup_at)}</p>
             {ptdConfig?.last_backup_filename ? <p className="break-all font-mono text-xs text-muted">{ptdConfig.last_backup_filename}</p> : null}
-            {ptdConfig?.last_error ? <p className="break-words text-xs text-destructive">上次备份失败：{ptdConfig.last_error}</p> : null}
+            {ptdConfig?.last_error ? <p className="break-words text-xs text-red-700">上次备份失败：{ptdConfig.last_error}</p> : null}
             {ptdBackupMessage ? <p className="break-words text-sm" role="status">{ptdBackupMessage}</p> : null}
-            {ptdConfigError ? <p className="text-sm text-destructive" role="alert">{ptdConfigError} <button type="button" className="underline underline-offset-2" onClick={loadPtdConfig}>重试</button></p> : null}
+            {ptdConfigError ? <p className="text-sm text-red-700" role="alert">{ptdConfigError} <button type="button" className="underline underline-offset-2" onClick={loadPtdConfig}>重试</button></p> : null}
           </section>
 
           {ptdFormError ? (
-            <div role="alert" className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive lg:col-span-2">
+            <div role="alert" className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-red-700 lg:col-span-2">
               {ptdFormError}
             </div>
           ) : null}
@@ -2001,12 +1968,36 @@ export function SitesPage() {
               {ptdTesting ? <Loader2 className="mr-2 size-4 motion-safe:animate-spin" /> : <Activity className="mr-2 size-4" />}
               {ptdTesting ? "测试中" : "测试连接"}
             </Button>
-            <Button onClick={() => void handleSavePtdConfig()} disabled={ptdSaving || ptdTesting || ptdBackingUp}>
+            <Button className={sitePrimaryButtonClassName} onClick={() => void handleSavePtdConfig()} disabled={ptdSaving || ptdTesting || ptdBackingUp}>
               {ptdSaving ? <Loader2 className="mr-2 size-4 motion-safe:animate-spin" /> : null}
               {ptdSaving ? "保存中" : "保存配置"}
             </Button>
           </div>
         </div>
+      </Dialog>
+
+      <Dialog
+        open={actionsTarget != null}
+        onClose={() => setActionsTarget(null)}
+        title={actionsTarget ? `${actionsTarget.name} · 更多操作` : "站点操作"}
+        panelClassName="max-w-lg"
+      >
+        {actionsTarget ? (
+          <div className="space-y-5 p-4 sm:p-6">
+            <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
+              <dt className="text-muted">账户</dt><dd className="break-words">{actionsTarget.stats?.username ?? "待获取"}</dd>
+              <dt className="text-muted">UID</dt><dd className="break-all">{actionsTarget.stats?.uid ?? "—"}</dd>
+              <dt className="text-muted">魔力</dt><dd>{actionsTarget.stats?.bonus?.toFixed(1) ?? "—"}</dd>
+              <dt className="text-muted">站点类型</dt><dd>{actionsTarget.site_type}</dd>
+              <dt className="text-muted">PTD 标识</dt><dd className="break-all">{ptdConfig?.site_identifiers[String(actionsTarget.id)] ?? "未识别"}</dd>
+            </dl>
+            <div className="grid gap-2">
+              <Button variant="outline" className="h-11 justify-start" onClick={() => { setCredentialMessage(""); setCredentialsTarget(actionsTarget); setActionsTarget(null); }}><KeyRound className="mr-2 size-4" />查看凭据</Button>
+              <Button variant="outline" className="h-11 justify-start" onClick={() => handleOpenSite(actionsTarget)}><ExternalLink className="mr-2 size-4" />打开站点主页</Button>
+              <Button variant="outline" className="h-11 justify-start text-red-700" onClick={() => { setDeleteError(""); setDeleteTarget(actionsTarget); setActionsTarget(null); }}><Trash2 className="mr-2 size-4" />删除站点</Button>
+            </div>
+          </div>
+        ) : null}
       </Dialog>
 
       <Dialog
@@ -2017,6 +2008,7 @@ export function SitesPage() {
       >
         {credentialsTarget ? (
           <div className="space-y-4 p-4 sm:p-6">
+            {credentialMessage ? <p role="status" className="break-words text-sm">{credentialMessage}</p> : null}
             <div className="rounded-2xl border border-border bg-surface-container/55 p-4">
               <SiteCredentialList
                 site={credentialsTarget}
@@ -2045,18 +2037,22 @@ export function SitesPage() {
             ? "修改站点连接配置"
             : "从 PT-Depiler 站点列表快速选择，或添加自定义站点"
         }
-        escMode="double"
-        panelClassName="max-w-6xl"
-      >
-        <div className="grid gap-5 p-4 sm:p-6 lg:grid-cols-[minmax(17rem,0.72fr)_minmax(28rem,1.28fr)] lg:items-start">
-          {formError ? (
-            <div
-              role="alert"
-              className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-sm text-destructive lg:col-span-2"
-            >
-              {formError}
+        panelClassName="max-w-2xl"
+        footer={
+          <div className="space-y-2">
+            {formError ? <p role="alert" className="break-words text-sm text-red-700">{formError}</p> : null}
+            <div className="flex justify-end gap-2">
+              <Button variant="secondary" className="h-11" onClick={closeForm} disabled={submitting}>取消</Button>
+              <Button type="submit" form="site-connection-form" className={sitePrimaryButtonClassName} disabled={submitting || requestHeadersLoading || Boolean(requestHeadersError)}>
+                {submitting && <Loader2 className="mr-2 size-4 animate-spin" />}
+                {editingId != null ? "保存" : "添加"}
+              </Button>
             </div>
-          ) : null}
+          </div>
+        }
+      >
+        <form id="site-connection-form" noValidate onSubmit={(event) => { event.preventDefault(); handleSubmit(); }} className="p-4 sm:p-6">
+          <fieldset disabled={submitting} className="min-w-0 space-y-5">
           <div className="min-w-0 space-y-4">
             {editingId == null ? (
               <div className="space-y-2 rounded-2xl border border-primary/20 bg-primary/5 p-3.5">
@@ -2076,7 +2072,7 @@ export function SitesPage() {
                 />
                 <div id="site-preset-help" className="text-[11px] leading-5 text-muted">
                   {sitePresetsError ? (
-                    <span className="text-destructive">
+                    <span className="text-red-700">
                       {sitePresetsError}。
                       <button type="button" className="cursor-pointer font-bold underline underline-offset-2" onClick={loadSitePresets}>重新加载</button>
                     </span>
@@ -2093,10 +2089,15 @@ export function SitesPage() {
               <Label htmlFor="site-name">名称</Label>
               <Input
                 id="site-name"
+                className="text-base"
+                required
+                aria-invalid={Boolean(fieldErrors.name)}
+                aria-describedby={fieldErrors.name ? "site-name-error" : undefined}
                 value={form.name}
                 onChange={(e) => patch({ name: e.target.value })}
                 placeholder="站点名称"
               />
+              {fieldErrors.name ? <p id="site-name-error" className="text-sm text-red-700">{fieldErrors.name}</p> : null}
             </div>
 
             <div className="space-y-2">
@@ -2115,7 +2116,7 @@ export function SitesPage() {
                 options={[
                   { value: "nexusphp", label: "NexusPHP" },
                   { value: "mteam", label: "M-Team" },
-                { value: "gazelle", label: "Gazelle" },
+                  { value: "gazelle", label: "Gazelle" },
                 ]}
               />
             </div>
@@ -2126,10 +2127,18 @@ export function SitesPage() {
               <Label htmlFor="site-base-url">基础 URL</Label>
               <Input
                 id="site-base-url"
+                className="text-base"
+                type="url"
+                required
+                autoCapitalize="none"
+                spellCheck={false}
+                aria-invalid={Boolean(fieldErrors.base_url)}
+                aria-describedby={fieldErrors.base_url ? "site-url-error" : undefined}
                 value={form.base_url}
                 onChange={(e) => patch({ base_url: e.target.value })}
                 placeholder="https://example.com"
               />
+              {fieldErrors.base_url ? <p id="site-url-error" className="text-sm text-red-700">{fieldErrors.base_url}</p> : null}
             </div>
 
             {renderAuthFields()}
@@ -2153,36 +2162,42 @@ export function SitesPage() {
             ) : null}
           </div>
 
-          <SiteRequestHeadersEditor
-            headers={form.request_headers}
-            loading={requestHeadersLoading}
-            onChange={updateRequestHeader}
-            onAdd={addRequestHeader}
-            onRemove={removeRequestHeader}
-            onRestore={restoreDefaultRequestHeaders}
-          />
-
-          <div className="flex justify-end gap-2 border-t border-border pt-4 lg:col-span-2">
-            <Button variant="secondary" onClick={closeForm}>
-              取消
-            </Button>
-            <Button onClick={handleSubmit} disabled={submitting || requestHeadersLoading}>
-              {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {editingId != null ? "保存" : "添加"}
-            </Button>
-          </div>
-        </div>
+          {requestHeadersError ? (
+            <div role="alert" className="space-y-2 rounded-xl border border-destructive/25 p-3 text-sm">
+              <p className="font-semibold text-red-700">请求头加载失败，暂时无法保存</p>
+              <p className="break-words">{requestHeadersError}</p>
+              <Button type="button" variant="outline" className="h-11" onClick={() => { if (editingId != null) loadRequestHeaders(editingId); }}>重新加载请求头</Button>
+            </div>
+          ) : null}
+          <details open={advancedOpen} onToggle={(event) => setAdvancedOpen(event.currentTarget.open)} className="group border-t border-border pt-2">
+            <summary className="flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 rounded-lg py-2 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary [&::-webkit-details-marker]:hidden">
+              <span>高级配置 <span className="font-normal text-muted">· 请求头 {requestHeadersLoading ? "加载中" : `${form.request_headers.length} 项`}</span></span>
+              <ChevronDown className="size-4 shrink-0 transition-transform group-open:rotate-180" />
+            </summary>
+            <p className="mb-4 mt-1 text-sm leading-6 text-muted">默认请求头适用于常规连接，仅在站点要求特殊请求头时修改。</p>
+            <SiteRequestHeadersEditor
+              headers={form.request_headers}
+              loading={requestHeadersLoading || Boolean(requestHeadersError)}
+              onChange={updateRequestHeader}
+              onAdd={addRequestHeader}
+              onRemove={removeRequestHeader}
+              onRestore={restoreDefaultRequestHeaders}
+            />
+          </details>
+          </fieldset>
+        </form>
       </Dialog>
 
       {/* ---- delete confirmation ---- */}
       <Dialog
         open={deleteTarget != null}
-        onClose={() => setDeleteTarget(null)}
+        onClose={() => { if (!deleting) { setDeleteTarget(null); setDeleteError(""); } }}
         title="确认删除"
         description={`确定要删除站点「${deleteTarget?.name ?? ""}」吗？此操作不可撤销。`}
       >
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="secondary" onClick={() => setDeleteTarget(null)}>
+        {deleteError ? <p role="alert" className="px-4 pt-4 text-sm text-red-700">{deleteError}</p> : null}
+        <div className="flex justify-end gap-2 p-4">
+          <Button variant="secondary" disabled={deleting} onClick={() => { setDeleteTarget(null); setDeleteError(""); }}>
             取消
           </Button>
           <Button
@@ -2201,7 +2216,7 @@ export function SitesPage() {
         open={testOpen}
         onClose={() => setTestOpen(false)}
         title="测试连接"
-        description="站点连接测试结果"
+        description={testTarget ? `${testTarget.name} · 连接测试结果` : "站点连接测试结果"}
       >
         {testing ? (
           <div className="flex items-center justify-center py-8 text-muted">
@@ -2209,7 +2224,7 @@ export function SitesPage() {
             测试中…
           </div>
         ) : testResult ? (
-          <div className="space-y-4">
+          <div className="space-y-4 p-4 sm:p-6">
             <div className="flex items-center gap-2">
               <span
                 className={`inline-block h-3 w-3 rounded-full ${testResult.success ? "bg-emerald-500" : "bg-red-500"}`}
@@ -2218,7 +2233,13 @@ export function SitesPage() {
                 {testResult.success ? "连接成功" : "连接失败"}
               </span>
             </div>
-            <p className="text-sm text-muted">{testResult.message}</p>
+            <p className="break-words text-sm text-muted" role="status">{testResult.message}</p>
+            {!testResult.success && testTarget ? (
+              <div className="flex flex-wrap gap-2">
+                <Button className={sitePrimaryButtonClassName} onClick={() => handleTest(testTarget)}>重试测试</Button>
+                <Button variant="outline" className="h-11" onClick={() => { setTestOpen(false); openEdit(testTarget); }}>编辑连接配置</Button>
+              </div>
+            ) : null}
 
             {testResult.user_stats && (
               <div className="rounded-2xl border border-border bg-surface-container/70 p-4">
@@ -2268,10 +2289,17 @@ export function SitesPage() {
         title="PT 数据总览"
         panelClassName="max-w-7xl"
       >
+        {overviewMessage ? <p role="status" className="px-4 pt-4 text-sm">{overviewMessage}</p> : null}
         {overviewLoading ? (
           <div className="flex min-h-[420px] items-center justify-center py-8 text-muted">
             <Loader2 className="mr-2 h-5 w-5 animate-spin" />
             正在读取站点统计数据…
+          </div>
+        ) : overviewError ? (
+          <div role="alert" className="space-y-3 p-6">
+            <p className="font-semibold text-red-700">站点总览加载失败</p>
+            <p className="break-words text-sm">{overviewError}</p>
+            <Button variant="outline" className="h-11" onClick={handleOverview}>重新加载总览</Button>
           </div>
         ) : overviewRows.length === 0 ? (
           <p className="py-8 text-center text-muted">暂无站点统计数据</p>
@@ -2288,7 +2316,7 @@ export function SitesPage() {
                       YUNMU PT PROOF
                     </span>
                     <span className="rounded-full border border-blossom/20 bg-white/60 px-3 py-1 text-xs font-bold text-[#b43767]">
-                      {successfulOverviewRows.length} 个站点已验证
+                      {successfulOverviewRows.length} 个站点有账户数据
                     </span>
                   </div>
                   <h3 className="mt-4 text-3xl font-black tracking-tight text-foreground sm:text-5xl">
@@ -2325,13 +2353,14 @@ export function SitesPage() {
                   <div className="grid gap-2 text-sm sm:grid-cols-2">
                     <ProofInfo label="生成时间" value={overviewGeneratedAt?.toLocaleString() ?? "-"} />
                     <ProofInfo label="配置站点" value={`${overviewRows.length} 个`} />
-                    <ProofInfo label="成功统计" value={`${successfulOverviewRows.length} 个`} />
+                    <ProofInfo label="有账户数据" value={`${successfulOverviewRows.length} 个`} />
                     <ProofInfo label="失败站点" value={`${failedOverviewRows.length} 个`} />
                   </div>
                 </div>
               </div>
             </section>
 
+            <p className="text-sm text-muted">汇总包含此前获取的账户数据；请结合各站点的最近检查时间和错误状态判断时效。</p>
             <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <OverviewMetricCard icon={UploadCloud} label="总上传量" value={totalUploadedCompact.value} unit={totalUploadedCompact.unit} />
               <OverviewMetricCard icon={DownloadCloud} label="总下载量" value={totalDownloadedCompact.value} unit={totalDownloadedCompact.unit} />
@@ -2388,7 +2417,7 @@ export function SitesPage() {
                         {row.stats ? formatRatio(row.stats.uploaded, row.stats.downloaded) : "-"}
                       </TableCell>
                       <TableCell className={row.error ? "text-red-600" : "text-muted"}>
-                        {row.error ?? "正常"}
+                        {row.error ?? (row.stats ? "最近拉取成功" : "等待刷新")}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -2414,6 +2443,17 @@ export function SitesPage() {
   );
 }
 
+function SiteStatusDetail({ site, showBadge = true }: { site: SiteRecord; showBadge?: boolean }) {
+  return (
+    <div className="space-y-2">
+      {showBadge ? <SiteHealthBadge site={site} /> : null}
+      {site.stats?.last_error ? <p className="break-words text-sm leading-6 text-red-700">{site.stats.last_error}</p> : null}
+      <p className="text-xs leading-5 text-muted">{site.stats?.last_checked_at ? `最近检查：${formatDateTime(site.stats.last_checked_at)}` : "尚未刷新账户数据"}</p>
+      {site.stats?.last_error && site.stats.uploaded != null ? <p className="text-xs text-muted">账户数值为此前获取的数据</p> : null}
+    </div>
+  );
+}
+
 function SiteHealthBadge({ site }: { site: SiteRecord }) {
   const health = getSiteHealth(site);
   const styles: Record<SiteHealth, string> = {
@@ -2422,12 +2462,12 @@ function SiteHealthBadge({ site }: { site: SiteRecord }) {
     pending: "bg-amber-100 text-amber-700",
   };
   const labels: Record<SiteHealth, string> = {
-    healthy: "正常",
+    healthy: "拉取成功",
     failed: "失败",
     pending: "待刷新",
   };
   return (
-    <span className={`inline-flex shrink-0 items-center rounded-full px-2.5 py-0.5 text-[10px] font-bold ${styles[health]}`}>
+    <span className={`inline-flex shrink-0 items-center rounded-full px-2.5 py-1 text-xs font-medium ${styles[health]}`}>
       {labels[health]}
     </span>
   );
@@ -2501,7 +2541,7 @@ function OverviewMobileCard({ row }: { row: SiteOverviewRow }) {
           <div className="mt-0.5 text-[11px] text-muted">UID {stats?.uid ?? "-"} · {stats?.username ?? "-"}</div>
         </div>
         <span className={`rounded-full px-2.5 py-0.5 text-[10px] font-bold ${row.error ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"}`}>
-          {row.error ? "失败" : "正常"}
+          {row.error ? "失败" : row.stats ? "拉取成功" : "待刷新"}
         </span>
       </div>
       <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
